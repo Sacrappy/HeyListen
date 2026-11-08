@@ -16,5 +16,5 @@ if (-not (Test-Path $wt)) { git -C $root worktree add -b $branch $wt main }
 $spec = Get-Content (Join-Path $root "docs\tickets\$Ticket.md") -Raw
 Push-Location $wt
 try {
-  opencode run --model $Model "You work on branch $branch only. Implement this ticket, run its tests, commit with message '$Ticket: <summary>'. Do not push. Ticket:`n$spec"
+  opencode run --model $Model "You work on branch $branch only. Implement this ticket, run its tests, commit with message '${Ticket}: <summary>'. Do not push. Ticket:`n$spec"
 } finally { Pop-Location }
