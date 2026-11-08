@@ -1805,7 +1805,7 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     // segments, and what follows them, into recordings of their own in the same epoch, with no write-back between them: each
     // one's refresh copied the CPU's 0 over the sum the segments before it had added on the GPU. The meter read only the last
     // recording's share, the exposure rose to its maximum: fog washed out, the ground's shadows gone, in every frame
-    static uint64_t done_epoch = 0;
+    static uint64_t done_epoch = ~0ull;   // (not 0: mirror_epoch starts at 0)
     if (done_epoch == mirror_epoch) return false;
     done_epoch = mirror_epoch;
     std::map<Pool*, std::vector<VkBufferCopy>> by_pool;
