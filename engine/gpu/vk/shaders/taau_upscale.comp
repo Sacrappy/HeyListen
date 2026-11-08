@@ -1,0 +1,32 @@
+#version 450
+// (hookshot) OoT's gameplay TAAU network (fd029a317a9a4b94) stood in for (vk_draw.cpp taau_stand_in): its input, the
+// scene colour in RGB9E5 that its first passes made, sampled with a linear filter and written to its output at the
+// output's size. The network's translation loses the blue channel (the yellow cast); this keeps the picture right at
+// the cost of its temporal anti-aliasing.
+//
+// Against one-frame flashes: the picture before (`hist`, this pass's own last output) bounds each pixel, which may
+// rise to 1.5x and fall to 0.6x of it in a frame (a light change or a camera cut settles over a few frames). Some
+// frames' scene colour blows up to white across the picture (or a light term drops out for a frame); those frames
+// came out as full-screen flashes. A NaN or infinite pixel takes the one before. pc.valid = 0 (the first frame, a
+// new size): no bound.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
+layout(binding = 2, r11f_g11f_b10f) uniform image2D hist;
+layout(push_constant) uniform P { ivec2 size; int valid; } pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    const vec2 uv = (vec2(g) + 0.5) / vec2(pc.size);
+    // (the input is the square root of the scene colour, the network's perceptual encoding, which its output undoes:
+    // 6637ac1d's means 0.58 0.50 0.27 -> 0.77 0.69 0.49)
+    const vec3 s = textureLod(src, uv, 0.0).rgb;
+    vec3 c = s * s;
+    if (pc.valid != 0) {
+        const vec3 p = imageLoad(hist, g).rgb;
+        c = mix(c, p, bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b)));
+        c = clamp(c, p * 0.6, p * 1.5 + 0.01);
+    }
+    imageStore(dst, g, vec4(c, 1.0));
+    imageStore(hist, g, vec4(c, 1.0));
+}

@@ -1,0 +1,65 @@
+"""The renderer's threads from an all-thread sample (host/mkw_glue.c HOS_SAMPLE_ALL): for the threads whose name starts
+with a prefix (default mkw_vk), the share of samples running, and the functions by inclusive and self share of the
+running samples (leaf in hookshot_vk.dll, hookshot.exe or the driver).
+
+    python -I scripts/vkprof.py work/runs/<run>_all.txt [top 40] [prefix mkw_vk]
+    (RX_MAPS=<folder>: another build's linker maps)
+"""
+import bisect, collections, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import prof  # noqa: E402
+
+top = int(sys.argv[2]) if len(sys.argv) > 2 else 40
+prefix = sys.argv[3] if len(sys.argv) > 3 else "mkw_vk"
+maps = {}
+for mod in ("hookshot.exe", "hookshot_vk.dll"):
+    mp = os.path.join(os.environ.get("RX_MAPS", prof.BUILD), mod[:-4] + ".map")
+    if os.path.exists(mp):
+        maps[mod] = prof.load_map(mp, 0x180000000 if mod.endswith(".dll") else 0x140000000)
+cache = {}
+
+
+def name(f):
+    if f in cache:
+        return cache[f]
+    mod, _, off = f.rpartition("+")
+    r = mod
+    if mod in maps:
+        a, n = maps[mod]
+        i = bisect.bisect_right(a, int(off, 16)) - 1
+        if i >= 0:
+            r = mod.split(".")[0] + ":" + prof.demangle(n[i])[:70]
+    cache[f] = r
+    return r
+
+
+RUN = ("hookshot_vk.dll", "hookshot.exe", "nvoglv64.dll")
+seen, running = collections.Counter(), collections.Counter()
+incl, self_ = collections.Counter(), collections.Counter()
+nrun = 0
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    head, _, st = line.rstrip("\n").partition("|")
+    th = head.split(" ", 1)[-1]
+    if not st or not th.startswith(prefix):
+        continue
+    frames = st.split(";")
+    seen[th] += 1
+    leafmod = frames[0].rpartition("+")[0]
+    if leafmod not in RUN:
+        continue
+    running[th] += 1
+    nrun += 1
+    names = [name(f) for f in frames]
+    self_[names[0]] += 1
+    for n in set(names):
+        incl[n] += 1
+print("-- running share by thread")
+for th in sorted(seen, key=lambda t: -running[t]):
+    print("  %5.1f%%  %s (%d samples)" % (100.0 * running[th] / seen[th], th, seen[th]))
+print("-- inclusive (share of %d running samples)" % nrun)
+for k, c in incl.most_common(top):
+    print("  %5.1f%%  %s" % (100.0 * c / max(1, nrun), k))
+print("-- self")
+for k, c in self_.most_common(top):
+    print("  %5.1f%%  %s" % (100.0 * c / max(1, nrun), k))

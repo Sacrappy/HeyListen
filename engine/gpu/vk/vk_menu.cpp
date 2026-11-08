@@ -1,0 +1,749 @@
+// The Insert menu. Drawn on the CPU (GDI text into a bitmap) and copied over the window's image at the last step of a present,
+// so it costs nothing while closed and it never touches the game's picture, nor what frame interpolation sees. Keys: Insert
+// opens and closes it, Up and Down choose, Left and Right change, Esc closes; the game gets no keyboard input while it is open.
+// (hookshot) A gamepad's Home button, or Select and Start together, opens it too; the D-pad chooses and changes, the bottom
+// face button changes too, the right one closes. The game gets no gamepad input while it is open either.
+// Its Controls page binds the Switch's buttons to gamepad inputs and keys.
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "vk_paths.h"
+#include "vk_menu.h"
+#include "vk_perf.h"
+#ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
+#define HOOKSHOT_VERSION "unknown"
+#endif
+
+namespace mkwvk {
+HWND app_window();
+
+Options opts;
+
+namespace {
+
+struct Row {
+    const char* name;
+    int* value;
+    int lo, hi, step;
+    const char* (*text)(int v);
+    const char* help;   // (shown under the list while the row is selected)
+};
+const char* tx_framegen(int v) {
+    static const char* t[] = {"Off", "", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
+    return t[v];
+}
+const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_fps_limit(int v) {
+    static const char* t[] = {"60", "90", "120", "144", "165", "240"};
+    return t[v < 0 || v > 5 ? 0 : v];
+}
+const char* tx_perf(int v) { return v == 2 ? "Full" : v ? "FPS" : "Off"; }
+const char* tx_upscale(int v) {
+    static const char* t[] = {"Off", "Catmull-Rom", "Lanczos"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
+    return t[v];
+}
+const char* tx_percent(int v) {
+    static char b[8];
+    snprintf(b, sizeof b, "%d%%", v);
+    return b;
+}
+const char* tx_resolution(int v) {
+    static const char* t[] = {"Auto", "100%", "75%", "67%", "50%"};
+    return t[v];
+}
+const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
+const char* tx_text_speed(int v) {
+    static const char* t[] = {"Normal", "2x", "4x", "Instant"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_handheld(int v) { return v ? "On (restart)" : "Off (restart)"; }
+const char* tx_ultrawide(int v) { return v ? "Monitor's shape (restart)" : "16:9 (restart)"; }
+const char* tx_preset(int v) {
+    static const char* t[] = {"Custom", "Minimum (4GB)", "Low (6GB)", "Balanced (8GB)", "High (12GB)", "Ultra (16GB+)"};
+    return t[std::min(std::max(v, 0), 5)];
+}
+void sync_preset_budgets(int p) {
+    switch (p) {
+    case 1: opts.vram_mb = 2200;  opts.mirror_mb = 256;  break;
+    case 2: opts.vram_mb = 3600;  opts.mirror_mb = 512;  break;
+    case 3: opts.vram_mb = 4800;  opts.mirror_mb = 1024; break;
+    case 4: opts.vram_mb = 7500;  opts.mirror_mb = 2048; break;
+    case 5: opts.vram_mb = 11000; opts.mirror_mb = 3072; break;
+    default: opts.vram_mb = 0;    opts.mirror_mb = 0;    break;
+    }
+}
+void apply_preset(int p) {
+    switch (p) {
+    case 1: // Minimum (4GB VRAM / iGPU)
+        opts.resolution = 4; opts.upscale = 2; opts.sharpness = 50;
+        opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 1;
+        break;
+    case 2: // Low (6GB VRAM)
+        opts.resolution = 2; opts.upscale = 2; opts.sharpness = 35;
+        opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 1;
+        break;
+    case 3: // Balanced (8GB VRAM)
+        opts.resolution = 1; opts.upscale = 1; opts.sharpness = 25;
+        opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
+        break;
+    case 4: // High (12GB VRAM)
+        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 30;
+        opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
+        break;
+    case 5: // Ultra (16GB+ VRAM)
+        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 40;
+        opts.framegen = 3;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
+        break;
+    default:
+        break;
+    }
+    sync_preset_budgets(p);
+}
+
+Row rows[] = {
+    {"Quality preset", &opts.preset, 0, 5, 1, tx_preset,
+     "Automatically configures resolution, upscaling, frame generation, and dynamic VRAM limits tailored to your GPU tier."},
+    {"Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
+     "Fills the whole screen with the game, without the window's border. The same as F11."},
+    {"Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
+     "Makes extra frames between the game's own (2x up to 8x), for smoother motion. Adds a little input delay, and fast motion or camera cuts "
+     "can show artifacts."},
+    {"Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
+     "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
+    {"Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
+     "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
+     "faster."},
+    {"Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
+     "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
+    {"Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
+     "Sharpens the picture as it goes to the window, with or without an upscaling filter. Too much shows halos around edges."},
+    {"Game speed", &opts.realtime, 0, 1, 1, tx_speed,
+     "Per frame: the game slows down whenever it runs below 60 fps. Real time: it keeps normal speed down to 15 fps by taking "
+     "longer steps."},
+    {"Frame rate limit", &opts.fps_limit, 0, 5, 1, tx_fps_limit,
+     "The game's own frame rate. Above 60 it needs Game speed on Real time (the game's time follows the clock, so it does not run "
+     "faster), and your display must run that fast to show every frame."},
+    {"Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
+     "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
+    {"Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
+     "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart."},
+    {"FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,
+     "FPS: frames per second and the frame time in the top right corner (with frame generation on, also the game's own rate). "
+     "Full: a panel with the GPU, VRAM, CPU and RAM load and a frame-time graph. F10 cycles Off, FPS and Full."},
+    {"Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
+     "On: the controller keeps playing the game while another window has the focus, for streaming or playing beside other "
+     "apps. The keyboard and mouse still need the game's window."},
+    {"Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
+     "How fast the letters of dialogue and other messages appear. Normal is the game's own pace, with its pauses. Instant shows "
+     "each page at once, as pressing A does."},
+
+    {"Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
+     "Which gamepad button and which keys press each of the Switch's buttons."},
+};
+constexpr int kRows = sizeof rows / sizeof rows[0];
+constexpr int kMenuWidth = 360;   // (at a scale of 1: 720 lines)
+
+std::atomic<bool> open_now{false};
+int selected = 0;
+bool menu_refresh = false;
+std::string ini_path() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string dir(exe, n);
+    return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_options.ini";
+}
+const char* ini_key(const Row& r) {
+    static char k[32];
+    size_t n = 0;
+    for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
+    k[n] = 0;
+    return k;
+}
+// (hookshot) the controls, kept by the host (host/nn_hid.c reads them back from here): pad_<button>, key_<button>
+const char* const bind_names[HOS_SW_N] = {"a", "b", "x", "y", "ls", "rs", "l", "r", "zl", "zr", "plus", "minus",
+                                          "left", "up", "right", "down"};
+bool can_bind() { return host && host->binding && host->bind && host->pad_raw; }
+void save() {
+    // (hookshot) the lines that are not the menu's are kept: the controls, pad_ and key_ (host/nn_hid.c)
+    std::string kept;
+    if (FILE* f = fopen(ini_path().c_str(), "r")) {
+        char line[256];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "pad_", 4) || !strncmp(line, "key_", 4)) kept += line;
+        fclose(f);
+    }
+    if (FILE* f = fopen(ini_path().c_str(), "w")) {
+        for (const Row& r : rows)
+            if (r.value) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
+        fprintf(f, "options_version=2\n");   // (game_speed below 2 was only ever the old default, see menu_init)
+        if (!can_bind()) fputs(kept.c_str(), f);
+        for (int i = 0; i < HOS_SW_N && can_bind(); i++)
+            fprintf(f, "pad_%s=%d\nkey_%s=%d,%d\n", bind_names[i], host->binding(HOS_BIND_PAD, i, 0), bind_names[i],
+                    host->binding(HOS_BIND_KEY, i, 0), host->binding(HOS_BIND_KEY, i, 1));
+        fclose(f);
+    }
+}
+
+// ---- (hookshot) the Controls page: what presses each of the Switch's buttons, a gamepad input and up to two keys ----
+struct Control {
+    int button;   // HOS_SW_*
+    const char* name;
+};
+const Control controls[] = {{HOS_SW_A, "A"}, {HOS_SW_B, "B"}, {HOS_SW_X, "X"}, {HOS_SW_Y, "Y"}, {HOS_SW_L, "L"},
+                            {HOS_SW_R, "R"}, {HOS_SW_ZL, "ZL"}, {HOS_SW_ZR, "ZR"}, {HOS_SW_PLUS, "Plus"},
+                            {HOS_SW_MINUS, "Minus"}, {HOS_SW_LS, "Left stick press"}, {HOS_SW_RS, "Right stick press"},
+                            {HOS_SW_UP, "D-pad up"}, {HOS_SW_DOWN, "D-pad down"}, {HOS_SW_LEFT, "D-pad left"},
+                            {HOS_SW_RIGHT, "D-pad right"}};
+constexpr int kControls = sizeof controls / sizeof controls[0];   // (then "Reset to defaults")
+const char* pad_name(int p) {
+    static const char* t[HOS_PAD_N] = {"Bottom button", "Right button", "Left button", "Top button", "Select / Back",
+                                       "Home", "Start", "Left stick press", "Right stick press", "L1 / LB", "R1 / RB",
+                                       "D-pad up", "D-pad down", "D-pad left", "D-pad right", "L2 / LT", "R2 / RT"};
+    return p >= 0 && p < HOS_PAD_N ? t[p] : "None";
+}
+const char* key_name(int vk) {
+    static char b[16];
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return b[0] = (char)vk, b[1] = 0, b;
+    if (vk >= VK_F1 && vk <= VK_F12) return snprintf(b, sizeof b, "F%d", vk - VK_F1 + 1), b;
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9) return snprintf(b, sizeof b, "Num %d", vk - VK_NUMPAD0), b;
+    switch (vk) {
+    case VK_SPACE: return "Space";
+    case VK_SHIFT: return "Shift";
+    case VK_CONTROL: return "Ctrl";
+    case VK_MENU: return "Alt";
+    case VK_TAB: return "Tab";
+    case VK_RETURN: return "Enter";
+    case VK_BACK: return "Backspace";
+    case VK_CAPITAL: return "Caps Lock";
+    case VK_UP: return "Up";
+    case VK_DOWN: return "Down";
+    case VK_LEFT: return "Left";
+    case VK_RIGHT: return "Right";
+    case VK_HOME: return "Home";
+    case VK_END: return "End";
+    case VK_PRIOR: return "Page Up";
+    case VK_NEXT: return "Page Down";
+    case VK_ADD: return "Num +";
+    case VK_SUBTRACT: return "Num -";
+    case VK_MULTIPLY: return "Num *";
+    case VK_DIVIDE: return "Num /";
+    case VK_DECIMAL: return "Num .";
+    case VK_OEM_1: return ";";
+    case VK_OEM_PLUS: return "=";
+    case VK_OEM_COMMA: return ",";
+    case VK_OEM_MINUS: return "-";
+    case VK_OEM_PERIOD: return ".";
+    case VK_OEM_2: return "/";
+    case VK_OEM_3: return "`";
+    case VK_OEM_4: return "[";
+    case VK_OEM_5: return "\\";
+    case VK_OEM_6: return "]";
+    case VK_OEM_7: return "'";
+    }
+    return snprintf(b, sizeof b, "Key %d", vk), b;
+}
+// the keys a binding can take (Esc cancels, Insert and F1 are the menu's, Delete clears)
+const std::vector<int>& bindable_keys() {
+    static std::vector<int> k;
+    if (k.empty()) {
+        for (int c = 'A'; c <= 'Z'; c++) k.push_back(c);
+        for (int c = '0'; c <= '9'; c++) k.push_back(c);
+        for (int c = VK_F2; c <= VK_F12; c++) k.push_back(c);
+        for (int c = VK_NUMPAD0; c <= VK_NUMPAD0 + 9; c++) k.push_back(c);
+        for (int c : {VK_SPACE, VK_SHIFT, VK_CONTROL, VK_MENU, VK_TAB, VK_RETURN, VK_BACK, VK_CAPITAL, VK_UP, VK_DOWN,
+                      VK_LEFT, VK_RIGHT, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_ADD, VK_SUBTRACT, VK_MULTIPLY,
+                      VK_DIVIDE, VK_DECIMAL, VK_OEM_1, VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+                      VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7})
+            k.push_back(c);
+    }
+    return k;
+}
+int page = 0;          // 0 the options, 1 the controls
+int csel = 0, ccol = 0;   // the controls' row (kControls: reset) and column (0 the gamepad, 1 the keyboard)
+int listening = 0;     // waiting for the new input: 1 a gamepad's, 2 a key
+bool listen_armed = false;   // (once what started it was let go)
+int64_t listen_end = 0;
+std::string keys_text(int button) {
+    const int a = host->binding(HOS_BIND_KEY, button, 0), b = host->binding(HOS_BIND_KEY, button, 1);
+    std::string t = a ? key_name(a) : "";
+    if (b) t += std::string(a ? ", " : "") + key_name(b);
+    return t.empty() ? "None" : t;
+}
+
+// ---- what is drawn: bitmaps of the menu and the counter, in the window's byte order ----
+struct Bitmap {
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> px;
+    uint64_t version = 0;
+    bool keyed = false;                   // (black is see-through: copied as the runs of pixels in between)
+    std::vector<VkBufferImageCopy> runs;
+};
+Bitmap menu_bmp;
+std::mutex bmp_mu;
+int scale_of(uint32_t h) { return std::max(1u, h / 720); }
+
+void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, uint32_t, int), int scale) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = (LONG)w;
+    bi.bmiHeader.biHeight = -(LONG)h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = CreateCompatibleDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { DeleteDC(dc); return; }
+    HGDIOBJ old = SelectObject(dc, bmp);
+    paint(dc, w, h, scale);
+    GdiFlush();
+    const bool rgba = dev.swap_format == VK_FORMAT_R8G8B8A8_UNORM || dev.swap_format == VK_FORMAT_R8G8B8A8_SRGB;
+    std::lock_guard lk(bmp_mu);
+    out.w = w, out.h = h;
+    out.px.assign((const uint8_t*)bits, (const uint8_t*)bits + (size_t)w * h * 4);
+    if (out.keyed) {
+        out.runs.clear();
+        for (uint32_t y = 0; y < h; y++) {
+            for (uint32_t x = 0; x < w;) {
+                const uint8_t* p = out.px.data() + ((size_t)y * w + x) * 4;
+                if (!(p[0] | p[1] | p[2])) { x++; continue; }
+                uint32_t e = x + 1;
+                for (; e < w; e++) {
+                    const uint8_t* q = out.px.data() + ((size_t)y * w + e) * 4;
+                    if (!(q[0] | q[1] | q[2])) break;
+                }
+                VkBufferImageCopy c{};
+                c.bufferOffset = ((uint64_t)y * w + x) * 4;
+                c.bufferRowLength = w;
+                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.imageOffset = {(int32_t)x, (int32_t)y, 0};
+                c.imageExtent = {e - x, 1, 1};
+                out.runs.push_back(c);
+                x = e;
+            }
+        }
+    }
+    for (size_t i = 0; i < out.px.size(); i += 4) {
+        if (rgba) std::swap(out.px[i], out.px[i + 2]);
+        out.px[i + 3] = 255;
+    }
+    out.version++;
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+HFONT font(int px, int weight) {
+    return CreateFontA(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                       DEFAULT_PITCH, "Segoe UI");
+}
+int help_px = 0;   // (the help text's height: measure_help)
+/// The help text word-wrapped to width, a TextOutA a line (the POSIX GDI stand-in has no DrawTextA), drawn at (x, y)
+/// when draw: its height in pixels either way
+int wrap_help(HDC dc, const char* text, int width, int x, int y, bool draw) {
+    SIZE sz{};
+    GetTextExtentPoint32A(dc, "Ag", 2, &sz);
+    const int line_h = (int)sz.cy;
+    int lines = 0;
+    for (const char* p = text; *p;) {
+        int n = 0;   // (the most whole words that fit; one word at least, however long)
+        for (int end = 0;; end++) {
+            while (p[end] && p[end] != ' ') end++;
+            GetTextExtentPoint32A(dc, p, end, &sz);
+            if (n && sz.cx > width) break;
+            n = end;
+            if (!p[end]) break;
+        }
+        if (draw) TextOutA(dc, x, y + lines * line_h, p, n);
+        lines++;
+        p += n;
+        while (*p == ' ') p++;
+    }
+    return lines * line_h;
+}
+void fill(HDC dc, int x, int y, int w, int h, COLORREF c) {
+    RECT r{x, y, x + w, y + h};
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, &r, b);
+    DeleteObject(b);
+}
+void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
+    fill(dc, 0, 0, (int)w, (int)h, RGB(16, 20, 18));
+    fill(dc, 0, 0, (int)w, 2 * s, RGB(96, 176, 112));
+    SetBkMode(dc, TRANSPARENT);
+    HFONT title = font(20 * s, FW_SEMIBOLD), body = font(16 * s, FW_NORMAL);
+    HGDIOBJ old = SelectObject(dc, title);
+    SetTextColor(dc, RGB(236, 240, 236));
+    TextOutA(dc, 16 * s, 12 * s, "Hookshot", 8);
+    {   // (which build, beside the title, so a report can say it without opening the log; the release alone when the whole
+        // line would run into the title)
+        SIZE tsz{};
+        GetTextExtentPoint32A(dc, "Hookshot", 8, &tsz);
+        HFONT small = font(12 * s, FW_NORMAL);
+        SelectObject(dc, small);
+        SetTextColor(dc, RGB(140, 150, 144));
+        std::string ver = HOOKSHOT_VERSION;
+        const int room = (int)w - 32 * s - tsz.cx - 12 * s;
+        SIZE sz{};
+        GetTextExtentPoint32A(dc, ver.c_str(), (int)ver.size(), &sz);
+        if (sz.cx > room && ver.find(" (") != std::string::npos) {
+            ver.resize(ver.find(" ("));
+            GetTextExtentPoint32A(dc, ver.c_str(), (int)ver.size(), &sz);
+        }
+        if (sz.cx <= room) TextOutA(dc, (int)w - 16 * s - sz.cx, 18 * s, ver.c_str(), (int)ver.size());
+        SelectObject(dc, title);
+        DeleteObject(small);
+    }
+    SelectObject(dc, body);
+    if (page == 1) {   // (hookshot) the Controls page
+        TextOutA(dc, 16 * s + 110 * s, 12 * s + 4 * s, "Controls", 8);
+        const int rh = 24 * s, top = 64 * s, xpad = 200 * s, xkey = 390 * s;
+        SetTextColor(dc, RGB(140, 150, 144));
+        TextOutA(dc, 16 * s, 44 * s, "Button", 6);
+        TextOutA(dc, xpad, 44 * s, "Gamepad", 7);
+        TextOutA(dc, xkey, 44 * s, "Keyboard", 8);
+        for (int i = 0; i <= kControls; i++) {
+            const int y = top + i * rh;
+            const bool sel = i == csel;
+            if (sel) fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
+            SetTextColor(dc, sel ? RGB(255, 255, 255) : RGB(196, 204, 198));
+            if (i == kControls) {
+                const char* t = "Reset to defaults";
+                TextOutA(dc, 16 * s, y + 3 * s, t, (int)strlen(t));
+                continue;
+            }
+            const Control& c = controls[i];
+            TextOutA(dc, 16 * s, y + 3 * s, c.name, (int)strlen(c.name));
+            for (int col = 0; col < 2; col++) {
+                std::string v = col == 0 ? pad_name(host->binding(HOS_BIND_PAD, c.button, 0)) : keys_text(c.button);
+                if (sel && col == ccol && listening) v = col == 0 ? "Press a button..." : "Press a key...";
+                if (sel && col == ccol) {
+                    SIZE sz{};
+                    GetTextExtentPoint32A(dc, v.c_str(), (int)v.size(), &sz);
+                    fill(dc, (col ? xkey : xpad) - 6 * s, y + 2 * s, (int)sz.cx + 12 * s, rh - 4 * s,
+                         listening ? RGB(150, 120, 40) : RGB(70, 120, 84));
+                }
+                TextOutA(dc, col ? xkey : xpad, y + 3 * s, v.c_str(), (int)v.size());
+            }
+        }
+        SetTextColor(dc, RGB(140, 150, 144));
+        const char* hint = listening ? "Press the new one   Esc cancels"
+                                     : "Enter binds   Delete clears   Esc goes back";
+        const char* hint2 = "Gamepad: D-pad moves, bottom button binds, right one goes back";
+        TextOutA(dc, 16 * s, top + (kControls + 1) * rh + 6 * s, hint, (int)strlen(hint));
+        TextOutA(dc, 16 * s, top + (kControls + 1) * rh + 26 * s, hint2, (int)strlen(hint2));
+        SelectObject(dc, old);
+        DeleteObject(title);
+        DeleteObject(body);
+        return;
+    }
+    const int rh = 28 * s, top = 44 * s;
+    for (int i = 0; i < kRows; i++) {
+        const int y = top + i * rh;
+        if (i == selected) fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
+        SetTextColor(dc, i == selected ? RGB(255, 255, 255) : RGB(196, 204, 198));
+        TextOutA(dc, 16 * s, y + 4 * s, rows[i].name, (int)strlen(rows[i].name));
+        char v[40];
+        if (!rows[i].value) snprintf(v, sizeof v, ">");   // (a page)
+        else snprintf(v, sizeof v, i == selected ? "<  %s  >" : "%s", rows[i].text(*rows[i].value));
+        SIZE sz{};
+        GetTextExtentPoint32A(dc, v, (int)strlen(v), &sz);
+        TextOutA(dc, (int)w - 16 * s - sz.cx, y + 4 * s, v, (int)strlen(v));
+    }
+    const int help_top = top + kRows * rh + 8 * s;
+    fill(dc, 16 * s, help_top - 4 * s, (int)w - 32 * s, std::max(1, s), RGB(52, 64, 56));
+    HFONT help = font(14 * s, FW_NORMAL);
+    SelectObject(dc, help);
+    SetTextColor(dc, RGB(176, 186, 180));
+    wrap_help(dc, rows[selected].help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
+    SelectObject(dc, body);
+    SetTextColor(dc, RGB(140, 150, 144));
+    const char* hint = "Arrows change   Insert, F1 or Home closes";
+    TextOutA(dc, 16 * s, help_top + 4 * s + help_px + 10 * s, hint, (int)strlen(hint));
+    SelectObject(dc, old);
+    DeleteObject(title);
+    DeleteObject(body);
+    DeleteObject(help);
+}
+/// The tallest help text at scale s, in pixels: the menu keeps that height whichever row is selected
+int measure_help(int s) {
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT f = font(14 * s, FW_NORMAL);
+    HGDIOBJ old = SelectObject(dc, f);
+    int most = 0;
+    for (const Row& r : rows) most = std::max(most, wrap_help(dc, r.help, (kMenuWidth - 32) * s, 0, 0, false));
+    SelectObject(dc, old);
+    DeleteObject(f);
+    DeleteDC(dc);
+    return most;
+}
+void redraw_menu(int s) {
+    if (page == 1) {
+        gdi_draw(menu_bmp, 600u * s, (uint32_t)((64 + (kControls + 1) * 24 + 52) * s), paint_menu, s);
+        return;
+    }
+    static int measured_at = 0;
+    if (measured_at != s) help_px = measure_help(s), measured_at = s;
+    // (title and rows, the rule and the help text, the hint line)
+    gdi_draw(menu_bmp, (uint32_t)(kMenuWidth * s), (uint32_t)((44 + kRows * 28 + 12 + 10 + 30) * s + help_px), paint_menu, s);
+}
+
+std::atomic<int64_t> game_frames{0}, shown_frames{0};
+int cur_scale = 1;
+
+struct Upload {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    void* map = nullptr;
+    uint64_t size = 0, version = 0;
+};
+Upload ups[2][3];   // (the menu's, the counter's; a frame in flight's each)
+
+void copy_over(VkCommandBuffer cmd, VkImage dst, Bitmap& b, Upload& u, int x, int y, uint32_t w, uint32_t h) {
+    std::lock_guard lk(bmp_mu);
+    if (!b.w || (uint32_t)x + b.w > w || (uint32_t)y + b.h > h) return;
+    const uint64_t size = (uint64_t)b.w * b.h * 4;
+    if (u.size < size) {
+        if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, u.buf, u.alloc, &u.map)) return;
+        u.size = size, u.version = 0;
+    }
+    if (u.version != b.version) std::memcpy(u.map, b.px.data(), size), u.version = b.version;
+    if (b.keyed) {
+        static thread_local std::vector<VkBufferImageCopy> at;
+        at = b.runs;
+        for (auto& r : at) r.imageOffset.x += x, r.imageOffset.y += y;
+        if (!at.empty()) vkCmdCopyBufferToImage(cmd, u.buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)at.size(), at.data());
+        return;
+    }
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageOffset = {x, y, 0};
+    c.imageExtent = {b.w, b.h, 1};
+    vkCmdCopyBufferToImage(cmd, u.buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+}
+
+} // namespace
+
+void menu_init() {
+    static bool done;
+    if (done) return;
+    done = true;
+    if (FILE* f = fopen(ini_path().c_str(), "r")) {
+        char line[80];
+        bool has_resolution = false;
+        bool v2 = false;
+        int old_dynres = -1;   // (the row before Resolution: 0, the full scale, is its 100%; 1 is Auto)
+        while (fgets(line, sizeof line, f)) {
+            char* eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            for (Row& r : rows)
+                if (r.value && !strcmp(line, ini_key(r))) *r.value = std::min(std::max(atoi(eq + 1), r.lo), r.hi);
+            has_resolution |= !strcmp(line, "resolution");
+            v2 |= !strcmp(line, "options_version");
+            if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
+        }
+        fclose(f);
+        if (!has_resolution && old_dynres >= 0) opts.resolution = old_dynres ? 0 : 1;
+        // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
+        // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
+        if (!v2) opts.realtime = 1;
+    }
+    if (opts.preset > 0) sync_preset_budgets(opts.preset);
+    if (opts.framegen == 1) opts.framegen = 2;
+    if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = std::min(std::max(atoi(e), 2), 8);
+    if (const char* e = getenv("RX_VK_PACE")) opts.pace = atoi(e) != 0;
+    if (const char* e = getenv("RX_VK_UPSCALE"))
+        for (Row& r : rows)
+            if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
+    if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
+    if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
+}
+
+bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
+
+void menu_note_frame(bool game_frame) {
+    shown_frames.fetch_add(1, std::memory_order_relaxed);
+    if (opts.show_fps) perf_note_frame();   // (the overlay's frame times: vk_perf.cpp)
+    if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+// The Fullscreen row and F11 are one setting: the row asks the window's thread (host/display.c), F11 shows in the row
+void fullscreen_tick() {
+    static int applied = 0, settle = 0;
+    const HWND main_window = app_window();
+    if (!main_window) return;
+    static const bool env = getenv("HOS_FULLSCREEN") != nullptr;   // (a test's own choice: the row is left alone)
+    if (env) return;
+    if (opts.fullscreen != applied) {
+        applied = opts.fullscreen;
+        settle = 60;
+        PostMessageA(main_window, WM_APP + 7, (WPARAM)applied, 0);
+        return;
+    }
+    if (settle > 0) { settle--; return; }
+    const int now = !(GetWindowLongA(main_window, GWL_STYLE) & WS_CAPTION);
+    if (now != applied) {
+        opts.fullscreen = applied = now;
+        menu_refresh = true;
+        save();
+    }
+}
+
+void menu_tick() {
+    fullscreen_tick();
+    enum { K_N = 11 };
+    static bool held[K_N];
+    static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
+                                  VK_RETURN, VK_DELETE, VK_BACK, VK_F10};   // (F10: the overlay mode)
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    const bool mine = pid == GetCurrentProcessId();
+    bool press[K_N] = {};
+    for (int i = 0; i < K_N; i++) {
+        const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
+        press[i] = down && !held[i];
+        held[i] = down;
+    }
+    // (hookshot) the gamepads, by position: Home, or Select and Start together, as Insert; the D-pad as the arrows,
+    // the bottom face button as Enter, the right one as Esc (not while a binding waits for its button)
+    static uint32_t pad_held = 0;
+    const uint32_t raw = mine && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
+    const uint32_t chord = 1u << HOS_PAD_BACK | 1u << HOS_PAD_START;
+    const bool chord_now = (raw & chord) == chord && (pad_held & chord) != chord;
+    pad_held = raw;
+    auto pad = [&](int p) { return listening != 1 && (pad_press >> p & 1) != 0; };
+    if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
+    if (open_now.load() && listening != 1) {
+        press[1] |= pad(HOS_PAD_UP), press[2] |= pad(HOS_PAD_DOWN), press[3] |= pad(HOS_PAD_LEFT);
+        press[4] |= pad(HOS_PAD_RIGHT), press[5] |= pad(HOS_PAD_EAST), press[7] |= pad(HOS_PAD_SOUTH);
+    }
+    const int scale = scale_of(dev.swap_extent.height);
+    bool changed = scale != cur_scale || menu_refresh;
+    menu_refresh = false;
+    cur_scale = scale;
+    if (press[10]) {
+        opts.show_fps = (opts.show_fps + 1) % 3;
+        menu_refresh = true;
+        save();
+    }
+    if (press[0] || press[6]) {
+        open_now = !open_now.load(), changed = true;
+        page = 0, listening = 0;
+    }
+    if (open_now.load() && page == 1) {   // (hookshot) the Controls page
+        if (!can_bind()) page = 0;
+        else if (listening) {
+            if (press[5] || prof_now() > listen_end) listening = 0, changed = true;   // (Esc, or nothing for a while)
+            else if (listening == 1) {
+                if (!listen_armed) listen_armed = (raw & ~(1u << HOS_PAD_GUIDE)) == 0;
+                else if (const uint32_t p = pad_press & ~(1u << HOS_PAD_GUIDE)) {
+                    int bit = 0;
+                    while (!(p >> bit & 1)) bit++;
+                    host->bind(HOS_BIND_PAD, controls[csel].button, 0, bit);
+                    listening = 0, changed = true;
+                    save();
+                }
+            } else {
+                int down = 0;
+                for (int k : bindable_keys())
+                    if (mine && (GetAsyncKeyState(k) & 0x8000)) {
+                        down = k;
+                        break;
+                    }
+                if (!listen_armed) listen_armed = !down;
+                else if (down) {
+                    host->bind(HOS_BIND_KEY, controls[csel].button, 0, down);
+                    host->bind(HOS_BIND_KEY, controls[csel].button, 1, 0);
+                    listening = 0, changed = true;
+                    save();
+                }
+            }
+        } else {
+            if (press[5]) page = 0, changed = true;
+            if (press[1]) csel = (csel + kControls) % (kControls + 1), changed = true;
+            if (press[2]) csel = (csel + 1) % (kControls + 1), changed = true;
+            if ((press[3] || press[4]) && csel < kControls) ccol ^= 1, changed = true;
+            if (press[7]) {
+                if (csel == kControls) host->bind(HOS_BIND_PAD, -1, 0, 0), save();
+                else listening = ccol ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
+                changed = true;
+            }
+            if ((press[8] || press[9]) && csel < kControls) {
+                if (ccol == 0) host->bind(HOS_BIND_PAD, controls[csel].button, 0, -1);
+                else for (int k = 0; k < 2; k++) host->bind(HOS_BIND_KEY, controls[csel].button, k, 0);
+                changed = true;
+                save();
+            }
+        }
+        if (changed) redraw_menu(scale);
+    } else if (open_now.load()) {
+        if (press[5]) open_now = false;
+        if (press[7] && !rows[selected].value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
+        if (press[1]) selected = (selected + kRows - 1) % kRows, changed = true;
+        if (press[2]) selected = (selected + 1) % kRows, changed = true;
+        if ((press[3] || press[4] || press[7]) && rows[selected].value) {   // (Enter, or the bottom face button, as Right)
+            Row& r = rows[selected];
+            if (press[7]) press[4] = true;
+            int v = *r.value + (press[4] ? r.step : -r.step);
+            if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
+            *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+            if (r.value == &opts.preset) {
+                apply_preset(*r.value);
+            } else if (r.value != &opts.fullscreen && r.value != &opts.show_fps) {
+                opts.preset = 0; // Custom
+                sync_preset_budgets(0);
+            }
+            changed = true;
+            save();
+        }
+        if (changed) redraw_menu(scale);
+    }
+    {   // (the full overlay's sampler runs only while it is shown)
+        static bool sampling = false;
+        const bool want = opts.show_fps == 2;
+        if (want != sampling) {
+            sampling = want;
+            if (want) {
+                VkPhysicalDeviceProperties pr{};
+                vkGetPhysicalDeviceProperties(dev.physical, &pr);
+                VkPhysicalDeviceMemoryProperties mp{};
+                vkGetPhysicalDeviceMemoryProperties(dev.physical, &mp);
+                uint64_t vram = 0;
+                for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+                    if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[i].size;
+                perf_sampling(true, pr.deviceName, (float)(vram >> 20));
+            } else {
+                perf_sampling(false, nullptr, -1);
+            }
+        }
+    }
+}
+
+void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h) {
+    // (the overlay, drawn with ImGui into the window's image: vk_overlay.cpp. The game image was just blitted into dst, and the
+    // overlay leaves it ready for the transfers below)
+    overlay_record(cmd, dst, w, h, opts.show_fps, open_now.load(std::memory_order_relaxed));
+    if (open_now.load(std::memory_order_relaxed)) {
+        std::unique_lock lk(bmp_mu);
+        const uint32_t mw = menu_bmp.w, mh = menu_bmp.h;
+        lk.unlock();
+        // (one copy finished before the next: on a Radeon the menu came out with its top torn away beside the FPS counter)
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &di);
+        if (mw) copy_over(cmd, dst, menu_bmp, ups[0][slot], (int)(w - mw) / 2, (int)(h - mh) / 2, w, h);
+    }
+}
+
+} // namespace mkwvk

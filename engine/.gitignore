@@ -1,0 +1,36 @@
+# ---- never commit the game or anything made from it ----
+# (decompressed modules, the loaded image, lifted C, test builds, romfs/exefs copies, dumps, keys)
+work/
+gen/
+image/
+exefs/
+romfs/
+*.bin
+*.keys
+*.nso
+*.nca
+*.nsp
+*.xci
+gamefile/
+*.nup
+*.nsz
+*.xcz
+
+# ---- build output and caches ----
+build/
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.sha1
+*.log
+
+# ---- Linux builds ----
+build-linux/
+*.so
