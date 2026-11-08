@@ -30,6 +30,7 @@
 #include "vk_gprof.h"
 #include "vk_framegen.h"
 #include "vk_menu.h"
+#include "vk_perf.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_state.h"
@@ -2347,6 +2348,8 @@ void log_frame_stats() {
              "translation %.0f ms in all, %d jobs queued",
              (pskip - l_pskip) / 120.0, (pwaits - l_pwaits) / 120.0, (pwait_ms - l_pwait_ms) / 120.0,
              shader_translate_ms(), jobs_pending());
+        const double overlay_wait_ms = (pwait_ms - l_pwait_ms) / 120.0;   // (the overlay's lines: vk_overlay.cpp)
+        double overlay_replay_ms = -1;
         l_pskip = pskip, l_pwaits = pwaits, l_pwait_ms = pwait_ms;
         {
             static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups",
@@ -2356,6 +2359,7 @@ void log_frame_stats() {
             char line[600];
             int n = snprintf(line, sizeof line, "vk: a frame's replay time (ms):");
             for (int i = 0; i < PROF_COUNT; i++) {
+                if (i == PROF_SUBMIT) overlay_replay_ms = (prof_ns[i] - last[i]) / 120.0 / 1e6;
                 n += snprintf(line + n, sizeof line - n, " %s %.2f%s", names[i], (prof_ns[i] - last[i]) / 120.0 / 1e6,
                               i + 1 < PROF_COUNT ? "," : "");
                 last[i] = prof_ns[i];
@@ -2399,6 +2403,14 @@ void log_frame_stats() {
             logf("vk: a frame: %.2f MB unswizzled on the CPU in %.2f ms", (ub - l_ub) / 120.0 / 1048576.0,
                  (un - l_un) / 120.0 / 1e6);
             l_ub = ub, l_un = un;
+        }
+        {
+            PerfWaits w;
+            w.replay_ms = (float)overlay_replay_ms;
+            w.gpu_ms = (float)((st_gpu_ns - l_gpu) / 120.0 / 1e6);
+            w.pipe_wait_ms = (float)overlay_wait_ms;   // (the waits for shaders and pipelines are counted together)
+            w.tex_uploads = (float)((up - l_up) / 120.0);
+            perf_set_waits(w);
         }
         l_gpu = st_gpu_ns, st_gpu_max_ns = 0;
         gprof_report(120);
@@ -2964,6 +2976,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         vkCmdCopyImageToBuffer(f.cmd, log_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, l.buf, 1, &c);
         l.used = true, l.at = prof_now(), l.seq = seq++, l.kind = present_kind.load();
     }
+    overlay_note_image((int)sw, (int)sh);
     menu_record(f.cmd, dst, log_slot, dev.swap_extent.width, dev.swap_extent.height);
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(f.cmd);

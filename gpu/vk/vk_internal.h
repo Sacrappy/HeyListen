@@ -31,6 +31,7 @@ void queue_flush();          // (the same, taking dev.present_mu)
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;
+    const char* present_mode_name = nullptr;   // (the swapchain's: the overlay shows it)
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceMemoryProperties memory{};

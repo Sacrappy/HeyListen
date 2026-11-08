@@ -376,6 +376,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swapchain = sc;
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
+    dev.present_mode_name = mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo";
     vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr);
     dev.swap_images.resize(n);
     vkGetSwapchainImagesKHR(dev.device, sc, &n, dev.swap_images.data());

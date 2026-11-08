@@ -21,6 +21,7 @@ float ring[kPerfHistory];
 int64_t ring_at[kPerfHistory];
 int ring_n = 0, ring_pos = 0;
 int64_t last_frame_ns = 0;
+PerfWaits waits;
 
 int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -142,7 +143,7 @@ void sampler() {
     std::unique_lock lk(mu);
     while (want) {
         lk.unlock();
-        s.cpu_total_pct = s.cpu_game_pct = -1;
+        s.cpu_total_pct = s.cpu_game_pct = s.cpu_temp_c = -1;
         s.ram_used_mb = s.ram_total_mb = s.ram_game_mb = -1;
         s.gpu_pct = s.gpu_temp_c = s.gpu_power_w = s.gpu_clock_mhz = s.vram_used_mb = -1;
         s.vram_total_mb = vram_total_hint;
@@ -152,7 +153,7 @@ void sampler() {
         lk.lock();
         std::memcpy(machine.cpu_name, s.cpu_name, sizeof s.cpu_name);
         std::memcpy(machine.gpu_name, s.gpu_name, sizeof s.gpu_name);
-        machine.cpu_total_pct = s.cpu_total_pct, machine.cpu_game_pct = s.cpu_game_pct;
+        machine.cpu_total_pct = s.cpu_total_pct, machine.cpu_game_pct = s.cpu_game_pct, machine.cpu_temp_c = s.cpu_temp_c;
         machine.ram_used_mb = s.ram_used_mb, machine.ram_total_mb = s.ram_total_mb, machine.ram_game_mb = s.ram_game_mb;
         machine.gpu_pct = s.gpu_pct, machine.gpu_temp_c = s.gpu_temp_c, machine.gpu_power_w = s.gpu_power_w;
         machine.gpu_clock_mhz = s.gpu_clock_mhz, machine.vram_used_mb = s.vram_used_mb, machine.vram_total_mb = s.vram_total_mb;
@@ -171,7 +172,7 @@ void perf_sampling(bool on, const char* gpu_name, float vram_total_mb) {
         want = true;
         if (!alive) {
             machine = {};
-            machine.cpu_total_pct = machine.cpu_game_pct = machine.ram_used_mb = machine.ram_total_mb = machine.ram_game_mb = -1;
+            machine.cpu_total_pct = machine.cpu_game_pct = machine.cpu_temp_c = machine.ram_used_mb = machine.ram_total_mb = machine.ram_game_mb = -1;
             machine.gpu_pct = machine.gpu_temp_c = machine.gpu_power_w = machine.gpu_clock_mhz = machine.vram_used_mb =
                 machine.vram_total_mb = -1;
             alive = true;
@@ -181,6 +182,16 @@ void perf_sampling(bool on, const char* gpu_name, float vram_total_mb) {
         want = false;
         cv.notify_all();
     }
+}
+
+void perf_waits(PerfWaits* out) {
+    std::lock_guard lk(mu);
+    *out = waits;
+}
+
+void perf_set_waits(const PerfWaits& w) {
+    std::lock_guard lk(mu);
+    waits = w;
 }
 
 void perf_note_frame() {

@@ -32,4 +32,10 @@ void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter sho
 /// Over the window's image (TRANSFER_DST_OPTIMAL), w x h: the menu and the FPS counter. slot: the frame in flight, 0 to 2.
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h);
 
+/// The performance overlay (vk_overlay.cpp, Dear ImGui): mode 1 FPS, 2 Full. Drawn into dst (TRANSFER_DST_OPTIMAL, left so).
+void overlay_record(VkCommandBuffer cmd, VkImage dst, uint32_t w, uint32_t h, int mode, bool menu_open);
+/// The game image's size the present shows (the overlay's picture lines)
+void overlay_note_image(int w, int h);
+void overlay_release();
+
 } // namespace mkwvk

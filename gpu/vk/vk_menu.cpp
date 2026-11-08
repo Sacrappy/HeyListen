@@ -277,7 +277,7 @@ struct Bitmap {
     bool keyed = false;                   // (black is see-through: copied as the runs of pixels in between)
     std::vector<VkBufferImageCopy> runs;
 };
-Bitmap menu_bmp, fps_bmp;
+Bitmap menu_bmp;
 std::mutex bmp_mu;
 int scale_of(uint32_t h) { return std::max(1u, h / 720); }
 
@@ -463,122 +463,6 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     DeleteObject(body);
     DeleteObject(help);
 }
-char fps_text[48] = "";
-char fps_sub[32] = "";
-char fps_ms[48] = "";   // (the frame time line: the average and the longest frame of the last half-second)
-/// The usual overlay: a bold green number with a dark edge, nothing behind it. Hard-edged letters: see-through pixels are copied or not.
-void outlined(HDC dc, int x, int y, const char* text, COLORREF colour, int edge) {
-    SetTextColor(dc, RGB(6, 8, 6));
-    const int n = (int)strlen(text);
-    for (int dy = -edge; dy <= edge; dy++)
-        for (int dx = -edge; dx <= edge; dx++)
-            if (dx || dy) TextOutA(dc, x + dx, y + dy, text, n);
-    SetTextColor(dc, colour);
-    TextOutA(dc, x, y, text, n);
-}
-HFONT hard_font(int px, int weight) {
-    return CreateFontA(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
-                       DEFAULT_PITCH, "Segoe UI");
-}
-void paint_fps(HDC dc, uint32_t w, uint32_t h, int s) {
-    fill(dc, 0, 0, (int)w, (int)h, RGB(0, 0, 0));
-    SetBkMode(dc, TRANSPARENT);
-    SetTextAlign(dc, TA_RIGHT | TA_TOP);
-    const COLORREF green = RGB(72, 255, 110);
-    const int right = (int)w - 2 * s;
-    HFONT label = hard_font(13 * s, FW_BOLD), big = hard_font(28 * s, FW_BOLD);
-    HGDIOBJ old = SelectObject(dc, label);
-    outlined(dc, right, 14 * s, "FPS", green, s);
-    SelectObject(dc, big);
-    outlined(dc, right - 30 * s, 0, fps_text, green, s);
-    if (fps_sub[0]) {
-        SelectObject(dc, label);
-        outlined(dc, right, 32 * s, fps_sub, RGB(226, 232, 226), s);
-    }
-    if (fps_ms[0]) {
-        SelectObject(dc, label);
-        outlined(dc, right, (fps_sub[0] ? 50 : 32) * s, fps_ms, RGB(226, 232, 226), s);
-    }
-    SelectObject(dc, old);
-    DeleteObject(label);
-    DeleteObject(big);
-}
-PerfStats perf_cur;
-/// The full overlay: GPU, VRAM, CPU and RAM with the machine's numbers, the frame rate and frame times, and the graph of the
-/// last frames. A dark panel (not black: black is see-through), in the colours of the oot-pc overlay.
-void paint_perf(HDC dc, uint32_t w, uint32_t h, int s) {
-    const PerfStats& p = perf_cur;
-    fill(dc, 0, 0, (int)w, (int)h, RGB(12, 14, 12));
-    SetBkMode(dc, TRANSPARENT);
-    HFONT font = CreateFontA(-13 * s, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
-    HFONT small = CreateFontA(-11 * s, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
-    HGDIOBJ old = SelectObject(dc, font);
-    const COLORREF gpu_c = RGB(140, 212, 79), cpu_c = RGB(46, 150, 204), ram_c = RGB(204, 115, 179), fps_c = RGB(242, 242, 242),
-                   dim = RGB(150, 158, 152);
-    const int x0 = 10 * s, x1 = 62 * s, lh = 19 * s;
-    int y = 8 * s;
-    auto num = [](char* b, size_t n, float v, const char* fmt) {
-        if (v < 0) snprintf(b, n, "-");
-        else snprintf(b, n, fmt, v);
-    };
-    auto row = [&](const char* label, COLORREF c, const char* text) {
-        SetTextAlign(dc, TA_LEFT | TA_TOP);
-        SetTextColor(dc, c);
-        TextOutA(dc, x0, y, label, (int)strlen(label));
-        SetTextColor(dc, fps_c);
-        TextOutA(dc, x1, y, text, (int)strlen(text));
-        y += lh;
-    };
-    char a[24], b[24], c[24], d[24], t[96];
-    num(a, sizeof a, p.gpu_pct, "%.0f%%"), num(b, sizeof b, p.gpu_temp_c, "%.0f C"), num(c, sizeof c, p.gpu_power_w, "%.0f W");
-    num(d, sizeof d, p.gpu_clock_mhz, "%.0f MHz");
-    snprintf(t, sizeof t, "%s   %s   %s   %s", a, b, c, d);
-    row("GPU", gpu_c, t);
-    num(a, sizeof a, p.vram_used_mb < 0 ? -1 : p.vram_used_mb / 1024, "%.1f");
-    num(b, sizeof b, p.vram_total_mb < 0 ? -1 : p.vram_total_mb / 1024, "%.1f");
-    snprintf(t, sizeof t, "%s / %s GB", a, b);
-    row("VRAM", gpu_c, t);
-    num(a, sizeof a, p.cpu_total_pct, "%.0f%%"), num(b, sizeof b, p.cpu_game_pct, "%.0f%%");
-    snprintf(t, sizeof t, "%s   game %s", a, b);
-    row("CPU", cpu_c, t);
-    num(a, sizeof a, p.ram_used_mb < 0 ? -1 : p.ram_used_mb / 1024, "%.1f");
-    num(b, sizeof b, p.ram_total_mb < 0 ? -1 : p.ram_total_mb / 1024, "%.1f");
-    num(c, sizeof c, p.ram_game_mb < 0 ? -1 : p.ram_game_mb / 1024, "%.1f");
-    snprintf(t, sizeof t, "%s / %s GB   game %s GB", a, b, c);
-    row("RAM", ram_c, t);
-    snprintf(t, sizeof t, "%.0f fps   %.1f ms   max %.1f ms", p.fps, p.frame_ms_avg, p.frame_ms_max);
-    row("FPS", fps_c, t);
-    // the graph: the last frame times, scaled to the worst of 50 ms and the longest seen (the line is 60 fps, 16.7 ms)
-    const int gx = 10 * s, gw = (int)w - 20 * s, gh = 46 * s, gy = y + 2 * s;
-    fill(dc, gx, gy, gw, gh, RGB(26, 30, 26));
-    float top = 50;
-    for (float f : p.frame_ms) top = f > top ? f : top;
-    HPEN grid = CreatePen(PS_SOLID, 1, RGB(60, 68, 60)), line = CreatePen(PS_SOLID, std::max(1, s), fps_c);
-    HGDIOBJ oldpen = SelectObject(dc, grid);
-    const int y60 = gy + gh - (int)(gh * (1000.0f / 60) / top);
-    MoveToEx(dc, gx, y60, nullptr), LineTo(dc, gx + gw, y60);
-    SelectObject(dc, line);
-    for (int i = 0; i < kPerfHistory; i++) {
-        const int px = gx + (int)((int64_t)gw * i / (kPerfHistory - 1));
-        const float f = p.frame_ms[i] > top ? top : p.frame_ms[i];
-        const int py = gy + gh - (int)(gh * f / top);
-        if (i == 0) MoveToEx(dc, px, py, nullptr);
-        else LineTo(dc, px, py);
-    }
-    SelectObject(dc, oldpen);
-    DeleteObject(grid);
-    DeleteObject(line);
-    y = gy + gh + 4 * s;
-    SelectObject(dc, small);
-    SetTextColor(dc, dim);
-    if (p.gpu_name[0]) TextOutA(dc, x0, y, p.gpu_name, (int)strlen(p.gpu_name)), y += 14 * s;
-    if (p.cpu_name[0]) TextOutA(dc, x0, y, p.cpu_name, (int)strlen(p.cpu_name));
-    SelectObject(dc, old);
-    DeleteObject(font);
-    DeleteObject(small);
-}
 /// The tallest help text at scale s, in pixels: the menu keeps that height whichever row is selected
 int measure_help(int s) {
     HDC dc = CreateCompatibleDC(nullptr);
@@ -603,7 +487,6 @@ void redraw_menu(int s) {
 }
 
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
-std::atomic<int64_t> last_note_ns{0}, worst_ns{0};   // (the FPS counter's frame time: the longest gap between two shown frames)
 int cur_scale = 1;
 
 struct Upload {
@@ -679,13 +562,7 @@ bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
 
 void menu_note_frame(bool game_frame) {
     shown_frames.fetch_add(1, std::memory_order_relaxed);
-    if (opts.show_fps == 2) perf_note_frame();
-    const int64_t t = prof_now(), prev = last_note_ns.exchange(t, std::memory_order_relaxed);
-    if (prev) {
-        const int64_t dt = t - prev;
-        int64_t w = worst_ns.load(std::memory_order_relaxed);
-        while (dt > w && !worst_ns.compare_exchange_weak(w, dt, std::memory_order_relaxed)) {}
-    }
+    if (opts.show_fps) perf_note_frame();   // (the overlay's frame times: vk_perf.cpp)
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -709,23 +586,6 @@ void fullscreen_tick() {
         menu_refresh = true;
         save();
     }
-}
-
-/// A rate over the half-second that just ended. The first call only starts that interval: the frames since launch,
-/// divided by one second, were shown as the rate the moment the counter was turned on.
-bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* last_shown, int64_t* last_game,
-              double* shown_rate, double* game_rate) {
-    if (now < *next) return false;
-    const bool have = *next != 0;
-    if (have) {
-        const double secs = (now - *next + 500000000) / 1e9;
-        *shown_rate = (shown - *last_shown) / secs;
-        *game_rate = (game - *last_game) / secs;
-    }
-    *last_shown = shown;
-    *last_game = game;
-    *next = now + 500000000;
-    return have;
 }
 
 void menu_tick() {
@@ -857,45 +717,12 @@ void menu_tick() {
             }
         }
     }
-    if (opts.show_fps) {
-        static int64_t next = 0, last_game = 0, last_shown = 0;
-        const int64_t now = prof_now();
-        double shown = 0, game = 0;
-        if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
-            snprintf(fps_text, sizeof fps_text, "%.0f", shown);
-            if (opts.framegen >= 2) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
-            else fps_sub[0] = 0;
-            const double worst = worst_ns.exchange(0, std::memory_order_relaxed) / 1e6;
-            if (shown > 0.5) snprintf(fps_ms, sizeof fps_ms, "%.1f ms  max %.1f", 1000.0 / shown, worst);
-            else fps_ms[0] = 0;
-            if (opts.show_fps == 2) {
-                perf_snapshot(&perf_cur);
-                fps_bmp.keyed = false;
-                gdi_draw(fps_bmp, 300u * scale, 194u * scale, paint_perf, scale);
-            } else {
-                fps_bmp.keyed = true;
-                gdi_draw(fps_bmp, 150u * scale, 72u * scale, paint_fps, scale);
-            }
-        }
-    }
 }
 
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h) {
-    if (opts.show_fps) {
-        // The game image was just blitted (or cleared) into dst. Its write must
-        // finish before the FPS pixels overwrite it; command order alone does
-        // not order these transfer writes. The menu below has its own barrier.
-        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
-        vkCmdPipelineBarrier2(cmd, &di);
-        std::unique_lock lk(bmp_mu);
-        const uint32_t fw = fps_bmp.w;
-        lk.unlock();
-        if (fw) copy_over(cmd, dst, fps_bmp, ups[1][slot], (int)w - (int)fw - (int)(12 * cur_scale), (int)(10 * cur_scale), w, h);
-    }
+    // (the overlay, drawn with ImGui into the window's image: vk_overlay.cpp. The game image was just blitted into dst, and the
+    // overlay leaves it ready for the transfers below)
+    overlay_record(cmd, dst, w, h, opts.show_fps, open_now.load(std::memory_order_relaxed));
     if (open_now.load(std::memory_order_relaxed)) {
         std::unique_lock lk(bmp_mu);
         const uint32_t mw = menu_bmp.w, mh = menu_bmp.h;

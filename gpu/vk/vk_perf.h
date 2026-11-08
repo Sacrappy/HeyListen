@@ -14,7 +14,7 @@ struct PerfStats {
     float fps, frame_ms_avg, frame_ms_max;
     float frame_ms[kPerfHistory];   // oldest first; frames not seen yet read 0
     char cpu_name[64];
-    float cpu_total_pct, cpu_game_pct;
+    float cpu_total_pct, cpu_game_pct, cpu_temp_c;   // (the temperature: Windows gives none without a driver: -1)
     float ram_used_mb, ram_total_mb, ram_game_mb;
     char gpu_name[96];
     float gpu_pct, gpu_temp_c, gpu_power_w, gpu_clock_mhz, vram_used_mb, vram_total_mb;
@@ -22,6 +22,12 @@ struct PerfStats {
 
 /// Starts (on) or stops (off) the sampling thread. gpu_name is the Vulkan device's name, to find its NVML twin.
 void perf_sampling(bool on, const char* gpu_name, float vram_total_mb);
+/// What the render thread waited for per frame, averaged over the last half second (-1: not counted)
+struct PerfWaits {
+    float replay_ms = -1, gpu_ms = -1, pipe_wait_ms = -1, shader_wait_ms = -1, tex_uploads = -1;
+};
+void perf_waits(PerfWaits* out);
+void perf_set_waits(const PerfWaits& w);   // (the back end's counters, once a window of frames ends)
 /// A frame was shown (any thread).
 void perf_note_frame();
 /// The latest numbers.
