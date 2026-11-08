@@ -16,5 +16,5 @@ if (-not (Test-Path $wt)) { git -C $root worktree add -b $branch $wt main }
 $spec = Get-Content (Join-Path $root "docs\tickets\$Ticket.md") -Raw
 Push-Location $wt
 try {
-  opencode run --model $Model "You work on branch $branch only. Implement this ticket, run its tests, commit with message '${Ticket}: <summary>'. Do not push. Ticket:`n$spec"
+  opencode run --model $Model "You work alone and unattended in this git worktree, on branch $branch only. Nobody will answer questions. Implement the whole ticket below, then run its tests (install missing Python tools with 'python -m pip install --user <pkg>'), then 'git add' and commit with message '${Ticket}: <summary>'. Do not stop before the commit exists. Do not push. Folders under E:\OOT outside this worktree are read-only references: read them, never write to them, never copy GPL code from them. Never read or copy game data (.nup, romfs, generated files). Ticket:`n$spec"
 } finally { Pop-Location }
