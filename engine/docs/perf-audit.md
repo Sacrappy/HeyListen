@@ -61,3 +61,33 @@ segments, or with two threads on 1,000-draw segments it is right. Forcing a sing
 (`RX_VK_PARALLEL_BOUNDARY=1|2`), or none before draw 700 (`RX_VK_PARALLEL_MINWORK=700`), still breaks it, so it is not one boundary's
 content: a race between the recording threads or an ordering dependency of the shared state (texture write tracking, mirrors, the
 per-thread caches). Finding it is the way to 60+ fps.
+
+### Root cause and fix (TICK-006, 2026-11-09)
+
+- **Not a race.** A diagnostic build that recorded the segments in order on the replay thread, and another that carried each segment's
+  final state into the next instead of the dry pass's snapshot, were just as wrong (the snapshots matched the carried state except the
+  dispatch grid, which a dispatch sets before use). Kokiri's command buffers are ~750 draws (4.7 segments of 160), so 640- and
+  1,000-draw segments never split them: "right with big segments" only meant "right when not split".
+- **Cause: the exposure meter's readback refresh, once per recording instead of once per submission part.** OoT's exposure meter is a
+  sum the GPU adds into a small page each frame; the CPU reads it and stores 0 back. `memory_rb_refresh` (`gpu/vk/vk_memory.cpp`,
+  called from `texture_uploads_recorded`) copies those pages from guest memory into the pool's mirror at the start of a recording's
+  uploads. Serial parts (`maybe_split`) write the mirrors back (`memory_end_submission`) and start a new mirror epoch before the next
+  refresh, so the sum carries over. The parallel path records each segment, and what follows them, into recordings of their own in the
+  same epoch with no write-back between: every segment's refresh copied the CPU's 0 over what the segments before it had added. The meter
+  saw only the last recording's share, the auto-exposure went to its maximum: washed-out fog, the ground's shadows lost in the glare.
+- **Fix**: `memory_rb_refresh` runs once per `mirror_epoch` (the part's first recording, which the parallel path submits before its
+  segments). Serial replay is unchanged (one refresh per part, as before).
+
+Results (this build, RX 5070 machine, `tools/bench/run_bench.py --duration 115 --warmup-s 45`, frame generation off):
+
+| Scene | Replay | fps | p50 | p99 | max |
+|---|---|---:|---:|---:|---:|
+| Kokiri walk | serial | 51.1 | 19.8 ms | 27.8 ms | 61 ms |
+| Kokiri walk | `RX_VK_PARALLEL=4` (run 1) | 66.3 | 14.8 ms | 19.1 ms | 50 ms |
+| Kokiri walk | `RX_VK_PARALLEL=4` (run 2) | 66.2 | 14.8 ms | 19.4 ms | 113 ms |
+
+(Baseline doc, 2026-11-08: 58.9 fps, p99 26.0 ms serial; today's serial run was slower, the parallel gain is against the same build.)
+Screenshots of the same walk (`engine/scripts/walk-test.sh`) match serial: fog and Link's and the trees' shadows. Flash detector
+(`scripts/framelog.py`) over three parallel walks: 12, 9 and 6 events, all 1-2 blocks (motion), against 5 of the same kind serially; no
+scene-wide flash. Hyrule Field was not measured: the title loads the most recent save (Kokiri), and switching saves was not allowed.
+Parallel stays **off by default** until Hyrule is checked.

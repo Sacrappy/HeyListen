@@ -1206,7 +1206,9 @@ void maybe_split(VkCommandBuffer& cmd) {
 // walk without it), and the replay fell from 12.6 to 8.5 ms (54 -> 58 fps, the game's 60 Hz pacing then the limit). But the picture is wrong
 // with segments of 160 or 320 draws: the fog is washed out and the ground has no shadows, from the first frame, with or without
 // Occlusion Off. Segments of 640 and one big one are right, and so are two threads on segments of 1000; no boundary placement alone does it
-// (RX_VK_PARALLEL_BOUNDARY=<k>, RX_VK_PARALLEL_MINWORK=<n> tried): a race between the recording threads, or an order dependency not yet found)
+// (RX_VK_PARALLEL_BOUNDARY=<k>, RX_VK_PARALLEL_MINWORK=<n> tried). TICK-006: not a race (the segments recorded in order on one thread
+// were as wrong): Kokiri's command buffers are ~750 draws, so 640 and 1000 never split them. Each segment's recording refreshed the
+// exposure meter's readback page from guest memory (memory_rb_refresh), wiping what the segments before it had added: now once a part)
 int par_threads() {
     static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
     return n;
