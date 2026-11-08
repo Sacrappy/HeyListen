@@ -115,12 +115,12 @@ def parse_presentmon_csv(path: Path) -> list[tuple[float, float]]:
     """PresentMon csv -> [(t_s, interval_ms)].
 
     Interval column: msBetweenPresents (1.x) or FrameTime (2.x console); time
-    axis: TimeInSeconds (1.x) or CPUStartTime (2.x), else accumulated intervals.
+    axis: TimeInSeconds (1.x), CPUStartTime (2.x) or TimeInMs (2.6), else accumulated intervals.
     Header names are matched case-insensitively.
     """
     raw: list[tuple[float, float]] = []
     try:
-        handle = Path(path).open("r", encoding="utf-8", errors="replace", newline="")
+        handle = Path(path).open("r", encoding="utf-8-sig", errors="replace", newline="")
     except OSError:
         return []
     with handle:
@@ -130,13 +130,14 @@ def parse_presentmon_csv(path: Path) -> list[tuple[float, float]]:
             return []
         cols = {h.strip().lower(): i for i, h in enumerate(header)}
         fi = next((cols[k] for k in ("msbetweenpresents", "frametime") if k in cols), None)
-        ti = next((cols[k] for k in ("timeinseconds", "cpustarttime") if k in cols), None)
+        ti = next((cols[k] for k in ("timeinseconds", "cpustarttime", "timeinms") if k in cols), None)
+        t_scale = 0.001 if ti is not None and header[ti].strip().lower() == "timeinms" else 1.0  # 2.6 CSV
         if fi is None:
             return []
         for row in reader:
             try:
                 ms = float(row[fi])
-                t = float(row[ti]) if ti is not None else float("nan")
+                t = float(row[ti]) * t_scale if ti is not None else float("nan")
             except (ValueError, IndexError):
                 continue
             if ms > 0:
