@@ -55,3 +55,17 @@ Spread over four runs <10%.
 Reading:
 - Hookshot's measured per-draw total is ~3.2 µs. Descriptor *recording* is only ~0.35 µs of it: bindless saves ~0.9 ms a frame on the driver side, not a 12-20x win on the whole replay.
 - The larger part of `build_descriptors` (19% of the replay thread) is Hookshot's own resolution work (uniform ranges, storage buffers through the driver banks, texture handle table). Bindless helps only if that resolution is also cached per binding generation instead of redone per draw.
+
+## 6. TICK-002 - shader census (2026-11-08)
+`tools/census/shader_census.py`, run on both NUPs (same newest title 0400486024dec800 v131072, identical results; ~4 s per NUP; the NUPs are decrypted, no keys needed).
+
+| Stage | Distinct programs | SASS bytes |
+|---|---:|---:|
+| vertex | 15,219 | 105.8 MB |
+| fragment | 16,862 | 365.6 MB |
+| compute | 3,968 | 28.2 MB |
+| task | 17 | 0.3 MB |
+| mesh | 491 | 14.1 MB |
+| **total** | **36,557** | **513.9 MB** |
+
+Reading: every shader program the game can bind is known ahead of time and enumerable from the package (the base v65536 title adds more: 61,939 across both titles). At Lichii's 2-4 ms per translation that is ~1.5-2.5 min of single-thread work, a few seconds on all cores: an offline SASS→SPIR-V pass at install time is realistic. What stays dynamic is the *pipeline* (program combination + render state), so the next step is to record the combinations actually used, then precompile those pipelines.
