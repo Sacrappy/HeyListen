@@ -33,3 +33,25 @@ Source: `E:\OOT\Lichii-1\NX2_NOTES.md`, `NX2_GPU_THREAD_SPLIT.md`.
 ## 4. Open measurements (first tickets)
 - Hyrule Field profile for Hookshot (never tested) and Lichii, same machine, same save.
 - Frametime capture (p50/p99/max) in Kokiri and Hyrule for both, as the baseline.
+
+## 5. TICK-003 - per-draw descriptor strategy microbenchmark (2026-11-08)
+Standalone headless Vulkan C++20 bench, no game data: `bench/descriptors`.
+Build: `cmake -S bench/descriptors -B build/descriptors -G "Visual Studio 17 2022" -A x64` then
+`cmake --build build/descriptors --config Release`. Run: `build/descriptors/Release/descriptor_bench.exe`.
+- Machine: NVIDIA GeForce RTX 5070, Vulkan 1.4.351, MSVC 19.44 (Release x64), Windows.
+- Workload: 3,000 draws/frame, 30 combined-image-sampler descriptors resolved per draw, 10 measured frames after 2 warmup frames, 8x8 render target.
+- Metric: CPU command-buffer recording time only; queue submit, fence wait and GPU execution are excluded.
+- Timed with `--no-validation`. Validation stays on by default to check correctness (0 errors / 0 warnings); its per-call cost inflated the first numbers 20-60x and they were discarded at review.
+- Test: `ctest --test-dir build/descriptors -C Release` passes (`--frames 2 --draws 300 --warmup 1`).
+
+| Strategy | CPU µs/draw | vs bindless | ms per 3,050-draw frame |
+|---|---:|---:|---:|
+| Push descriptors (`VK_KHR_push_descriptor`) | 0.35 | 6.8x | 1.06 |
+| Bindless descriptor indexing (runtime array, push-constant indices) | 0.05 | 1.0x | 0.16 |
+| `VK_EXT_descriptor_buffer` (30 `vkGetDescriptorEXT` per draw) | 0.14 | 2.7x | 0.42 |
+
+Spread over four runs <10%.
+
+Reading:
+- Hookshot's measured per-draw total is ~3.2 µs. Descriptor *recording* is only ~0.35 µs of it: bindless saves ~0.9 ms a frame on the driver side, not a 12-20x win on the whole replay.
+- The larger part of `build_descriptors` (19% of the replay thread) is Hookshot's own resolution work (uniform ranges, storage buffers through the driver banks, texture handle table). Bindless helps only if that resolution is also cached per binding generation instead of redone per draw.
