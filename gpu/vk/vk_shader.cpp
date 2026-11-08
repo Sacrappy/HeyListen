@@ -1496,7 +1496,6 @@ thread_local ProgFast prog_fast[2];
 
 const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {
     if (!s.has_prog) return nullptr;
-    if (kind == ProgramKind::Mesh) return mesh_program_for(s, color_types);
     const bool compute = kind == ProgramKind::Compute;
     static int64_t st_hit, st_none, st_differ, st_calls;   // (logged now and then: how the cache does)
     if (++st_calls % 200000 == 0)
@@ -1509,8 +1508,6 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
             prog_same((int)kind, s.prog.serial, stages, bind, reg, ub, s.nvattr, s.vattr, color_types, f.kind, f.serial,
                       f.stages, f.bind, f.reg, f.ub, f.nvattr, f.vattr, f.ct))
             return st_hit++, f.p;
-    const uint64_t key = (compute ? 0x5EED : pick_inputs(s, color_types)) * 1099511628211ull ^ s.prog.serial;
-    Pick& pk = picks[key];
     auto keep = [&](const Program* p) {
         if (!p || !p->ready.load(std::memory_order_acquire) || p->failed) return p;
         if (!(prog_fast[0].on && prog_fast[0].p == p)) prog_fast[1] = prog_fast[0];
@@ -1521,6 +1518,11 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
         std::memcpy(f.ct, color_types, sizeof f.ct);
         return p;
     };
+    // (a mesh draw, most of OoT's: the same quick answer as a graphics draw's, for the same program, bindings and registrations; its
+    // lookup took the shader lock, built the key and checked the textures' types again at every draw, 9% of the replay thread)
+    if (kind == ProgramKind::Mesh) return keep(mesh_program_for(s, color_types));
+    const uint64_t key = (compute ? 0x5EED : pick_inputs(s, color_types)) * 1099511628211ull ^ s.prog.serial;
+    Pick& pk = picks[key];
     if (pk.p && pk.p->ready.load(std::memory_order_acquire) && !pk.p->failed) {
         if (pk.p->answers.empty()) return st_hit++, keep(pk.p);
         static thread_local std::vector<uint32_t> now;

@@ -1549,42 +1549,53 @@ std::vector<WriteBack> writebacks;
 // stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
 // scene black for a frame (the one-frame dark flashes, every 15-30 frames; 17 in 40 s of Kokiri, 0 with mirrors off). They are
 // left out of the write-back now. RX_VK_WB_REPORTS=1: written back with the rest, as before
-// (the words are appended as they come, a few thousand a frame, and folded into a sorted list when a write-back asks: a std::set
-// insert each was 3% of the replay thread)
+// (a page's words as a bitmap, by page number: a counter report sets two bits, no allocation and no tree insert at every report, which
+// as a std::set insert was 3% of the replay thread. A write-back walks the pages that hold words)
 std::mutex cpu_words_mu;
-std::vector<uint64_t> cpu_words;   // (sorted, no repeats)
-std::vector<uint64_t> cpu_words_new;   // (as appended)
-void fold_cpu_words() {   // (cpu_words_mu held)
-    if (cpu_words_new.empty()) return;
-    std::sort(cpu_words_new.begin(), cpu_words_new.end());
-    cpu_words_new.erase(std::unique(cpu_words_new.begin(), cpu_words_new.end()), cpu_words_new.end());
-    std::vector<uint64_t> merged;
-    merged.reserve(cpu_words.size() + cpu_words_new.size());
-    std::set_union(cpu_words.begin(), cpu_words.end(), cpu_words_new.begin(), cpu_words_new.end(), std::back_inserter(merged));
-    cpu_words.swap(merged);
-    cpu_words_new.clear();
-    if (cpu_words.size() > 65536) cpu_words.clear();
-}
+struct WordPage {
+    uint64_t bits[8] = {};   // (512 words of 8 bytes: 4 KB)
+};
+std::map<uint64_t, WordPage> cpu_pages;   // (by guest page number)
+uint64_t cpu_last_page = ~0ull;
+WordPage* cpu_last = nullptr;
 } // namespace
 void memory_cpu_owned(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
     if (off || !guest) return;
     std::lock_guard lk(cpu_words_mu);
-    if (cpu_words_new.size() > 32768) fold_cpu_words();
-    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words_new.push_back(a);
+    if (cpu_pages.size() > 8192) cpu_pages.clear(), cpu_last_page = ~0ull, cpu_last = nullptr;
+    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) {
+        const uint64_t page = a >> 12;
+        if (page != cpu_last_page) cpu_last = &cpu_pages[page], cpu_last_page = page;   // (std::map nodes keep their address)
+        const uint64_t bit = (a >> 3) & 511;
+        cpu_last->bits[bit >> 6] |= 1ull << (bit & 63);
+    }
 }
 namespace {
+// The first word at or after from and before limit (guest addresses); limit when there is none. (cpu_words_mu held)
+uint64_t next_cpu_word(uint64_t from, uint64_t limit) {
+    for (auto it = cpu_pages.lower_bound(from >> 12); it != cpu_pages.end() && (it->first << 12) < limit; ++it) {
+        const uint64_t base = it->first << 12;
+        uint64_t first_bit = base < from ? ((from - base + 7) >> 3) : 0;   // (the words of this page from there)
+        for (uint64_t bit = first_bit; bit < 512; bit = (bit & ~63ull) + 64) {
+            uint64_t w = it->second.bits[bit >> 6] & (~0ull << (bit & 63));
+            if (!w) continue;
+            const uint64_t at = base + (((bit & ~63ull) + (uint64_t)__builtin_ctzll(w)) << 3);
+            return at < limit ? at : limit;
+        }
+    }
+    return limit;
+}
 // (a write-back's runs with the replay's own words cut out of them: runs of p, offsets in the pool)
 void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
     std::lock_guard lk(cpu_words_mu);
-    fold_cpu_words();
-    if (cpu_words.empty()) return;
+    if (cpu_pages.empty()) return;
     std::vector<VkBufferCopy> out;
     for (const VkBufferCopy& r : runs) {
         uint64_t at = r.srcOffset;
         const uint64_t end = r.srcOffset + r.size;
-        for (auto it = std::lower_bound(cpu_words.begin(), cpu_words.end(), p.lo + at); it != cpu_words.end() && *it < p.lo + end; ++it) {
-            const uint64_t w = *it - p.lo;
+        for (uint64_t g = next_cpu_word(p.lo + at, p.lo + end); g < p.lo + end; g = next_cpu_word(g + 8, p.lo + end)) {
+            const uint64_t w = g - p.lo;
             if (w > at) out.push_back({at, at, w - at});
             at = std::max(at, w + 8);
         }
