@@ -3,7 +3,7 @@
 param(
   [Parameter(Mandatory)][string]$Ticket,
   [Parameter(Mandatory)][string]$Slug,
-  [string]$Model = "opencode/deepseek-v4.1-flash"   # provider/model; oc_sk_ keys belong to OpenCode Zen (provider "opencode")
+  [string]$Model = "opencode-go/deepseek-v4.1-flash"   # provider/model (OpenCode Go subscription)
 )
 $ErrorActionPreference = "Stop"
 # Workers use their own opencode data folder: the default one (~/.local/share/opencode)
