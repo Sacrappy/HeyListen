@@ -46,3 +46,18 @@ Replacing guest code would gain nothing on the critical path, which is the rende
 3. Recording on more than one thread. `RX_VK_PARALLEL=4` gave 55 -> 65 fps but one-frame flashes come back (5 in 25 s with the flash
    detector); `RX_VK_ASYNC=1` was slower (32 fps).
 4. A frame generation setting (the menu's 2x, 3x) for the display rate.
+
+## Parallel recording (2026-11-08): the largest gain found, and why it is off
+
+`RX_VK_PARALLEL=4` records a command buffer's segments (160 draws each) on four threads after a serial dry pass. With
+`HOOKSHOT_OCCLUSION_OFF=1` the replay fell from 12.6 to 8.5 ms a frame and Kokiri reached the game's own 60 Hz pacing (58 fps median with
+some frames over 20 ms, from memory sync spikes of 3-6 ms and descriptor stalls). The one-frame black flashes of out-of-order segments did
+not come back with Occlusion Off (no real flash in six walks of ~25 s; five in one walk without it; the flashes at presents 147-149 are the
+title's fade).
+
+It is not on by default: **the picture is wrong**, constantly, not as a flash. With segments of 160 or 320 draws the fog is washed out
+and the ground loses its shadows (as if the shadow map were empty), with or without Occlusion Off. With one big segment, with 640-draw
+segments, or with two threads on 1,000-draw segments it is right. Forcing a single boundary at any of the first boundaries
+(`RX_VK_PARALLEL_BOUNDARY=1|2`), or none before draw 700 (`RX_VK_PARALLEL_MINWORK=700`), still breaks it, so it is not one boundary's
+content: a race between the recording threads or an ordering dependency of the shared state (texture write tracking, mirrors, the
+per-thread caches). Finding it is the way to 60+ fps.

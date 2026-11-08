@@ -22,6 +22,7 @@
 #include <thread>
 #include <string>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1201,6 +1202,11 @@ void maybe_split(VkCommandBuffer& cmd) {
 // (RX_VK_PARALLEL=<threads recording a command buffer, the replay thread one of them>; 0, 1: off, the default. Segments
 // recorded out of order left one-frame black scenes in play, 48-93 in a walk through Kakariko against none on the
 // replay thread alone, at about the same frame rate here: 36-40 fps against 38-41)
+// (2026-11-08, this fork: with HOOKSHOT_OCCLUSION_OFF=1 the flashes of out-of-order segments did not come back in six Kokiri walks (five in one
+// walk without it), and the replay fell from 12.6 to 8.5 ms (54 -> 58 fps, the game's 60 Hz pacing then the limit). But the picture is wrong
+// with segments of 160 or 320 draws: the fog is washed out and the ground has no shadows, from the first frame, with or without
+// Occlusion Off. Segments of 640 and one big one are right, and so are two threads on segments of 1000; no boundary placement alone does it
+// (RX_VK_PARALLEL_BOUNDARY=<k>, RX_VK_PARALLEL_MINWORK=<n> tried): a race between the recording threads, or an order dependency not yet found)
 int par_threads() {
     static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
     return n;
@@ -1319,12 +1325,24 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     const int nseg = (int)std::clamp<int64_t>(total / per, 1, kMaxBatch);
     std::vector<Segment> seg;
     seg.push_back({h, nullptr, &start, ub0, 0});
+    // (RX_VK_PARALLEL_BOUNDARY=<k>, diagnosis: only the k-th boundary of each command buffer splits it, and its program's code keys are logged,
+    // to find which boundary a wrong picture comes from)
+    static const int only_boundary = getenv("RX_VK_PARALLEL_BOUNDARY") ? atoi(getenv("RX_VK_PARALLEL_BOUNDARY")) : 0;
     for (int k = 1; k < nseg; k++) {
+        if (only_boundary && k != only_boundary) continue;
         const int64_t want = total * k / nseg;
         const ParPoint* at = nullptr;
         for (const ParPoint& q : par_points)
             if (q.work >= want) { at = &q; break; }
         if (!at || at->p == seg.back().p) continue;
+        // (RX_VK_PARALLEL_MINWORK=<n>, diagnosis: no boundary before that many draws and dispatches of the command buffer)
+        static const int64_t min_work = getenv("RX_VK_PARALLEL_MINWORK") ? atoll(getenv("RX_VK_PARALLEL_MINWORK")) : 0;
+        if (at->work < min_work) continue;
+        if (only_boundary) {
+            static std::set<std::string> seen;
+            const std::string keys = program_code_keys(at->s);
+            if (seen.insert(keys).second && seen.size() < 40) logf("vk: parallel boundary %d at work %lld of %lld: program%s", k, (long long)at->work, (long long)total, keys.c_str());
+        }
         seg.back().end = at->p;
         seg.push_back({at->p, nullptr, &at->s, at->ub, at->cond});
     }
