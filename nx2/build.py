@@ -410,6 +410,16 @@ def main():
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
              hot_fl if os.path.basename(s).startswith("code_hot") else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
+    # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
+    # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
+    fp = lambda b: hashlib.sha1(b).hexdigest()[:10]
+    norm = lambda f: " ".join(x.replace(kit.ROOT, "<root>") for x in f if not x.startswith("-I")).encode()
+    code = hashlib.sha1()
+    for code_src in sorted(x for x in srcs if os.path.basename(x).startswith("code_")):
+        code.update(os.path.basename(code_src).encode() + open(code_src, "rb").read())
+    print("object keys: game-code headers %s, flags %s, hot flags %s, lifted code %s (%d files)" % (
+        fp(deps), fp(norm(fl)), fp(norm(hot_fl)), code.hexdigest()[:10],
+        sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
         ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK

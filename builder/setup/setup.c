@@ -236,9 +236,15 @@ static void prune(const wchar_t *versions, const wchar_t *downloads, const char 
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
             char name[260];
             WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof name, NULL, NULL);
-            if (!strcmp(name, tag) || (before[0] && !strcmp(name, before))) continue;
+            /* (issue 611: only the version installed stays; the one before was 1.3 GB nobody rolled back to. A folder still in use
+               (the builder that started this, closing; a build it left) cannot be renamed: it stays, and goes at a later run) */
+            (void)before;
+            if (!strcmp(name, tag)) continue;
             swprintf(p, MAX_PATH, L"%ls\\%ls", versions, fd.cFileName);
-            rmtree(p);
+            wchar_t gone[MAX_PATH];
+            swprintf(gone, MAX_PATH, L"%ls.gone", p);
+            if (wcslen(fd.cFileName) > 5 && !wcscmp(fd.cFileName + wcslen(fd.cFileName) - 5, L".gone")) rmtree(p);
+            else if (MoveFileW(p, gone)) rmtree(gone);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -531,9 +537,58 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
+/* (launch mode) "Hookshot Launcher.exe" in a game folder (nx2/make_game.py puts this file there under that name): the installed
+   builder opened as the game's launcher (--launch <that folder>: Play, and Update when a newer release is out), at once, with no
+   window, download or network of its own. With no builder installed yet, the setup runs as usual and then opens the launcher. */
+static int launch_installed(const wchar_t *args) {
+    wchar_t base[MAX_PATH], cur[MAX_PATH], exe[MAX_PATH], dir[MAX_PATH], cmd[4096];
+    if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base) != S_OK) return 0;
+    char tag[128] = "";
+    swprintf(cur, MAX_PATH, L"%ls\\HookshotBuilder\\versions\\current.txt", base);
+    read_small(cur, tag, sizeof tag);
+    if (!tag[0]) return 0;
+    wchar_t wtag[128];
+    MultiByteToWideChar(CP_UTF8, 0, tag, -1, wtag, 128);
+    swprintf(dir, MAX_PATH, L"%ls\\HookshotBuilder\\versions\\%ls\\HookshotBuilder", base, wtag);
+    swprintf(exe, MAX_PATH, L"%ls\\HookshotBuilder.exe", dir);
+    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) return 0;
+    swprintf(cmd, 4096, L"\"%ls\" %ls", exe, args);
+    STARTUPINFOW si = {sizeof si};
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) return 0;
+    CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+    return 1;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev;
     wcsncpy(g_cmdline, cmdline ? cmdline : L"", 2047);
+    {
+        wchar_t self[MAX_PATH];
+        GetModuleFileNameW(NULL, self, MAX_PATH);
+        const wchar_t *name = wcsrchr(self, L'\\');
+        name = name ? name + 1 : self;
+        if (!_wcsicmp(name, L"hookshot.exe") && !wcsstr(g_cmdline, L"--")) {   /* (the game folder's launcher) */
+            wchar_t *slash = wcsrchr(self, L'\\');
+            if (slash) *slash = 0;
+            swprintf(g_cmdline, 2047, L"--launch \"%ls\"", self);
+            if (launch_installed(g_cmdline)) return 0;
+            /* (no builder installed on this PC: the game itself, at once; nothing is downloaded to show a Play button) */
+            wchar_t game[MAX_PATH], cmd[MAX_PATH + 4];
+            swprintf(game, MAX_PATH, L"%ls\\bin\\hookshot.exe", self);
+            swprintf(cmd, MAX_PATH + 4, L"\"%ls\"", game);
+            STARTUPINFOW si = {sizeof si};
+            PROCESS_INFORMATION pi;
+            if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, self, &si, &pi)) {
+                CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+                return 0;
+            }
+            MessageBoxW(NULL, L"The game (bin\\hookshot.exe) is missing from this folder. Build it again with the Hookshot Builder.", L"Hookshot",
+                        MB_ICONERROR);
+            return 1;
+        }
+        if (wcsstr(g_cmdline, L"--launch") && launch_installed(g_cmdline)) return 0;
+    }
     INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&icc);
     WNDCLASSW wc = {0};

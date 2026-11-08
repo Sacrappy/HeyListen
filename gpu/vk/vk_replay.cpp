@@ -2551,14 +2551,10 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             // otherwise runs a frame ahead and writes data a pass of this frame has yet to read, and the scene and the
             // exposure meter's samples of it came out too bright for one frame (one-frame exposure flashes).
             // RX_VK_WAIT_GPU=<frames>: that many frames ahead instead; -1: no wait, as before
-            // (hookshot, 2026-11-08: on Linux only by default. On Windows with an RTX 4060 Ti it cost ~10 fps (37.6 against 47.3 with
-            // PR 523's per-queue fences) and changed nothing in the one-frame flicker counts; its author measured 70 -> 0
-            // flashes on Linux)
-#ifdef _WIN32
-            static const int ahead = getenv("RX_VK_WAIT_GPU") ? atoi(getenv("RX_VK_WAIT_GPU")) : -1;
-#else
+            // (hookshot, 2026-11-08: on Windows too. At the owner's settings (3440x1440, 100% resolution, Lanczos) on an RTX 4060 Ti
+            // the flicker he saw went away with it and came back without it, and came back with 1 frame ahead; 32.7 fps against 34.2.
+            // About ten players reported the flashing on Windows (issue 574: NVIDIA and AMD). Its author measured 70 -> 0 on Linux)
             static const int ahead = getenv("RX_VK_WAIT_GPU") ? atoi(getenv("RX_VK_WAIT_GPU")) : 0;
-#endif
             if (ahead == 0) wait_value(value);
             static uint64_t values[8];
             if (ahead > 0) {

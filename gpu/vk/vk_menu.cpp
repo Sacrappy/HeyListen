@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "vk_paths.h"
 #include "vk_menu.h"
 #include "vk_perf.h"
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
@@ -154,7 +155,7 @@ int selected = 0;
 bool menu_refresh = false;
 std::string ini_path() {
     char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    const DWORD n = game_module_path(exe, MAX_PATH);
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_options.ini";
 }

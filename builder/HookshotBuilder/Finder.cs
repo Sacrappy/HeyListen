@@ -77,9 +77,14 @@ static class Finder
     static string StartLink => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Hookshot.lnk");
 
     /// Made or removed as the two ticks say (Windows' own shell object writes the .lnk)
+    /// The shortcuts the player has, made again (onto the folder's launcher now that it has one); none made where there was none
+    public static void RefreshShortcuts(string gameFolder) => Shortcuts(gameFolder, File.Exists(DesktopLink), File.Exists(StartLink));
+
     public static void Shortcuts(string gameFolder, bool desktop, bool start)
     {
         var exe = Path.Combine(gameFolder, "hookshot.exe");
+        // (hookshot.exe: the game's launcher in a folder built since it came (Play, and Update when a newer release is out), else the game)
+        var target = exe;
         foreach (var (link, want) in new[] { (DesktopLink, desktop), (StartLink, start) })
         {
             try
@@ -93,7 +98,7 @@ static class Finder
                 if (type == null || !File.Exists(exe)) continue;
                 dynamic shell = Activator.CreateInstance(type)!;
                 dynamic s = shell.CreateShortcut(link);
-                s.TargetPath = exe;
+                s.TargetPath = target;
                 s.WorkingDirectory = gameFolder;
                 s.IconLocation = exe + ",0";
                 s.Description = "The Legend of Zelda: Ocarina of Time, built by Hookshot";

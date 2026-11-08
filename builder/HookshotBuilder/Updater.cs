@@ -19,7 +19,7 @@ static class Updater
     const string SetupList = "hookshot-setup.txt";              // (scripts/make_setup_parts.py)
     static readonly TimeSpan[] RetryDelays = { TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(6), TimeSpan.FromSeconds(12), TimeSpan.FromSeconds(20) };
 
-    public static async void FromCommandLine(MainWindow w)
+    public static void FromCommandLine(MainWindow w)
     {
         var a = Environment.GetCommandLineArgs();
         string? folder = null, tag = null;
@@ -31,7 +31,70 @@ static class Updater
             else if (a[i] == "--fetched") fetched = true;
         }
         if (folder == null) return;
-        w.BeginUpdate(folder);
+        UpdateFolder(w, folder, tag, fetched);
+    }
+
+    /// The latest release's tag, quietly (null: GitHub did not answer); a few tries, 20 s at most
+    public static async Task<string?> LatestTag()
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("HookshotBuilder");
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, Latest);
+                request.Headers.Accept.ParseAdd("application/vnd.github+json");
+                using var response = await http.SendAsync(request);
+                if (response.IsSuccessStatusCode)
+                {
+                    using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+                    return doc.RootElement.GetProperty("tag_name").GetString();
+                }
+                if ((int)response.StatusCode < 500) return null;
+            }
+            catch (Exception) { }
+            await Task.Delay(TimeSpan.FromSeconds(2 << attempt));
+        }
+        return null;
+    }
+
+    /// The latest release's setup (HookshotBuilder.exe) downloaded and started with args: it installs the new builder (only the
+    /// parts that changed) and starts it with the same args; this one closes. (no args: the new builder opens as it does)
+    public static async Task RunLatestSetup(MainWindow w, IEnumerable<string> args)
+    {
+        var token = w.DownloadToken;
+        using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("HookshotBuilder");
+        w.Note("Asking GitHub for the latest release");
+        string? setupUrl = null, setupApiUrl = null;
+        long setupSize = 0;
+        using (var response = await GetWithRetries(w, http, Latest, token, "application/vnd.github+json", TimeSpan.FromSeconds(30)))
+        using (var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token)))
+            foreach (var asset in doc.RootElement.GetProperty("assets").EnumerateArray())
+                if (asset.GetProperty("name").GetString() == SetupAsset)
+                {
+                    setupUrl = asset.GetProperty("browser_download_url").GetString();
+                    setupApiUrl = asset.GetProperty("url").GetString();
+                    setupSize = asset.GetProperty("size").GetInt64();
+                }
+        if (setupUrl == null) throw new InvalidOperationException("The latest release has no " + SetupAsset + ".");
+        var cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "update");
+        Directory.CreateDirectory(cache);
+        var setup = Path.Combine(cache, SetupAsset);
+        w.Note("Downloading the new Hookshot Builder");
+        await DownloadWithRetries(w, http, setupUrl, setupApiUrl, setup, setupSize, token);
+        var si = new ProcessStartInfo(setup) { UseShellExecute = false, WorkingDirectory = cache };
+        foreach (var arg in args) si.ArgumentList.Add(arg);
+        Process.Start(si);
+        Application.Current.Shutdown();
+    }
+
+    /// The game in folder built again with the latest release: here when these tools are it (or fetched), else after the setup
+    /// installed it (it starts the new builder with --update folder --tag t --fetched)
+    public static async void UpdateFolder(MainWindow w, string folder, string? tag, bool fetched)
+    {
+        w.BeginUpdate(folder, tag);
         var tools = Tools.Find();
         if (tools == null)
         {

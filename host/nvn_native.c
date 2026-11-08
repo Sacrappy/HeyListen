@@ -420,9 +420,30 @@ NV(nvnBufferInitialize) {
     RET(1);
 }
 NV(nvnBufferFinalize) { memset(P(0), 0, sizeof(nvn_buffer)); }
+/* (hookshot, issue 287) A buffer with no memory pool, mapped: the game filled 0x3d0 bytes at what it got back, 0, and crashed
+   on a scene change (Hyrule Castle / Castle Town / Hyrule Field, Kakariko day to night; thread OptimizeChangeBanc, right after
+   "flags of no memory pool"). Zeroed scratch memory in the game's address space instead, as large as the biggest asked for
+   (never freed: it comes rarely), and who asked, once. */
+static uint64_t scratch_map(uint64_t size, uint64_t lr) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static uint64_t at, have;
+    static int told;
+    AcquireSRWLockExclusive(&lock);
+    if (size > have) {
+        have = (size + 0xffff) & ~0xffffull;
+        at = hos_sys_alloc(have, 0x1000);
+    }
+    const uint64_t r = at;
+    if (told++ < 4) hos_log("nvn: a buffer of no memory pool mapped (lr %#llx): %#llx bytes of scratch", (unsigned long long)lr,
+                            (unsigned long long)size);
+    ReleaseSRWLockExclusive(&lock);
+    return r;
+}
 NV(nvnBufferMap) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
-    if (!o->pool || !o->pool->mem) { RET(0); return; }
+    if (!o) { RET(0); return; }
+    if (!o->pool) { RET(scratch_map(o->size ? o->size : 0x1000, c->x[30])); return; }
+    if (!o->pool->mem) { RET(0); return; }
     RETP(o->pool->mem + o->off);
 }
 NV(nvnBufferGetAddress) {

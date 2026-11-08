@@ -1,6 +1,7 @@
 // The Vulkan back end's start: vulkan-1.dll, the instance, the device (Vulkan 1.3 and the extensions the NVN replay
 // wants where the GPU has them: mesh shaders, host memory import, graphics pipeline libraries), the window's
 // swapchain, and the rx_* table (vk_api.h). The NVN replay itself is vk_replay.cpp.
+#include "vk_paths.h"
 #include "vk_loader.h"
 
 #include <cstdarg>
@@ -394,7 +395,7 @@ HWND main_window = nullptr;
 bool prepare_only() { return getenv("HOOKSHOT_PREPARE_ONLY") != nullptr; }
 std::string skipped_path() {
     char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    const DWORD n = game_module_path(exe, MAX_PATH);
     std::string path(exe, n);
     return path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepare_skipped";
 }

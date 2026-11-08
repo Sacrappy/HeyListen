@@ -4,6 +4,7 @@
    folder again from the game files the folder keeps, and the game closes. A folder with no hookshot_version.txt (built from the
    repository, or before updates came in) is never asked about. HOOKSHOT_NO_UPDATE_CHECK=1 (hookshot_env.txt) turns it off */
 #ifdef _WIN32
+#include "hos_paths.h"
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
@@ -80,7 +81,7 @@ static int latest_tag(char *tag, size_t cap) {
 void hos_update_check(void) {
     if (getenv("HOOKSHOT_NO_UPDATE_CHECK") && strcmp(getenv("HOOKSHOT_NO_UPDATE_CHECK"), "0")) return;
     wchar_t dir[MAX_PATH], file[MAX_PATH + 64];
-    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+    DWORD n = hos_game_path_w(dir, MAX_PATH);
     if (!n || n >= MAX_PATH) return;
     while (n && dir[n - 1] != L'\\' && dir[n - 1] != L'/') n--;
     if (!n) return;

@@ -466,6 +466,33 @@ bool gpu_page(uint64_t page) {
     return gpu_pages.count((uint32_t)page) != 0;
 }
 
+// (RX_VK_PROTECT_BARE=1, an experiment for the one-frame foliage flicker and the floating trees) The ranges a shader writes
+// through a table pointer (vk_draw.cpp: a bare entry, only its first 64 bytes marked written) are GPU-written pages the
+// mirror syncs know nothing of: a CPU write anywhere on such a page copied the CPU's whole page over the GPU's records
+// (NX2navi found the same: "trees drawn from records lost that way stretched into columns reaching the sky", and culled
+// foliage drew garbage for a frame). Pages noted here keep the GPU's version when the CPU also wrote them since the
+// pool's last sync. Nothing is copied back to guest memory (that overwrote the CPU's own data beside them once).
+std::mutex prot_mu;
+std::unordered_map<uint32_t, uint32_t> prot_pages;   // page -> gen_now when a shader last wrote through it
+std::atomic<int64_t> st_prot_kept{0};
+bool protect_bare_on() {
+    static const bool v = getenv("RX_VK_PROTECT_BARE") && getenv("RX_VK_PROTECT_BARE")[0] == '1';
+    return v;
+}
+bool prot_page_since(uint64_t page, uint32_t synced) {
+    std::lock_guard lk(prot_mu);
+    const auto it = prot_pages.find((uint32_t)page);
+    return it != prot_pages.end() && it->second >= synced;
+}
+void memory_protect_gpu(uint64_t guest, uint64_t size) {
+    if (!size || !protect_bare_on()) return;
+    const uint64_t p0 = guest >> kPageShift, p1 = (guest + size - 1) >> kPageShift;
+    if (p1 - p0 > 16384) return;   // (64 MB at most: a guess past that is not the GPU's records)
+    std::lock_guard lk(prot_mu);
+    for (uint64_t p = p0; p <= p1; p++) prot_pages[(uint32_t)p] = gen_now;
+    if (prot_pages.size() > 4000000) prot_pages.clear();
+}
+
 void memory_stamp(uint64_t guest, uint64_t size) {
     if (!size) return;
     {   // (RX_VK_LOG_STAMP=<lo>:<hi> (hex guest addresses): the stamps there, 300 lines, with their callers)
@@ -1675,6 +1702,11 @@ void mirror_sync(Pool& p) {
                      "pool synced at %u, gen now %u)", (unsigned long long)(page << kPageShift), (unsigned long long)p.lo,
                      live ? "live" : "from a capture", pg, (unsigned)p.synced_gen, gen_now);
         }
+        if (dirty && protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
+            st_prot_kept++;
+            page++;
+            continue;
+        }
         if (dirty && !sync_live()) {   // (as a capture took it, if the page was not written since)
             const CapEntry e = cap_entry(page);
             if (e.gen && e.gen == pg) {
@@ -2253,9 +2285,9 @@ void memory_end_submission(VkCommandBuffer cmd) {
             static int64_t l_old;
             logf("vk: mirror syncs (600 submits): %lld dirty pages from their submits' captures, %lld from earlier ones', "
                  "%lld from guest memory as it was at the replay; %zu captures kept; %lld pages the GPU wrote copied over "
-                 "(%lld live)", (long long)(st_sync_cap_pages - l_cap), (long long)(st_sync_old_pages - l_old),
-                 (long long)(st_sync_live_pages - l_live), cap_bufs.size(), (long long)st_sync_gpu_pages,
-                 (long long)st_sync_gpu_live);
+                 "(%lld live); %lld kept for the GPU (RX_VK_PROTECT_BARE)", (long long)(st_sync_cap_pages - l_cap),
+                 (long long)(st_sync_old_pages - l_old), (long long)(st_sync_live_pages - l_live), cap_bufs.size(),
+                 (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
             std::vector<std::pair<int64_t, uint64_t>> top;
             for (const auto& [lo, k] : live_by_pool) top.push_back({k, lo});

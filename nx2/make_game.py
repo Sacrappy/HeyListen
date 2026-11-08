@@ -760,8 +760,18 @@ def main():
     built = os.path.join(work, "sa", "build")
     # (the new files are copied in beside the old ones as <name>.new and swapped in only once all are complete: a build stopped while
     # copying, or a full disk, left a half-written 460 MB hookshot.exe and no game to play. The old game stays playable until the swap)
-    staged = [(os.path.join(built, n), os.path.join(out, n)) for n in BESIDE if os.path.exists(os.path.join(built, n))]
+    # (Windows) hookshot.exe in the folder is the game's launcher: the builder's small setup, which opens the installed builder as a
+    # launcher for this folder (Play, and Update left of it when a newer release is out: builder/setup/setup.c launch mode), or starts
+    # the game when no builder is installed. The game and its DLLs are in bin\; its files (image.bin, romfs, saves, settings, caches)
+    # stay in the folder (host/hos_paths.h). Without the setup (a development build) the game stays hookshot.exe in the folder
+    launcher = os.path.join(os.path.dirname(os.path.abspath(ROOT)), "HookshotBuilder-Setup.exe")
+    launcher = launcher if not LINUX and os.path.isfile(launcher) else None
+    game_dir = os.path.join(out, "bin") if launcher else out
+    os.makedirs(game_dir, exist_ok=True)
+    staged = [(os.path.join(built, n), os.path.join(game_dir, n)) for n in BESIDE if os.path.exists(os.path.join(built, n))]
     staged.append((os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin")))
+    if launcher:
+        staged.append((launcher, os.path.join(out, "hookshot.exe")))
     for src, dst in staged:
         try:
             if os.path.exists(dst + ".new"):
@@ -777,6 +787,13 @@ def main():
         except PermissionError:
             fail("Could not replace %s. Close any running copy of Hookshot and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
+    if launcher:   # (a folder built before the launcher: its game's DLLs and map left the folder for bin\; hookshot.exe is the launcher now)
+        for n in BESIDE[1:] + ["hookshot.map", "hookshot-game.exe"]:
+            try:
+                if os.path.isfile(os.path.join(out, n)):
+                    os.remove(os.path.join(out, n))
+            except OSError:
+                pass
     # every shader of the game, for its first start to translate (gpu/vk/vk_shader.cpp seed_open). Without it the game still runs, compiling them
     # as it meets them: not worth stopping a finished build for
     if subprocess.call(shader_census_cmd(romfs, os.path.join(out, "hookshot_shaders.bin")), stdout=sys.stderr):

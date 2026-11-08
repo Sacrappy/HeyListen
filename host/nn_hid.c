@@ -24,6 +24,7 @@
    Npad states share one layout (NpadCommonState): { s64 sampling; u64 buttons; s32 lx, ly; s32 rx, ry; u32 attributes;
    pad } = 0x28 bytes. */
 #include "hos.h"
+#include "hos_paths.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -358,7 +359,7 @@ static void binds_load(void) {
     }
     binds_default();
     char path[MAX_PATH];
-    const DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+    const DWORD len = hos_game_path_a(path, MAX_PATH);
     char *slash = len ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/') */
     FILE *f = NULL;
     if (slash) {

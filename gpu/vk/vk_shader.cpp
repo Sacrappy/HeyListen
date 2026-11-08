@@ -41,6 +41,7 @@
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/runtime_info.h"
 
+#include "vk_paths.h"
 #include "vk_internal.h"
 #include "vk_jobs.h"
 #include "vk_draw.h"
@@ -825,7 +826,7 @@ void disk_init() {
     std::call_once(once, [] {
         if (getenv("RX_VK_NO_PROGRAM_CACHE")) return;
         char exe[MAX_PATH];
-        const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        const DWORD n = game_module_path(exe, MAX_PATH);
         std::string path(exe, n);
         path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
         const uint64_t stamp = disk_stamp();
@@ -1638,7 +1639,7 @@ struct Seed {
 } seed;
 std::string beside_exe(const char* name) {
     char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    const DWORD n = game_module_path(exe, MAX_PATH);
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
 }
