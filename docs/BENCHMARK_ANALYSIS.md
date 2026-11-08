@@ -33,3 +33,26 @@ Source: `E:\OOT\Lichii-1\NX2_NOTES.md`, `NX2_GPU_THREAD_SPLIT.md`.
 ## 4. Open measurements (first tickets)
 - Hyrule Field profile for Hookshot (never tested) and Lichii, same machine, same save.
 - Frametime capture (p50/p99/max) in Kokiri and Hyrule for both, as the baseline.
+
+## 5. TICK-003 - per-draw descriptor strategy microbenchmark (2026-11-08)
+Standalone headless Vulkan C++20 bench, no game data: `bench/descriptors`.
+Build: `cmake -S bench/descriptors -B build/descriptors -G "Visual Studio 17 2022" -A x64` then
+`cmake --build build/descriptors --config Release`. Run: `build/descriptors/Release/descriptor_bench.exe`.
+- Machine: NVIDIA GeForce RTX 5070, Vulkan 1.4.351, MSVC 19.44 (Release x64), Windows.
+- Workload: 3,000 draws/frame, 30 combined-image-sampler descriptors resolved per draw, 10 measured frames after 2 warmup frames, 8x8 render target.
+- Metric: CPU command-buffer recording time only; queue submit, fence wait and GPU execution are excluded.
+- Validation: `VK_LAYER_KHRONOS_validation` enabled, 0 errors / 0 warnings.
+- Test: `ctest --test-dir build/descriptors -C Release` passes (`--frames 2 --draws 300 --warmup 1`).
+
+| Strategy | CPU µs/draw | vs bindless |
+|---|---:|---:|
+| Push descriptors (`VK_KHR_push_descriptor`) | 22.28 | 19.7x |
+| Bindless descriptor indexing (runtime array, push-constant indices) | 1.13 | 1.0x |
+| `VK_EXT_descriptor_buffer` | 13.94 | 12.3x |
+
+Median of four full runs; run-to-run spread was <1% for push and descriptor buffer and ~5-8% for bindless.
+
+Notes:
+- The descriptor-buffer case still writes all 30 descriptors per draw (`vkGetDescriptorEXT` into a host-visible ring) because it models Hookshot's per-draw `build_descriptors`; pre-building the ring once would remove almost all of that cost.
+- Bindless wins because the per-draw work is 30 index stores plus one `vkCmdPushConstants`; the descriptor set is built once.
+- This supports section 3.3: replace per-draw push descriptors with bindless indexing (or a pre-built descriptor buffer) to cut the replay thread's per-draw CPU cost by roughly 12-20x.
