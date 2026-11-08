@@ -2,7 +2,7 @@
    when it is not the release this game folder was built with, the player is asked whether to update. Yes starts the Hookshot Builder
    that made the folder (hookshot_version.txt, written by nx2/make_game.py) with --update: it downloads the new release and builds the
    folder again from the game files the folder keeps, and the game closes. A folder with no hookshot_version.txt (built from the
-   repository, or before updates came in) is never asked about. HOOKSHOT_NO_UPDATE_CHECK=1 (hookshot_env.txt) turns it off */
+   repository, or before updates came in) is never asked about. HOOKSHOT_NO_UPDATE_CHECK=1 (hookshot_env.txt) turns it off; in this fork it is off unless HOOKSHOT_UPDATE_CHECK=1 */
 #ifdef _WIN32
 #include "hos_paths.h"
 #include <windows.h>
@@ -80,6 +80,9 @@ static int latest_tag(char *tag, size_t cap) {
 
 void hos_update_check(void) {
     if (getenv("HOOKSHOT_NO_UPDATE_CHECK") && strcmp(getenv("HOOKSHOT_NO_UPDATE_CHECK"), "0")) return;
+    /* (this fork builds its own game from its own sources: NotRexed's releases are not its updates, so the offer is opt-in here,
+       HOOKSHOT_UPDATE_CHECK=1) */
+    if (!getenv("HOOKSHOT_UPDATE_CHECK") || !strcmp(getenv("HOOKSHOT_UPDATE_CHECK"), "0")) return;
     wchar_t dir[MAX_PATH], file[MAX_PATH + 64];
     DWORD n = hos_game_path_w(dir, MAX_PATH);
     if (!n || n >= MAX_PATH) return;

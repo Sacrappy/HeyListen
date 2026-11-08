@@ -4,13 +4,14 @@
 #
 #   powershell -File scripts/dev-build.ps1 -Game E:\OOT\hookshot-fork-game
 #
-# Changing nx2/ (the lifter) or the game-code patches needs a full build (nx2/make_game.py); host/ and gpu/ edits
-# are what this is for.
+# -Lift lifts the game again first (a change to nx2/ or a merge that brings one); host/ and gpu/ edits need no lift.
 param(
     [string]$Game = "$PSScriptRoot\..\work\game",
     [string]$Work = "$env:LOCALAPPDATA\HookshotBuilder",
     [string]$Tools = "",      # the HookshotBuilder "tools" folder (python, llvm-mingw, cpm, wgpu-native); found beside Work when empty
-    [int]$Jobs = 8
+    [int]$Jobs = 8,
+    [switch]$Lift             # lift the game again first (after a change to nx2/'s lifter or the game-code patches, or a merge that brings one):
+                              # a few minutes, then only the chunks whose lifted code changed are compiled
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path "$PSScriptRoot\..").Path
@@ -31,9 +32,15 @@ $env:OOT_ROMFS = "$Game\romfs"
 $env:RX_RELEASE = "1"
 $env:A64_HOT_CHUNK = "1"
 if (Test-Path "$Work\hot_funcs.txt") { $env:A64_HOT_FUNCS = "$Work\hot_funcs.txt" }
+if (Test-Path "$Work\hookshot_pieces.prof") { $env:RX_PGO = "$Work\hookshot_pieces.prof" }
 $env:PYTHONIOENCODING = "utf-8"
 Push-Location $root
 try {
+    if ($Lift) {
+        & "$Tools\python\python.exe" -I nx2/lift.py --standalone --write --exefs $env:OOT_EXEFS --work $Work
+        if ($LASTEXITCODE) { throw "lift failed" }
+        if (Test-Path "$Work\sa\gen\code_hot.c") { & "$Tools\python\python.exe" -I nx2/split_hot.py "$Work\sa\gen" }
+    }
     & "$Tools\python\python.exe" -I nx2/build.py --standalone --jobs $Jobs
     if ($LASTEXITCODE) { throw "build failed" }
     $built = Join-Path $Work "sa\build"
