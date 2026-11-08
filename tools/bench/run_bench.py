@@ -22,9 +22,20 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: warm-up counted from launch (warmup_origin, launch_offset_s)
 HARD_LIMIT_S = 120.0
 DEFAULT_DURATION_S = 90.0
+# Hookshot, measured on the TICK-004 traces (see README "Warm-up"): gameplay starts
+# ~29 s after launch in Kokiri and ~53-57 s in Hyrule Field, and the Hyrule scene-entry
+# hitches end ~55 s after launch.  60 s from launch covers both.  Lichii: no warm-up
+# (the baseline measured the whole capture).
+HOOKSHOT_DEFAULT_WARMUP_S = 60.0
+LICHII_DEFAULT_WARMUP_S = 0.0
+# A launch->first present offset outside this range means the trace clock is not the
+# perf_counter clock (the offset is then taken from when the first row appears).
+OFFSET_MAX_S = 120.0
+MEASURE_MIN_S = 30.0  # warn when less than this is left to measure after the warm-up
+REPEAT_SPREAD_LIMIT_PCT = 5.0
 
 # Input scripts (HOS_INPUT_SCRIPT syntax) reaching the save from Hookshot's title.
 LOAD_SAVE = "30:A,34:A,38:A,42:A,46:A,50:A,54:A,58:A,62:A,66:A,70:A"
@@ -68,31 +79,54 @@ def compute_stats(intervals_ms: list[float]) -> dict:
 
 
 # ------------------------------------------------------------------- parsers
+def _trace_samples(path: Path) -> list[tuple[int, int]]:
+    """Valid (return_ns, interval_ns) pairs of a HOS_PRESENT_TRACE csv, in file order.
+
+    Malformed lines (e.g. a line cut by the forced kill) are skipped.
+    """
+    out: list[tuple[int, int]] = []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) != 3 or not parts[0].isdigit():
+            continue
+        try:
+            out.append((int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+    return out
+
+
 def parse_hookshot_trace(path: Path) -> list[tuple[float, float]]:
     """HOS_PRESENT_TRACE csv (frame,return_ns,interval_ns) -> [(t_s, interval_ms)].
 
     t_s is seconds since the first present.  Frame 1 (interval 0) and malformed
     lines (e.g. a line cut by the forced kill) are skipped.
     """
-    rows: list[tuple[float, float]] = []
-    t0 = None
+    samples = _trace_samples(path)
+    if not samples:
+        return []
+    t0 = samples[0][0]
+    return [((ret - t0) / 1e9, interval / 1e6) for ret, interval in samples if interval > 0]
+
+
+def hookshot_first_return_ns(path: Path) -> int | None:
+    """return_ns of the first valid trace row (absolute game clock), or None."""
+    samples = _trace_samples(path)
+    return samples[0][0] if samples else None
+
+
+def trace_has_row(path: Path) -> bool:
+    """True once the trace file holds at least one complete data row (cheap, for polling)."""
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        with Path(path).open("rb") as f:
+            head = f.read(4096).decode("utf-8", errors="replace")
     except OSError:
-        return rows
-    for line in text.splitlines():
-        parts = line.strip().split(",")
-        if len(parts) != 3 or not parts[0].isdigit():
-            continue
-        try:
-            ret, interval = int(parts[1]), int(parts[2])
-        except ValueError:
-            continue
-        if t0 is None:
-            t0 = ret
-        if interval > 0:
-            rows.append(((ret - t0) / 1e9, interval / 1e6))
-    return rows
+        return False
+    return any(len(p) == 3 and p[0].isdigit() for p in (ln.strip().split(",") for ln in head.splitlines()))
 
 
 _LOG_WINDOW = re.compile(r"vk:\s*\d+\s+presents,\s*([0-9.]+)\s+fps;")
@@ -156,6 +190,63 @@ def parse_presentmon_csv(path: Path) -> list[tuple[float, float]]:
 
 def window(rows: list[tuple[float, float]], skip_first_s: float) -> list[float]:
     return [ms for t, ms in rows if t >= skip_first_s]
+
+
+def skip_from_first_present(warmup_s: float, origin: str, launch_offset_s: float | None) -> float:
+    """Seconds after the first present before measuring starts.
+
+    origin "launch": warmup_s is counted from the game launch, so subtract the
+    launch -> first present offset (never below 0: a warm-up shorter than the
+    offset discards nothing).  origin "first_present" (or no offset known): as is.
+    """
+    if origin == "launch" and launch_offset_s is not None:
+        return max(0.0, warmup_s - launch_offset_s)
+    return max(0.0, warmup_s)
+
+
+def cut_label(warmup_s: float, origin: str, launch_offset_s: float | None) -> str:
+    if warmup_s <= 0:
+        return "whole capture"
+    if origin == "launch" and launch_offset_s is not None:
+        return f"{warmup_s:g} s after launch"
+    return f"{warmup_s:g} s after first present"
+
+
+def resolve_launch_offset(trace: Path, launch_ns: int, first_seen_ns: int | None,
+                          ) -> tuple[float | None, str | None]:
+    """Launch -> first present offset in seconds, and a note when it is a fallback.
+
+    The game's return_ns is the same clock as time.perf_counter_ns() on Windows (QPC):
+    on the TICK-004 runs, boot time + return_ns gives a first present 11-13 s after the
+    recorded started_utc (the ~9 s shader precompile is most of it), so the offset is
+    first_return_ns - launch_ns.  If that is implausible (another clock), the
+    offset is the time the first trace row was seen on disk (polled during the run;
+    an upper bound, the file is buffered).
+    """
+    first_ret = hookshot_first_return_ns(trace)
+    if first_ret is not None:
+        off = (first_ret - launch_ns) / 1e9
+        if 0.0 <= off <= OFFSET_MAX_S:
+            return off, None
+    if first_seen_ns is not None:
+        off = (first_seen_ns - launch_ns) / 1e9
+        if 0.0 <= off <= OFFSET_MAX_S:
+            return off, ("trace clock is not the launch clock; launch offset taken from the "
+                         "time the first trace row was seen (upper bound, buffered writes)")
+    return None, "launch offset unknown; warm-up counted from the first present"
+
+
+def fps_spread(fps_values: list[float]) -> dict:
+    """Spread between repeated runs: (max - min) / mean, in percent."""
+    vals = [v for v in fps_values if v > 0]
+    if not vals:
+        return {"fps_mean": 0.0, "fps_min": 0.0, "fps_max": 0.0,
+                "spread_pct": None, "within_limit": False}
+    mean = sum(vals) / len(vals)
+    spread = 100.0 * (max(vals) - min(vals)) / mean
+    return {"fps_mean": mean, "fps_min": min(vals), "fps_max": max(vals),
+            "spread_pct": spread if len(vals) > 1 else None,
+            "within_limit": len(vals) > 1 and spread <= REPEAT_SPREAD_LIMIT_PCT}
 
 
 # ------------------------------------------------------------------ watchdog
@@ -236,6 +327,13 @@ def detect_build(exe: Path) -> str:
     return "lichii" if any(t in n for t in ("lichii", "eden")) else "hookshot"
 
 
+def resolve_warmup(warmup_arg: float | None, build: str) -> float:
+    """--warmup-s if given, else the per-build default (counted from launch for Hookshot)."""
+    if warmup_arg is not None:
+        return max(0.0, float(warmup_arg))
+    return HOOKSHOT_DEFAULT_WARMUP_S if build == "hookshot" else LICHII_DEFAULT_WARMUP_S
+
+
 def run(args: argparse.Namespace) -> dict:
     exe = Path(args.exe).resolve()
     out = Path(args.out).resolve()
@@ -244,6 +342,10 @@ def run(args: argparse.Namespace) -> dict:
     warnings: list[str] = []
     if duration < args.duration:
         warnings.append(f"duration clamped to {duration} s to respect the {HARD_LIMIT_S:.0f} s limit")
+    warmup = resolve_warmup(args.warmup_s, build)
+    if duration - warmup < MEASURE_MIN_S:
+        warnings.append(f"only {max(0.0, duration - warmup):.0f} s left to measure after the "
+                        f"{warmup:g} s warm-up; use a longer --duration (max {HARD_LIMIT_S - 5:.0f})")
 
     env = os.environ.copy()
     cmd = [str(exe)]
@@ -277,9 +379,13 @@ def run(args: argparse.Namespace) -> dict:
     started = time.monotonic()
     started_utc = utc_now()
     exit_code = None
+    launch_ns = None
+    first_seen_ns = None
+    next_check = 0.0
     log = log_path.open("wb")
     try:
         dog.start()
+        launch_ns = time.perf_counter_ns()  # same clock as the game's return_ns (see resolve_launch_offset)
         game = subprocess.Popen(cmd, cwd=str(exe.parent), env=env, stdout=log, stderr=subprocess.STDOUT)
         dog.add(game)
         if monitor_cmd:
@@ -289,6 +395,10 @@ def run(args: argparse.Namespace) -> dict:
             if game.poll() is not None:
                 warnings.append("game exited before the duration was over")
                 break
+            if build == "hookshot" and first_seen_ns is None and time.monotonic() >= next_check:
+                next_check = time.monotonic() + 0.5
+                if trace_has_row(trace):
+                    first_seen_ns = time.perf_counter_ns()
             time.sleep(0.2)
         exit_code = game.poll()
     finally:
@@ -299,6 +409,7 @@ def run(args: argparse.Namespace) -> dict:
     if dog.fired:
         warnings.append("hard watchdog fired")
 
+    offset, origin = None, "first_present"
     if build == "hookshot":
         rows = parse_hookshot_trace(trace)
         if rows:
@@ -306,11 +417,19 @@ def run(args: argparse.Namespace) -> dict:
         else:
             warnings.append("no present trace rows (HOS_PRESENT_TRACE empty or missing)")
         windows = parse_hookshot_log(log_path)
+        if launch_ns is not None:
+            offset, note = resolve_launch_offset(trace, launch_ns, first_seen_ns)
+            if note:
+                warnings.append(note)
+        if offset is not None:
+            origin = "launch"
     else:
         rows = parse_presentmon_csv(pm_csv)
         if not rows:
             warnings.append("no PresentMon rows")
         windows = []
+        warnings.append("warm-up counted from the first PresentMon row (no launch offset for Lichii)")
+    skip = skip_from_first_present(warmup, origin, offset)
     result = {
         "schema_version": SCHEMA_VERSION,
         "build": build,
@@ -320,16 +439,51 @@ def run(args: argparse.Namespace) -> dict:
         "started_utc": started_utc,
         "duration_requested_s": duration,
         "wall_clock_s": round(wall, 3),
-        "warmup_s": args.warmup_s,
+        "warmup_s": warmup,
+        "warmup_origin": origin,
+        "launch_offset_s": None if offset is None else round(offset, 3),
         "killed_by_harness": killed,
         "watchdog_fired": dog.fired,
         "exit_code": exit_code,
-        **compute_stats(window(rows, args.warmup_s)),
+        **compute_stats(window(rows, skip)),
         "log_window_fps": windows,
         "warnings": warnings,
     }
+    if rows and not result["frames"]:
+        result["warnings"].append(f"no frames after the {warmup:g} s warm-up")
     (out / "bench.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
+
+
+def run_repeat(args: argparse.Namespace) -> list[dict]:
+    """--repeat N: N runs back to back into <out>/run1..runN, then <out>/repeat.json.
+
+    Each run is its own launch with its own warm-up and watchdog; the game is killed
+    at the end of each run before the next one starts.  N = 1 writes to <out> directly.
+    """
+    n = int(args.repeat)
+    if n < 1:
+        raise SystemExit("--repeat must be >= 1")
+    if n == 1:
+        return [run(args)]
+    out = Path(args.out).resolve()
+    results = []
+    for i in range(1, n + 1):
+        results.append(run(argparse.Namespace(**{**vars(args), "out": str(out / f"run{i}")})))
+    spread = fps_spread([r["fps"] for r in results])
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "build": results[0]["build"],
+        "scene": args.scene,
+        "limit_pct": REPEAT_SPREAD_LIMIT_PCT,
+        **spread,
+        "runs": [{"run": i + 1, "dir": f"run{i + 1}", "fps": r["fps"], "frames": r["frames"],
+                  "p50_ms": r["frame_time_ms"]["p50"], "p95_ms": r["frame_time_ms"]["p95"],
+                  "p99_ms": r["frame_time_ms"]["p99"], "max_ms": r["frame_time_ms"]["max"]}
+                 for i, r in enumerate(results)],
+    }
+    (out / "repeat.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return results
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -339,7 +493,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--build", choices=("auto", "hookshot", "lichii"), default="auto")
     p.add_argument("--duration", type=float, default=DEFAULT_DURATION_S, help="wall clock seconds (default 90, max 115)")
-    p.add_argument("--warmup-s", type=float, default=0.0, help="ignore frames in the first N s of the trace")
+    p.add_argument("--warmup-s", type=float, default=None,
+                   help="ignore frames before N s after game LAUNCH (Hookshot default 60; Lichii default 0)")
+    p.add_argument("--repeat", type=int, default=1, help="N back-to-back runs into <out>/run1..N + repeat.json")
     p.add_argument("--fps-limit", type=int, default=120, help="Hookshot HOS_FPS_LIMIT")
     p.add_argument("--input-script", help="Hookshot HOS_INPUT_SCRIPT override")
     p.add_argument("--presentmon", help="path to PresentMon (Lichii)")
@@ -348,9 +504,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    res = run(build_parser().parse_args(argv))
-    print(json.dumps({k: res[k] for k in ("build", "scene", "frames", "fps", "frame_time_ms", "wall_clock_s")}, indent=2))
-    return 0 if res["frames"] else 2
+    args = build_parser().parse_args(argv)
+    results = run_repeat(args)
+    for res in results:
+        print(json.dumps({k: res[k] for k in ("build", "scene", "frames", "fps", "frame_time_ms",
+                                              "wall_clock_s", "warmup_origin", "launch_offset_s")}, indent=2))
+    if len(results) > 1:
+        spread = fps_spread([r["fps"] for r in results])
+        sp = "n/a" if spread["spread_pct"] is None else f"{spread['spread_pct']:.1f}%"
+        print(f"repeat: fps {spread['fps_min']:.1f}-{spread['fps_max']:.1f} "
+              f"(mean {spread['fps_mean']:.1f}), spread {sp}, "
+              f"{'within' if spread['within_limit'] else 'NOT within'} {REPEAT_SPREAD_LIMIT_PCT:g}%")
+    return 0 if all(r["frames"] for r in results) else 2
 
 
 if __name__ == "__main__":
