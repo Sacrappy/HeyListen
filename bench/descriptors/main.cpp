@@ -180,6 +180,7 @@ struct Options {
     int frames = 10;
     int warmup = 2;
     std::uint32_t draws = 3000;
+    bool validation = true;
 };
 
 enum class Strategy {
@@ -293,7 +294,7 @@ struct Bench {
 bool Bench::createInstance() {
     configureLayerPath();
 
-    const bool validation = hasLayer("VK_LAYER_KHRONOS_validation");
+    const bool validation = options.validation && hasLayer("VK_LAYER_KHRONOS_validation");
     const bool debugUtils = hasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     validationEnabled = validation;
     debugUtilsEnabled = debugUtils && validation;
@@ -1392,6 +1393,8 @@ int main(int argc, char** argv) {
             bench.options.frames = std::max(1, std::atoi(argv[++i]));
         } else if (argument == "--warmup" && hasValue) {
             bench.options.warmup = std::max(0, std::atoi(argv[++i]));
+        } else if (argument == "--no-validation") {
+            bench.options.validation = false;
         } else if (argument == "--draws" && hasValue) {
             bench.options.draws = static_cast<std::uint32_t>(std::max(1, std::atoi(argv[++i])));
         } else {

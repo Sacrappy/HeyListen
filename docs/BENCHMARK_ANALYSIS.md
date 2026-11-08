@@ -41,18 +41,17 @@ Build: `cmake -S bench/descriptors -B build/descriptors -G "Visual Studio 17 202
 - Machine: NVIDIA GeForce RTX 5070, Vulkan 1.4.351, MSVC 19.44 (Release x64), Windows.
 - Workload: 3,000 draws/frame, 30 combined-image-sampler descriptors resolved per draw, 10 measured frames after 2 warmup frames, 8x8 render target.
 - Metric: CPU command-buffer recording time only; queue submit, fence wait and GPU execution are excluded.
-- Validation: `VK_LAYER_KHRONOS_validation` enabled, 0 errors / 0 warnings.
+- Timed with `--no-validation`. Validation stays on by default to check correctness (0 errors / 0 warnings); its per-call cost inflated the first numbers 20-60x and they were discarded at review.
 - Test: `ctest --test-dir build/descriptors -C Release` passes (`--frames 2 --draws 300 --warmup 1`).
 
-| Strategy | CPU µs/draw | vs bindless |
-|---|---:|---:|
-| Push descriptors (`VK_KHR_push_descriptor`) | 22.28 | 19.7x |
-| Bindless descriptor indexing (runtime array, push-constant indices) | 1.13 | 1.0x |
-| `VK_EXT_descriptor_buffer` | 13.94 | 12.3x |
+| Strategy | CPU µs/draw | vs bindless | ms per 3,050-draw frame |
+|---|---:|---:|---:|
+| Push descriptors (`VK_KHR_push_descriptor`) | 0.35 | 6.8x | 1.06 |
+| Bindless descriptor indexing (runtime array, push-constant indices) | 0.05 | 1.0x | 0.16 |
+| `VK_EXT_descriptor_buffer` (30 `vkGetDescriptorEXT` per draw) | 0.14 | 2.7x | 0.42 |
 
-Median of four full runs; run-to-run spread was <1% for push and descriptor buffer and ~5-8% for bindless.
+Spread over four runs <10%.
 
-Notes:
-- The descriptor-buffer case still writes all 30 descriptors per draw (`vkGetDescriptorEXT` into a host-visible ring) because it models Hookshot's per-draw `build_descriptors`; pre-building the ring once would remove almost all of that cost.
-- Bindless wins because the per-draw work is 30 index stores plus one `vkCmdPushConstants`; the descriptor set is built once.
-- This supports section 3.3: replace per-draw push descriptors with bindless indexing (or a pre-built descriptor buffer) to cut the replay thread's per-draw CPU cost by roughly 12-20x.
+Reading:
+- Hookshot's measured per-draw total is ~3.2 µs. Descriptor *recording* is only ~0.35 µs of it: bindless saves ~0.9 ms a frame on the driver side, not a 12-20x win on the whole replay.
+- The larger part of `build_descriptors` (19% of the replay thread) is Hookshot's own resolution work (uniform ranges, storage buffers through the driver banks, texture handle table). Bindless helps only if that resolution is also cached per binding generation instead of redone per draw.
