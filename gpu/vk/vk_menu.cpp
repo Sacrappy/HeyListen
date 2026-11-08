@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "vk_menu.h"
+#include "vk_perf.h"
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
 #endif
@@ -36,6 +37,7 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_perf(int v) { return v == 2 ? "Full" : v ? "FPS" : "Off"; }
 const char* tx_upscale(int v) {
     static const char* t[] = {"Off", "Catmull-Rom", "Lanczos"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
@@ -124,8 +126,9 @@ Row rows[] = {
      "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
     {"Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
      "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart."},
-    {"FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
-     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate."},
+    {"FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,
+     "FPS: frames per second and the frame time in the top right corner (with frame generation on, also the game's own rate). "
+     "Full: a panel with the GPU, VRAM, CPU and RAM load and a frame-time graph. F10 cycles Off, FPS and Full."},
     {"Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
      "On: the controller keeps playing the game while another window has the focus, for streaming or playing beside other "
      "apps. The keyboard and mouse still need the game's window."},
@@ -462,6 +465,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
 }
 char fps_text[48] = "";
 char fps_sub[32] = "";
+char fps_ms[48] = "";   // (the frame time line: the average and the longest frame of the last half-second)
 /// The usual overlay: a bold green number with a dark edge, nothing behind it. Hard-edged letters: see-through pixels are copied or not.
 void outlined(HDC dc, int x, int y, const char* text, COLORREF colour, int edge) {
     SetTextColor(dc, RGB(6, 8, 6));
@@ -491,9 +495,89 @@ void paint_fps(HDC dc, uint32_t w, uint32_t h, int s) {
         SelectObject(dc, label);
         outlined(dc, right, 32 * s, fps_sub, RGB(226, 232, 226), s);
     }
+    if (fps_ms[0]) {
+        SelectObject(dc, label);
+        outlined(dc, right, (fps_sub[0] ? 50 : 32) * s, fps_ms, RGB(226, 232, 226), s);
+    }
     SelectObject(dc, old);
     DeleteObject(label);
     DeleteObject(big);
+}
+PerfStats perf_cur;
+/// The full overlay: GPU, VRAM, CPU and RAM with the machine's numbers, the frame rate and frame times, and the graph of the
+/// last frames. A dark panel (not black: black is see-through), in the colours of the oot-pc overlay.
+void paint_perf(HDC dc, uint32_t w, uint32_t h, int s) {
+    const PerfStats& p = perf_cur;
+    fill(dc, 0, 0, (int)w, (int)h, RGB(12, 14, 12));
+    SetBkMode(dc, TRANSPARENT);
+    HFONT font = CreateFontA(-13 * s, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    HFONT small = CreateFontA(-11 * s, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    HGDIOBJ old = SelectObject(dc, font);
+    const COLORREF gpu_c = RGB(140, 212, 79), cpu_c = RGB(46, 150, 204), ram_c = RGB(204, 115, 179), fps_c = RGB(242, 242, 242),
+                   dim = RGB(150, 158, 152);
+    const int x0 = 10 * s, x1 = 62 * s, lh = 19 * s;
+    int y = 8 * s;
+    auto num = [](char* b, size_t n, float v, const char* fmt) {
+        if (v < 0) snprintf(b, n, "-");
+        else snprintf(b, n, fmt, v);
+    };
+    auto row = [&](const char* label, COLORREF c, const char* text) {
+        SetTextAlign(dc, TA_LEFT | TA_TOP);
+        SetTextColor(dc, c);
+        TextOutA(dc, x0, y, label, (int)strlen(label));
+        SetTextColor(dc, fps_c);
+        TextOutA(dc, x1, y, text, (int)strlen(text));
+        y += lh;
+    };
+    char a[24], b[24], c[24], d[24], t[96];
+    num(a, sizeof a, p.gpu_pct, "%.0f%%"), num(b, sizeof b, p.gpu_temp_c, "%.0f C"), num(c, sizeof c, p.gpu_power_w, "%.0f W");
+    num(d, sizeof d, p.gpu_clock_mhz, "%.0f MHz");
+    snprintf(t, sizeof t, "%s   %s   %s   %s", a, b, c, d);
+    row("GPU", gpu_c, t);
+    num(a, sizeof a, p.vram_used_mb < 0 ? -1 : p.vram_used_mb / 1024, "%.1f");
+    num(b, sizeof b, p.vram_total_mb < 0 ? -1 : p.vram_total_mb / 1024, "%.1f");
+    snprintf(t, sizeof t, "%s / %s GB", a, b);
+    row("VRAM", gpu_c, t);
+    num(a, sizeof a, p.cpu_total_pct, "%.0f%%"), num(b, sizeof b, p.cpu_game_pct, "%.0f%%");
+    snprintf(t, sizeof t, "%s   game %s", a, b);
+    row("CPU", cpu_c, t);
+    num(a, sizeof a, p.ram_used_mb < 0 ? -1 : p.ram_used_mb / 1024, "%.1f");
+    num(b, sizeof b, p.ram_total_mb < 0 ? -1 : p.ram_total_mb / 1024, "%.1f");
+    num(c, sizeof c, p.ram_game_mb < 0 ? -1 : p.ram_game_mb / 1024, "%.1f");
+    snprintf(t, sizeof t, "%s / %s GB   game %s GB", a, b, c);
+    row("RAM", ram_c, t);
+    snprintf(t, sizeof t, "%.0f fps   %.1f ms   max %.1f ms", p.fps, p.frame_ms_avg, p.frame_ms_max);
+    row("FPS", fps_c, t);
+    // the graph: the last frame times, scaled to the worst of 50 ms and the longest seen (the line is 60 fps, 16.7 ms)
+    const int gx = 10 * s, gw = (int)w - 20 * s, gh = 46 * s, gy = y + 2 * s;
+    fill(dc, gx, gy, gw, gh, RGB(26, 30, 26));
+    float top = 50;
+    for (float f : p.frame_ms) top = f > top ? f : top;
+    HPEN grid = CreatePen(PS_SOLID, 1, RGB(60, 68, 60)), line = CreatePen(PS_SOLID, std::max(1, s), fps_c);
+    HGDIOBJ oldpen = SelectObject(dc, grid);
+    const int y60 = gy + gh - (int)(gh * (1000.0f / 60) / top);
+    MoveToEx(dc, gx, y60, nullptr), LineTo(dc, gx + gw, y60);
+    SelectObject(dc, line);
+    for (int i = 0; i < kPerfHistory; i++) {
+        const int px = gx + (int)((int64_t)gw * i / (kPerfHistory - 1));
+        const float f = p.frame_ms[i] > top ? top : p.frame_ms[i];
+        const int py = gy + gh - (int)(gh * f / top);
+        if (i == 0) MoveToEx(dc, px, py, nullptr);
+        else LineTo(dc, px, py);
+    }
+    SelectObject(dc, oldpen);
+    DeleteObject(grid);
+    DeleteObject(line);
+    y = gy + gh + 4 * s;
+    SelectObject(dc, small);
+    SetTextColor(dc, dim);
+    if (p.gpu_name[0]) TextOutA(dc, x0, y, p.gpu_name, (int)strlen(p.gpu_name)), y += 14 * s;
+    if (p.cpu_name[0]) TextOutA(dc, x0, y, p.cpu_name, (int)strlen(p.cpu_name));
+    SelectObject(dc, old);
+    DeleteObject(font);
+    DeleteObject(small);
 }
 /// The tallest help text at scale s, in pixels: the menu keeps that height whichever row is selected
 int measure_help(int s) {
@@ -519,6 +603,7 @@ void redraw_menu(int s) {
 }
 
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
+std::atomic<int64_t> last_note_ns{0}, worst_ns{0};   // (the FPS counter's frame time: the longest gap between two shown frames)
 int cur_scale = 1;
 
 struct Upload {
@@ -594,6 +679,13 @@ bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
 
 void menu_note_frame(bool game_frame) {
     shown_frames.fetch_add(1, std::memory_order_relaxed);
+    if (opts.show_fps == 2) perf_note_frame();
+    const int64_t t = prof_now(), prev = last_note_ns.exchange(t, std::memory_order_relaxed);
+    if (prev) {
+        const int64_t dt = t - prev;
+        int64_t w = worst_ns.load(std::memory_order_relaxed);
+        while (dt > w && !worst_ns.compare_exchange_weak(w, dt, std::memory_order_relaxed)) {}
+    }
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -638,10 +730,10 @@ bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* 
 
 void menu_tick() {
     fullscreen_tick();
-    enum { K_N = 10 };
+    enum { K_N = 11 };
     static bool held[K_N];
     static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
-                                  VK_RETURN, VK_DELETE, VK_BACK};
+                                  VK_RETURN, VK_DELETE, VK_BACK, VK_F10};   // (F10: the overlay mode)
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
@@ -669,6 +761,11 @@ void menu_tick() {
     bool changed = scale != cur_scale || menu_refresh;
     menu_refresh = false;
     cur_scale = scale;
+    if (press[10]) {
+        opts.show_fps = (opts.show_fps + 1) % 3;
+        menu_refresh = true;
+        save();
+    }
     if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
@@ -741,6 +838,25 @@ void menu_tick() {
         }
         if (changed) redraw_menu(scale);
     }
+    {   // (the full overlay's sampler runs only while it is shown)
+        static bool sampling = false;
+        const bool want = opts.show_fps == 2;
+        if (want != sampling) {
+            sampling = want;
+            if (want) {
+                VkPhysicalDeviceProperties pr{};
+                vkGetPhysicalDeviceProperties(dev.physical, &pr);
+                VkPhysicalDeviceMemoryProperties mp{};
+                vkGetPhysicalDeviceMemoryProperties(dev.physical, &mp);
+                uint64_t vram = 0;
+                for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+                    if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[i].size;
+                perf_sampling(true, pr.deviceName, (float)(vram >> 20));
+            } else {
+                perf_sampling(false, nullptr, -1);
+            }
+        }
+    }
     if (opts.show_fps) {
         static int64_t next = 0, last_game = 0, last_shown = 0;
         const int64_t now = prof_now();
@@ -749,8 +865,17 @@ void menu_tick() {
             snprintf(fps_text, sizeof fps_text, "%.0f", shown);
             if (opts.framegen >= 2) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
             else fps_sub[0] = 0;
-            fps_bmp.keyed = true;
-            gdi_draw(fps_bmp, 120u * scale, 54u * scale, paint_fps, scale);
+            const double worst = worst_ns.exchange(0, std::memory_order_relaxed) / 1e6;
+            if (shown > 0.5) snprintf(fps_ms, sizeof fps_ms, "%.1f ms  max %.1f", 1000.0 / shown, worst);
+            else fps_ms[0] = 0;
+            if (opts.show_fps == 2) {
+                perf_snapshot(&perf_cur);
+                fps_bmp.keyed = false;
+                gdi_draw(fps_bmp, 300u * scale, 194u * scale, paint_perf, scale);
+            } else {
+                fps_bmp.keyed = true;
+                gdi_draw(fps_bmp, 150u * scale, 72u * scale, paint_fps, scale);
+            }
         }
     }
 }
