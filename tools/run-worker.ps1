@@ -6,6 +6,9 @@ param(
   [string]$Model = "opencode/deepseek-v4.1-flash"   # provider/model; oc_sk_ keys belong to OpenCode Zen (provider "opencode")
 )
 $ErrorActionPreference = "Stop"
+# Workers use their own opencode data folder: the default one (~/.local/share/opencode)
+# was written by a newer dev build and opencode 1.19.x refuses to open it.
+if (-not $env:XDG_DATA_HOME) { $env:XDG_DATA_HOME = "E:\OOT\oc-data" }
 $root = git rev-parse --show-toplevel
 $branch = "feature/$Ticket-$Slug"
 $wt = Join-Path (Split-Path $root) "HeyListen-wt\$Ticket"
