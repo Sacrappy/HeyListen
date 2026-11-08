@@ -59,6 +59,7 @@ struct Program {
     };
     std::vector<Answer> answers;
     uint64_t variant = 0;   // (a hash of the answers: key alone names all the variants of these stages)
+    mutable std::atomic<int64_t> wm_sig{-1};   // (hookshot: what its write masks are made from, vk_draw.cpp program_wm_sig; -1: not asked yet)
 };
 
 enum class ProgramKind { Graphics, Compute, Mesh };
@@ -79,6 +80,22 @@ size_t seed_open();
 void seed_close();
 /// Program i of the seed, translated and kept for the default state (null: kept already, or it does not translate); its modules are yours
 std::unique_ptr<Program> seed_program(size_t i, int inputs = 0);
+bool seed_is_compute(size_t i);
+/// (hookshot) Seed program i, a compute program, kept in hookshot_programs.bin with every texture variant its questions can make (up
+/// to cap variants); made is given each variant not kept before
+struct SeedVariants {
+    size_t variants = 0, questions = 0;
+    bool kept = false, failed = false, capped = false;
+};
+SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program&)>& made);
+/// (hookshot, the prediction: vk_predict.cpp) a kept graphics program variant as hookshot_programs.bin has it: each stage's SPIR-V
+struct KeptProgram {
+    uint64_t key = 0, variant = 0;
+    bool mesh = false;
+    std::vector<std::pair<VkShaderStageFlagBits, std::vector<uint32_t>>> stages;
+};
+void program_cache_each(const std::function<void(const KeptProgram&)>& fn);
+void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn);   // (made for fn, then let go; still kept)
 const Program* program_find(uint64_t key, uint64_t variant);
 /// The NVN stages of the bound program, for logs (stage field of each control section)
 void log_program_stages(const NvnState& s, const char* why);
