@@ -31,6 +31,9 @@ LOAD_SAVE = "30:A,34:A,38:A,42:A,46:A,50:A,54:A,58:A,62:A,66:A,70:A"
 HOOKSHOT_SCENES = {
     "kokiri-idle": LOAD_SAVE,  # Link stands at the spawn point
     "kokiri-walk": LOAD_SAVE + ",76:LUP/6000,83:LRIGHT/4000,89:LDOWN/5000",
+    # Same inputs; the scene is whichever save the title selects (the last one used).
+    "hyrule-idle": LOAD_SAVE,
+    "hyrule-walk": LOAD_SAVE + ",76:LUP/6000,83:LRIGHT/4000,89:LDOWN/5000",
 }
 
 
