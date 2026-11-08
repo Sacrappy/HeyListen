@@ -40,3 +40,19 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+
+# Engine (Hookshot import): work folders, caches, and build outputs
+engine/work/
+engine/build/
+engine/build-linux/
+work/
+gen/
+image/
+*.bin
+*.keys
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.sha1
+*.so

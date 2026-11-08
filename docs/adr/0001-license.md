@@ -1,6 +1,6 @@
 # ADR 0001 — License
 
-Status: accepted (2026-11-08)
+Status: superseded: GPL-3.0 since TICK-005 (originally accepted 2026-11-08). HeyListen forked Hookshot; `LICENSE` is GPL-3.0 and the engine lives in `engine/`.
 
 - Original HeyListen code is MIT.
 - Hookshot (NotRexed/Hookshot) and Eden/Lichii are GPL. Reading them for analysis is fine; **copying or porting substantial code** from them makes HeyListen a derivative work.
