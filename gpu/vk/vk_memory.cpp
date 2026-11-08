@@ -1549,26 +1549,41 @@ std::vector<WriteBack> writebacks;
 // stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
 // scene black for a frame (the one-frame dark flashes, every 15-30 frames; 17 in 40 s of Kokiri, 0 with mirrors off). They are
 // left out of the write-back now. RX_VK_WB_REPORTS=1: written back with the rest, as before
+// (the words are appended as they come, a few thousand a frame, and folded into a sorted list when a write-back asks: a std::set
+// insert each was 3% of the replay thread)
 std::mutex cpu_words_mu;
-std::set<uint64_t> cpu_words;
+std::vector<uint64_t> cpu_words;   // (sorted, no repeats)
+std::vector<uint64_t> cpu_words_new;   // (as appended)
+void fold_cpu_words() {   // (cpu_words_mu held)
+    if (cpu_words_new.empty()) return;
+    std::sort(cpu_words_new.begin(), cpu_words_new.end());
+    cpu_words_new.erase(std::unique(cpu_words_new.begin(), cpu_words_new.end()), cpu_words_new.end());
+    std::vector<uint64_t> merged;
+    merged.reserve(cpu_words.size() + cpu_words_new.size());
+    std::set_union(cpu_words.begin(), cpu_words.end(), cpu_words_new.begin(), cpu_words_new.end(), std::back_inserter(merged));
+    cpu_words.swap(merged);
+    cpu_words_new.clear();
+    if (cpu_words.size() > 65536) cpu_words.clear();
+}
 } // namespace
 void memory_cpu_owned(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
     if (off || !guest) return;
     std::lock_guard lk(cpu_words_mu);
-    if (cpu_words.size() > 65536) cpu_words.clear();
-    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words.insert(a);
+    if (cpu_words_new.size() > 32768) fold_cpu_words();
+    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words_new.push_back(a);
 }
 namespace {
 // (a write-back's runs with the replay's own words cut out of them: runs of p, offsets in the pool)
 void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
     std::lock_guard lk(cpu_words_mu);
+    fold_cpu_words();
     if (cpu_words.empty()) return;
     std::vector<VkBufferCopy> out;
     for (const VkBufferCopy& r : runs) {
         uint64_t at = r.srcOffset;
         const uint64_t end = r.srcOffset + r.size;
-        for (auto it = cpu_words.lower_bound(p.lo + at); it != cpu_words.end() && *it < p.lo + end; ++it) {
+        for (auto it = std::lower_bound(cpu_words.begin(), cpu_words.end(), p.lo + at); it != cpu_words.end() && *it < p.lo + end; ++it) {
             const uint64_t w = *it - p.lo;
             if (w > at) out.push_back({at, at, w - at});
             at = std::max(at, w + 8);

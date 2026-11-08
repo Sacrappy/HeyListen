@@ -845,7 +845,11 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (!dev.eds3_polygon) key = mix(key, (uint64_t)s.poly.mode);
     if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
     if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
-    static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
+    // (a thread-local pointer made on first use, not a thread-local map: its dynamic initialisation made every access a call into
+    // the TLS init wrapper, the same one for all of them, ~3% of the replay thread in all)
+    static thread_local std::unordered_map<uint64_t, PipeEntry*>* mine_p = nullptr;   // (entries live as long as the cache)
+    if (!mine_p) mine_p = new std::unordered_map<uint64_t, PipeEntry*>;
+    auto& mine = *mine_p;
     if (auto m = mine.find(key); m != mine.end()) return remember(m->second);
     ParLock lk;
     auto it = pipelines.find(key);
@@ -1121,7 +1125,9 @@ VkSampler sampler_for(int id, bool compare) {
         std::memcpy(&w, b + i, std::min<size_t>(8, sizeof p - i));
         key = mix(key, w);
     }
-    static thread_local std::unordered_map<uint64_t, VkSampler> mine;   // (samplers are never destroyed)
+    static thread_local std::unordered_map<uint64_t, VkSampler>* mine_p = nullptr;   // (samplers are never destroyed; see pipeline_for)
+    if (!mine_p) mine_p = new std::unordered_map<uint64_t, VkSampler>;
+    auto& mine = *mine_p;
     if (auto m = mine.find(key); m != mine.end()) return m->second;
     ParLock lk;
     auto it = samplers.find(key);
@@ -1571,6 +1577,7 @@ bool table_track_open(int logged, int seen, int unlimited) {
 }
 
 void build_descriptors(const NvnState& s, const Program& p) {
+    DescWriter& dw = mkwvk::dw;   // (one access to the thread-local, not one for each use below)
     dw.reset();
     draw_sampled.clear();
     dump_written.clear();
