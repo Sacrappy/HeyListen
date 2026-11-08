@@ -102,7 +102,7 @@ static int fps_limit(void) {
     static int env = -1;
     if (env < 0) env = getenv("HOS_FPS_LIMIT") ? atoi(getenv("HOS_FPS_LIMIT")) : 0;
     int rx_option(int id, int otherwise);
-    int v = env > 0 ? env : rx_option(6, 60);
+    int v = env > 0 ? env : rx_option(9, 60);
     v = v < 30 ? 30 : v > 360 ? 360 : v;
     return rx_option(0, 1) && v > 60 ? v : 60;   /* (Per frame: the game's steps are whole frames of 1/60 s: 60) */
 }
