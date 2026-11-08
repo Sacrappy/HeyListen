@@ -1801,6 +1801,13 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
 bool memory_rb_refresh(VkCommandBuffer up) {
     std::lock_guard lk(pools_mu);
     if (rb_pages.empty() || !up) return false;
+    // (hookshot, TICK-006) once a submission part (mirror_epoch), in its first recording. A parallel replay records a part's
+    // segments, and what follows them, into recordings of their own in the same epoch, with no write-back between them: each
+    // one's refresh copied the CPU's 0 over the sum the segments before it had added on the GPU. The meter read only the last
+    // recording's share, the exposure rose to its maximum: fog washed out, the ground's shadows gone, in every frame
+    static uint64_t done_epoch = 0;
+    if (done_epoch == mirror_epoch) return false;
+    done_epoch = mirror_epoch;
     std::map<Pool*, std::vector<VkBufferCopy>> by_pool;
     for (auto it = rb_pages.begin(); it != rb_pages.end();) {
         if (it->second + 600 < mirror_epoch) { it = rb_pages.erase(it); continue; }   // (not read for a while)
