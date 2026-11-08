@@ -1243,7 +1243,10 @@ void maybe_split(VkCommandBuffer& cmd) {
 // were as wrong): Kokiri's command buffers are ~750 draws, so 640 and 1000 never split them. Each segment's recording refreshed the
 // exposure meter's readback page from guest memory (memory_rb_refresh), wiping what the segments before it had added: now once a part)
 int par_threads() {
-    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
+    // (HeyListen, TICK-006) on by default since the fix: 4 threads with 8+ hardware threads (Kokiri 54->65 fps, Hyrule Field 49->62,
+    // p99 26->20 and 66->19 ms, same picture). RX_VK_PARALLEL=0 turns it off
+    static const int dflt = std::thread::hardware_concurrency() >= 8 ? 4 : 0;
+    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : dflt, 0, 8);
     return n;
 }
 struct ParPool {

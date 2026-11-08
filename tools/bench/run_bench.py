@@ -382,6 +382,9 @@ def run(args: argparse.Namespace) -> dict:
     launch_ns = None
     first_seen_ns = None
     next_check = 0.0
+    image = exe.name
+    if instances(image):
+        raise SystemExit(f"{image} is already running: refusing to start a second instance")
     log = log_path.open("wb")
     try:
         dog.start()
@@ -405,6 +408,14 @@ def run(args: argparse.Namespace) -> dict:
         killed = exit_code is None
         dog.stop()  # kills game + monitor if still running, always
         log.close()
+        # (2026-11-09: ~30 game windows appeared once after a session, cause unknown) none may outlive the run
+        for _ in range(10):
+            if not instances(image):
+                break
+            subprocess.run(["taskkill", "/F", "/IM", image], capture_output=True)
+            time.sleep(1)
+        if instances(image):
+            warnings.append(f"{image} still running after the run")
     wall = time.monotonic() - started
     if dog.fired:
         warnings.append("hard watchdog fired")
@@ -501,6 +512,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--presentmon", help="path to PresentMon (Lichii)")
     p.add_argument("--game", help="Lichii: game file passed with -g (the emulator loads its own save)")
     return p
+
+
+def instances(image: str) -> int:
+    """Number of running processes with this image name (Windows tasklist; 0 elsewhere)."""
+    if os.name != "nt":
+        return 0
+    out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
+                         capture_output=True, text=True, errors="replace").stdout
+    return sum(1 for line in out.splitlines() if line.lower().startswith(f'"{image.lower()}"'))
 
 
 def main(argv: list[str] | None = None) -> int:
