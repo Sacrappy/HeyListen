@@ -1519,9 +1519,10 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
         std::memcpy(f.ct, color_types, sizeof f.ct);
         return p;
     };
-    // (a mesh draw, most of OoT's: the same quick answer as a graphics draw's, for the same program, bindings and registrations; its
-    // lookup took the shader lock, built the key and checked the textures' types again at every draw, 9% of the replay thread)
-    if (kind == ProgramKind::Mesh) return keep(mesh_program_for(s, color_types));
+    // (a mesh draw: always looked up in full. A quick answer for the same program, bindings and registrations, as graphics draws
+    // have, was tried and left out: it gained nothing measurable, and a mesh program's variant depends on the types of the
+    // textures it samples, which the bindings' generations do not all follow)
+    if (kind == ProgramKind::Mesh) return mesh_program_for(s, color_types);
     const uint64_t key = (compute ? 0x5EED : pick_inputs(s, color_types)) * 1099511628211ull ^ s.prog.serial;
     Pick& pk = picks[key];
     if (pk.p && pk.p->ready.load(std::memory_order_acquire) && !pk.p->failed) {
