@@ -1,0 +1,5 @@
+Application,ProcessID,SwapChainAddress,Runtime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,TimeInSeconds,msBetweenPresents,msBetweenDisplayChange,msInPresentAPI
+lichii.exe,1234,0x1,DXGI,1,0,0,Hardware: Independent Flip,1.000,16.7,16.7,0.2
+lichii.exe,1234,0x1,DXGI,1,0,0,Hardware: Independent Flip,1.017,16.7,16.7,0.2
+lichii.exe,1234,0x1,DXGI,1,0,0,Hardware: Independent Flip,1.050,33.4,33.3,0.2
+lichii.exe,1234,0x1,DXGI,1,0,0,Hardware: Independent Flip,1.067,16.6,16.7,0.2
