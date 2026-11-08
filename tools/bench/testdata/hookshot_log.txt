@@ -1,0 +1,4 @@
+sleep: OoT's present poll looks at its event between yields (HOS_PRESENT_POLL)
+vk: 120 presents, 58.3 fps; a frame: 3050 draws (0 skipped), 3050 dispatches
+vk: 240 presents, 12.5 fps; a frame: 120 draws (0 skipped), 120 dispatches
+vk: 360 presents, 57.9 fps; a frame: 2990 draws (4 skipped), 2990 dispatches
