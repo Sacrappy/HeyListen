@@ -1,0 +1,42 @@
+# Build
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.a
+*.dll
+*.exe
+target/
+# Generated from the user's game: never commit
+generated/
+*.nup
+*.nso
+*.nca
+romfs/
+exefs/
+*_pipelines.bin
+*_shaders.bin
+*_programs.bin
+*_prepared.bin
+*.spv
+image.bin
+user/
+# Ghidra / REA
+*.gpr
+*.rep/
+*.lock
+*.lock~
+rea-snapshots/
+# Tools
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
+*.log
