@@ -95,6 +95,17 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
    interval's vsyncs (1: 60 fps, 2: 30) after the last present, so the game runs at the display's rate.
    HOS_NO_PACING=1: as fast as it can. */
 static volatile int present_interval = 1;
+/* (hookshot) The frame rate limit: 60, or what the Insert menu's Frame rate limit (HOS_FPS_LIMIT=<30..360> over it) gives. Above 60 the game
+   runs its frames at that rate with its time following the clock (Game speed Real time): the display queue, the step (realtime_step)
+   and the game's own limiter (+0xfc) are all at the limit */
+static int fps_limit(void) {
+    static int env = -1;
+    if (env < 0) env = getenv("HOS_FPS_LIMIT") ? atoi(getenv("HOS_FPS_LIMIT")) : 0;
+    int rx_option(int id, int otherwise);
+    int v = env > 0 ? env : rx_option(6, 60);
+    v = v < 30 ? 30 : v > 360 ? 360 : v;
+    return rx_option(0, 1) && v > 60 ? v : 60;   /* (Per frame: the game's steps are whole frames of 1/60 s: 60) */
+}
 static int64_t next_frame_at, window_start, frames_in_window;
 static volatile LONG64 presents;
 int hos_vi_native_interval(Ctx *c, int requested) {
@@ -230,6 +241,8 @@ static void realtime_step(int64_t now) {
             hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x58.. %d %d %d %d", *limit, *(uint8_t *)GP(mod + 0x231),
                     *(uint8_t *)GP(mod + 0x232), *(int *)GP(mod + 0x2c8), *(int *)GP(mod + 0x270 + 0x58), *(int *)GP(mod + 0x270 + 0x28),
                     *(int *)GP(mod + 0x270 + 0x2c), *(int *)GP(mod + 0x270 + 0x30));
+        const int cap = fps_limit();
+        if (cap > 60 && target < cap) target = cap;   /* (the Insert menu's limit raises the game's own limiter too) */
         if (target && *limit > 0 && *limit < target) *limit = target;
     }
     if (!rx_option(0, 1)) {   /* (the Insert menu: per frame) */
@@ -255,11 +268,12 @@ static void realtime_step(int64_t now) {
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
     double ratio = sum / count * 60.0 + carry;
-    ratio = ratio < 1.0 ? 1.0 : ratio > 4.0 ? 4.0 : ratio;
+    const int cap = fps_limit();
+    ratio = ratio < 60.0 / cap ? 60.0 / cap : ratio > 4.0 ? 4.0 : ratio;
     int fps = (int)(60.0 / ratio + 0.5);
-    fps = fps < 15 ? 15 : fps > 60 ? 60 : fps;
+    fps = fps < 15 ? 15 : fps > cap ? cap : fps;
     int *slot = (int *)GP(mod + 0x2c8);
-    if (*slot < 15 || *slot > 60) {
+    if (*slot < 15 || *slot > 360) {
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;
@@ -305,7 +319,8 @@ void hos_vi_native_presented(void) {
         if (ms < 0) ms = getenv("HOS_FRAME_SLEEP_MS") ? atoi(getenv("HOS_FRAME_SLEEP_MS")) : 0;
         if (ms) hos_sleep_ns(ms * 1000000LL);
     }
-    const int64_t period = 1000000000LL / 60 * present_interval, now = hos_now_ns();
+    const int limit = fps_limit();
+    const int64_t period = limit > 60 ? 1000000000LL / limit : 1000000000LL / 60 * present_interval, now = hos_now_ns();
     realtime_step(now);
     /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */
     next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now + period;

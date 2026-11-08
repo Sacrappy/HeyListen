@@ -9,7 +9,7 @@ Prints the functions by inclusive share (in the stack at all) and by self share 
 """
 import bisect, collections, os, re, sys
 
-BUILD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work", "sa", "build")
+BUILD = os.environ.get("HOOKSHOT_BUILD") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work", "sa", "build")
 
 
 def load_map(path, base):

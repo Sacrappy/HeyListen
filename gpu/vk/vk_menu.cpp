@@ -37,6 +37,10 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_fps_limit(int v) {
+    static const char* t[] = {"60", "90", "120", "144", "165", "240"};
+    return t[v < 0 || v > 5 ? 0 : v];
+}
 const char* tx_perf(int v) { return v == 2 ? "Full" : v ? "FPS" : "Off"; }
 const char* tx_upscale(int v) {
     static const char* t[] = {"Off", "Catmull-Rom", "Lanczos"};
@@ -122,6 +126,9 @@ Row rows[] = {
     {"Game speed", &opts.realtime, 0, 1, 1, tx_speed,
      "Per frame: the game slows down whenever it runs below 60 fps. Real time: it keeps normal speed down to 15 fps by taking "
      "longer steps."},
+    {"Frame rate limit", &opts.fps_limit, 0, 5, 1, tx_fps_limit,
+     "The game's own frame rate. Above 60 it needs Game speed on Real time (the game's time follows the clock, so it does not run "
+     "faster), and your display must run that fast to show every frame."},
     {"Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
      "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
     {"Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
