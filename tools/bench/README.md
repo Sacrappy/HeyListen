@@ -39,7 +39,7 @@ No per-frame log exists: the emulator log (`%APPDATA%\eden\log\eden_log.txt`) ha
 settings and no frame times. The source is **PresentMon** (not installed on this
 machine at the time of writing). Without it the script exits before launching anything.
 It runs `PresentMon --process_name lichii.exe --output_file presentmon.csv --timed N
---terminate_after_timed --stop_existing_session --no_top` and reads `msBetweenPresents`
+--terminate_after_timed --stop_existing_session --no_console_stats` (PresentMon 2.6; 1.x used `--no_top`) and reads `msBetweenPresents`
 (1.x) or `FrameTime` (2.x). Needs an elevated shell or Performance Log Users
 membership for ETW. The scene is not controllable: Lichii has no input script, so
 `--scene` is only a label and the user positions the game; this is a gap. These are

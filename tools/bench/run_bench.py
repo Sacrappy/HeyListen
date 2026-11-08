@@ -266,7 +266,7 @@ def run(args: argparse.Namespace) -> dict:
             cmd += ["-g", args.game]
         monitor_cmd = [pm, "--process_name", exe.name, "--output_file", str(pm_csv),
                        "--timed", str(int(duration)), "--terminate_after_timed",
-                       "--stop_existing_session", "--no_top"]
+                       "--stop_existing_session", "--no_console_stats"]
     out.mkdir(parents=True, exist_ok=True)
 
     dog = Watchdog(duration + 20.0)
