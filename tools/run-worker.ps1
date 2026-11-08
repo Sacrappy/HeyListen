@@ -3,7 +3,7 @@
 param(
   [Parameter(Mandatory)][string]$Ticket,
   [Parameter(Mandatory)][string]$Slug,
-  [string]$Model = "deepseek/deepseek-v4.1-flash"   # check the exact id with: opencode models
+  [string]$Model = "opencode/deepseek-v4.1-flash"   # provider/model; oc_sk_ keys belong to OpenCode Zen (provider "opencode")
 )
 $ErrorActionPreference = "Stop"
 $root = git rev-parse --show-toplevel
