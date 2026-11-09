@@ -62,3 +62,29 @@ the script's existing exclusive interval is active; it is not a focus override.
 
 License: GPL-3.0-or-later, as mkw-recomp: a64-kit's translator is suyu's (GPL-2.0-or-later) and Eden's code is
 GPL-3.0.
+
+## Native replacements of hot guest code (TICK-026)
+
+A hot guest block (or function) can be handed to a host function written from its observed behaviour. The lifted C is
+never edited by hand: `nx2/native_replace.py` (run by `nx2/oot_patches.py` after every lift) puts a gate at the
+block's entry and a differential check at its exit label(s); the native code lives in `host/hos_native.c`.
+
+- **Switch per replacement**: `HOS_NR_<NAME>` = `0` (guest code; the default until a replacement is proven, set in
+  `nr_info[].default_mode`), `1` (native) or `diff`.
+- **Differential mode** (`HOS_NR_<NAME>=diff`, debug only): 1 call in `HOS_NR_DIFF_EVERY` (default 64) per thread runs
+  the native code first on a copy of the registers, with its stores held in a log (`nr_st`); the guest code then runs
+  as usual and, at the block's exit, x0-x31, NZCV and the logged stores are compared with the guest's. The log
+  (`native: <name> differential: N checks, D differences`) prints at every 2^k checks and every 100,000; the first 20
+  differences are logged in full. Stores the guest makes that the native code does not make are not seen: each
+  replacement documents the memory its guest block writes.
+- **Safety**: an entry records SHA-1 hashes of the block's lifted text regions the native code was written against. If
+  a game update or lifter change alters them the gate is not added (the guest code runs) and the lift prints
+  `native_replace: ... NOT applied` with the new hashes.
+- **Adding one**: in `host/hos_native.c` add an enum value, an `nr_info` row, the native function (guest memory through
+  `nr_ld*` / `nr_st`, the guest address and the observed semantics in its comment; no game code or data copied) and
+  `int hos_nr_<name>(Ctx *c) { return nr_gate(c, ID, fn); }`; in `nx2/native_replace.py` add an entry (same id: head,
+  entry text, exit labels, goto label, regions and hashes). Lift (`dev-build.ps1 -Lift`), run a full bench run with
+  `HOS_NR_<NAME>=diff` (0 differences), then measure A/B with `=1` against `=0`.
+- **Finding candidates**: `python -I scripts/hotmap.py <HOS_SAMPLE_ALL file>` (with `RX_MAPS` at the build's maps):
+  the critical chain's guest functions by inclusive and self time, with threads, callers and callees
+  (`docs/hotmap.md`).

@@ -900,3 +900,39 @@ What would move this spot: the job chain's guest code (TICK-011/022: lifter-leve
 walk) and the GPU wait in f_806668b0 (~2.3 ms a frame).
 
 Not verified: a build with the FMA fast path at this spot; GPU-side cost at this spot (Nsight); Hyrule Field (nothing changed).
+
+## TICK-026: hot-function map, native replacement framework, first replacement (2026-11-09)
+
+**Map**: see `docs/hotmap.md` (Castle Town Market; `scripts/hotmap.py`). Nothing dominates the chain. The largest self
+time is the module system (f_8009bb80 3.9%) and the executors' dispatcher (f_8004ab40 2.8%). After that comes a tail of
+self-contained FP kernels at 1-2.5% each, plus ParallelDecompThread's decompressor (f_801102e0 13.5%, probably off the
+frame's path).
+
+**Framework**: `nx2/native_replace.py` plus `host/hos_native.c` (development.md, "Native replacements"). There is one
+switch per replacement, `HOS_NR_<NAME>` = 0/1/diff, and every replacement defaults to off. The differential mode
+samples 1 call in `HOS_NR_DIFF_EVERY`. The gate is added only when the lifted block's text hashes match.
+
+**First replacement**: `HOS_NR_STRCMP_805AFC70`. It replaces the inlined strcmp of f_805aeea0's binary search (guest
+0x805afc70-0x805afda0, inside the search loop 0x805afbc0-0x805afda4). The native version compares 8 bytes per step
+where no page boundary is crossed and computes the guest's exact result registers and NZCV. The guest block writes no
+memory. **Differential run**: one full 105 s bench run with DIFF_EVERY=16 made 14.9 M checks over 238 M calls, all on
+OptimizeChangeBanc, with **0 differences**. HOS_SPEED_LOG ratio was 60.1-60.9.
+
+A/B, kokiri-idle, 105 s, interleaved, same binary, env switch only (fps / 1% low / p99 / log mean 70-100 s):
+
+| run | off (guest) | on (native) |
+|---|---|---|
+| 1 | 51.1 / 12.3 / 35.1 ms / 52.8 (hitch run, max 168 ms) | 57.7 / 33.3 / 25.1 ms / 58.2 |
+| 2 | 57.7 / 39.0 / 23.4 ms / 57.5 | 61.8 / 42.7 / 21.6 ms / 61.8 |
+| 3 | 55.3 / 28.1 / 29.2 ms / 55.2 | 60.0 / 32.7 / 24.8 ms / 60.3 |
+| mean | 54.7 (56.5 without the hitch run) / 26.5 / 55.2 | **59.8 / 36.2 / 60.1** |
+| extra off runs | profile run 56.6 / 32.4; differential run 55.1 / 28.5 | |
+
+On won every pair, by about +3-5 fps. That is more than expected, because OptimizeChangeBanc is not on the frame's
+path (TICK-025). A likely reason is that its lookups now take less core time from the executors on the virtual cores
+it shares, but this was not proven. Three pairs fall within the known 54-61 spread, so this needs more runs before
+the default is turned on. **The default stays off.**
+
+Not verified: screenshots (RX_VK_SHOTS only writes in headless mode and no headless run was made). NPC behaviour was
+checked only through the differential run and the speed ratio. Hyrule Field was not run. No profile was taken with
+the replacement on.
