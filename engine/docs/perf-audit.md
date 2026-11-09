@@ -386,3 +386,60 @@ before (the walks are not pixel-equal: presents fall at other moments at the hig
 
 Not verified: other scenes (Kokiri, cutscenes, menus, loads), other GPUs, long sessions (the mirrors holding writes are kept:
 VRAM use over time not measured), a CPU read without an invalidate (the counters would not see one).
+
+## TICK-016: GPU cost of the translated frame (2026-11-09)
+
+Hyrule Field, `run_bench.py --scene hyrule-walk --duration 115`, limit 120, RTX 5070. GPU time from `RX_VK_PASS_TIMING=1` (the last
+600-present report of the run; inflated by the timestamps, read the shares).
+
+GPU time a frame by kind, base build:
+
+| kind | ms | spans | | whose |
+|---|---:|---:|---|---|
+| all | 9.78 | | | |
+| pass (draws) | 4.89 | 160 | 2058 draws | the game's |
+| dispatch | 1.78 | 127 | | the game's |
+| msync (CPU pages -> mirror) | 1.29 | 56 | 1561 regions, 11.1 MB | engine (TICK-015) |
+| barrier (recordings) | 0.56 | 311 | 112 the game's, 74 pass start, 87 dispatch, rest recording edges | game 0.24, engine 0.32 |
+| wb (mirror -> guest) | 0.42 | 10 | 14 MB | engine (TICK-015) |
+| rbrefresh | 0.41 | 25 | 546 pages, 2.1 MB | engine (PR 430) |
+| xfer, event, ubupd, clear, upload barriers | 0.16 | | | engine |
+
+Top passes are the game's: two one-draw 2048x1152 passes (B10G11R11 target + depth) at 0.82 and 0.56 ms (programs 4f0c0b40ab3a32cd and
+739acd678ae08655, each with a storage buffer the replay cannot bind: "reads zeros"), then 0.17-0.07 ms passes and dispatches
+(755a777ada52677d 41 runs 0.18 ms, ee7764a6b1ef459c 0.17 ms). So ~6.7 of 9.8 ms is the game's draws and dispatches, ~2.1 ms the
+engine's copies, ~0.5 ms barriers.
+
+Checked and not waste:
+- Render target formats: `vk_formats.cpp` maps each NVN format to the same width (RGBX formats to their RGBA kind, which Vulkan needs).
+- Load/store ops: every pass LOAD/STORE in GENERAL. The GPU here renders immediate-mode (no tile memory): load/store of a
+  transient depth costs nothing like on a tiler, and a DONT_CARE would need knowing the next reader. Not changed.
+- Clears: 1 a frame.
+- Barriers: of 414 full barriers recorded a frame, 178 are already left out as repeats (TICK-010). Two experiments, off by default
+  (`vk_texture.cpp` pass_start_barrier / dispatch_barrier, `vk_work.h` counting non-draw work by command buffer):
+  `RX_VK_PASS_TRUST=1` leaves out the pass-start barrier after draws only (8 of 74 a frame: passes nearly always follow a copy, clear
+  or update), `RX_VK_DISPATCH_TRUST=1` the dispatch barrier after draws and dispatches only (87 of 87). Together 414 -> 325
+  barriers, 0.55 -> 0.42 ms of barrier spans, and no fps change: 72.6 / 72.6 against 72.6 / 73.9 (pass trust alone) and
+  73.1 / 72.7 (defaults). The drains cost the GPU little; the frame is not held by them. Left off: no gain for an ordering the
+  game might rely on.
+- Robust buffers (`opts.robust`, device robustBufferAccess2, on by default for the device faults and flashes of 53caac5f): not
+  measured in this ticket (an A/B with `RX_VK_ROBUST=0` was not run). It costs the driver's bounds checks on storage/uniform
+  accesses, not the translated code.
+
+| Run | fps | 1% low | p99 | > 8.33 ms |
+|---|---:|---:|---:|---:|
+| base (sprint figure) | ~73.6 | ~37 | ~20 ms | 100% |
+| pass trust 1 / 2 | 72.6 / 73.9 | 40.7 / 39.5 | 20.1 / 18.9 ms | 100% |
+| pass + dispatch trust 1 / 2 | 72.6 / 72.6 | 39.1 / 35.4 | 20.4 / 20.3 ms | 100% |
+| final (defaults = base behaviour) 1 / 2 | 73.1 / 72.7 | 41.7 / 40.8 | 19.3 / 20.0 ms | 100% |
+
+Conclusion: the engine-side GPU waste left is the copies (msync 1.3, wb 0.4, rbrefresh 0.4 ms), not barriers, formats or
+load/store ops; the rest is the game's own shaders at 2048x1152. Next candidates: rbrefresh copies every readback page at each of
+~25 submissions a frame, even unwritten by the CPU (a page the CPU did not write since could be skipped, but the capture's deferral
+of CPU writes, `capture_owns`, makes that touch the exposure-meter ordering of TICK-006: not done); the msync regions; and the
+resolution of the two big passes (the game's dynamic resolution resolved to 2048x1152).
+
+Correctness (final build, experiments off): flash detector over two walks 19 and 9 events, all 1-2 blocks at 86 s (motion, as
+TICK-015's 21 / 19); screenshots every 1200 presents show lighting, fog, grass and HUD as before (not diffed against a base walk);
+`HOS_SPEED_LOG=1` 99.98%. The shader cache stamp is unchanged (no file of it touched). Not verified: the experiments' pictures
+(flash detector not run with them on), other scenes, other GPUs, the cost of Robust buffers.

@@ -1723,10 +1723,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 } // namespace
 
 std::atomic<uint64_t> work_epoch{0};
+std::atomic<uint64_t> other_work_by_cmd[64]{};
+std::atomic<uint64_t> xfer_work_by_cmd[64]{};
 namespace {
 // (each thread's own: the display thread's present records barriers too)
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)
 thread_local uint64_t last_barrier_epoch = 0;
+thread_local uint64_t last_barrier_other = 0, last_barrier_xfer = 0;   // (TICK-016: the command buffer's counts at that barrier)
 std::atomic<int64_t> st_barriers_made{0}, st_barriers_left_out{0};
 } // namespace
 void barrier_stats(int64_t* made, int64_t* left_out) {
@@ -1754,6 +1757,39 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
     last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    last_barrier_other = other_work_slot(cmd).load(std::memory_order_relaxed);
+    {
+        const uintptr_t v = (uintptr_t)cmd;
+        last_barrier_xfer = xfer_work_by_cmd[((v >> 4) ^ (v >> 10) ^ (v >> 16)) & 63].load(std::memory_order_relaxed);
+    }
+}
+
+// (TICK-016, experiments, off by default) The barriers the replay adds at a pass's start and before a dispatch, left out when only
+// draws (and, for a dispatch, dispatches) were recorded on this command buffer since the last full barrier: no copy, clear, update or
+// query into it (vk_work.h counts them by command buffer). What one pass or dispatch writes and the next reads the game orders itself
+// with nvnCommandBufferBarrier, which stays a full barrier. Hyrule Field: RX_VK_PASS_TRUST=1 left out 8 of 74 pass-start barriers a
+// frame, RX_VK_DISPATCH_TRUST=1 (with it) 87 of 87 dispatch barriers: 414 -> 325 full barriers a frame, 0.55 -> 0.42 ms of barrier
+// spans, fps unchanged (72.6 / 72.6 against 72.6 / 73.9): the drains cost the GPU little, the frame is not limited by them. Left
+// off: no gain for the ordering the game may rely on.
+void pass_start_barrier(VkCommandBuffer cmd, const char* why) {
+    static const bool trust = getenv("RX_VK_PASS_TRUST") != nullptr;
+    if (trust && !par_active.load(std::memory_order_relaxed) && cmd == last_barrier_cmd &&
+        other_work_slot(cmd).load(std::memory_order_relaxed) == last_barrier_other) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    full_barrier(cmd, why);
+}
+
+void dispatch_barrier(VkCommandBuffer cmd, const char* why) {
+    static const bool trust = getenv("RX_VK_DISPATCH_TRUST") != nullptr;
+    const uintptr_t v = (uintptr_t)cmd;
+    if (trust && !par_active.load(std::memory_order_relaxed) && cmd == last_barrier_cmd &&
+        xfer_work_by_cmd[((v >> 4) ^ (v >> 10) ^ (v >> 16)) & 63].load(std::memory_order_relaxed) == last_barrier_xfer) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    full_barrier(cmd, why);
 }
 
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
