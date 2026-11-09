@@ -1,0 +1,5 @@
+# TICK-016 — GPU cost of the translated frame  · model: Opus
+**Why**: after TICK-015 the frame is still GPU-bound: ~10.3 ms GPU a frame under RX_VK_PASS_TIMING (passes 5.3 ms, dispatches 1.8 ms, copies ~1.7 ms, readback 0.4 ms), GPU ~77% busy at ~74 fps in Hyrule Field. 120 fps needs < 8.3 ms. ~2000 draws, ~130 dispatches, 152 passes and 131 barriers a frame.
+**Goal**: per-pass GPU timing (RX_VK_PASS_TIMING, Nsight-like counters if available) to separate what the game's own work costs from what the translation adds: full barriers where a narrower one would do (vk_work.h full_barrier), render pass splits / load-store ops (LOAD where DONT_CARE is safe, store of transient depth), translated shader inefficiencies (SASS→SPIR-V: e.g. emulated ops, bounds checks, robust buffer access "Robust buffers" option), redundant clears/copies, render target formats wider than needed. Fix the engine-side waste.
+**Acceptance**: GPU ms a frame down (by category), Hyrule fps / 1% low up at limit 120, picture correct (screenshots + flash detector), game speed 100% (HOS_SPEED_LOG=1).
+**Branch**: `feature/TICK-016-gpu-frame`
