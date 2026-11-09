@@ -26,3 +26,5 @@ Also found: with Real time on, the game runs somewhat faster at ~65 fps than at 
 - TICK-015 merged: write-backs skipped for CPU_CACHED pools never invalidated (fallback: an invalidate makes the pool written back for good). Hyrule 67.7 -> 73.9 fps.
 - Hookshot upstream d3659c5 pulled (OoT debug tools): F10 overlay key moved to index 17 (upstream took 13-16 for page keys). Pipeline notes were empty after TICK-015's stamp incident; re-recorded by the first run.
 - Order changed: TICK-016 (GPU cost of the translated frame) before TICK-012/011, since the GPU is the limit (~10 ms a frame).
+- TICK-016 merged as diagnostics only (barrier trust switches off: no fps change). GPU ~9.8 ms of a 13.5 ms frame, ~77% busy: the limit is now the CPU/GPU serialisation (capture wait) -> TICK-017. The two costliest passes read an unbound storage buffer -> TICK-018 (possible rendering bug).
+- Hookshot upstream pull 4 (11 commits) done between tickets by a Sonnet sub-agent.
