@@ -28,3 +28,4 @@ Also found: with Real time on, the game runs somewhat faster at ~65 fps than at 
 - Order changed: TICK-016 (GPU cost of the translated frame) before TICK-012/011, since the GPU is the limit (~10 ms a frame).
 - TICK-016 merged as diagnostics only (barrier trust switches off: no fps change). GPU ~9.8 ms of a 13.5 ms frame, ~77% busy: the limit is now the CPU/GPU serialisation (capture wait) -> TICK-017. The two costliest passes read an unbound storage buffer -> TICK-018 (possible rendering bug).
 - Hookshot upstream pull 4 (11 commits) done between tickets by a Sonnet sub-agent.
+- TICK-017 merged as diagnostics/experiments only (all off): letting the CPU run ahead made the GPU slower (56 fps), ~5 ms GPU-busy a frame untimed; the capture wait protects pages in CPU-read pools, not the exposure meter. Next: TICK-019 (GPU reads of imported host memory) before TICK-018.
