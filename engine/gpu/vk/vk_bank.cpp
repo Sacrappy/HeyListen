@@ -40,6 +40,8 @@ std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: re
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
+// (TICK-007) and a version a sampler slot (12 bits of a handle): a draw's cached sampler is checked against it, without reg_mu
+std::atomic<uint32_t> samp_versions[1 << 12];
 
 // NVN2 compute's c0: the workgroup counts at 0, then the uniform buffer table, the storage buffer table, texture
 // handles and image handles, as many slots of each as the control section says (+0xb1, +0xb2, +0xb3, +0xb6)
@@ -181,6 +183,10 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     if ((size_t)id >= samp_regs.size()) samp_regs.resize((size_t)id + 256);
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
+    samp_versions[id].fetch_add(1, std::memory_order_acq_rel);
+}
+uint32_t sampler_slot_version(int id) {
+    return id >= 0 && id < (1 << 12) ? samp_versions[id].load(std::memory_order_acquire) : 0;
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);

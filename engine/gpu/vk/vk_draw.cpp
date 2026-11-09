@@ -1801,21 +1801,54 @@ bool table_track_open(int logged, int seen, int unlimited) {
     return logged < 60 && (unlimited || seen < kTableTrackLooks);
 }
 
+// (TICK-007) A program's texture descriptors as this thread last resolved them: a draw whose handle for a slot is the one before, with
+// the texture slot, the sampler slot and the texture set unchanged since (their versions and the destroy generation), takes the view,
+// the texture and the sampler from here instead of handle_hits' search and sampler_for's (which takes reg_mu, shared by all the
+// recording threads, and hashes the sampler's parameters). The handle itself is read again every draw (from the driver bank, a
+// uniform buffer or a handle program): only its resolution to Vulkan objects is kept, for 4 handles a slot. Per thread (parallel recording), no lock.
+// RX_VK_NO_SLOT_CACHE=1: every slot resolved as before
+struct TexSlot {
+    uint32_t handle = 0, version = 0, samp_version = 0, tex_epoch = 0;
+    uint64_t destroy_gen = ~0ull;
+    VkImageView view = VK_NULL_HANDLE;
+    Texture* tex = nullptr;
+    VkSampler sampler = VK_NULL_HANDLE;
+    bool valid = false;
+};
+constexpr size_t kTexWays = 4;   // (the handles kept a slot)
+struct ProgSlots {
+    uint64_t key = 0;
+    std::vector<TexSlot> tex;
+};
+thread_local std::unordered_map<const Program*, ProgSlots> prog_slots;
+
 void build_descriptors(const NvnState& s, const Program& p) {
+    DescWriter& dw = mkwvk::dw;   // (TICK-007: the thread_locals once, not a TLS wrapper call at every use)
+    std::vector<const Texture*>& draw_sampled = mkwvk::draw_sampled;
     dw.reset();
     draw_sampled.clear();
     dump_written.clear();
     dump_inputs.clear();
-    size_t nbuf = 0, nimg = 0, nview = 0;
+    size_t nbuf = 0, nimg = 0, nview = 0, ntex = 0;
     for (const Stage& st : p.stages) {
         for (const auto& d : st.info.constant_buffer_descriptors) nbuf += d.count;
         for (const auto& d : st.info.storage_buffers_descriptors) nbuf += d.count;
         for (const auto& d : st.info.texture_buffer_descriptors) nview += d.count;
         for (const auto& d : st.info.image_buffer_descriptors) nview += d.count;
-        for (const auto& d : st.info.texture_descriptors) nimg += d.count;
+        for (const auto& d : st.info.texture_descriptors) nimg += d.count, ntex += d.count;
         for (const auto& d : st.info.image_descriptors) nimg += d.count;
     }
     dw.bufs.reserve(nbuf), dw.imgs.reserve(nimg), dw.views.reserve(nview);   // (stable pointers below)
+    static const bool no_slot_cache = getenv("RX_VK_NO_SLOT_CACHE") != nullptr;
+    TexSlot* slots = nullptr;
+    if (!no_slot_cache && ntex) {
+        auto& table = prog_slots;
+        ProgSlots& ps = table[&p];
+        if (ps.key != p.key || ps.tex.size() != ntex * kTexWays) ps.key = p.key, ps.tex.assign(ntex * kTexWays, TexSlot{});
+        slots = ps.tex.data();
+    }
+    size_t tslot = 0;
+    const uint64_t dgen_now = slots ? texture_destroy_generation() : 0;
     FINE_N(FC_DESCS, (int64_t)(nbuf + nimg + nview));
     uint32_t binding = 0;
     auto write = [&](VkDescriptorType type, uint32_t count) {
@@ -2105,8 +2138,29 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // every other frame. No texture there now. RX_VK_HANDLE_POINTER=1: the old handle
                 const uint32_t handle = handle_is_storage_pointer(info, d, k) ? 0u : handle_of(s, st, d, k);
                 Texture* tex = nullptr;
-                VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
-                                          : VK_NULL_HANDLE;
+                VkImageView view = VK_NULL_HANDLE;
+                VkSampler sampler = VK_NULL_HANDLE;
+                // (a few handles a slot, by the handle's hash: a program drawn with one texture, then another, and back)
+                TexSlot* sl = slots ? &slots[tslot++ * kTexWays + ((handle * 0x9E3779B1u) >> 30) % kTexWays] : nullptr;
+                // (the versions read before resolving: a registration after them is seen at the next draw)
+                const uint32_t version = sl ? texture_slot_version((int)(handle & 0xFFFFF)) : 0;
+                const uint32_t samp_version = sl ? sampler_slot_version((int)(handle >> 20)) : 0;
+                if (sl && sl->valid && sl->handle == handle && sl->version == version && sl->samp_version == samp_version &&
+                    sl->destroy_gen == dgen_now) {
+                    view = sl->view, tex = sl->tex, sampler = sl->sampler;
+                    if (tex && sl->tex_epoch != texture_epoch()) {   // (as texture_view_of's hit: once a submission)
+                        if (!texture_touch_quick(tex, true)) {
+                            ParLock lk;
+                            texture_touch(tex, true);
+                        }
+                        sl->tex_epoch = texture_epoch();
+                    }
+                } else {
+                    view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex) : VK_NULL_HANDLE;
+                    sampler = sampler_for((int)(handle >> 20), d.is_depth);
+                    if (sl)
+                        *sl = TexSlot{handle, version, samp_version, texture_epoch(), dgen_now, view, tex, sampler, true};
+                }
                 if (dump_on()) dump_input('t', (uint32_t)(dw.imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
                 if (log_img_wanted(p.key)) {
@@ -2133,7 +2187,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled.push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                dw.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
+                dw.imgs.push_back({sampler, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw.imgs[first];
             dw.writes.push_back(w);
@@ -3297,6 +3351,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
         hits_value = value;               // texture do, and are touched again once a submission)
         targets_serial = ~0ull;
         if (handle_hits.size() > 65536) handle_hits.clear();
+        if (prog_slots.size() > 8192) prog_slots.clear();
     }
     for (auto& row : bank_cache)
         for (BankCache& c : row) c = BankCache{}, c.at = UINT64_MAX;

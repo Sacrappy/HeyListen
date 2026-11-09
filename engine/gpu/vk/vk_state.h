@@ -67,6 +67,7 @@ bool sampler_of(int id, nvn_samp_par* p);
 uint64_t registrations_generation();
 /// Changes whenever the slot may resolve to another texture (its registrations, its texture finalized)
 uint32_t texture_slot_version(int id);
+uint32_t sampler_slot_version(int id);   // (TICK-007: bumped by every registration of that sampler slot)
 
 /// One word of a driver constant bank (c0 / c2) as the NVN driver lays it out for the bound state
 uint32_t driver_bank_word(const NvnState& s, int bank, int stage, uint32_t offset);
