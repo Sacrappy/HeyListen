@@ -210,6 +210,7 @@ void wait_value(uint64_t v) {
 }
 } // namespace
 uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
+int64_t vk_value_submitted_ns(uint64_t v);
 void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
     if (!timeline || completed() >= v) return;
     queue_flush_for(FR_VALUE);
@@ -217,9 +218,31 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
     wi.semaphoreCount = 1;
     wi.pSemaphores = &timeline;
     wi.pValues = &v;
+    const uint64_t done0 = completed();
+    const int64_t t0 = std::chrono::steady_clock::now().time_since_epoch().count(), sub = vk_value_submitted_ns(v);
     if (vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT) {
         static std::atomic<int> logged{0};
         if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
+    }
+    {   // (TICK-010) what the capture waits for: how long, how far ahead of the GPU, and how long the GPU had it by then
+        static std::mutex mu;
+        static int64_t n, unsub, wait_ns, max_ns, gpu_had_ns, ahead, n_traced;
+        static const bool trace = getenv("RX_VK_CAPWAIT_TRACE") != nullptr;   // (TICK-010 diagnostic: each wait, 400 of them after 3000)
+        const int64_t t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+        const uint64_t q = q_values.load();
+        std::lock_guard lk(mu);
+        n++, wait_ns += t1 - t0, max_ns = std::max(max_ns, t1 - t0), ahead += (int64_t)(v - done0);
+        if (trace && n > 3000 && n_traced < 400)
+            n_traced++, logf("vk: capture wait for %llu: done %llu, handed out %llu; %.2f ms, submitted %.2f ms before it",
+                             (unsigned long long)v, (unsigned long long)done0, (unsigned long long)q, (t1 - t0) / 1e6,
+                             sub ? (t0 - sub) / 1e6 : -1.0);
+        if (sub) gpu_had_ns += t1 - sub; else unsub++;
+        if (n % 600 == 0) {
+            logf("vk: capture waits: %lld, %.2f ms each (max %.2f), %.1f values ahead of the GPU, %lld not yet submitted, the GPU "
+                 "had the value %.2f ms when it came; v - handed out now %lld", (long long)n, wait_ns / 600 / 1e6, max_ns / 1e6,
+                 ahead / 600.0, (long long)unsub, gpu_had_ns / std::max<int64_t>(1, 600 - unsub) / 1e6, (long long)(v - q));
+            unsub = wait_ns = max_ns = gpu_had_ns = ahead = 0;
+        }
     }
 }
 namespace {
@@ -285,7 +308,16 @@ Recording& begin_recording(uint64_t value) {
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
 }
+// (TICK-010) when each timeline value's recording went to the queue (host steady clock, ns): a capture's wait reports how
+// long the GPU had it (vk_timeline_wait)
+std::atomic<int64_t> value_submit_ns[1024];
+std::atomic<uint64_t> value_submit_v[1024];
 void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0) {
+    {
+        const uint64_t v = signal_at ? signal_at : r.value;
+        value_submit_ns[v & 1023].store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+        value_submit_v[v & 1023].store(v, std::memory_order_relaxed);
+    }
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
     gpu_time_end(r);
@@ -474,6 +506,9 @@ void ub_prune(uint64_t done) {
 }
 
 } // namespace
+int64_t vk_value_submitted_ns(uint64_t v) {   // (0: not submitted yet, or the ring came round)
+    return value_submit_v[v & 1023].load(std::memory_order_relaxed) == v ? value_submit_ns[v & 1023].load(std::memory_order_relaxed) : 0;
+}
 
 uint64_t ub_generation() {
     return ub_gen;
