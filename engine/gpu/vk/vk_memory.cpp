@@ -30,6 +30,7 @@
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
+#include "shaders/msync_scatter_comp_spv.h"   // (TICK-021: the mirror syncs' scatter copy)
 #ifdef __linux__
 #include <cerrno>
 #include <dlfcn.h>
@@ -858,7 +859,7 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     }
     size = cap_buf_size(need);
     map = nullptr;
-    const bool ok = create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
+    const bool ok = create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, buffer, alloc, &map,
                                          size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
     static int logged;   // (TICK-019: the mirror syncs copy from these)
     if (ok && logged++ < 1) log_alloc_where("a capture buffer (the mirror syncs' source)", alloc);
@@ -2134,6 +2135,129 @@ void transfer_barrier(VkCommandBuffer cmd) {
     full_barrier(cmd, "barrier (write-back or sync)");   // (the same barrier; one right after another is left out)
 }
 
+// ---- (TICK-021) the mirror syncs' scatter copy ----
+// The syncs copied ~1570 regions a frame of 4-8 KB each (dirty pages, scattered) with vkCmdCopyBuffer: 1.3 ms of GPU time for
+// ~11 MB, ~0.8 us a region whatever its size. Here the regions are cut into entries of at most 4 KB, listed in a host-visible
+// ring, and one compute dispatch (shaders/msync_scatter.comp, buffer device addresses) copies them all: a workgroup an entry.
+// The presync (memory_sync_mirrors_before_segments) batches every pool's into one dispatch; a sync at a binding is one of its
+// own. A full barrier before and after (the upload command buffer's copies, the mirrors' readers). Regions not 16-byte aligned
+// go to vkCmdCopyBuffer as before. RX_VK_MSYNC_SCATTER=0: all of them as before
+struct ScatterEntry { uint64_t src, dst; uint32_t size, pad[3]; };
+static_assert(sizeof(ScatterEntry) == 32);
+struct Scatter {
+    bool tried = false, ok = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkBuffer ring = VK_NULL_HANDLE;
+    VmaAllocation ring_alloc = nullptr;
+    ScatterEntry* map = nullptr;
+    VkDeviceAddress ring_addr = 0;
+    size_t pos = 0;
+    uint64_t lap_value = 0, prev_lap_value = 0;   // (the newest recording that listed entries in this lap, and in the last one)
+} scatter;
+constexpr size_t kScatterEntries = 1u << 17;   // (4 MB of entries: ~45 frames of Hyrule Field's)
+std::mutex scatter_mu;
+thread_local std::vector<ScatterEntry> scatter_pending;
+thread_local bool scatter_batch = false;
+std::atomic<int64_t> st_scatter_entries{0}, st_scatter_dispatches{0}, st_scatter_bytes{0};
+bool scatter_on() {
+    static const bool v = !getenv("RX_VK_MSYNC_SCATTER") || getenv("RX_VK_MSYNC_SCATTER")[0] != '0';
+    return v;
+}
+bool scatter_ready() {   // (scatter_mu held)
+    if (scatter.tried) return scatter.ok;
+    scatter.tried = true;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof(MSYNC_SCATTER_COMP_SPV), mi.pCode = MSYNC_SCATTER_COMP_SPV;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(dev.device, &mi, nullptr, &module) != VK_SUCCESS) return false;
+    VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.pushConstantRangeCount = 1, li.pPushConstantRanges = &pr;
+    bool ok = vkCreatePipelineLayout(dev.device, &li, nullptr, &scatter.layout) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = module, ci.stage.pName = "main";
+        ci.layout = scatter.layout;
+        ok = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &scatter.pipeline) == VK_SUCCESS;
+    }
+    vkDestroyShaderModule(dev.device, module, nullptr);
+    void* m = nullptr;
+    ok = ok && create_buffer(kScatterEntries * sizeof(ScatterEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             true, scatter.ring, scatter.ring_alloc, &m, false) && m;
+    if (ok) {
+        scatter.map = (ScatterEntry*)m;
+        VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        da.buffer = scatter.ring;
+        scatter.ring_addr = vkGetBufferDeviceAddress(dev.device, &da);
+        ok = scatter.ring_addr != 0;
+    }
+    scatter.ok = ok;
+    logf("vk: mirror syncs: scatter copy %s", ok ? "on" : "NOT available (copies as before)");
+    return ok;
+}
+VkDeviceAddress buffer_address(VkBuffer b) {
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = b;
+    return vkGetBufferDeviceAddress(dev.device, &da);
+}
+/// (regions of src -> dst queued for the scatter, cut into 4 KB entries; false: not possible, copy them as before)
+bool scatter_add(VkDeviceAddress src, VkDeviceAddress dst, const std::vector<VkBufferCopy>& rs) {
+    if (!scatter_on() || !src || !dst) return false;
+    {
+        std::lock_guard lk(scatter_mu);
+        if (!scatter_ready()) return false;
+    }
+    uint64_t entries = 0;
+    for (const VkBufferCopy& r : rs) entries += (r.size + 4095) / 4096;
+    if (scatter_pending.size() + entries > kScatterEntries / 2) return false;   // (a load's hundreds of MB: plain copies)
+    for (const VkBufferCopy& r : rs)
+        if (((src + r.srcOffset) | (dst + r.dstOffset) | r.size) & 15) return false;
+    for (const VkBufferCopy& r : rs)
+        for (uint64_t o = 0; o < r.size; o += 4096)
+            scatter_pending.push_back({src + r.srcOffset + o, dst + r.dstOffset + o, (uint32_t)std::min<uint64_t>(4096, r.size - o), {}});
+    return true;
+}
+/// The queued entries, one dispatch into cmd, between two full barriers
+bool scatter_flush(VkCommandBuffer cmd, const char* label) {
+    if (scatter_pending.empty()) return false;
+    const size_t n = scatter_pending.size();
+    size_t at;
+    {
+        std::lock_guard lk(scatter_mu);
+        if (scatter.pos + n > kScatterEntries) {   // (a new lap: what the lap before the last one listed must be done; it is, ~90 frames ago)
+            if (scatter.prev_lap_value > vk_timeline_completed()) vk_timeline_wait(scatter.prev_lap_value);
+            scatter.prev_lap_value = scatter.lap_value;
+            scatter.pos = 0;
+        }
+        at = scatter.pos;
+        scatter.pos += n;
+        scatter.lap_value = std::max(scatter.lap_value, mem_rec_value);
+    }
+    std::memcpy(scatter.map + at, scatter_pending.data(), n * sizeof(ScatterEntry));
+    flush_mapped(scatter.ring_alloc, (at + n) * sizeof(ScatterEntry));
+    full_barrier(cmd, "barrier (write-back or sync)");
+    {
+        GprofSpan gp(cmd, label);
+        gp.items = (int)n;
+        for (size_t i = 0; i < n; i++) gp.bytes += scatter_pending[i].size;
+        st_scatter_bytes += (int64_t)gp.bytes;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, scatter.pipeline);
+        for (size_t done = 0; done < n;) {   // (65535 workgroups a dispatch at most)
+            const uint32_t k = (uint32_t)std::min<size_t>(n - done, 65535);
+            struct { uint64_t list; uint32_t count, pad; } pc{scatter.ring_addr + (at + done) * sizeof(ScatterEntry), k, 0};
+            vkCmdPushConstants(cmd, scatter.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);
+            vkCmdDispatch(cmd, k, 1, 1);
+            done += k;
+        }
+    }
+    full_barrier(cmd, "barrier (write-back or sync)");
+    st_scatter_entries += (int64_t)n, st_scatter_dispatches++;
+    scatter_pending.clear();
+    return true;
+}
+
 /// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer)
 void mirror_sync(Pool& p) {
     p.synced_epoch = mirror_epoch;
@@ -2211,13 +2335,25 @@ void mirror_sync(Pool& p) {
         page++;
     }
     if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
+    const VkDeviceAddress maddr = scatter_on() && (!cap_runs.empty() || !runs.empty()) ? buffer_address(p.mirror) : 0;
     for (const auto& [buf, rs] : cap_runs) {
+        if (maddr && scatter_add(buffer_address(buf), maddr, rs)) {
+            for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size;
+            st_sync_copies += (int64_t)rs.size();
+            continue;
+        }
         GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages from a capture -> mirror)");
         gp.items = (int)rs.size();
         vkCmdCopyBuffer(upload_command_buffer(), buf, p.mirror, (uint32_t)rs.size(), rs.data());
         for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
         st_sync_copies += (int64_t)rs.size();
     }
+    if (!runs.empty() && maddr && scatter_add(p.address, maddr, runs)) {
+        for (const VkBufferCopy& r : runs) st_sync_bytes += (int64_t)r.size;
+        st_sync_copies += (int64_t)runs.size();
+        runs.clear();
+    }
+    if (!scatter_batch) scatter_flush(upload_command_buffer(), "msync scatter (CPU pages -> mirrors, one dispatch)");
     if (runs.empty()) return;
     checkpoint_mark(upload_command_buffer(), p.lo, 'm');
     GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages live from guest memory -> mirror)");
@@ -2276,13 +2412,17 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     }
     if (by_pool.empty()) return false;
     full_barrier(up);   // (after the older submissions' write-backs into guest memory and this one's other uploads)
-    GprofSpan gp(up, "rbrefresh copies (readback pages guest -> mirror)");
-    gp.items = 0;
-    for (auto& [pp, rs] : by_pool) {
-        vkCmdCopyBuffer(up, pp->buffer, pp->mirror, (uint32_t)rs.size(), rs.data());
-        st_rb_refresh += (int64_t)rs.size();
-        gp.items += (int)rs.size(), gp.bytes += rs.size() * 4096;
+    {   // (TICK-021: ~22 single pages, one dispatch rather than a copy region each; RX_VK_MSYNC_SCATTER=0: copies)
+        GprofSpan gp(up, "rbrefresh copies (readback pages guest -> mirror)");
+        gp.items = 0;
+        for (auto& [pp, rs] : by_pool) {
+            st_rb_refresh += (int64_t)rs.size();
+            if (scatter_add(pp->address, buffer_address(pp->mirror), rs)) continue;
+            vkCmdCopyBuffer(up, pp->buffer, pp->mirror, (uint32_t)rs.size(), rs.data());
+            gp.items += (int)rs.size(), gp.bytes += rs.size() * 4096;
+        }
     }
+    scatter_flush(up, "rbrefresh scatter (readback pages guest -> mirror, one dispatch)");
     static std::atomic<int64_t> n{0};
     if (++n % 3000 == 1) logf("vk: readback pages refreshed from guest memory: %lld pages so far", (long long)st_rb_refresh.load());
     return true;
@@ -2752,12 +2892,15 @@ void memory_sync_mirrors_before_segments() {
     static const bool off = getenv("RX_VK_NO_PRESYNC") != nullptr;
     if (off || !mirror_on() || !mirror_upload) return;
     std::lock_guard lk(pools_mu);
+    scatter_batch = true;   // (TICK-021: every pool's in one dispatch)
     for (auto& kv : imported) {
         Pool& p = kv.second;
         if (p.mstate != Pool::MIRROR_ON || p.synced_epoch == mirror_epoch) continue;
         mirror_sync(p);
         p.sync_seg = 0;
     }
+    scatter_batch = false;
+    scatter_flush(upload_command_buffer(), "msync scatter (CPU pages -> mirrors, one dispatch)");
 }
 
 /// A pool's mirror made, filled in the recording's upload command buffer: all of it, then the pages a capture holds
@@ -2882,6 +3025,14 @@ void memory_end_submission(VkCommandBuffer cmd) {
                  (long long)(st_sync_old_pages - l_old), (long long)(st_sync_live_pages - l_live), cap_bufs.size(),
                  (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
+            {   // (TICK-021: the scatter copy's share)
+                static int64_t l_se, l_sd, l_sb, l_sc, l_sy;
+                const int64_t se = st_scatter_entries.load(), sd = st_scatter_dispatches.load(), sb = st_scatter_bytes.load();
+                logf("vk: mirror syncs (600 submits, a submit): %.1f regions, %.2f MB; scatter %.1f dispatches, %.1f entries, %.2f MB "
+                     "(rbrefresh included)", (st_sync_copies - l_sc) / 600.0, (st_sync_bytes - l_sy) / 600.0 / 1048576, (sd - l_sd) / 600.0,
+                     (se - l_se) / 600.0, (sb - l_sb) / 600.0 / 1048576);
+                l_se = se, l_sd = sd, l_sb = sb, l_sc = st_sync_copies, l_sy = st_sync_bytes;
+            }
             std::vector<std::pair<int64_t, uint64_t>> top;
             for (const auto& [lo, k] : live_by_pool) top.push_back({k, lo});
             std::sort(top.rbegin(), top.rend());
