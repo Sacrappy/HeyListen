@@ -3100,7 +3100,17 @@ void texture_frame(uint64_t completed) {
     static const bool no_evict = getenv("RX_VK_NO_EVICT") != nullptr;   // (an experiment: nothing evicted)
     // (hookshot) under the budget, every 600 presents: the render targets drawn over since (below), unused for 120
     const bool sweep = total_bytes <= budget;
-    if (no_evict || (sweep && frame_no % 600)) return;
+    // (TICK-027) a render target another image has since been drawn over (drawn_over below) holds nothing: it goes once
+    // unused for RX_VK_EVICT_OVERWRITTEN_UNUSED frames (8; 0: as before, with the rest), every 10 frames, under the
+    // budget too. Castle Town while walking and turning: ~25 targets a frame made over the same storage at new sizes, the
+    // old ones kept 60+ frames: textures 6 -> 9 GB, VRAM 12.6 of 11 GB allowed, the driver paging, image binds and
+    // destroys a fifth of the replay thread's time, 63 -> 35 fps
+    static const uint64_t overwritten_unused = [] {
+        const char* e = getenv("RX_VK_EVICT_OVERWRITTEN_UNUSED");
+        return e ? (atoi(e) <= 0 ? (uint64_t)0 : (uint64_t)std::max(3, atoi(e))) : (uint64_t)8;
+    }();
+    const bool full_pass = !(sweep && frame_no % 600);
+    if (no_evict || (!full_pass && !overwritten_unused)) return;
     std::vector<std::pair<uint64_t, Texture*>> order;
     order.reserve(textures.size());
     for (auto& kv : textures) order.push_back({kv.second->last_frame, kv.second.get()});
@@ -3164,8 +3174,73 @@ void texture_frame(uint64_t completed) {
         logf("vk: finalized textures the GPU drew once, kept for being made again: %zu (%llu KB):%s", finalized_kept_n,
              (unsigned long long)(finalized_kept >> 10), n ? line : "");
     }
+    // (TICK-027) a render target over part of whose storage another one, not inside it, was drawn after its last use: its
+    // texels are gone on the console too. OoT's transient targets move through a pool: each frame a full-screen set at
+    // other addresses overlapping the last ones, never at the same address, so drawn_over missed them (4 GB in Castle
+    // Town while walking, unused 8-59 frames). A target inside it (a layer or level of an array) does not count
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> drawn;   // (start, end, last written) of the rendered ones
+    uint64_t drawn_max = 0;
+    if (overwritten_unused) {
+        drawn.reserve(order.size());
+        for (auto& [last, tex] : order)
+            if (tex->gpu_written) {
+                const uint64_t sz = std::max<uint64_t>(tex->guest_size, 1);
+                drawn.emplace_back(tex->gpu, tex->gpu + sz, tex->last_written);
+                drawn_max = std::max(drawn_max, sz);
+            }
+        std::sort(drawn.begin(), drawn.end());
+    }
+    const auto overlapped_later = [&](const Texture* tex) {
+        if (!tex->gpu_written || drawn.empty()) return false;
+        const uint64_t lo = tex->gpu, hi = tex->gpu + std::max<uint64_t>(tex->guest_size, 1);
+        auto it = std::lower_bound(drawn.begin(), drawn.end(), std::make_tuple(hi, (uint64_t)0, (uint64_t)0));
+        while (it != drawn.begin()) {
+            --it;
+            const auto& [a, e, w] = *it;
+            if (a + drawn_max <= lo) break;   // (none further back reaches it)
+            // (only one over its first byte: one that only reaches into its end may be a neighbour whose storage size
+            // was counted generously, and one inside it is itself, a layer or a level)
+            if (!(a <= lo && e > lo) || (a == lo && e == hi)) continue;
+            if (w > tex->last_frame) return true;
+        }
+        return false;
+    };
+    if (frame_no % 600 == 0) {   // (TICK-027) what the textures are: by frames unused and kind, MB (count)
+        uint64_t mb[3][4] = {}, cnt[3][4] = {};
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t, int>, std::pair<size_t, uint64_t>> mid;
+        for (auto& [last, tex] : order) {
+            const uint64_t u = frame_no - last;
+            const int a = u < 8 ? 0 : u < 60 ? 1 : 2;
+            const int k = drawn_over(tex) || overlapped_later(tex) ? 1 : tex->gpu_written ? (tex->released ? 3 : 2) : 0;
+            mb[a][k] += tex->bytes, cnt[a][k]++;
+            if (a == 1) { auto& m = mid[{tex->width, tex->height, tex->nvn_format, k}]; m.first++, m.second += tex->bytes; }
+        }
+        logf("vk: textures by frames unused <8 / 8-59 / 60+, MB (n): uploaded %llu (%llu) / %llu (%llu) / %llu (%llu); drawn over "
+             "%llu (%llu) / %llu (%llu) / %llu (%llu); rendered %llu (%llu) / %llu (%llu) / %llu (%llu); rendered, released %llu "
+             "(%llu) / %llu (%llu) / %llu (%llu)",
+             (unsigned long long)(mb[0][0] >> 20), (unsigned long long)cnt[0][0], (unsigned long long)(mb[1][0] >> 20), (unsigned long long)cnt[1][0], (unsigned long long)(mb[2][0] >> 20), (unsigned long long)cnt[2][0],
+             (unsigned long long)(mb[0][1] >> 20), (unsigned long long)cnt[0][1], (unsigned long long)(mb[1][1] >> 20), (unsigned long long)cnt[1][1], (unsigned long long)(mb[2][1] >> 20), (unsigned long long)cnt[2][1],
+             (unsigned long long)(mb[0][2] >> 20), (unsigned long long)cnt[0][2], (unsigned long long)(mb[1][2] >> 20), (unsigned long long)cnt[1][2], (unsigned long long)(mb[2][2] >> 20), (unsigned long long)cnt[2][2],
+             (unsigned long long)(mb[0][3] >> 20), (unsigned long long)cnt[0][3], (unsigned long long)(mb[1][3] >> 20), (unsigned long long)cnt[1][3], (unsigned long long)(mb[2][3] >> 20), (unsigned long long)cnt[2][3]);
+        std::vector<std::pair<uint64_t, std::tuple<uint32_t, uint32_t, uint32_t, int>>> top;
+        for (auto& [k, v] : mid) top.push_back({v.second, k});
+        std::sort(top.rbegin(), top.rend());
+        char line[700];
+        int n = 0;
+        for (size_t i = 0; i < top.size() && i < 12 && n < 600; i++) {
+            const auto& [w, h, f, k] = top[i].second;
+            n += snprintf(line + n, sizeof line - n, " %ux%u NVN %#x %s: %zu (%llu MB);", w, h, f, k == 0 ? "up" : k == 1 ? "over" : k == 2 ? "rend" : "rel",
+                          mid[top[i].second].first, (unsigned long long)(top[i].first >> 20));
+        }
+        logf("vk: textures unused 8-59 frames, the largest kinds:%s", n ? line : "");
+    }
     for (auto& [last, tex] : order) {
-        if ((!sweep && total_bytes <= budget / 8 * 7) || frame_no - last < (sweep ? std::max<uint64_t>(120, min_unused) : min_unused)) break;
+        const bool full_due = full_pass && !((!sweep && total_bytes <= budget / 8 * 7) ||
+                                             frame_no - last < (sweep ? std::max<uint64_t>(120, min_unused) : min_unused));
+        if (!full_due) {   // (TICK-027: past the usual pass, only targets drawn over, unused for overwritten_unused frames)
+            if (!overwritten_unused || frame_no - last < overwritten_unused) break;
+            if (tex->last_value > completed || keep_finalized(tex) || !(drawn_over(tex) || overlapped_later(tex))) continue;
+        }
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -3177,7 +3252,7 @@ void texture_frame(uint64_t completed) {
         // (TICK-023: and 600 over the texture budget, for one that can be written back: a course left behind 10 s ago goes, written back first below, before
         // the VRAM fills; with 3600 an area change kept the last area's 3 GB of render targets for a minute)
         const uint64_t keep_rendered = (known && used > allowed) || (!sweep && flushable(*tex)) ? 600 : 3600;
-        const bool overwritten = drawn_over(tex);   // (above)
+        const bool overwritten = drawn_over(tex) || overlapped_later(tex);   // (above)
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
             if (finalized_kept <= keep_finalized_max) continue;
             finalized_kept -= tex->bytes;

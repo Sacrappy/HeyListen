@@ -971,3 +971,41 @@ fps: mean of the log's 120-present windows from present 6000 (Castle Town), one 
 pressure the budget sat at the recent-use floor (3.3 GB) and the ground stayed right. Not verified: windowed (non-headless)
 play, walking/area changes, other GPUs (AMD/Intel) for the dedicated BC case, the lazy-mirror free path (no mirror freed
 while drawn was seen, not proven safe either), why NVIDIA's dedicated allocation breaks raw-view-written BC images.
+
+## TICK-027: Castle Town walking and turning, 60 -> 30 fps (2026-11-09)
+
+**Cause: VRAM over-commit from render targets that the engine kept after the game had already drawn new targets over their storage. It is not occlusion and not pipeline creation.** New scene `castle-move` (tools/bench/run_bench.py) loads the most recent save (Castle Town Market). B at 72-75 s closes the talk that the last title A presses start next to the dancing couple. From 76 s it walks forward and back with right-stick camera turns, five times. Per-120-present windows (base build): draws stay about the same while moving as while standing (~2,150-2,300). Pipelines made: 0 (3,170 cached). Uploads: 2-9 a frame, 0.5-2.6 MB. Once the moves start, the texture count jumps by ~1,100 in one window (about +2.7 GB, from 6 to 8.8 GB, budget 6,144 MB). VRAM then reads **12.6 GB used of 11.0 GB allowed**, so the driver pages. About 25 textures a frame are made and retired (standing: 7-12). Replay submit time goes from 7.5 to 12-17 ms a frame, and GPU time from 2.2 to 3-9 ms. The all-thread profile during the turns (crit.py, 3,844 instants) shows no game thread running in 40% of instants, with main waiting in f_806668b0 / f_81207a50, the GPU/replay waits. In those instants the Presentation thread runs texture_frame (19%), VMA CreateBlock (5%) and targets() (4%). Over all its samples, vmaCreateImage -> BindImageMemory takes 9.5% and destroy_image 7.6%.
+
+A per-kind count of the textures (logged every 600 presents, `vk: textures by frames unused`) showed ~4 GB of render targets unused for 8-59 frames. These were mostly 1280x720 NVN 0x29/0x25 and 2560x1440 0x3f/0x34 sets, 50-90 copies of each. OoT's transient targets move through a pool: each frame it makes a new full-screen set at other addresses that overlap the previous sets, never at the same address. So `drawn_over` (same start address only) missed them, and they stayed for the 60-frame minimum. An env-only check with `RX_VK_EVICT_MIN_UNUSED=10` (for everything) brought moving to 53-55 fps, which confirmed the cause.
+
+**Fix** (vk_texture.cpp, texture_frame): a render target goes once it has been unused for `RX_VK_EVICT_OVERWRITTEN_UNUSED` frames (default 8; 0 restores the old behaviour) if one of these holds:
+- another target has been drawn at its address (drawn_over);
+- a target drawn after its last use covers its first byte. A target inside it (a layer or level) does not count, and neither does a neighbour that only reaches into its end.
+
+This check runs every 10 presents, under the budget too, and never touches finalized-kept textures or ones the GPU may still read. Textures while moving fall from 6-8.8 GB to 4.4-4.5 GB, and VRAM stays under the limit (8.5-8.7 of 10.9 GB).
+
+castle-move, 3 runs each, same binary, A = `RX_VK_EVICT_OVERWRITTEN_UNUSED=0` (as before). Windows are by time after launch: standing 70-84 s, moving 88-110 s.
+
+| run | standing fps / 1% low / > 33 ms | moving fps / 1% low / > 33 ms | moving: textures MB, made a frame, replay ms |
+|---|---|---|---|
+| A1 | 51.1 / 6.2 / 4.1% | 40.1 / 5.9 / 10.4% | 6434, 14.2, 12.6 |
+| A2 | 50.1 / 7.7 / 4.4% | 43.5 / 7.0 / 9.1% | 5940, 12.6, 10.9 |
+| A3 | 40.9 / 6.9 / 14.2% | 31.2 / 6.3 / 24.0% | 7929, 21.1, 14.4 |
+| B1 | 58.0 / 18.9 / 1.1% | 50.9 / 10.7 / 5.3% | 4391, 11.3, 9.5 |
+| B2 | 64.3 / 32.0 / 0.2% | 56.7 / 18.8 / 1.8% | 4498, 12.4, 9.5 |
+| B3 | 60.2 / 31.1 / 0.2% | 51.7 / 11.0 / 4.2% | 4389, 11.5, 9.5 |
+
+kokiri-idle (Castle Town Market save, standing), 75-110 s, fps / 1% low / > 33 ms: A 48.9 / 8.7 / 6.4%, 65.1 / 31.8 / 0.2%,
+62.6 / 14.0 / 1.5% (mean 58.9); B 64.4 / 30.5 / 0.3%, 64.0 / 33.4 / 0.2%, 64.1 / 31.5 / 0.3% (mean 64.2).
+
+Draws per frame did not change (~2,100-2,300 in both). Moving is still ~8 fps below standing: ~12-25 targets a frame are still made (VkImage create and bind) as the pool moves. Recycling images of the same create-info is the next step and was not done here. HOS_SPEED_LOG ratio while moving was 56-62, around 60.
+
+**Real occlusion queries (tried, dropped).** A one-frame-late implementation was built and measured:
+- a ring of 4096 occlusion queries, one per draw between a samples-passed reset and its report;
+- reports written in stream order with the address's last completed count, and 4096 until it had one.
+
+It produced counts (800-1,900 reports a frame, ~80% of them 0) and fewer draws (1,200-2,000), but Castle Town rendered washed-out mint/white, with buildings and meshes missing or flickering (framelog: dark/bright events of up to 111 of 144 blocks). This is the known breakage of enabling occlusion in this game (Hookshot issues 1002/1004, Lichii). The code was reverted. Nothing of NX2navi was kept, so no THIRD_PARTY_NOTICES row. The engine's answer stays as it was (every samples-passed report 4096; `HOOKSHOT_OCCLUSION_OFF=1` patches the game's queries out).
+
+Also seen, and not caused by this ticket: the teal/white over-bright ground and some missing objects in Castle Town while walking. They show up in headless shots at presents ~6000-7500 and in windowed framelog frames, including with the unmodified backup build (backup-tick027). The sun glare drawn through walls when the camera is inside geometry comes from the fixed "visible" answer.
+
+Not verified: Hyrule Field; other GPUs; the windowed picture beyond framelog thumbnails; whether the faster eviction makes rendered textures come back empty in other scenes (the rule only takes targets whose storage a later target covers).
