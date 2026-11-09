@@ -745,3 +745,63 @@ side alone: the main thread's own work plus its job group is ~8.5 ms.
 
 Not verified: Kokiri and other scenes; limit 144; other CPUs (fewer cores: the virtual cores and the spin may matter there);
 the lifter-level options (no -Lift build).
+
+## TICK-022: lifter-wide overhead in the lifted guest code (2026-11-09)
+
+**Result: one lifter change kept: the software FMA calls are ~98% gone and the result bits are unchanged. Frame rate unchanged
+(within the spread). The job chain is the same ~8.4 ms. The other candidates are already cheap, or need their current cost to be
+correct.** `hyrule-walk`, limit 120, Ryzen 7 7800X3D, RTX 5070.
+
+**What the software FMA was.** The FPX1 fast paths already use the host FPU: x86-64-v3 for all code, so `__builtin_fma` for binary64.
+binary32 FMA went through binary64 and fell back at binary32 midpoints. The `recomp_fpe_fma32` exact body (and
+`a64_fpx_mul32_fma32`, the lane fallback of vector FMUL) ran whenever a fast path refused. A probe build counted why it was called
+(Hyrule walk, 12.6 M calls in ~100 s, FZ on, fpsr 0x9f):
+quiet-NaN operand 98.5%, a tiny/zero result under FZ 0.7%, normal results 0.9% (midpoints, and the mul fast path's KEEP rules),
+signalling NaN 0, infinity < 0.01%. Most of the calls came from vector FMULs over a lane that holds a NaN.
+
+Changes (`third_party/a64-kit`):
+- `a64_lift.py`: `a64_fpx_qnan_fma32` in front of the exact body in every `*_fma32` helper. It covers a quiet NaN operand with no signalling
+  NaN, and returns the addend's NaN, else the first factor's, else the second's, with no flag (as the exact body does). It leaves to the body:
+  signalling NaNs (IOC), a quiet NaN addend with inf*0 (default NaN + IOC), and under FZ any subnormal operand (flushed: IDC, and
+  a flushed factor can make inf*0). FPCR.DN is clear by `RECOMP_FPX_OPEN`.
+- `suyu/arm64_to_c.h`: FMADD/FRECPS/FRSQRTS binary32 fast paths use `__builtin_fmaf` (vfmadd, one rounding) when built with FMA3
+  (`RECOMP_FPX_FMA64`), and no longer go through binary64 with a midpoint fallback.
+
+FP equivalence (host tests, scratch):
+- Hardware `fmaf` against the old binary64 route: 200 M operand triples (random, low-precision mantissas, subnormals, zeros,
+  infinities, NaNs). 0 differences where the old route kept a result. NaN results are never kept. 0.2% of the triples were midpoints
+  that the old route sent to the exact body. `fmaf` rounds them once, correctly, as AArch64 does.
+- The quiet-NaN path against the exact body (`recomp_fpe_fma32` text from `sa/gen/a64_suyu.c`): 50 M triples, FZ on/off, IDC set/clear.
+  10.8 M took the fast path, with 0 differences in value or fpsr. A first version kept FZ subnormals while IDC was set. That gave 49 k
+  differences (a flushed factor makes inf*0 -> default NaN), so it now leaves them to the body.
+
+A/B, 4 runs each, interleaved (base = TICK-011 build; fp = this change; mark = fp plus the experiment below):
+
+| config | fps (4 runs) | mean | 1% low mean | p99 mean | log mean 70-110 s |
+|---|---|---:|---:|---:|---:|
+| base | 75.3 76.0 75.5 76.3 | 75.8 | 39.7 | 19.0 ms | 75.8 |
+| fp | 75.1 75.1 74.1 75.8 | 75.0 | 40.0 | 19.8 ms | 75.3 |
+| mark | 76.0 75.1 75.9 75.6 | 75.7 | 41.2 | 19.0 ms | 75.6 |
+
+All within the run spread (~2 fps). The chain (`crit.py`, 12 s from 80 s, ~3000 instants): base main runs 21.8% and waits for the job group
+41.6% of instants; fp 21.3% / 41.4%. That is ~8.4 ms either way. The FMA calls were a few us a frame spread over job threads, not on the chain.
+
+Not kept:
+- **A64_MARK only when crossing** (`RX_MARK_CROSS_ONLY` experiment): the second dirty-page store only when a store crosses into the next page.
+  The exe is +26 MB (1.22 M marked store sites). +0.6 fps against fp, -0.1 against base: noise. The earlier note (MKW, -0.3 ms, +20 MB)
+  does not show here.
+
+Measured and left:
+- **A64_POLL**: 440 k loop-header polls. Each is a relaxed load of `c->poll` plus a predicted-not-taken branch (`a64_poll` is out of line).
+  On x86 that is a plain mov + cmp/jne on a line the thread owns. Hoisting it out of loops would break preemption of long guest loops
+  (the scheduler's interrupt), for ~1 cycle an iteration.
+- **Atomics**: LDAPR is an acquire load (a plain mov). LDAR is a seq_cst load (a mov). LSE ops and CAS are lock-prefixed RMWs, which x86 needs
+  for any atomic RMW. STLR is a seq_cst store (xchg), which RCsc STLR->LDAR ordering requires on x86. No cheaper lowering keeps the semantics.
+- **Compiler flags**: every piece is already built for `-march=x86-64-v3` (AVX2, FMA, BMI1/2, LZCNT, MOVBE; host_cpu.py picks it, RX_MARCH
+  overrides) with `-ffp-contract=off` (needed: the exact bodies assume C rounding as written). `-march=native` would add AVX-512 (Zen 4), and
+  the game would then stop on a CPU without it. It was not tried: the guest code is scalar and branchy, and the FMA was the only x86-64-v3
+  feature the lifted code did not use.
+
+Correctness: HOS_SPEED_LOG ratio 59.8-60.1 (base and fp). Screenshots at frames 1200..9600 (RX_VK_SHOT_EVERY=1200): the same walk, Link on
+the same path. Shots are per frame, so the positions differ only by the fps at that frame. The flash detector over 2 walks (fp, 30 s
+each): 13 and 12 small events (1-2 blocks, at the same spot ~20 s in), 0 on made frames. No base framelog in this ticket for comparison.
