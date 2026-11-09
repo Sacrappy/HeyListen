@@ -2747,6 +2747,14 @@ void mirror_free(Pool& p) {
     p.mstate = Pool::MIRROR_NONE;
     pools_gen++;   // (a parallel replay thread's pool cache: looked up again)
 }
+// (TICK-023) A live pool's mirror holding GPU writes left out of the write-back (TICK-015) was never given back. One idle as
+// long as the others that go (kLongIdle, or kIdleEpochs when the mirrors' budget is short) is listed here; the next submission's
+// end copies its left-out pages (the CPU's pages and words, and texture storage, cut out, as the write-backs do) from the mirror
+// into guest memory and then frees the mirror: the buffer is destroyed once the GPU is past that copy (mirror_free's value), so
+// a pool bound later is synced from guest memory holding the GPU's words. RX_VK_KEEP_LAZY_MIRRORS=1: kept, as before
+std::vector<Pool*> lazy_release;
+int64_t st_lazy_released = 0;
+uint64_t st_lazy_released_bytes = 0, st_lazy_written_back = 0;
 void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     static const bool keep = getenv("RX_VK_MIRROR_KEEP") != nullptr;   // (A/B: mirrors kept, as before)
     if (keep) return;
@@ -2756,6 +2764,14 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
         if (p.inherit_pending && !p.lazy_held && mirror_epoch - p.retired_epoch > kIdleEpochs) p.inherit_pending = false;
         if (p.mstate == Pool::MIRROR_ON && p.retired_value <= mem_completed && !p.inherit_pending) mirror_free(p);
     }
+    // (TICK-023) the process past 80% of the VRAM the driver allows (VK_EXT_memory_budget): the mirrors idle for kIdleEpochs go as
+    // when their own budget is short (1.3-1.4 GB of mirrors held through a walk with the heaps at 83-89%)
+    bool vram_tight = false;
+    {
+        uint64_t used = 0, allowed = 0;
+        vram_tight = vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 80;
+    }
+    if (vram_tight) want_bytes = std::max(want_bytes, mirror_budget());
     std::vector<Pool*> idle;
     for (auto& [lo, p] : imported)
         if (p.mstate == Pool::MIRROR_ON && !p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
@@ -2763,6 +2779,13 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
     for (Pool* p : idle)
         if (mirror_epoch - p->synced_epoch > kLongIdle || mirror_bytes + want_bytes > mirror_budget()) mirror_free(*p);
+    static const bool keep_lazy = getenv("RX_VK_KEEP_LAZY_MIRRORS") != nullptr;
+    if (!keep_lazy)
+        for (auto& [lo, p] : imported)
+            if (p.mstate == Pool::MIRROR_ON && p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed &&
+                (mirror_epoch - p.synced_epoch > kLongIdle || mirror_bytes + want_bytes > mirror_budget()) &&
+                std::find(lazy_release.begin(), lazy_release.end(), &p) == lazy_release.end())
+                lazy_release.push_back(&p);
     static int64_t logged_at;
     if (st_mirrors_freed / 16 != logged_at) {
         logged_at = st_mirrors_freed / 16;
@@ -3156,6 +3179,50 @@ void memory_end_submission(VkCommandBuffer cmd) {
         }
         transfer_barrier(cmd);
         writebacks.clear();
+    }
+    if (!lazy_release.empty()) {   // (TICK-023, above: the left-out pages written back, then the mirror freed)
+        std::vector<VkBufferCopy> runs;
+        bool barrier = false;
+        for (Pool* p : lazy_release) {
+            const auto live = imported.find(p->lo);
+            // (still a live pool, mirrored, idle: one bound again since the listing keeps its mirror)
+            if (live == imported.end() || &live->second != p || p->mstate != Pool::MIRROR_ON || !p->lazy_held ||
+                p->synced_epoch + kIdleEpochs >= mirror_epoch)
+                continue;
+            runs.clear();
+            {
+                std::lock_guard nk(nvn_pools_mu);
+                for (uint64_t q = p->lo >> kPageShift; q <= (p->hi - 1) >> kPageShift; q++) {
+                    if (!skipped_pages.count((uint32_t)q) || cpu_pages.count((uint32_t)q)) continue;
+                    const uint64_t a = std::max(p->lo, q << kPageShift), b = std::min(p->hi, (q + 1) << kPageShift);
+                    if (a >= b || replay_tex_storage_in(a, b - a)) continue;
+                    if (!runs.empty() && runs.back().srcOffset + runs.back().size == a - p->lo) runs.back().size += b - a;
+                    else runs.push_back({a - p->lo, a - p->lo, b - a});
+                }
+            }
+            cut_cpu_words(*p, runs);
+            if (!runs.empty()) {
+                if (!barrier) transfer_barrier(cmd), barrier = true;
+                vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
+                for (const VkBufferCopy& r : runs) {
+                    st_lazy_written_back += r.size;
+                    wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
+                }
+            }
+            p->lazy_held = false;
+            if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (the copy reads the mirror: freed after it)
+            st_lazy_released++, st_lazy_released_bytes += p->hi - p->lo;
+            mirror_free(*p);
+        }
+        if (barrier) transfer_barrier(cmd);
+        lazy_release.clear();
+        static int64_t logged_at = -1;
+        if (st_lazy_released / 8 != logged_at) {
+            logged_at = st_lazy_released / 8;
+            logf("vk: mirrors holding left-out write-backs given back: %lld (%llu MB), %.2f MB written back into guest memory first; "
+                 "%llu MB of mirrors now", (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20),
+                 st_lazy_written_back / 1048576.0, (unsigned long long)(mirror_bytes >> 20));
+        }
     }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
     // in the mirror and written back; CPU writes collected at the next submission get a newer generation)
