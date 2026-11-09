@@ -3,3 +3,5 @@
 **Goal**: real occlusion counts with one frame of latency, safe defaults (not ready = visible), the game's occlusion reads re-enabled; measure draws, replay CPU, GPU time, and the game's own CPU (does it skip work for occluded objects?).
 **Acceptance**: draws a frame down at Castle Town and Hyrule Field; fps / 1% low up; no popping or flashes (flash detector, screenshots while walking/turning); game speed ok.
 **Branch**: `feature/TICK-027-occlusion`
+
+**Added 2026-11-09 (user report)**: in Castle Town Market, standing still with a fixed camera reaches ~60 fps, but moving and turning the camera drops to ~30 fps. First diagnose that on a scripted Castle Town scene with walking and camera turns (right stick in HOS_INPUT_SCRIPT): per-120-present windows of draws, pipelines made, textures made/uploaded, replay times, GPU busy, and an all-thread profile during the turns; then decide whether real occlusion, streaming (textures/pipelines), or something else is the main cause, and fix the main one first.
