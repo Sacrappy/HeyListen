@@ -15,3 +15,6 @@ Rules for every replacement:
 | TICK-028 | Sonnet | Subgroup reconvergence + dark-frame diagnostics |
 | TICK-029 | Sonnet | Memory pressure follow-ups |
 | TICK-030+ | Opus | Next native replacements by rank |
+
+## Decision 2026-11-09 (user)
+Real occlusion queries break this game's rendering (permanent white/missing meshes, washed-out picture), a known unsolved issue in Hookshot and Lichii. Occlusion stays OFF. TICK-027 refocused on the Castle Town move/turn drops (60 -> ~30 fps) without occlusion.
