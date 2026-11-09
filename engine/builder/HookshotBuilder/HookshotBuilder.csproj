@@ -29,7 +29,7 @@
   <!-- Inter (SIL Open Font License, Fonts/Inter-LICENSE.txt) and the HeyListen icon, inside the app -->
   <ItemGroup>
     <Resource Include="Fonts\*.ttf" />
-    <Resource Include="Images\hookshot.png" />
+    <Resource Include="Images\heylisten.png" />
     <None Include="Fonts\Inter-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
