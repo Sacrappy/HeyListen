@@ -2131,6 +2131,7 @@ bool tex_pages_any(uint64_t gpu, uint64_t size) {
 void texture_created_of(const nvn_tex* t) { tex_pages_add(t, +1); }
 uint64_t fence();
 void invalidate(uint64_t gpu, uint64_t size) {
+    if (size) memory_cpu_reads(host->gpu_guest(gpu), size);   // (TICK-015: its pool's write-backs made from now on)
     static const bool log_inv = getenv("RX_VK_LOG_INVALIDATE") != nullptr;
     static std::atomic<int> logged{0};
     if (log_inv && logged++ < 400) {
@@ -3642,5 +3643,7 @@ std::recursive_mutex& par_mutex() {
 int64_t par_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+bool replay_tex_storage_in(uint64_t gpu, uint64_t size) { return tex_pages_any(gpu, size); }
 
 } // namespace mkwvk

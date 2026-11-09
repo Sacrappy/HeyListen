@@ -333,3 +333,56 @@ pixel-equal.
 Not verified: other scenes (Kokiri, cutscenes, menus); whether other systems read +0x2c8 after the game's reset (they see
 60 as before); other GPUs; frame rates above ~70 in gameplay (the GPU bound): the title ran at 120 with the right
 step (ratio 60.26 a second at 120 fps).
+
+## TICK-015: the engine's own GPU copies (2026-11-09)
+
+Hyrule Field, `run_bench.py --scene hyrule-walk --duration 115`, limit 120, RTX 5070; `nvidia-smi` utilisation averaged from 60 s.
+
+What the write-backs were: 7 MB a submission, almost all into the game's CPU_CACHED pools (NVN flags 0x24), which on the
+console the CPU reads only after `nvnMemoryPoolInvalidateMappedRange`. With no write-back at all (`RX_VK_NO_WRITEBACK=1`, an
+upper bound, not correct): 71.4 fps, GPU 94% busy.
+
+**Write-backs left out** (`vk_memory.cpp`, "Write-backs left out"): the host hands the back end each game pool's NVN flags (a
+second DLL export, `mkwvk_pool_flags`: `vk_api.h` is in the shader caches' stamp, and changing it dropped the program cache once
+during this ticket, re-prepared in ~45 s). A pool written back for 600 submissions with no invalidate of it keeps the GPU's
+writes in its mirror from then on, except the pages the CPU writes (seen by the mirror syncs: a stale page from guest memory
+would otherwise go over the GPU's words). Always written back: CPU_UNCACHED pools, ranges outside any game pool, live
+texture storage. An invalidate makes its pool eager for good; mirrors holding such writes are not given back. In the walk:
+55 pools left out; 0 reads and 0 CPU writes after a range was left out; 0 bindings of such a pool in guest memory (all counted
+in the log every 600 submits). Written back: outside game pools 0.12 MB a submit, pools the CPU reads 0.47 MB.
+`RX_VK_WB_EAGER=1`: everything, as before.
+
+**Mirror syncs from a capture**: adjacent pages (in the capture and in the pool) merged into one copy region: 2790 -> 1630
+regions a frame. Copying only dirty sub-ranges of a page was not done (the write watch is per page; finding the words would
+mean diffing each page on the CPU).
+
+GPU time a frame by kind (`RX_VK_PASS_TIMING=1`, inflated by the timestamps):
+
+| | before | after |
+|---|---:|---:|
+| all | 11.39 ms | 10.26 ms |
+| wb (mirror -> guest) | 1.56 ms, 67.5 MB | 0.42 ms, 13.9 MB |
+| msync (CPU pages -> mirror) | 2.06 ms, 10.9 MB, 2791 regions | 1.35 ms, 11.5 MB, 1629 regions |
+| rbrefresh | 0.40 ms | 0.38 ms |
+| passes / dispatches | 4.70 / 1.75 ms | 5.32 / 1.76 ms |
+
+| Run | fps | 1% low | p99 | > 8.33 ms | nvidia-smi |
+|---|---:|---:|---:|---:|---:|
+| before 1 | 68.0 | 40.3 | 20.4 ms | 99.9% | 80.4% |
+| before 2 | 67.4 | 33.3 | 21.9 ms | 99.9% | 80.3% |
+| after 1 | 73.3 | 40.5 | 19.6 ms | 100.0% | 76.8% |
+| after 2 | 74.4 | 41.3 | 19.1 ms | 100.0% | 77.0% |
+
+(Walks with shots and the frame log: before 67.7 / 67.4, after 72.2 / 73.4 / 73.8 / 72.4 / 73.1.) The GPU is less busy and the
+frame faster: the GPU-bound share shrank; the capture wait is 2.3-2.7 ms a frame (was 2.7-3.0 in this build's base run).
+
+Not done: (c) a transfer queue (the write-backs and syncs sit between the graphics work with full barriers on both sides;
+what remains is ~1.8 ms and their dependencies on the passes would need queue-ownership transfers); (d) the capture wait was
+left as it is (removing it was slower in TICK-010, and the GPU is still ~77% busy).
+
+Correctness: flash detector (`scripts/framelog.py`) over two walks each: before 20 and 24 events, after 21 and 19, all 1-4
+blocks (motion, mostly at 85-87 s), no scene-wide flash. Screenshots every 1200 presents: lighting, fog, shadows and grass as
+before (the walks are not pixel-equal: presents fall at other moments at the higher frame rate). `HOS_SPEED_LOG=1`: 99.98-100.02%.
+
+Not verified: other scenes (Kokiri, cutscenes, menus, loads), other GPUs, long sessions (the mirrors holding writes are kept:
+VRAM use over time not measured), a CPU read without an invalidate (the counters would not see one).

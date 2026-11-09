@@ -205,6 +205,12 @@ static void flush_early(void) {
     ReleaseSRWLockExclusive(&early_lock);
 }
 
+/* (TICK-015) the back end's second export: a game pool's NVN flags (which pools the CPU may read back) */
+static void (*vk_pool_flags)(uint64_t gpu, uint64_t size, uint32_t flags);
+void rx_nvn_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
+    if (vk && vk_pool_flags) vk_pool_flags(gpu, size, flags);
+}
+
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
@@ -218,6 +224,7 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
         return NULL;
     }
     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
+    vk_pool_flags = (void (*)(uint64_t, uint64_t, uint32_t))(void *)GetProcAddress(m, "mkwvk_pool_flags");   /* (TICK-015; optional) */
     const MkwVkRenderer *r = init ? init(&vk_host) : NULL;
     if (!r || r->version != MKWVK_API_VERSION) {
         hos_log("rx: the Vulkan back end did not start: WebGPU");
