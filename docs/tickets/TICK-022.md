@@ -1,0 +1,5 @@
+# TICK-022 — Faster lifted guest code on the job chain  · model: Opus
+**Why**: TICK-011: the main thread's work plus its job group is ~8.5 ms a frame (> the 8.3 ms a 120 fps frame allows), as a chain of dependent jobs; the cost is spread across guest code (no function > 6%), so only a lifter-wide gain moves it. Candidates seen: software FMA helpers ~3% of a job thread, A64_POLL / A64_MARK overhead in hot loops, atomics lowering, spin_until_set ~5% of host samples.
+**Goal**: measure and remove lifter-level overhead across the hot code: hardware FMA (the host CPU has FMA3) instead of software helpers where the semantics match (fused, same rounding), cheaper or hoisted poll/mark points in hot loops, cheaper lowering of LSE/LDAPR/PAC patterns, compiler flags for the hot pieces (-O3/-march for the hot set, if the build allows a per-piece flag); verify bit-exact behaviour where it matters (game speed log, screenshots, flash detector).
+**Acceptance**: main thread + job group ms a frame down (crit.py), fps / 1% low up (4 runs + log mean, A/B interleaved), no behaviour change.
+**Branch**: `feature/TICK-022-lifter-speed`
