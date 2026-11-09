@@ -38,5 +38,5 @@ if [ -x "$HERE/bin/hookshot" ]; then
     cd "$HERE"
     exec ./bin/hookshot
 fi
-echo "Hookshot: the game (bin/hookshot) is missing from this folder. Build it again with Hookshot Builder." >&2
+echo "HeyListen: the game (bin/hookshot) is missing from this folder. Build it again with HeyListen Builder." >&2
 exit 1

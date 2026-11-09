@@ -253,13 +253,13 @@ def check_modules(exefs):
                 head = f.read(16)
             if head[:4] != b"NSO0":
                 fail("The file %s in this dump is not a game module (it starts %s). Try another dump of the game, or send this message to the "
-                     "Hookshot developers." % (name, head.hex()))
+                     "HeyListen developers." % (name, head.hex()))
 
 
 def check_supported_build(exefs):
     bid = build_id(os.path.join(exefs, "main"))
     if not bid.startswith(BUILD_ID):
-        fail("This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
+        fail("This is build %s. HeyListen supports build %s." % (bid[:8], BUILD_ID))
 
 
 def check_cache_paths(out, paths):
@@ -288,7 +288,7 @@ def check_cpu():
     from host_cpu import host_march
     m = host_march()
     if m != "x86-64-v3":
-        fail("Your processor has no AVX2 (it runs %s), and the AppImage's renderer needs it. Build Hookshot from source "
+        fail("Your processor has no AVX2 (it runs %s), and the AppImage's renderer needs it. Build HeyListen from source "
              "instead (see the readme): a source build follows your processor." % m)
 
 
@@ -305,9 +305,9 @@ def check(a, work):
     else:
         bid = build_id(os.path.join(a.exefs, "main"))
     if bid.startswith(BUILD_ID):
-        say("check", "ok", "This is the version Hookshot supports (build %s)." % bid[:8])
+        say("check", "ok", "This is the version HeyListen supports (build %s)." % bid[:8])
     else:
-        say("check", "bad", "This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
+        say("check", "bad", "This is build %s. HeyListen supports build %s." % (bid[:8], BUILD_ID))
 
 
 def visual_studio_environment():
@@ -410,7 +410,7 @@ def check_linux_compiler():
     import toolchain
     cc = toolchain.find("clang")
     if not os.path.isfile(cc):
-        fail("No C compiler was found. Install clang (and lld), or use the Hookshot AppImage, which brings its own.")
+        fail("No C compiler was found. Install clang (and lld), or use the HeyListen AppImage, which brings its own.")
     sysroot = os.environ.get("HOOKSHOT_SYSROOT")
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "t.c")
@@ -473,7 +473,7 @@ def bundled_mingw():
             missing = [n for n in ("clang.exe", "clang++.exe", "ld.lld.exe")
                        if not os.path.isfile(os.path.join(here, "bin", n))]
             fail("Files of the builder's own compiler are missing (%s in %s). Your antivirus most likely removed them "
-                 "(a false alarm on unsigned programs): restore them from its quarantine or allow the Hookshot Builder folder, "
+                 "(a false alarm on unsigned programs): restore them from its quarantine or allow the HeyListen Builder folder, "
                  "then unzip HookshotBuilder.zip again and build. Visual Studio is not needed."
                  % (", ".join(missing) or "bin", os.path.join(here, "bin")))
     return os.environ.get("HOOKSHOT_MINGW", "")
@@ -486,7 +486,7 @@ def check_mingw():
     cc = toolchain.find("clang")   # (HOOKSHOT_MINGW's, else the one toolchain.py finds: the same as the build uses)
     if not os.path.isfile(cc):   # (HOOKSHOT_MINGW set to a folder without the compiler: said here, not as a silent SystemExit)
         fail("The builder's own compiler was not found at %s. Set HOOKSHOT_MINGW to an llvm-mingw folder, or unpack the "
-             "Hookshot Builder zip again into a folder your antivirus allows." % cc)
+             "HeyListen Builder zip again into a folder your antivirus allows." % cc)
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "t.c")
         with open(src, "w") as f:
@@ -912,7 +912,7 @@ def main(a=None):
     if a.update:
         if not os.path.isdir(kept) or not os.path.isdir(romfs):
             fail("This game folder has no copy of the game files to update from: it was built before updates came in. Choose your game files "
-                 "in Hookshot Builder and build into the same folder once; updates after that work by themselves.")
+                 "in HeyListen Builder and build into the same folder once; updates after that work by themselves.")
         check_cache_paths(out, (kept, romfs))
         shutil.copytree(kept, exefs)
         check_modules(exefs)
@@ -1084,7 +1084,7 @@ def main(a=None):
         try:
             os.replace(dst + ".new", dst)   # (linux: a running copy keeps its own file; windows: a running exe cannot be replaced)
         except PermissionError:
-            fail("Could not replace %s. Close any running copy of Hookshot and check that the file and folder are writable, then retry. "
+            fail("Could not replace %s. Close any running copy of HeyListen and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
     if launcher:   # (a folder built before the launcher: its libraries left the folder for bin\; hookshot is the launcher now)
         stale = [] if LINUX else sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
@@ -1158,7 +1158,7 @@ def cli():
             import traceback
             print(traceback.format_exc(), flush=True)
             say("error", "The builder stopped on an error it did not expect: %s: %s. Please send the text under Show details to the "
-                "Hookshot issues page." % (type(e).__name__, str(e)[:300]))
+                "HeyListen issues page." % (type(e).__name__, str(e)[:300]))
             sys.exit(1)
 
 

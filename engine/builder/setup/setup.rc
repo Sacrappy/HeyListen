@@ -1,4 +1,4 @@
-1 ICON "hookshot.ico"
+1 ICON "heylisten.ico"
 1 24 "setup.manifest"
 1 VERSIONINFO
 FILEVERSION 1,0,0,0
@@ -8,11 +8,11 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "CompanyName", "Hookshot"
-      VALUE "FileDescription", "Hookshot Builder setup"
-      VALUE "ProductName", "Hookshot Builder"
+      VALUE "CompanyName", "HeyListen"
+      VALUE "FileDescription", "HeyListen Builder setup"
+      VALUE "ProductName", "HeyListen Builder"
       VALUE "FileVersion", "1.0.0"
-      VALUE "OriginalFilename", "HookshotBuilder-Setup.exe"
+      VALUE "OriginalFilename", "HeyListenBuilder.exe"
     END
   END
   BLOCK "VarFileInfo"

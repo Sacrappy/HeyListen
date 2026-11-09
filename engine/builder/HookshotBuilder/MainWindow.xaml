@@ -1,7 +1,7 @@
 <Window x:Class="HookshotBuilder.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Hookshot" Width="960" Height="600" ResizeMode="CanMinimize"
+        Title="HeyListen" Width="960" Height="600" ResizeMode="CanMinimize"
         WindowStartupLocation="CenterScreen" Background="Transparent" AllowDrop="True"
         UseLayoutRounding="True" SnapsToDevicePixels="True" FontFamily="{StaticResource Ui}">
 
@@ -32,7 +32,7 @@
             </Ellipse.Fill>
             <Ellipse.RenderTransform><ScaleTransform x:Name="HaloScale"/></Ellipse.RenderTransform>
           </Ellipse>
-          <Image Source="pack://application:,,,/Images/hookshot.png" Width="178" RenderTransformOrigin="0.5,0.5" RenderOptions.BitmapScalingMode="HighQuality">
+          <Image Source="pack://application:,,,/Images/heylisten.png" Width="178" RenderTransformOrigin="0.5,0.5" RenderOptions.BitmapScalingMode="HighQuality">
             <Image.RenderTransform>
               <TransformGroup>
                 <RotateTransform x:Name="BobTurn"/>
@@ -42,7 +42,8 @@
             <Image.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="14" Direction="270" Opacity="0.6" Color="Black"/></Image.Effect>
           </Image>
         </Grid>
-        <TextBlock Text="Hookshot" FontSize="22" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,16,0,0"/>
+        <TextBlock Text="HeyListen" FontSize="22" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,16,0,0"/>
+        <TextBlock Text="A fork of Hookshot by NotRexed and its contributors · GPL-3.0" FontSize="11" Foreground="#80FFFFFF" HorizontalAlignment="Center" Margin="0,2,0,0"/>
         <TextBlock x:Name="SplashText" Text="Starting…" FontSize="13" Foreground="#A6FFFFFF" HorizontalAlignment="Center" Margin="0,6,0,0" MinHeight="20"/>
         <Border Width="200" Height="3" CornerRadius="1.5" Background="#14FFFFFF" Margin="0,16,0,0" ClipToBounds="True">
           <Border Width="80" HorizontalAlignment="Left" CornerRadius="1.5">
@@ -69,10 +70,10 @@
 
       <!-- the head: the hookshot, and the steps (or the update's versions) -->
       <StackPanel Orientation="Horizontal" Margin="28,0,0,0" VerticalAlignment="Center">
-        <Image Source="pack://application:,,,/Images/hookshot.png" Width="28" RenderOptions.BitmapScalingMode="HighQuality">
+        <Image Source="pack://application:,,,/Images/heylisten.png" Width="28" RenderOptions.BitmapScalingMode="HighQuality">
           <Image.Effect><DropShadowEffect BlurRadius="6" ShadowDepth="2" Direction="270" Opacity="0.5" Color="Black"/></Image.Effect>
         </Image>
-        <TextBlock Text="Hookshot" FontSize="15" FontWeight="Bold" Margin="10,0,0,0" VerticalAlignment="Center"/>
+        <TextBlock Text="HeyListen" FontSize="15" FontWeight="Bold" Margin="10,0,0,0" VerticalAlignment="Center"/>
         <Border x:Name="VersionChip" Margin="12,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
           <TextBlock x:Name="VersionChipText" FontSize="12" Foreground="{StaticResource InkSoft}" VerticalAlignment="Center"/>
         </Border>
@@ -104,7 +105,7 @@
           </Grid.RowDefinitions>
           <StackPanel>
             <TextBlock x:Name="FilesTitle" Style="{StaticResource Heading}" Text="Build your game"/>
-            <TextBlock x:Name="FilesSub" Style="{StaticResource Sub}" Text="Pick your game files and where the game goes. Hookshot does the rest, once."/>
+            <TextBlock x:Name="FilesSub" Style="{StaticResource Sub}" Text="Pick your game files and where the game goes. HeyListen does the rest, once."/>
           </StackPanel>
 
           <StackPanel Grid.Row="1">
@@ -249,6 +250,11 @@
             <CheckBox x:Name="DesktopTick" Style="{StaticResource Tick}" Content="Desktop shortcut" IsChecked="True" Click="ShortcutsChanged"/>
             <CheckBox x:Name="StartTick" Style="{StaticResource Tick}" Content="Start menu entry" IsChecked="True" Margin="18,0,0,0" Click="ShortcutsChanged"/>
           </StackPanel>
+          <!-- (HeyListen) saves to and from an emulator: Saves.cs, upstream's scripts/oot_saves.py -->
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,18,0,0">
+            <Button Style="{StaticResource LinkButton}" Content="Import saves from an emulator" Click="ImportSavesDone"/>
+            <Button Style="{StaticResource LinkButton}" Content="Export saves" Margin="18,0,0,0" Click="ExportSavesDone"/>
+          </StackPanel>
           <!-- what the builder keeps on this PC for quick updates (Storage.cs), and letting it go -->
           <StackPanel x:Name="StorageRow" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,26,0,0" MaxWidth="560">
             <TextBlock x:Name="StorageNote" Style="{StaticResource Note}" TextAlignment="Center" TextWrapping="Wrap"/>
@@ -259,7 +265,7 @@
           </StackPanel>
         </StackPanel>
 
-        <!-- ===== the launcher (Hookshot Launcher.exe in the game folder, started with launch and its folder) ===== -->
+        <!-- ===== the launcher (HeyListen Launcher.exe in the game folder, started with launch and its folder) ===== -->
         <StackPanel x:Name="LaunchPage" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center">
           <TextBlock Style="{StaticResource Label}" Text="THE LEGEND OF ZELDA" HorizontalAlignment="Center"/>
           <TextBlock Style="{StaticResource Heading}" Text="Ocarina of Time" HorizontalAlignment="Center" FontSize="34" Margin="0,4,0,0"/>
@@ -278,6 +284,10 @@
           </StackPanel>
           <Button x:Name="LaunchFolder" Style="{StaticResource LinkButton}" Foreground="{StaticResource InkFaint}" HorizontalAlignment="Center"
                   Margin="0,22,0,0" Content="Open the game folder" Click="LaunchFolderClick"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,10,0,0">
+            <Button Style="{StaticResource LinkButton}" Foreground="{StaticResource InkFaint}" Content="Import saves from an emulator" Click="ImportSavesLaunch"/>
+            <Button Style="{StaticResource LinkButton}" Foreground="{StaticResource InkFaint}" Content="Export saves" Margin="18,0,0,0" Click="ExportSavesLaunch"/>
+          </StackPanel>
         </StackPanel>
 
         <!-- ===== when something goes wrong ===== -->

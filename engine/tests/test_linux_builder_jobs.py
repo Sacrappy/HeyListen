@@ -141,7 +141,7 @@ class BuilderBuildJobsTests(unittest.TestCase):
         self.assertFalse(hasattr(harness.gui, "proc"))
         self.assertEqual(len(harness.events), 1)
         kind, title, message = harness.events[0]
-        self.assertEqual((kind, title), ("error", "Hookshot"))
+        self.assertEqual((kind, title), ("error", "HeyListen"))
         self.assertIn("HOOKSHOT_JOBS", message)
         self.assertIn("0 for automatic", message)
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": raw, "RX_JOBS": "2"})

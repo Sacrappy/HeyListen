@@ -158,7 +158,7 @@ sealed class Runner
             {
                 if (lastError != null && lastError.Contains("Microsoft Store", StringComparison.OrdinalIgnoreCase))
                     return (false, "Python 3 was not found: the 'python' command on this PC is the Microsoft Store shortcut, which only opens " +
-                                   "the Store. Install Python 3 from python.org (not the Store version), or use the full Hookshot Builder package.");
+                                   "the Store. Install Python 3 from python.org (not the Store version), or use the full HeyListen Builder package.");
                 return (false, lastError ?? "The game tools stopped without saying why (exit code " + p.ExitCode + ").");
             }
             return result;
@@ -169,7 +169,7 @@ sealed class Runner
             if (tools.Python == "python" && Directory.Exists(Path.Combine(tools.Root, "python")))
                 return (false, "The builder's own Python (tools/python/python.exe) is missing. Your antivirus probably removed it: restore it " +
                                "from quarantine, or unpack the zip again into a folder your antivirus allows, then try again.");
-            return (false, "Python 3 was not found. Install it from python.org (not the Microsoft Store build), or use the full Hookshot Builder package.");
+            return (false, "Python 3 was not found. Install it from python.org (not the Microsoft Store build), or use the full HeyListen Builder package.");
         }
     }
 }

@@ -40,13 +40,13 @@ if [ -z "$folder" ]; then
 fi
 
 if ! ready "$folder"; then
-    echo "Hookshot: no built game to start. Build one with Hookshot Builder, or pass its folder." >&2
+    echo "HeyListen: no built game to start. Build one with HeyListen Builder, or pass its folder." >&2
     # (HOOKSHOT_LAUNCH_CONFIG is a test: it must not open a dialog)
     if [ -z "${HOOKSHOT_LAUNCH_CONFIG:-}" ]; then
         if command -v zenity >/dev/null 2>&1; then
-            zenity --error --title=Hookshot --text="No built game to start. Build one with Hookshot Builder first." || true
+            zenity --error --title=Hookshot --text="No built game to start. Build one with HeyListen Builder first." || true
         elif command -v kdialog >/dev/null 2>&1; then
-            kdialog --error "No built game to start. Build one with Hookshot Builder first." || true
+            kdialog --error "No built game to start. Build one with HeyListen Builder first." || true
         fi
     fi
     exit 1

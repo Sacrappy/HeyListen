@@ -6,13 +6,15 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>HookshotBuilder</AssemblyName>
+    <AssemblyName>HeyListenBuilder</AssemblyName>
     <RootNamespace>HookshotBuilder</RootNamespace>
     <Version>0.1.0</Version>
-    <Product>Hookshot Builder</Product>
+    <Product>HeyListen Builder</Product>
+    <Company>HeyListen (a fork of Hookshot)</Company>
+    <Copyright>GPL-3.0-or-later. HeyListen is a fork of Hookshot by NotRexed</Copyright>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <ApplicationIcon Condition="Exists('..\..\work\hookshot.ico')">..\..\work\hookshot.ico</ApplicationIcon>
+    <ApplicationIcon>..\..\assets\heylisten.ico</ApplicationIcon>
   </PropertyGroup>
 
   <!-- Needs nothing installed: dotnet publish -c Release. A folder (the app and .NET's own signed files), not one compressed exe:
@@ -24,7 +26,7 @@
     <DebugType>none</DebugType>
   </PropertyGroup>
 
-  <!-- Inter (SIL Open Font License, Fonts/Inter-LICENSE.txt) and the hookshot, inside the app -->
+  <!-- Inter (SIL Open Font License, Fonts/Inter-LICENSE.txt) and the HeyListen icon, inside the app -->
   <ItemGroup>
     <Resource Include="Fonts\*.ttf" />
     <Resource Include="Images\hookshot.png" />

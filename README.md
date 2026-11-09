@@ -18,6 +18,10 @@ See [docs/BENCHMARK_ANALYSIS.md](docs/BENCHMARK_ANALYSIS.md) and [docs/tickets/]
 - `tools/` — worker (opencode) orchestration, REA/Ghidra scripts
 - `references/` — manifest of the comparison repos and builds (kept in place, not committed)
 
+## Playing it
+
+Users: [docs/USER_GUIDE.md](docs/USER_GUIDE.md) (the HeyListen Builder from the [releases](https://github.com/Sacrappy/HeyListen/releases) builds the game from your own `.nup`). Maintainers: `tools/release/make_release.ps1 -Tag vX.Y.Z` makes the release assets (see the script's header); the icon is `engine/assets/heylisten.svg` (original art, drawn by `tools/release/make_icon.py`).
+
 ## License
 
 GPL-3.0-or-later (see [LICENSE](LICENSE)). HeyListen is a fork of [Hookshot](https://github.com/NotRexed/Hookshot) (GPL-3.0), which lives in `engine/` with its history; its lifter is derived from suyu (GPL-2.0-or-later) and its Vulkan back end contains Eden code (GPL-3.0). Third-party sources and their licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). See [docs/adr/0001-license.md](docs/adr/0001-license.md).

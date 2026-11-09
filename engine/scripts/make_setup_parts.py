@@ -1,4 +1,7 @@
-"""The parts HookshotBuilder-Setup.exe downloads (builder/setup/setup.c), from a Hookshot Builder package folder.
+"""(HeyListen: the setup is released as HeyListenBuilder.exe, its list is heylisten-setup.txt, its new parts
+HeyListenBuilder-<part>-<sha>.zip; parts reused from upstream keep their names and URLs.)
+
+The parts HookshotBuilder-Setup.exe downloads (builder/setup/setup.c), from a Hookshot Builder package folder.
 
     python -I scripts/make_setup_parts.py <package folder> <tag> <out folder> [--base <url the parts are served from>]
                                           [--reuse <an earlier release's hookshot-setup.txt>]
@@ -24,6 +27,8 @@ import zipfile
 
 SKIP_EXT = {".ps1", ".psm1", ".bat", ".cmd", ".js", ".vbs", ".html", ".htm", ".hta", ".wsf", ".pyc"}
 SKIP_DIRS = {"__pycache__"}
+LIST_NAME = "heylisten-setup.txt"                        # (HeyListen; upstream: hookshot-setup.txt)
+PART_PREFIXES = ("HeyListenBuilder-", "HookshotBuilder-")
 TOOLS_PARTS = ("python", "emsdk", "cpm", "third_party", "wgpu-native")   # (tools/<name>: each its own part)
 LLVM = ("552191b5754c49a5a20723276a6fc56541ea1922c4c50b7b669022333fc1b40f", 191037046,
         "llvm-mingw-20261104-ucrt-x86_64",
@@ -66,18 +71,18 @@ def main():
     p.add_argument("--reuse", help="an earlier hookshot-setup.txt: the parts the package has no folder for, from it")
     a = p.parse_args()
     root = os.path.abspath(a.package)
-    if not os.path.isfile(os.path.join(root, "HookshotBuilder.exe")):
-        sys.exit("not a Hookshot Builder package folder: %s" % root)
+    if not os.path.isfile(os.path.join(root, "HeyListenBuilder.exe")):
+        sys.exit("not a HeyListen Builder package folder: %s" % root)
     # (the parts live in one release of their own, named by their checksum: a part that did not change is not uploaded again, and a
     # release itself holds only HookshotBuilder.exe (the setup) and the list it reads)
-    base = (a.base or "https://github.com/NotRexed/Hookshot/releases/download/builder-parts").rstrip("/")
+    base = (a.base or "https://github.com/Sacrappy/HeyListen/releases/download/builder-parts").rstrip("/")
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(root, "tools", "version.txt"), "w", newline="\n") as f:
         f.write(a.tag + "\n")
 
     top = sorted(os.listdir(root))
     builder_files = [n for n in top if os.path.isfile(os.path.join(root, n)) and
-                     (n.startswith("HookshotBuilder") or n in ("LICENSE", "README.txt"))]   # (HookshotBuilder-Setup.exe too: Repair runs it)
+                     (n.startswith(("HookshotBuilder", "HeyListenBuilder")) or n in ("LICENSE", "README.txt"))]   # (HookshotBuilder-Setup.exe too: Repair runs it)
     runtime_files = [n for n in top if os.path.isfile(os.path.join(root, n)) and n not in builder_files]
     runtime_dirs = [n for n in top if os.path.isdir(os.path.join(root, n)) and n != "tools"]
     tools = sorted(os.listdir(os.path.join(root, "tools")))
@@ -94,8 +99,11 @@ def main():
         with open(a.reuse, encoding="utf-8") as f:
             for line in f.read().splitlines():
                 w = line.split()
-                if len(w) == 7 and w[0] == "part" and w[6].rsplit("/", 1)[-1].startswith("HookshotBuilder-"):
-                    reuse[w[6].rsplit("/", 1)[-1][len("HookshotBuilder-"):].rsplit("-", 1)[0]] = line
+                # (HeyListen: an upstream Hookshot list names its parts HookshotBuilder-*, ours HeyListenBuilder-*)
+                fn = w[6].rsplit("/", 1)[-1] if len(w) == 7 else ""
+                prefix = next((x for x in PART_PREFIXES if fn.startswith(x)), None)
+                if w and w[0] == "part" and prefix:
+                    reuse[fn[len(prefix):].rsplit("-", 1)[0]] = line
     lines = ["tag %s" % a.tag]
     for name in ("app", "dotnet") + TOOLS_PARTS:
         if not parts.get(name):
@@ -105,16 +113,16 @@ def main():
                 lines.append(reuse[name])
                 print("%-12s (as in %s)" % (name, os.path.basename(a.reuse)), flush=True)
             continue
-        zp = os.path.join(a.out, "HookshotBuilder-%s.zip" % name)
+        zp = os.path.join(a.out, "HeyListenBuilder-%s.zip" % name)
         sha, size = write_zip(zp, root, parts[name])
-        named = os.path.join(a.out, "HookshotBuilder-%s-%s.zip" % (name, sha[:12]))
+        named = os.path.join(a.out, "HeyListenBuilder-%s-%s.zip" % (name, sha[:12]))
         os.replace(zp, named)
         zp = named
         lines.append("part %s %d . - - %s/%s" % (sha, size, base, os.path.basename(zp)))
         print("%-12s %5d files %5d MB  %s" % (name, len(parts[name]), size >> 20, sha[:16]), flush=True)
     lines.append("part %s %d HookshotBuilder/tools %s llvm-mingw %s" % LLVM)
-    lines.append("run HookshotBuilder/HookshotBuilder.exe")
-    with open(os.path.join(a.out, "hookshot-setup.txt"), "w", newline="\n") as f:
+    lines.append("run HookshotBuilder/HeyListenBuilder.exe")   # (the package folder keeps upstream's name: setup.c, Updater.cs)
+    with open(os.path.join(a.out, LIST_NAME), "w", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
 
 

@@ -1230,12 +1230,12 @@ DWORD GetWindowThreadProcessId(HWND w, DWORD *pid) {
 }
 int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type) {
     (void)w, (void)type;
-    fprintf(stderr, "%s: %s\n", caption ? caption : "Hookshot", text ? text : "");
+    fprintf(stderr, "%s: %s\n", caption ? caption : "HeyListen", text ? text : "");
     typedef int (*ShowFn)(uint32_t, const char *, const char *, void *);   /* (SDL3's and SDL2's alike; its result unread) */
     void *sdl = dlopen("libSDL3.so.0", RTLD_NOW | RTLD_NOLOAD);
     if (!sdl) sdl = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_NOLOAD);
     ShowFn show = sdl ? (ShowFn)dlsym(sdl, "SDL_ShowSimpleMessageBox") : NULL;
-    if (show) show(0x10, caption ? caption : "Hookshot", text ? text : "", NULL);
+    if (show) show(0x10, caption ? caption : "HeyListen", text ? text : "", NULL);
     return 1;
 }
 

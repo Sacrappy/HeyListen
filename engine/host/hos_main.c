@@ -333,7 +333,7 @@ static const char *saves_dir(const char *beside) {
         snprintf(note, sizeof note, "%.*s" SEP_S "saves-moved.txt", sep ? (int)(sep - beside) : 0, beside);
         FILE *f = fopen(note, "w");
         if (f) {
-            fprintf(f, "Hookshot's saves are now in\n%s\n\nThey moved there from the user folder that was here.\n", dir);
+            fprintf(f, "HeyListen's saves are now in\n%s\n\nThey moved there from the user folder that was here.\n", dir);
             fclose(f);
         }
         hos_log("saves: moved from %s to %s", beside, dir);
