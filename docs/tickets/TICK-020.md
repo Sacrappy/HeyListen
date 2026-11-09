@@ -1,0 +1,5 @@
+# TICK-020 — Full GPU timeline with Nsight Systems  · model: Opus
+**Why**: in-engine timestamps cover ~9.8 ms of GPU work a frame while a frame is ~13.6 ms with the GPU ~74% busy; under CPU/GPU overlap ~5 ms of GPU-busy time a frame is in no timed command buffer (TICK-017). TICK-019 ruled out GPU reads of host memory. Nsight Systems 2025.5.2 and Nsight Compute 2025.4.1 are installed (C:\Program Files\NVIDIA Corporation\).
+**Goal**: capture a Hyrule Field gameplay window with `nsys profile` (Vulkan API trace, WDDM queue/residency, GPU metrics sampling, OS runtime) and account for the whole frame on the GPU and on the CPU threads: queue submissions and gaps, the present path, WDDM paging/residency, copy vs graphics queue use, idle bubbles and what CPU event each waits for. Compare serial default vs RX_VK_CAPTURE_DEFER=1. Then fix the largest engine-side cause found (or write precisely what is game work).
+**Acceptance**: a frame budget table (CPU threads and GPU, ms) explaining 13.6 ms; the largest engine cost addressed with fps/1% low before/after, picture and speed checks.
+**Branch**: `feature/TICK-020-nsight`
