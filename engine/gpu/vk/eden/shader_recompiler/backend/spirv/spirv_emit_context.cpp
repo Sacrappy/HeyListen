@@ -1346,7 +1346,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // fuller buffer search, NVIDIA's compiler took 41 s on 53caac5f and the driver reset. Lichii PR 408 found the same (161 s for 68 programs)
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, spv::FunctionControlMask::DontInline, function_type)};
+        // (#994, the floating trees) the task and mesh stages' load helpers are inlined (EDEN_NX2_GM_INLINE=0: not; an EDEN_
+        // switch, so in the program cache's stamp). Not inlined, NVIDIA's compiler (RTX 3070, Windows) gave OoT's tree task
+        // 3cb76827 a wrong address for its third load: n = load(file + 4), code = load(cells[e]), then
+        // load(file + (n + 9 + e) * 4) went to file + (code + 9 + e) * 4, the second call's result in place of the first's,
+        // though the SPIR-V names the first. That load, the cell's end in the placement file's prefix sums, read 0 outside
+        // every buffer, and min(end - start, 256) made every visible cell 256 trees, the next cells' trees drawn in its place:
+        // the wall of trees in the sky. The culling's compute programs, with hundreds of global loads, keep the helper
+        // (NVIDIA took 41 s on one inlined, above)
+        static const bool gm_inline{!getenv("EDEN_NX2_GM_INLINE") || getenv("EDEN_NX2_GM_INLINE")[0] != '0'};
+        const bool inline_here{gm_inline && (stage == Stage::Task || stage == Stage::Mesh)};
+        const Id func_id{OpFunction(type, inline_here ? spv::FunctionControlMask::Inline : spv::FunctionControlMask::DontInline,
+                                    function_type)};
         const Id addr{OpFunctionParameter(U64)};
         define_body(ssbo_member, addr, element_pointer, shift,
                     [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
