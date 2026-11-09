@@ -4718,10 +4718,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         pe = graphics_pipeline(p, s, at, topo);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
-        // (TICK-008) A pipeline still being built is never waited for, whatever the targets: the draw is left out of the frame. Into
-        // targets made this frame the picture lacks it for a frame (counted: st_pipe_fresh_skips). RX_VK_PIPE_WAIT_FRESH=1: those
-        // draws wait, as before (RX_VK_PIPE_SKIP=0: every draw waits)
-        static const bool wait_fresh = getenv("RX_VK_PIPE_WAIT_FRESH") != nullptr;
+        // (TICK-008) A pipeline still being built: the draw is left out of the frame, except into targets made this frame (a shadow
+        // map, a new effect target), which wait as before so the picture never lacks it (user's choice, 2026-11-09: no flicker on a
+        // first visit). RX_VK_PIPE_WAIT_FRESH=0: those are left out too (counted: st_pipe_fresh_skips); RX_VK_PIPE_SKIP=0: every draw waits
+        static const bool wait_fresh = !getenv("RX_VK_PIPE_WAIT_FRESH") || strcmp(getenv("RX_VK_PIPE_WAIT_FRESH"), "0") != 0;
         if (may_skip || !(always_wait || wait_fresh)) {
             st_pending_skips++;
             if (!may_skip) st_pipe_fresh_skips.fetch_add(1, std::memory_order_relaxed);
