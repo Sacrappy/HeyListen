@@ -513,6 +513,7 @@ uint64_t memory_guest_pages() {
         return 0;
     }
     std::memset(mapped, 0, bytes);
+    log_alloc_where("page table of guest memory (read by shaders following pointers)", a);
     VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     da.buffer = b;
     guest_pages_address = vkGetBufferDeviceAddress(dev.device, &da);
@@ -857,8 +858,11 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     }
     size = cap_buf_size(need);
     map = nullptr;
-    return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
-                                size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
+    const bool ok = create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
+                                         size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
+    static int logged;   // (TICK-019: the mirror syncs copy from these)
+    if (ok && logged++ < 1) log_alloc_where("a capture buffer (the mirror syncs' source)", alloc);
+    return ok;
 }
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
 std::mutex cap_ranges_mu;
@@ -1928,6 +1932,7 @@ constexpr uint64_t kLazyWarm = 600;
 std::atomic<uint64_t> nvn_pools_gen{1};   // (bumped when a pool is made: lazy_cpu_page's cache)
 int64_t st_lazy_bytes = 0, st_lazy_late = 0, st_lazy_cpu = 0, st_lazy_pools = 0;
 std::atomic<int64_t> st_lazy_direct{0};
+std::atomic<int64_t> st_direct_fast{0}, st_direct_fast_bytes{0};   // (TICK-019: guest-memory binds on the lock-free path, not in direct_by_pool)
 int64_t st_kept_by[6];   // (bytes written back, by why: 0 no game pool, 1 read, 2 written by the CPU, 3 uncached, 4 warming, 5 texture)   // (bindings without the lock too)
 bool wb_lazy_on() {
     static const bool v = !getenv("RX_VK_WB_EAGER") || getenv("RX_VK_WB_EAGER")[0] == '0';
@@ -2223,6 +2228,7 @@ void mirror_sync(Pool& p) {
 }
 
 } // namespace
+std::atomic<int64_t> st_import_texel_views{0}, st_import_texel_bytes{0}, st_import_unswizzle_bytes{0};
 
 // ---- (from PR 430, YunaraDebugs) Readback pages: GPU results the CPU reads (invalidate) and then writes, as OoT's exposure meter (a
 // sum the GPU adds into each frame; the CPU reads it and stores 0 back). On the console the GPU adds into that memory as it is when
@@ -2460,6 +2466,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
         if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) {
             if (p->lazy_held) st_lazy_direct.fetch_add(1, std::memory_order_relaxed);   // (a diagnostic: guest memory without the GPU writes left in the mirror)
+            if (mirror_on()) st_direct_fast.fetch_add(1, std::memory_order_relaxed), st_direct_fast_bytes.fetch_add((int64_t)size, std::memory_order_relaxed);
             return remember({p->buffer, off, size, 0});
         }
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
@@ -2917,6 +2924,15 @@ void memory_end_submission(VkCommandBuffer cmd) {
                      "%.1f MB in all, a range counted once a submit): %s", all / 1048576.0, ds.c_str());
             }
             direct_by_pool.clear(), direct_bytes_by_pool.clear();
+            {   // (TICK-019) what else the GPU reads in imported guest memory, not through a mirror
+                static int64_t l_fast, l_fastb, l_tv, l_tvb, l_un;
+                const int64_t f = st_direct_fast.load(), fb = st_direct_fast_bytes.load(), tv = st_import_texel_views.load(),
+                              tvb = st_import_texel_bytes.load(), un = st_import_unswizzle_bytes.load();
+                logf("vk: GPU reads of imported guest memory (600 submits, a submit): binds on the lock-free path %.1f (%.2f MB), texel buffer "
+                     "views %.1f (%.2f MB), GPU unswizzles %.2f MB; mirrors %llu MB", (f - l_fast) / 600.0, (fb - l_fastb) / 600.0 / 1048576,
+                     (tv - l_tv) / 600.0, (tvb - l_tvb) / 600.0 / 1048576, (un - l_un) / 600.0 / 1048576, (unsigned long long)(mirror_bytes >> 20));
+                l_fast = f, l_fastb = fb, l_tv = tv, l_tvb = tvb, l_un = un;
+            }
             if (wb_lazy_on()) {
                 static int64_t l_lazy, l_wb;
                 logf("vk: write-backs (600 submits): %.1f MB a submit copied, %.1f MB left in the mirrors (pools the CPU does not "
