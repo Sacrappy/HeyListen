@@ -521,3 +521,90 @@ TICK-015/016); screenshots every 1200 presents: lighting, fog, grass and HUD as 
 Not verified: other scenes (a pool over the mirrors' budget, or Kokiri, could still be read over PCIe: the new log line would show it),
 other GPUs (a card without ReBAR puts the page table and the streams in system memory: `log_alloc_where` says where), the RX_VK_MIRROR=0
 A/B (not run: with every pool mirrored there was nothing to compare against), Nsight.
+
+## TICK-020: the whole frame in Nsight Systems (2026-11-09)
+
+**Result: the 13.6 ms are accounted for. One Vulkan queue; the GPU is busy ~11 ms of a frame and idle ~4 ms, and every idle bubble
+is the GPU waiting for the CPU to submit (none waits on a semaphore, the present or untimed work). The "untimed" GPU time of
+TICK-016/017 is draw work: Nsight's per-workload timing does not split render passes, the in-engine timestamps do. The CPU side is
+bound by the game's own threads plus one GPU drain a frame. The engine-side change tried (segments of the parallel replay in even
+rounds) shortened the replay's recording wait but did not move the frame rate: not kept.** `hyrule-walk`, limit 120, RTX 5070.
+
+How it was captured (Nsight Systems 2025.5.2 CLI, 12 s from 82 s after launch, the bench's environment):
+`nsys profile --trace=vulkan,nvtx --vulkan-gpu-workload=individual --delay=82 --duration=12 --kill=true`. Without administrator
+rights nsys cannot register its Vulkan layer (it writes HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers: "Failed to write to
+registry", seen with an nvlog.config): no Vulkan event is collected. Passing its folder through `VK_ADD_IMPLICIT_LAYER_PATH`
+loads both of its manifests (the plain and the system-wide one, same DLL) and crashes in vkCreateInstance; a folder holding only
+`VkLayer_nsight-sys_windows.json` with an absolute `library_path`, plus `ENABLE_VK_LAYER_NV_nsight_sys=1`, both given with
+`--env-var`, works (545k events). Not available without administrator rights: WDDM trace (queue packets, paging/residency, the
+present's blit and DWM), GPU metrics (ERR_NVGPUCTRPERM), CPU sampling and context switches. CPU stacks came from the engine's
+own sampler instead (`HOS_PROFILE=5 HOS_SAMPLE_ALL`, 12 s of the same walk, `scripts/crit.py`).
+Under nsys the game ran at 66.4 fps (15.05 ms; ~73 without): read the shares.
+
+GPU, a frame (default, nsys 15.05 ms; in-engine split from `RX_VK_PASS_TIMING=1` in the same walk, inflated by its timestamps):
+
+| | ms | what |
+|---|---:|---|
+| queues | | one queue (the graphics+compute family's single queue); no copy or async-compute queue; 31 submissions a frame |
+| GPU busy (union of submissions) | 10.97 | = nvidia-smi's ~74% |
+| - replay submissions 0.3-2.5 ms | 6.12 | the game's passes and dispatches, segments of the parallel replay |
+| - one long replay submission (~4.2 ms, once a frame) | 3.20 | render passes (the 2048x1152 scene passes); Nsight times only its non-draw items (~10 us) |
+| - small replay submissions | 1.07 | |
+| - submissions with no vkQueueSubmit2 of the app (empty, ~3 us each) | 0.53 | |
+| - the main thread's memory-work submits | 0.05 | 2 a frame, ~22 us each |
+| in-engine: passes / dispatches | 5.06 / 1.82 | game |
+| in-engine: msync / wb / rbrefresh | 1.30 / 0.43 / 0.43 | engine (copies, TICK-015/016) |
+| in-engine: barriers | 0.58 | game 0.24, engine 0.34 |
+| present | ~0.02 GPU, 0.18 CPU | the f.done submit before vkQueuePresentKHR; the blit itself is not visible without the WDDM trace |
+| GPU idle | 4.08 | |
+| - waiting for a Presentation-thread submit | 2.11 | 4.5 gaps a frame (0.55 ms of them in gaps over 1 ms) |
+| - waiting for a main-thread submit | 1.58 | 1.7 gaps a frame, mostly the one after the drain (below) |
+| - work already submitted, GPU not running it | 0.07 | 17 gaps a frame under 10 us: no semaphore or present bubble |
+
+The frame's shape (one frame of the capture): the GPU runs the long submission and the present's submit; the main thread waits in
+the capture wait (vkWaitSemaphores, 1.8 ms a frame under nsys) until the GPU has finished everything up to the frame's last
+submission; the GPU then has nothing until the main thread's memory-work submits (~1.3 ms later) and the Presentation thread's first
+big segment (~3.2 ms after the drain). Every frame the GPU drains, then waits for the CPU, then the CPU waits for the GPU.
+
+CPU, a frame (HOS_SAMPLE_ALL, 2877 instants of 2 ms, unprofiled 13.6 ms frame; nsys for the Vulkan calls):
+
+| thread | running | blocked in |
+|---|---:|---|
+| sead::MainThread | 22% (3.0 ms) | the game's WaitLightEvent for its job threads (f_8007fe60) 43% (5.8 ms); the capture wait for the GPU (f_806668b0) 20% (2.7 ms); other game waits and SleepThread 9% |
+| Presentation Thread | 16% (2.2 ms; vkQueueSubmit2 0.48, vkQueuePresentKHR 0.18) | the parallel replay waiting for its workers (run_submit) 23% (3.1 ms); idle in ReceiveLightMessageQueue 47% |
+| replay workers (4) | ~1 ms a frame of Vulkan calls in all (vkCmdBindPipeline 0.48) | idle otherwise; while the Presentation thread waits for them ~1 of 4 records, the others idle |
+| game job threads (BaseProcExecutor0-5, ModuleSystemWorker1-5) | 13-27% each | game |
+
+23% of instants no game thread runs: the main thread is then in the capture wait (70%) and the engine's threads are idle: the
+GPU-bound part of the frame (~3 ms). The rest of the frame the game's own threads run (game CPU work ~10 ms).
+
+RX_VK_CAPTURE_DEFER=1 under nsys (66.7 fps, 14.99 ms): GPU busy 10.77 ms (6.22 / 3.04 / 0.98 / 0.47 / 0.05 as above), idle 4.22
+(Presentation thread 2.43, main thread 1.44, GPU-side 0.06). The main thread still waits 2.25 ms a frame in vkWaitSemaphores: the
+game's own nvnSyncWait for the present fence (TICK-017) takes the capture wait's place, and the frame keeps the same
+drain-then-produce shape: that is why the deferral is neutral. The ~5 ms of untimed GPU-busy time of TICK-017 did not show: the GPU
+did the same work a frame in both modes and no gap had submitted work waiting. It was measured at 56 fps without nsys; with nsys's
+CPU overhead both modes are CPU-bound at ~66 fps, so whatever slowed the GPU when the CPU ran ahead (contention, WDDM
+residency/paging) needs the WDDM trace or GPU metrics (administrator) to be seen.
+
+Largest costs, and whose: the game's passes and dispatches ~6.9 ms of GPU (game); the game's job threads ~10 ms of CPU (game); the
+drain a frame (~3 ms in which only the GPU works: the engine's capture wait by default, the game's fence wait with the deferral);
+the engine's copies ~2.2 ms of GPU; the replay's wait for its slowest segment ~3.1 ms a frame on the Presentation thread,
+overlapped with the game's threads.
+
+Tried (engine, not kept): the parallel replay splits a command buffer into total/160 segments, at most 6 (often 5 on 4 threads: a
+second round of one). Segments in two even rounds (8 on 4 threads, boundary points every 32 draws instead of 64): the recording of a
+parallel command buffer 1.10-1.24 -> 0.99-1.00 ms, frame rate unchanged:
+
+| Run | fps | 1% low | 0.1% low | p99 | > 8.33 ms | log mean 70-110 s |
+|---|---:|---:|---:|---:|---:|---:|
+| base 1 / 2 | 72.2 / 72.6 | 41.2 / 38.9 | 27.6 / 21.6 | 20.6 / 20.7 ms | 100% | 72.3 / 72.7 |
+| even rounds 1 / 2 | 71.7 / 73.5 | 42.0 / 37.7 | 22.2 / 16.0 | 19.5 / 19.1 ms | 100% | 71.9 / 73.2 |
+
+(A first variant, even rounds only when total/160 called for two or more segments, averaged 6.0 segments: 73.6 fps, one run.)
+That wait is overlapped with the game's threads and not on the frame's critical path; the change adds submits and barriers and was
+reverted (no build with it left in the game folder). What would move the frame: less GPU work before the drain (the engine's msync
+copies, 1.3 ms, are its largest item: ~1570 small regions a frame from host-cached capture buffers, ~8.7 GB/s) or less game CPU
+work; overlap (the deferral) only moves the wait into the game.
+
+Not verified: WDDM-level events (paging, residency, the present's blit, other processes' GPU work), GPU counters, CPU context
+switches (all need administrator rights); other scenes and GPUs.
