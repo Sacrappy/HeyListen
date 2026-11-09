@@ -741,6 +741,20 @@ def seed_pipelines(out):
     print("the shipped pipeline list: %d KB, built before the first title" % (os.path.getsize(seed) >> 10), flush=True)
 
 
+def ship_state_list(out):
+    """The pipeline state list made from a play of the game on the development PC (work/pipeline_states.bin: each pipeline's stage
+    code keys, vertex and target formats and draw state; hashes and state only, no game code), as the folder's
+    hookshot_pipeline_states_shipped.bin: the first start's shader preparation builds those pipelines before the title, from the
+    player's own shaders (hookshot_shaders.bin), instead of compiling each when it is first drawn. Good for any build: optional"""
+    src = os.path.join(ROOT, "work", "pipeline_states.bin")
+    dst = os.path.join(out, "hookshot_pipeline_states_shipped.bin")
+    if not os.path.isfile(src):
+        return
+    if not (os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False)):
+        shutil.copyfile(src, dst)
+    print("the shipped pipeline state list: %d pipelines" % ((os.path.getsize(src) - 12) // 528), flush=True)
+
+
 def folder_language(out):
     """the language a game folder was built in: the code line of its language.txt"""
     try:
@@ -987,6 +1001,20 @@ def main(a=None):
         key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
         if os.path.exists(key_file):
             os.remove(key_file)   # (a lift stopped halfway leaves no key behind)
+        # (hookshot) the lifted C of an earlier lift goes first: a file that lift made and this one does not (another builder's naming,
+        # a chunk cut short) was compiled with the new ones, undefined or doubly defined game functions at the link (issue 1176).
+        # The objects stay cached by their contents, so a file this lift writes the same is not compiled again
+        gen_dir = os.path.join(work, "sa", "gen")
+        if os.path.isdir(gen_dir):
+            for f in os.listdir(gen_dir):
+                if f.startswith("code_") and (f.endswith(".c") or f.endswith(".c.whole")):
+                    try:
+                        os.remove(os.path.join(gen_dir, f))
+                    except FileNotFoundError:
+                        pass   # (already gone: another cleanup removed it)
+                    except OSError as e:
+                        fail("Could not remove earlier translated file %s: %s. The new translation has not started." %
+                             (os.path.join(gen_dir, f), e))
         run(PY + ["nx2/lift.py", "--standalone", "--write", "--exefs", exefs, "--work", work], env)
         if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):
             run(PY + ["nx2/split_hot.py", os.path.join(work, "sa", "gen")], env)   # (eight files side by side: ~6 minutes, not 79)
@@ -1041,7 +1069,17 @@ def main(a=None):
             parts = line.split(" ")
             if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                 plan[:] = [int(parts[1]), int(parts[2])]
-    run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compiled)
+    try:
+        run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compiled)
+    except SystemExit:
+        # (hookshot) a compile or link that failed forgets the lift: the next build translates the game again. A lifted file cut short
+        # (an antivirus, a full disk, a stopped run: "g_module_b" for g_module_base, issue 1197) or lifted C another builder left (20
+        # undefined game functions at the link, issue 1176) otherwise failed the same way at every try, the key still matching
+        key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
+        if os.path.exists(key_file):
+            os.remove(key_file)
+            print("the build failed: the next one translates the game again (its translated code is not reused)", flush=True)
+        raise
     compile_seconds = time.time() - compile_started
 
     say("stage", "finish", "Putting the game folder together")
@@ -1102,6 +1140,7 @@ def main(a=None):
     if LINUX and os.path.exists(icon):   # (the window's icon: host/posix/display_sdl.c)
         shutil.copy2(icon, os.path.join(out, "hookshot.png"))
     seed_pipelines(out)
+    ship_state_list(out)
     language = os.path.join(out, "language.txt")   # (the same text as host/nn_applet.c writes)
     with open(language, "w", encoding="utf-8", newline="\n") as f:
         f.write("# The game's language. Change the line below to one of the codes listed here, save, and start the game again.\n\n%s\n\n" % a.language)
@@ -1125,6 +1164,13 @@ def main(a=None):
     # changed; the builder says how much stays and lets it go. Kept in a development checkout)
     if os.path.normcase(work) != os.path.normcase(os.path.abspath(os.path.join(ROOT, "work"))):
         shutil.rmtree(exefs, ignore_errors=True)
+        # (players asked for the space back: the translated code and the compiled objects (4 GB and more) go too once the game is
+        # ready, on Windows and Linux alike. The next update translates and compiles again, about as long as a first build.
+        # HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, as before)
+        if os.environ.get("HOOKSHOT_KEEP_BUILD_FILES", "0") in ("", "0"):
+            for sub in ("sa", "objcache", "probe"):
+                shutil.rmtree(os.path.join(work, sub), ignore_errors=True)
+            print("the build files in %s were deleted (HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quicker updates)" % work, flush=True)
     total_seconds = time.time() - STARTED
     previous = record_times(work, run_files, compile_seconds, total_seconds, modules=plan[1],
                             kind="update" if a.update else "build")

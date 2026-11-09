@@ -64,6 +64,7 @@ inline u32 RenameableFields(u32 opcode) {
     switch (opcode) {
     case 0x381: case 0x981: return 1 | 2;   // LDG Rd, [Ra] (0x381: Ra a register pair)
     case 0x986: return 2 | 4;          // STG [Ra], Rb
+    case 0x593: return 1 | 2 | 4;      // SUATOM: scalar destination, coordinate and addend
     default: break;
     }
     if (extended_renaming) {
@@ -94,6 +95,7 @@ inline u32 RenameableFields(u32 opcode) {
 // 32-bit operand taken for a quad reached R239 or the scratch from R236 or R244 and failed whole mesh programs (OoT's
 // foliage).
 inline u32 FieldSpan(u32 opcode, u32 field) {
+    if (opcode == 0x593) return field < 3 ? 1 : 0;
     if (!extended_renaming) return 0;
     const u32 family = opcode & 0x1ff, form = (opcode >> 9) & 7;
     if (opcode == 0x805) return field == 0 ? 2 : 0;
@@ -202,6 +204,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         u32 nrenamed = 0;
         std::array<bool, 256> marker_taken{};
         std::array<bool, 256> native_occupied{};
+        // (RX_VK_MARKERS_V205=1: markers avoid only the native high registers, as in v2.0.5: an A/B for the AMD stripes report)
+        static const bool markers_v205 = std::getenv("RX_VK_MARKERS_V205") != nullptr;
         {
             const u32 renameable = RenameableFields(opcode);
             constexpr u32 bits[4]{16, 24, 32, 64};
@@ -240,7 +244,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     for (u32 m = 216; m + span <= 246 && marker == 255; m += span) {
                         bool ok = true;
                         for (u32 k = 0; k < span && ok; ++k)
-                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_occupied[m + k];
+                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] &&
+                                 !(markers_v205 ? native_high[m + k] : native_occupied[m + k]);
                         if (ok) marker = m;
                     }
                     if (marker != 255 && nrenamed < 8) {
@@ -1444,6 +1449,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
             break;
         }
+        case 0x593: { // SUATOM.D.1D.ADD.U32.STRONG.GPU.IGN, direct descriptor, no fault predicate.
+            const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+            if (insn.words[2] != 0x001ee000 || insn.Bits(59, 5) || binding >= 18 || offset > 0x1fff ||
+                (insn.words[3] & 0xc00001ffU))
+                return fail(index, "native direct surface atomic mode");
+            if (!bind_texture_buffer(binding))
+                return fail(index, "native surface descriptor buffer conflict");
+            // Strong(GPU) is the atomic's coherence/scope, not acquire/release. The existing image
+            // atomic backend uses Device/Relaxed; explicit native MEMBARs are lowered separately.
+            emit(base(0xea00000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
+                (u64{insn.Bits(32, 8)} << 20) | (u64{offset} << 36));
+            break;
+        }
         case 0x59f: { // SURED.D.2D.<op>.STRONG.GPU.IGN U32, direct descriptor (title 1's race compute).
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
@@ -1959,7 +1977,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(78, 2)} << 39));
             break;
         }
-        case 0x305: case 0xb05: case 0xd05: { // F2I NTZ, register/constant-buffer/uniform source
+        case 0x305: case 0x905: case 0xb05: case 0xd05: { // F2I NTZ, register/immediate/constant-buffer/uniform source
+            const bool immediate = opcode == 0x905;
             const u32 mode = insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U);
             // F16 source: bit 72 signs the result as in the other forms, bits 60-61 pick H0/H1.
             const bool half = opcode == 0x305 && (mode & ~0x100U) == 0x0010f000;
@@ -1970,12 +1989,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // (hookshot) a negated or absolute register source (bits 63, 62), made first
             const bool source_mod = opcode == 0x305 && !half && (insn.words[1] & 0x3fffff00U) == 0;
             if ((!half && !small && !floor && !nearest && !ceil && (mode & ~0x10100U) != 0x0020f000) ||
-                (opcode != 0xb05 && !source_mod && (insn.words[1] & (half ? 0xefffff00U : 0xffffff00U))) ||
+                (opcode != 0xb05 && !immediate && !source_mod && (insn.words[1] & (half ? 0xefffff00U : 0xffffff00U))) ||
+                (immediate && insn.Bits(24, 8)) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, false, false)
+            u32 source = immediate ? materialize(1, 0, 252, false, false)
+                       : opcode == 0xb05 ? materialize(2, 0, 252, false, false)
                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if (source_mod && insn.Bits(62, 2)) source = materialize(0, insn.Bits(32, 8), 249, insn.Bits(62, 1), insn.Bits(63, 1));
             if (half) {
