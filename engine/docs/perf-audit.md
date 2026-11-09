@@ -608,3 +608,61 @@ work; overlap (the deferral) only moves the wait into the game.
 
 Not verified: WDDM-level events (paging, residency, the present's blit, other processes' GPU work), GPU counters, CPU context
 switches (all need administrator rights); other scenes and GPUs.
+
+## TICK-021: the mirror syncs' copies in one compute dispatch (2026-11-09)
+
+**Result: engine copy GPU time (msync + wb + rbrefresh) 2.19 -> 0.81 ms a frame (-63%); msync 1.35 -> 0.29 ms, rbrefresh 0.41 ->
+0.09 ms, wb unchanged. fps +0.9 (72.4 -> 73.0 log mean): the frame is held by the CPU side (TICK-020), not by these copies.**
+`hyrule-walk`, limit 120, RTX 5070; A/B in one build with `RX_VK_MSYNC_SCATTER=0` (as before).
+
+What it was: ~1650 copy regions a frame (11.5 MB, mostly 1-2 dirty pages each, scattered) in ~53 vkCmdCopyBuffer calls. At ~25 us
+a call and ~0.8 us a region, the cost was per region, not per byte. Adjacent pages were already merged (TICK-015). Pages next to each
+other in the pool are consecutive slots in their capture (slots follow the sorted written-page list), so merging across a gap
+would copy pages the capture does not hold. Filling a gap from guest memory is wrong for lazy pools (the GPU's words are only in
+the mirror) and for captured pools (guest memory is the game's next frame).
+
+**Scatter copy** (`vk_memory.cpp`, "the mirror syncs' scatter copy"; `shaders/msync_scatter.comp`): each sync region is cut into
+entries of at most 4 KB (source and destination buffer device addresses, size). The entries go into a 4 MB host-visible ring, and
+one dispatch copies them, one 256-invocation workgroup an entry, 16 bytes an invocation. The presync
+(`memory_sync_mirrors_before_segments`) batches every pool into one dispatch. A sync at a binding gets one of its own. Readback
+refresh pages use the same path, after its existing barrier and still last of the uploads. Full barriers before and after each
+dispatch. Capture buffers now carry STORAGE and SHADER_DEVICE_ADDRESS usage. A region not 16-byte aligned, or a batch over half the
+ring (a load), goes through vkCmdCopyBuffer as before. The ring waits for its lap-before-last at wrap (~90 frames back, never
+waited for). The order of the copies and what they copy is unchanged: the same pages from the same sources. The pipeline sits
+outside the program cache. No shader-stamp input was touched (`vk_memory.cpp` and `shaders/` are not stamp inputs).
+
+GPU time a frame by kind (`RX_VK_PASS_TIMING=1`, one walk each, last report; inflated by the timestamps):
+
+| | before (`RX_VK_MSYNC_SCATTER=0`) | after |
+|---|---:|---:|
+| msync | 1.349 ms, 53 spans, 1650 regions, 11.47 MB | 0.291 ms, 31 dispatches, 2938 entries, 11.48 MB |
+| rbrefresh | 0.412 ms, 544 pages, 2.12 MB | 0.093 ms, 544 pages, 2.13 MB |
+| wb | 0.428 ms, 14.0 MB | 0.429 ms, 13.9 MB |
+| upload-buffer barriers | 0.074 ms, 71 | 0.162 ms, 123 (the dispatches' own) |
+| copies + their barriers | 2.26 ms | 0.98 ms |
+
+| Run | fps | 1% low | p99 | log mean 70-110 s |
+|---|---:|---:|---:|---:|
+| before 1 / 2 | 72.9 / 72.6 | 41.5 / 39.6 | 19.4 / 20.2 ms | 72.4 / 71.9 |
+| after 1 / 2 | 73.7 / 73.7 | 40.8 / 39.2 | 19.0 / 19.6 ms | 73.0 / 73.0 |
+
+CPU cost: the entries are built where the regions were (the replay's recording, under pools_mu): ~3000 32-byte entries a frame plus
+a ~100 KB memcpy into the ring. Not timed apart, and too small to show in the fps.
+
+Not done, and why:
+- Skipping unchanged pages (CPU compare against a shadow): unsafe as it stands. A page whose new CPU bytes equal the last synced ones
+  may still have GPU words in the mirror: the exposure meter is the classic case (CPU writes 0, GPU adds, CPU writes 0 again). A
+  skip would keep the GPU's sum (the TICK-006 failure). Making it safe needs the set of pages the GPU wrote, which is incomplete
+  (bare table writes past 64 bytes). It would also add a ~11 MB compare a frame on the replay thread. After the scatter, msync is
+  0.29 ms, so there is little left to win.
+- Sub-page granularity: the write watch is per page.
+- Write-backs: ~14 MB in ~140 runs, ~44 us a span: bandwidth, not per-region overhead (~32 GB/s, VRAM -> host). The runs also have
+  8-byte cuts (`cut_cpu_words`), so they are not 16-byte aligned.
+- Readback refresh limited to the pages actually read or written: its GPU cost is now 0.09 ms, and changing it touches the
+  ordering of TICK-006.
+
+Correctness: flash detector (`scripts/framelog.py`, whole walk) after 13 and 20 events, before 9: all 1-2 blocks at 86.0-86.9 s
+(motion, as in TICK-015/016). Screenshots every 1200 presents: lighting, fog, shadows, grass and HUD as in the base walk (not
+pixel-equal). `HOS_SPEED_LOG=1`: steady seconds 59.99 / 60.00 after, 60.03 before.
+Not verified: other scenes (Kokiri's exposure, cutscenes, loads: the plain-copy fallback for big batches only seen at load),
+other GPUs (AMD/Intel buffer-device-address reads of host-cached memory), long sessions.

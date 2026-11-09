@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+// (TICK-021) The mirror syncs' many small copies (CPU pages from a capture or guest memory -> a pool's VRAM mirror) in one
+// dispatch: a workgroup a list entry, each entry at most 4 KB, 16 bytes an invocation. The GPU's copy command paid ~0.8 us a
+// region for ~1570 regions a frame. Addresses are buffer device addresses; all offsets and sizes are multiples of 16.
+layout(local_size_x = 256) in;
+layout(buffer_reference, buffer_reference_align = 16) buffer V4 { uvec4 v[]; };
+struct Entry { uvec2 src; uvec2 dst; uint size; uint pad0; uint pad1; uint pad2; };
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer List { Entry e[]; };
+layout(push_constant) uniform P { uvec2 list; uint count; uint pad; } pc;
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= pc.count) return;
+    const Entry e = List(pc.list).e[i];
+    const uint k = gl_LocalInvocationID.x;
+    if (k * 16u < e.size) V4(e.dst).v[k] = V4(e.src).v[k];
+}
