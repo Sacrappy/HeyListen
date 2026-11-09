@@ -666,3 +666,82 @@ Correctness: flash detector (`scripts/framelog.py`, whole walk) after 13 and 20 
 pixel-equal). `HOS_SPEED_LOG=1`: steady seconds 59.99 / 60.00 after, 60.03 before.
 Not verified: other scenes (Kokiri's exposure, cutscenes, loads: the plain-copy fallback for big batches only seen at load),
 other GPUs (AMD/Intel buffer-device-address reads of host-cached memory), long sessions.
+
+## TICK-011: the game's CPU critical path (2026-11-09)
+
+**Result: the CPU side of the frame is the game's own job graph, spread over many guest functions; neither host
+synchronisation, the virtual cores, thread priorities nor the spin moves it. One host change kept: the dirty-page scan
+of the submit-time capture skips 256 clean pages a load (main thread). Log mean 72.5 -> 74.6 fps over 4 + 4 runs (A/B
+against the same tree without it: 73.4 -> 74.6); within the bigger single-run spread, but every run after is above every
+run before.** `hyrule-walk`, limit 120, Ryzen 7 7800X3D (8 cores / 16 threads), RTX 5070. Lifted code unchanged (no -Lift).
+
+The frame (~13.5 ms; `HOS_SAMPLE_ALL`, 25 s of the walk, ~6100 instants; ms a frame = share x 13.5 ms):
+
+| thread | running | blocked in |
+|---|---:|---|
+| sead::MainThread | 21% (2.9 ms) | the job group's WaitLightEvent (f_8007fe60, group f_80070b20) 52% of its blocked instants (5.6 ms); the capture wait (f_806668b0 -> vkWaitSemaphores) 31% (3.3 ms); SleepThread (f_800998a0) 5%; f_83acfb90's event 5% |
+| BaseProcExecutor0 | 24% (3.3 ms) | its worker loop f_8004ab40 |
+| BaseProcExecutor1-5, ModuleSystemWorker1-5, NavMeshCAStepDepWorker1 | 12-19% each | the worker loops |
+| Presentation Thread | 16% (2.2 ms) | ReceiveLightMessageQueue (f_834a3060) |
+| replay workers | 8% | idle |
+
+The chain: the main thread runs ~2.9 ms (of which the engine's submit path under f_806668b0 ~0.5 ms: `collect_in` 0.2,
+`capture_make`, `refresh_pool_ranges_locked`, `take_capture`), hands a job group to the workers and waits 5.6 ms for it,
+then waits ~3 ms for the GPU (TICK-010/020). While it waits for the job group, the number of job threads working
+(spinning excluded): 0 for 13%, 1 for 34%, 2 for 20%, 3+ for 33% of the instants. The tail is one thread at a time:
+BaseProcExecutor0 22%, NavMeshCAStepDepWorker1 17%, BaseProcExecutor1 11%, ModuleSystemWorker1 9% of those instants, in
+the jobs under f_8004ab40 (f_800b3ce0, f_8016b320, f_819b8e20, f_83af6150) and under the main's own worker loop f_8007fe60
+(f_820da77c). That is the game's job graph: a chain of dependent jobs, not a lack of cores.
+
+Where the cost is: spread. On the busiest job thread no guest function has more than 6% of its running samples
+(f_801d99a0 6.0%, f_81501400 2.5%, f_81a20b40 1.9%, ...); f_82bde830 (main, 9%) is game logic with atomics, not a libc
+routine. The software FMA helpers (`a64_fpx_mul32_fma32`, `recomp_fpe_fma32`) ~3% of a job thread. All of these functions
+are already in the hot list and the PGO profile (hot_funcs.txt, hookshot_pieces.prof): no lifter-level item stands out.
+Host share of the running samples, all threads: `spin_until_set` 5.1-5.5% (the 20 us spin before an event or queue
+sleep; 12% of a job thread's running time, mostly the workers waiting for their next job), `obj_lookup` + `obj` ~2.6%
+(LockMutex from f_80364080 on the main thread: 3% of its time), `collect_in` 1.2-1.5%.
+
+Synchronisation, measured (`HOS_WAKE_LAT=1`): signal to running again 5-7 us on average for the job threads and the main
+thread (longest 120-260 us), ~40-50 wake-ups a frame per job thread: well under 0.5 ms a frame per thread, and the main
+thread itself ~20 sleeping wake-ups a frame. Not the frame's limit.
+
+Virtual cores (`HOS_VCORES`, six, the game's core masks): new diagnostic `HOS_VCORE_LOG=1` (hos_thread.c: per thread,
+with the `vcores:` line, its waits for a core and the time in them). In the walk the game threads wait for a core 0.2-4 ms
+a second each (sead::MainThread 1.5 ms a second); only AudioFrameworkThread (35 ms/s) and NavMeshDepWorker2 (22 ms/s)
+wait more, neither on the frame's path. The total wait count varies a lot between runs (1.4k to 25k a 5 s) at the same fps.
+
+Experiments (env only, each 2 runs; log mean 70-110 s; base 71.9 / 72.2 / 73.7 / 72.2):
+
+| Run | fps | 1% low | p99 | log mean |
+|---|---:|---:|---:|---:|
+| `HOS_SPIN_US=0` (no spin) | 73.8 / 72.9 | 36.3 / 36.1 | 20.8 / 21.4 ms | 73.1 / 72.5 |
+| `HOS_RESERVE_CORE=0` (game threads also on the last core) | 74.2 / 73.4 | 41.9 / 38.6 | 19.6 / 20.1 ms | 73.6 / 72.8 |
+| `HOS_PRIO=MainThread=2,Presentation=2` | 72.4 / 73.4 | 36.3 / 39.3 | 21.1 / 19.1 ms | 71.8 / 72.9 |
+| `HOS_PRIO` main, job threads, Presentation = above normal | 73.9 / 73.2 | 39.4 / 41.1 | 19.4 / 18.9 ms | 73.5 / 72.7 |
+
+All within the spread: the 20 us spin, the core kept free (used only by the async replay, off by default) and Windows
+priorities do not limit the frame. A larger per-thread object cache (1024 -> 4096) did not lower `obj_lookup`'s share
+(the misses are not capacity): not kept.
+
+Kept: `collect_in` (host/rx_backend.c, the soft write watch's dirty bytes read at each submit: twice a frame on the main
+thread, before the capture and in memory_collect_written) first tests 256 pages with one 256-byte load while the range is
+clean (before: 32). Same pages collected; only the scan is shorter.
+
+| Build | fps | 1% low | p99 | > 8.33 ms | log mean 70-110 s |
+|---|---:|---:|---:|---:|---:|
+| backup build (game folder before) 1-4 | 72.6 / 72.9 / 74.2 / 72.9 | 38.3 / 36.0 / 43.9 / 36.9 | 20.9 / 20.8 / 19.1 / 21.2 ms | 100% | 71.9 / 72.2 / 73.7 / 72.2 |
+| same tree without the change (A/B, interleaved) | 74.7 / 73.4 | 39.1 / 45.9 | 19.3 / 19.1 ms | 100% | 74.0 / 72.7 |
+| with the change + 4096 cache (interleaved) | 75.4 / 76.0 / 74.7 / 74.5 | 41.6 / 40.8 / 41.1 / 32.5 | 19.3 / 18.5 / 19.0 / 19.2 ms | 100% | 74.7 / 75.4 / 74.1 / 74.1 |
+| final (the change only) | 74.9 / 75.4 | 39.2 / 45.5 | 19.2 / 18.5 ms | 100% | 74.3 / 75.0 |
+
+Correctness: no game logic touched. `HOS_SPEED_LOG=1` ratio 59.8-60.3 a second through the walk (both runs). Flash
+detector over two walks: 13 and 9 events, all 1 block, darker, ~30-33 s into the log (motion; TICK-021: 13/20 after, 9
+before). Screenshots every 1200 presents: picture as in the base walk.
+
+What would move the frame: the job chain is the game's, so only faster guest code on it (a lifter-level gain across many
+functions, e.g. the soft FMA helpers or the A64_POLL/A64_MARK overhead in hot loops, needs a -Lift build and was not tried
+here) or fewer of the chain's waits for the GPU (the ~3 ms drain, TICK-020). 120 fps (8.3 ms) is not reachable on the CPU
+side alone: the main thread's own work plus its job group is ~8.5 ms.
+
+Not verified: Kokiri and other scenes; limit 144; other CPUs (fewer cores: the virtual cores and the spin may matter there);
+the lifter-level options (no -Lift build).
