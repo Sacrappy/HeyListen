@@ -232,10 +232,25 @@ void perf_picture(uint32_t w, uint32_t h, const ImVec4& c) {
     snprintf(v[0], sizeof v[0], "%ux%u", w, h);
     if (image_w.load() > 0) snprintf(v[1], sizeof v[1], "%ux%u", (unsigned)image_w.load(), (unsigned)image_h.load());
     else snprintf(v[1], sizeof v[1], "%s", kNone);
-    snprintf(v[2], sizeof v[2], "%s", kNone);   // (the 3D scene's size: the game's dynamic resolution, not known here)
+    // (HeyListen) the 3D scene's size: the Resolution row's fixed scale of the game image (a twelfth, as vk_menu.cpp's game_size), or
+    // the game's own dynamic resolution
+    if (resolution_auto() || image_w.load() <= 0) {
+        snprintf(v[2], sizeof v[2], "%s", resolution_auto() ? "auto (dynamic)" : kNone);
+    } else {
+        const int s = resolution_scale();   // (1/10000)
+        const unsigned iw = (unsigned)image_w.load(), ih = (unsigned)image_h.load();
+        snprintf(v[2], sizeof v[2], "%ux%u (%d%%)", (unsigned)((iw * (uint64_t)s + 9999) / 10000), (unsigned)(ih * (uint64_t)s / 10000),
+                 (s + 50) / 100);
+    }
     static const char* const scaling[] = {"bilinear", "Catmull-Rom", "Lanczos"};
     snprintf(v[3], sizeof v[3], "%s", scaling[opts.upscale < 0 || opts.upscale > 2 ? 0 : opts.upscale]);
-    snprintf(v[4], sizeof v[4], "%s", opts.framegen >= 2 ? "frame generation" : kNone);
+    {   // (HeyListen) the game's frame rate limit (option 9 / HOS_FPS_LIMIT, what host/nn_vi.c paces at), and frame generation on top
+        static const int lim[] = {60, 90, 120, 144, 165, 240};
+        int fps = !opts.realtime ? 60 : lim[opts.fps_limit < 0 || opts.fps_limit > 5 ? 0 : opts.fps_limit];
+        if (const char* e = getenv("HOS_FPS_LIMIT")) fps = atoi(e) > 0 ? atoi(e) : fps;
+        if (opts.framegen >= 2) snprintf(v[4], sizeof v[4], "%d fps + frame generation", fps);
+        else snprintf(v[4], sizeof v[4], "%d fps", fps);
+    }
     snprintf(v[5], sizeof v[5], "%s", dev.present_mode_name ? dev.present_mode_name : kNone);
     static const char* const labels[6] = {"Window", "Game image", "3D scene", "Scaling", "Frame limit", "Presentation"};
     if (!ImGui::BeginTable("##perfp", 2, ImGuiTableFlags_SizingFixedFit)) return;
