@@ -193,6 +193,7 @@ static void scan_dt(long long presents) {
    1/15 s, as TotK Recomp's frame_rate.c (slower frames slow the game down, as on the console), at least 1/60 s (the game's
    own limit holds it at 60). HOS_REALTIME_STEP=0: the shipping whole steps. */
 extern volatile uint64_t hos_gfx_module;
+extern volatile int hos_realtime_fps;   /* (nn_os_sync.c) */
 volatile int hos_fixed_resolution = 0;   /* (the lifted code reads these: nx2/oot_patches.py) */
 volatile uint32_t hos_fixed_scale_bits = 0x3f800000;   /* (HOS_RES_SCALE: the fixed path's scale) */
 volatile int hos_dynres_runs = 0;   /* (the dynamic path's frames: it fills fields the 3D reads, +8 +16 +168) */
@@ -264,6 +265,7 @@ static void realtime_step(int64_t now) {
     if (!rx_option(0, 1)) {   /* (the Insert menu: per frame) */
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
+        hos_realtime_fps = 0;
         return;
     }
     static int64_t last;
@@ -272,7 +274,7 @@ static void realtime_step(int64_t now) {
     static long long steps;
     const double dt = (now - last) / 1e9;
     last = now;
-    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; return; }   /* (a load: the average starts again) */
+    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; hos_realtime_fps = 0; return; }   /* (a load: the average starts again) */
     /* (HOS_REALTIME_WINDOW=<1-5>: frames averaged for the step; 1: each step the last frame's own time) */
     static int window = -1;
     if (window < 0) {
@@ -283,9 +285,11 @@ static void realtime_step(int64_t now) {
     if (count < (unsigned)window) count++;
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
-    double ratio = sum / count * 60.0 + carry;
+    /* (TICK-014: the carry is kept against the unclamped time; clamped first, a frame shorter than 1 / cap lost its
+       difference and one longer kept it: +0.9% speed at the 60 limit) */
+    const double owed = sum / count * 60.0 + carry;
     const int cap = fps_limit();
-    ratio = ratio < 60.0 / cap ? 60.0 / cap : ratio > 4.0 ? 4.0 : ratio;
+    double ratio = owed < 60.0 / cap ? 60.0 / cap : owed > 4.0 ? 4.0 : owed;
     int fps = (int)(60.0 / ratio + 0.5);
     fps = fps < 15 ? 15 : fps > cap ? cap : fps;
     int *slot = (int *)GP(mod + 0x2c8);
@@ -294,9 +298,20 @@ static void realtime_step(int64_t now) {
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;
     }
-    carry = ratio - 60.0 / fps;
+    {   /* (TICK-014 diagnostic, HOS_SPEED_LOG) whether the game rewrote the slot since the last present */
+        static int on = -1, written;
+        static long same, changed, last_seen;
+        if (on < 0) on = getenv("HOS_SPEED_LOG") != NULL;
+        if (on && written) {
+            if (*slot == written) same++; else changed++, last_seen = *slot;
+            if (same + changed >= 600) hos_log("vi: slot: kept %ld, rewritten %ld (last to %ld) of 600; written %d", same, changed, last_seen, written), same = changed = 0;
+        }
+        written = fps;
+    }
+    carry = owed - 60.0 / fps;
     carry = carry > 0.5 ? 0.5 : carry < -0.5 ? -0.5 : carry;
     *slot = fps;
+    hos_realtime_fps = fps;   /* (and at the game's read of it: nn_os_sync.c) */
     if (!(steps++ % 3000)) hos_log("vi: real-time step on: ratio %.3f, game's frame rate %d", ratio, fps);
 }
 /* HOS_PRESENT_TRACE=<csv>: native game present-call returns, not GPU completion or display times.
@@ -327,9 +342,36 @@ static void present_trace(int64_t frame, int64_t now) {
         flushed = now;
     }
 }
+/* (hookshot, TICK-014) HOS_SPEED_LOG=1: the game's clock against the wall clock, once a second. The frame-time block
+   (*(*0x84c9e890), the object f_80706be0 hands f_83b6e300 each frame) holds the step the engine advances by, in 1/60 s:
+   +16 the ratio (60 / nominal fps, from +0x2c8), +0 the step after the game's own time scales. Summed over the frames
+   of a second they are the game-seconds of that wall second x 60: 60.0 is real speed */
+static void speed_log(int64_t now) {
+    static int on = -1;
+    static int64_t start;
+    static double sum_ratio, sum_step;
+    static long frames;
+    if (on < 0) on = getenv("HOS_SPEED_LOG") != NULL;
+    if (!on) return;
+    const uint64_t holder = G64(0x84c9e890), t = holder ? G64(holder) : 0;
+    if (!t) return;
+    float ratio, step;
+    memcpy(&ratio, GP(t + 16), 4);
+    memcpy(&step, GP(t + 0), 4);
+    sum_ratio += ratio, sum_step += step, frames++;
+    if (!start) start = now;
+    if (now - start >= 1000000000LL) {
+        const double s = (now - start) / 1e9;
+        const uint64_t mod = hos_gfx_module;
+        hos_log("vi: speed: %.3f s, %ld frames (%.1f fps), game 1/60 s a second: ratio %.2f, step %.2f, nominal %d", s, frames,
+                frames / s, sum_ratio / s, sum_step / s, mod ? *(int *)GP(mod + 0x2c8) : -1);
+        start = now, sum_ratio = sum_step = 0, frames = 0;
+    }
+}
 void hos_vi_native_presented(void) {
     static long long scan_n;
     scan_dt(++scan_n);
+    speed_log(hos_now_ns());
     {   /* HOS_FRAME_SLEEP_MS (diagnostic): slower frames, for game speed against frame rate */
         static int ms = -1;
         if (ms < 0) ms = getenv("HOS_FRAME_SLEEP_MS") ? atoi(getenv("HOS_FRAME_SLEEP_MS")) : 0;

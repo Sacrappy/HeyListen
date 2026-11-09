@@ -753,7 +753,14 @@ static void who_note_signal(Ctx *c, uint64_t key) {
     }
     ReleaseSRWLockExclusive(&lk);
 }
+/* (hookshot, TICK-014) The real-time step's frame rate (nn_vi.c realtime_step; 0: none). The game sets the graphics
+   module's nominal fps (+0x2c8) back to 60 each frame when it is over 60, so the rate written at the present was lost
+   above 60 and every frame stepped a whole 1/60 s: at 68 fps the game ran 13% fast, 2x at 120. f_80706be0 signals this
+   light event (lr 0x80706c88) right before it reads the rate for the frame's step (60 / +0x2c8), with the module in x21:
+   the rate is written there, after the game's own write */
+volatile int hos_realtime_fps;
 HLE(_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE) {
+    if (c->x[30] == 0x80706c88 && hos_realtime_fps && c->x[21]) G32(c->x[21] + 0x2c8) = (uint32_t)hos_realtime_fps;
     who_note_signal(c, ARG(0));
     event_signal(obj(ARG(0), K_EVENT));
 }

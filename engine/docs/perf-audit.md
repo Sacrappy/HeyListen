@@ -296,3 +296,40 @@ runs somewhat faster at 65 fps than at 60 even with Real time on: a pre-existing
 units (an in-game clock was not logged).
 
 Not verified: other GPUs; Kokiri; the cause of the 60-vs-65 fps walk difference.
+
+## TICK-014: game speed above 60 fps
+
+Method: `HOS_SPEED_LOG=1` (nn_vi.c `speed_log`) sums, once a wall second, the step the engine advances each frame by, read
+back from the game's frame-time block (`*(*0x84c9e890)`, the object f_80706be0 hands f_83b6e300: +16 the ratio
+60 / nominal fps, +0 the step after the game's own time scales), in 1/60 s: 60.0 a second is real speed. Figures: the
+last ~33 s of `run_bench.py --scene hyrule-walk --duration 115` (the walk and after), game seconds / wall seconds.
+
+| Build | limit | fps | game speed |
+|---|---:|---:|---:|
+| before | 60 | 59.6 | 100.94% |
+| before | 120 | 66.3 / 67.1 (two runs) | 111.50% / 112.61% |
+| after | 60 | 59.7 / 59.6 (shots) | 100.16% / 100.25% |
+| after | 90 | 68.2 | 99.98% |
+| after | 120 | 65.9 / 68.5 / 66.3 (shots) | 100.02% / 100.01% / 99.97% |
+| after | 360 (uncapped, GPU-bound) | 68.5 | 100.01% |
+
+Cause: above 60 the game sets the graphics module's nominal fps (+0x2c8) back to 60 every frame (diagnostic: of 600
+presents at the 120 limit, 600 found the host's 66-120 rewritten to 60; at or under 60 it is kept). The real-time step
+written at the present was lost, every frame stepped a whole 1/60 s, and the game ran at fps/60: 13% fast at 68 fps,
+2x at 120 (the title). Second, smaller: `realtime_step` clamped the step to 1 / cap before it kept the carry, so frames
+shorter than the cap lost their difference and longer ones did not (+0.9% at the 60 limit).
+
+Fix (host only): `realtime_step` keeps its rate in `hos_realtime_fps`; nn_os_sync.c's SignalLightEvent, called by
+f_80706be0 (lr 0x80706c88) just before it reads +0x2c8 with the module in x21, writes the rate there, after the game's
+own write. The carry is kept against the unclamped time. Game speed Real time (default): game time follows the
+clock at any rate from 15 fps up to the limit (60-360). Per frame: the limit is 60 and each frame is 1/60 s (unchanged).
+
+fps / p99 (summarize.py, 60 s after launch): before 67.0 / 20.7 ms at 120; after 69.2 / 20.0 (120), 69.1 / 20.2 (360),
+68.6 / 19.9 (90), 59.8 / 20.7 (60): unchanged within run spread. Screenshots (`RX_VK_SHOT_EVERY=30`, presents mapped
+to seconds from launch with the present trace, 96 s: sh60 present 5340, sh120 present 8280): Link at the same stretch
+of the walk, by the same tree and rock; the start of the walk also depends on load timing, so the shots are not
+pixel-equal.
+
+Not verified: other scenes (Kokiri, cutscenes, menus); whether other systems read +0x2c8 after the game's reset (they see
+60 as before); other GPUs; frame rates above ~70 in gameplay (the GPU bound): the title ran at 120 with the right
+step (ratio 60.26 a second at 120 fps).
