@@ -63,6 +63,10 @@ VmaPool images_pool() {
     return image_pool;
 }
 
+uint64_t big_image_bytes() {   // (TICK-023: RX_VK_BIG_IMAGE_MB, 16 by default; 0: none forced dedicated)
+    static const uint64_t big = (uint64_t)(getenv("RX_VK_BIG_IMAGE_MB") ? std::max(0, atoi(getenv("RX_VK_BIG_IMAGE_MB"))) : 16) << 20;
+    return big;
+}
 std::atomic<int> vram_alloc_failures{0};   // (TICK-023: images VRAM refused, read by the texture budget)
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated) {
     VmaAllocationCreateInfo ai{};
@@ -75,12 +79,25 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     // object of its own: in the 128 MB blocks, the ones evicted left their space free in blocks still holding others (4 GB free in
     // the blocks after a walk in Kokiri, the driver's count unchanged), so evicting them gave nothing back. RX_VK_BIG_IMAGE_MB=<n>
     // (0: in the pool, as before)
-    static const uint64_t big = (uint64_t)(getenv("RX_VK_BIG_IMAGE_MB") ? std::max(0, atoi(getenv("RX_VK_BIG_IMAGE_MB"))) : 16) << 20;
-    if (big && (uint64_t)ci.extent.width * ci.extent.height * ci.extent.depth * ci.arrayLayers * 4 >= big) dedicated = true;
+    // (TICK-030) not a block-compressed image (BLOCK_TEXEL_VIEW_COMPATIBLE: the game's BC textures, which shaders write
+    // through raw R32G32(B32A32)_UINT block views): Castle Town's ground (BC5/BC6H/BC7, 3064 x 2656, 2288 x 6112,
+    // 1144 x 3056 x 3, 8-14 MB but 32-56 MB by the 4-bytes estimate) in memory of their own rendered flat teal from its
+    // first frame, the same images in the pool right (bisected by RX_VK_BIG_IMAGE_MB: 16 and 32 teal, 64 and 0 right).
+    // The re-encoded BC3 arrays (written by buffer copies) are asked for by vk_texture.cpp by their real size
+    const uint64_t big = big_image_bytes();
+    if (big && !(ci.flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) &&
+        (uint64_t)ci.extent.width * ci.extent.height * ci.extent.depth * ci.arrayLayers * 4 >= big)
+        dedicated = true;
     if (dedicated) {   // (a memory object of its own, which freeing gives back whole: a pool's block is kept by VMA when it empties)
         VmaAllocationCreateInfo dai = ai;
         dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+        if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) {
+            static std::atomic<int> told{0};
+            if (getenv("RX_VK_LOG_DEDICATED") && told++ < 200)
+                logf("vk: dedicated image %ux%ux%u x%u levels %u format %d usage %#x flags %#x tiling %d", ci.extent.width,
+                     ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels, (int)ci.format, ci.usage, ci.flags, (int)ci.tiling);
+            return true;
+        }
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
     if (VmaPool pool = no_pool ? VK_NULL_HANDLE : images_pool()) {
