@@ -34,6 +34,13 @@ LIST = "heylisten-setup.txt"
 # Never in a release asset: the game, keys, what is made from the game, caches.
 FORBIDDEN = re.compile(r"(\.(nup|nsp|xci|nsz|xcz|nca|nso|keys|spv)$|(^|/)(romfs|exefs|objcache|generated|gen|image|user)/|"
                        r"(^|/)(image\.bin|main|prod\.keys|title\.keys)$|_(pipelines|shaders|programs|prepared)\.bin$)", re.I)
+# Exact paths that match FORBIDDEN but hold no game data: upstream's public builder profile ships the lifted-C chunk
+# boundaries (57 guest addresses, nx2/chunks.py) under tools/work/image/
+ALLOWED = {"HookshotBuilder/tools/work/image/chunks.txt"}
+
+
+def forbidden(path):
+    return path.replace("\\", "/") not in ALLOWED and bool(FORBIDDEN.search(path))
 
 
 def run(cmd, **kw):
@@ -78,11 +85,11 @@ def check_assets(folder):
         for f in fs:
             p = os.path.join(d, f)
             rel = os.path.relpath(p, folder).replace(os.sep, "/")
-            if FORBIDDEN.search(rel):
+            if forbidden(rel):
                 bad.append(rel)
             if f.lower().endswith(".zip"):
                 with zipfile.ZipFile(p) as z:
-                    bad += ["%s: %s" % (rel, n) for n in z.namelist() if FORBIDDEN.search(n)]
+                    bad += ["%s: %s" % (rel, n) for n in z.namelist() if forbidden(n)]
     if bad:
         sys.exit("refusing: these look like game data, keys or caches:\n  " + "\n  ".join(bad[:50]))
 
