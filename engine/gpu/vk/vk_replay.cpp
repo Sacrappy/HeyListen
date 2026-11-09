@@ -2028,7 +2028,45 @@ uint64_t fence_q(uint64_t queue) {
     auto it = q_last.find(queue);
     return it != q_last.end() ? it->second : fence();
 }
+thread_local int wait_path;   // (TICK-017: how a fence wait ended: 1 recorded whole, 2 stopped work held, 3 the timeline)
+int wait_inner(uint64_t f, uint64_t timeout_ns);
+uint64_t fence();
+/// (TICK-017) the game's fence waits that block (nvnSyncWait, nvnQueueFinish): how long, how far ahead of the GPU, by path.
+/// RX_VK_FENCE_WAIT_LOG=1: also the first 60 over 5 ms, one by one
 int wait(uint64_t f, uint64_t timeout_ns) {
+    if (completed() >= f) return 1;
+    const uint64_t done0 = completed(), latest = fence();
+    bool recorded;
+    {
+        std::lock_guard mk(rec_map_mu);
+        recorded = value_rec.count(f) != 0;
+    }
+    const int blocked0 = (int)blocked_n.load();
+    const auto t0 = std::chrono::steady_clock::now();
+    wait_path = 0;
+    const int r = wait_inner(f, timeout_ns);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    static std::mutex mu;
+    static int64_t n, n_long, by_path[4], unrec, logged;
+    static double sum_ms, max_ms, ahead;
+    static const bool each = getenv("RX_VK_FENCE_WAIT_LOG") != nullptr;
+    std::lock_guard lk(mu);
+    if (!timeout_ns) return r;
+    n++, sum_ms += ms, max_ms = std::max(max_ms, ms), ahead += (double)(f - done0), by_path[wait_path & 3]++, unrec += !recorded;
+    if (ms > 5) n_long++;
+    if (each && ms > 5 && logged < 60)
+        logged++, logf("vk: fence wait %llu: %.2f ms, path %d, done %llu, latest %llu, %srecorded, %d queues stopped",
+                       (unsigned long long)f, ms, wait_path, (unsigned long long)done0, (unsigned long long)latest,
+                       recorded ? "" : "not ", blocked0);
+    if (n % 300 == 0) {
+        logf("vk: fence waits: %lld, %.2f ms each (max %.2f, %lld over 5 ms), %.1f values ahead of the GPU, %lld not recorded yet; "
+             "path recorded %lld, stopped %lld, timeline %lld", (long long)n, sum_ms / 300, max_ms, (long long)n_long, ahead / 300,
+             (long long)unrec, (long long)by_path[1], (long long)by_path[2], (long long)by_path[3]);
+        sum_ms = max_ms = ahead = 0, n_long = unrec = 0, by_path[0] = by_path[1] = by_path[2] = by_path[3] = 0;
+    }
+    return r;
+}
+int wait_inner(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
     queue_flush_for(FR_WAIT);
     // (hookshot) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
@@ -2044,12 +2082,15 @@ int wait(uint64_t f, uint64_t timeout_ns) {
             }
         }
         int ok = 0;
+        wait_path = 1;
         if (mine && wait_recorded(f, timeout_ns, &ok)) return ok;
     }
     // (a wait that needs stopped work: another queue's submit usually lets that on in a moment. Forced at once, as the main thread
     // waits ~15 times a second, 69000 waits went past in five minutes, and each one that mattered was a black frame.
     // RX_VK_WAIT_HOLD_US: how long the waiter gives it. A wait for older work than the stopped ones needs nothing of them)
+    wait_path = 3;
     if (timeout_ns && !async_on() && blocked_n.load()) {
+        wait_path = 2;
         static const int64_t hold_ns = (getenv("RX_VK_WAIT_HOLD_US") ? atoll(getenv("RX_VK_WAIT_HOLD_US")) : 3000) * 1000;
         const auto t0 = std::chrono::steady_clock::now();
         for (;;) {

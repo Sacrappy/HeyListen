@@ -761,6 +761,7 @@ struct Capture {
     void* map = nullptr;
     uint64_t bsize = 0;
     size_t nbytes = 0;
+    std::vector<uint32_t> deferred;   // (TICK-017: pages left to the GPU's copy from guest memory, capture_make)
 };
 std::mutex cap_mu;
 std::deque<std::unique_ptr<Capture>> captures;
@@ -1320,7 +1321,7 @@ std::unique_ptr<Capture> capture_make() {
         if (!spare.empty()) c = std::move(spare.back()), spare.pop_back();
     }
     if (!c) c = std::make_unique<Capture>();
-    c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0;
+    c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->deferred.clear();
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
     // every written page was taken at first (hundreds of MB a submit where the game streams its world), and the whole
@@ -1360,8 +1361,17 @@ std::unique_ptr<Capture> capture_make() {
     // words from the frame before; the mirror sync of the page put them back over the GPU's newer ones, and the exposure
     // stepped for a frame (one-frame flashes, 40-120 a minute in Kokiri Forest). Only the copies of such pages wait, for the
     // last submission writing them back: not every frame's present. RX_VK_CAPTURE_WAIT=0: off
+    // (hookshot, TICK-017) That wait, on the game's thread, was 2.3-5.5 ms a frame: the CPU and the GPU took turns. Such a page is
+    // now left out of the capture (its slot not used) and marked written: the submission's mirror sync copies it from guest memory
+    // on the GPU, as its work starts, after the earlier submissions' write-backs into guest memory (the queue's order and the
+    // sync's barrier): the GPU's words of the write-back and the CPU's, as the wait gave, with no thread waiting. (A CPU write
+    // to the page after the submit is in the copy too: the console's GPU reads memory as it is when its work runs.)
+    // RX_VK_CAPTURE_DEFER=1: on (an experiment, off by default: slower, TICK-017 in docs/perf-audit.md); RX_VK_CAPTURE_SLACK=<k>:
+    // with it, the game's thread still waits for the submission k before (pacing only)
+    std::vector<uint32_t>& deferred = c->deferred;
     if (n > 0) {
         static const bool cap_wait = !getenv("RX_VK_CAPTURE_WAIT") || atoi(getenv("RX_VK_CAPTURE_WAIT")) != 0;
+        static const bool defer = getenv("RX_VK_CAPTURE_DEFER") && atoi(getenv("RX_VK_CAPTURE_DEFER")) != 0;   // (off: see TICK-017)
         uint64_t v = 0;
         if (cap_wait) {
             const uint64_t done = vk_timeline_completed();
@@ -1369,10 +1379,15 @@ std::unique_ptr<Capture> capture_make() {
             if (!wb_pages.empty())
                 for (int64_t i = 0; i < n; i++) {
                     auto it = wb_pages.find(pages[i]);
-                    if (it != wb_pages.end() && it->second > done) v = std::max(v, it->second);
+                    if (it != wb_pages.end() && it->second > done) {
+                        v = std::max(v, it->second);
+                        if (defer) deferred.push_back(pages[i]);
+                    }
                 }
         }
-        if (v) vk_timeline_wait(v);
+        static const uint64_t slack = getenv("RX_VK_CAPTURE_SLACK") ? atoll(getenv("RX_VK_CAPTURE_SLACK")) : 2;
+        if (v && !defer) vk_timeline_wait(v);
+        else if (v > slack) vk_timeline_wait(v - slack);   // (pacing only: see TICK-017 in docs/perf-audit.md)
     }
     if (n > 0) {
         c->pages.assign(pages, pages + n);
@@ -1382,7 +1397,8 @@ std::unique_ptr<Capture> capture_make() {
             ok.assign((size_t)n, 0);
             copy_pages(pages, n, (uint8_t*)c->map, ok.data());
             for (int64_t i = 0; i < n; i++)
-                if (ok[i]) c->copied.push_back(pages[i]), c->slots.push_back((uint32_t)i);
+                if (ok[i] && (deferred.empty() || std::find(deferred.begin(), deferred.end(), pages[i]) == deferred.end()))
+                    c->copied.push_back(pages[i]), c->slots.push_back((uint32_t)i);
             c->nbytes = (size_t)n * 4096;
             flush_mapped(c->alloc, c->nbytes);
         }
@@ -1425,6 +1441,7 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
     if (completed > mem_completed) mem_completed = completed;
 }
+bool memory_is_rb_page_locked(uint32_t page);
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
@@ -1487,6 +1504,23 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 std::memcpy(slot.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096, 4096);
             }
         }
+    }
+    if (!c->deferred.empty()) {   // (TICK-017: the pages the wait was for, logged: the evidence of which reads need the GPU's results)
+        static int64_t caps, pages_n, logged;
+        caps++, pages_n += (int64_t)c->deferred.size();
+        for (uint32_t p : c->deferred)
+            if (logged < 24) {
+                logged++;
+                const uint64_t ga = (uint64_t)p << kPageShift;
+                auto pit = imported.upper_bound(ga);
+                const Pool* pool = pit != imported.begin() && ga < std::prev(pit)->second.hi ? &std::prev(pit)->second : nullptr;
+                logf("vk: capture defer: page %#llx (pool %#llx+%#llx, readback page %d) left to the GPU's copy at %llu",
+                     (unsigned long long)ga, (unsigned long long)(pool ? pool->lo : 0), (unsigned long long)(pool ? ga - pool->lo : 0),
+                     memory_is_rb_page_locked(p) ? 1 : 0, (unsigned long long)value);
+            }
+        if (caps % 600 == 0)
+            logf("vk: capture defer: %lld captures had pages a write-back in flight writes (%.2f pages each)", (long long)caps,
+                 pages_n / 600.0), pages_n = 0;
     }
     const auto tk1 = std::chrono::steady_clock::now();
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
@@ -2206,6 +2240,9 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
     if (off || !size || size > 0x4000) return;   // (small results only: meters and counters)
     std::lock_guard lk(pools_mu);
     for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
+}
+bool memory_is_rb_page_locked(uint32_t page) {   // (TICK-017's log; pools_mu held)
+    return rb_pages.count(page) != 0;
 }
 /// Records the refresh copies into the submission's upload command buffer; true when it recorded any
 bool memory_rb_refresh(VkCommandBuffer up) {
