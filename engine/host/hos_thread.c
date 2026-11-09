@@ -1105,6 +1105,7 @@ static void vc_grant(int c) {
     vc_take(best, c);
     WakeConditionVariable(&best->vc_cv);
 }
+static void vc_thread_log(double secs);
 static void vc_stats_locked(int64_t now) {
     if (!vc_st.since) vc_st.since = now;
     if (now - vc_st.since < 5000000000LL) return;
@@ -1112,8 +1113,38 @@ static void vc_stats_locked(int64_t now) {
             (long long)vc_st.takes, (long long)vc_st.waits, vc_st.waits ? vc_st.wait_ns / 1e3 / vc_st.waits : 0.0,
             vc_st.max_ns / 1e6, (long long)vc_st.kicks, (long long)vc_st.yields, (long long)vc_st.escapes,
             (now - vc_st.since) / 1e9);
+    vc_thread_log((now - vc_st.since) / 1e9);
     memset(&vc_st, 0, sizeof vc_st);
     vc_st.since = now;
+}
+/* HOS_VCORE_LOG=1 (diagnostic): with the "vcores:" line, each thread that waited for a core: its waits, the time in
+   them, its priority and core mask (which threads the six cores hold back, and from whom) */
+static struct { HosThread *t; int64_t n, ns; } vc_th[64];
+static void vc_thread_note(HosThread *t, int64_t waited) {   /* holding vc_lock */
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_VCORE_LOG") != NULL;
+    if (!on) return;
+    int i = 0;
+    while (i < 64 && vc_th[i].t && vc_th[i].t != t) i++;
+    if (i == 64) return;
+    vc_th[i].t = t;
+    vc_th[i].n++;
+    vc_th[i].ns += waited;
+}
+static void vc_thread_log(double secs) {   /* holding vc_lock */
+    for (int k = 0; k < 64 && vc_th[k].t; k++) {
+        int best = k;
+        for (int j = k + 1; j < 64 && vc_th[j].t; j++)
+            if (vc_th[j].ns > vc_th[best].ns) best = j;
+        const __typeof__(vc_th[0]) tmp = vc_th[k];
+        vc_th[k] = vc_th[best];
+        vc_th[best] = tmp;
+        if (k < 16)
+            hos_log("vcores: %s (priority %d, mask %#llx, ideal %d): %lld waits, %.2f ms a second", vc_th[k].t->name,
+                    vc_th[k].t->priority, (unsigned long long)vc_th[k].t->core_mask, vc_th[k].t->ideal_core,
+                    (long long)vc_th[k].n, vc_th[k].ns / 1e6 / secs);
+    }
+    memset(vc_th, 0, sizeof vc_th);
 }
 static int64_t vc_env_ns(const char *name, int64_t us) {
     const char *e = getenv(name);
@@ -1188,6 +1219,7 @@ static void vc_acquire(HosThread *t) {
     const int64_t waited = hos_now_ns() - t0;
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
+    vc_thread_note(t, waited);
     vc_stats_locked(hos_now_ns());
     ReleaseSRWLockExclusive(&vc_lock);
 }
