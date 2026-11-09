@@ -450,7 +450,8 @@ static DWORD WINAPI work(LPVOID unused) {
     }
     wchar_t base[MAX_PATH], downloads[MAX_PATH];
     if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base) != S_OK) fail(L"No local application data folder.");
-    wcscat(base, L"\\HookshotBuilder");
+    wcscat(base, L"\\HeyListenBuilder");   /* (HeyListen: never the Hookshot Builder's folder. The merge of upstream's HOOKSHOT_SETUP_BASE
+                                               brought the old name back: v0.1.0-rc1 installed over Hookshot and removed its version) */
     {   /* (HOOKSHOT_SETUP_BASE=<folder>: install there instead, for testing installs and updates without touching the real one) */
         const wchar_t *tb = _wgetenv(L"HOOKSHOT_SETUP_BASE");
         if (tb && *tb) wcsncpy(base, tb, MAX_PATH - 1), base[MAX_PATH - 1] = 0;
