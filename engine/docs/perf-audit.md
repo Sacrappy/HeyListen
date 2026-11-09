@@ -443,3 +443,42 @@ Correctness (final build, experiments off): flash detector over two walks 19 and
 TICK-015's 21 / 19); screenshots every 1200 presents show lighting, fog, grass and HUD as before (not diffed against a base walk);
 `HOS_SPEED_LOG=1` 99.98%. The shader cache stamp is unchanged (no file of it touched). Not verified: the experiments' pictures
 (flash detector not run with them on), other scenes, other GPUs, the cost of Robust buffers.
+
+## TICK-017: CPU/GPU overlap (2026-11-09)
+
+**Result: not reached. Letting the CPU run ahead of the GPU makes the GPU slower per frame, so the overlap loses. Behaviour unchanged
+by default; the commit adds the experiment (off) and two diagnostics.** Hyrule Field, `hyrule-walk`, limit 120, RTX 5070.
+
+Which reads need the GPU's results: the capture wait is never for the exposure meter's readback page. The deferral log (`vk: capture
+defer: page ...`) names page 0x100d6c8000 (pool 0x100d000000 +0x6c8000), not in `rb_pages`; once the CPU runs ahead, 66-105 pages a
+capture (pools 0x102b000000, 0x1030000000: the CPU-read pools TICK-015 still writes back, ~0.47 MB a submit), none in `rb_pages`.
+So the wait is for a page the CPU and a write-back share, not for a value the CPU reads.
+
+Tried:
+1. The page copied again by a helper thread once the write-back is done, the next submission waiting on the GPU for a host-signalled
+   timeline semaphore. Hung at the title on NVIDIA/Windows (a submit waiting on a not-yet-signalled host semaphore; the helper and
+   the replay then blocked): dropped.
+2. `RX_VK_CAPTURE_DEFER=1` (kept, off): such pages are left out of the capture and the mirror sync copies them from guest memory on
+   the GPU, after the earlier write-backs (queue order): the same bytes the wait gave, no thread waits. `RX_VK_CAPTURE_SLACK=<k>`
+   (with it) keeps a pacing wait for the submission k before.
+
+| Run | fps | 1% low | p99 | > 8.33 ms | GPU busy |
+|---|---:|---:|---:|---:|---:|
+| base 1 / 2 | 73.0 / 72.9 | 38.7 / 39.6 | 19.5 / 19.9 ms | 100% / 100% | 75.8% / 75.6% |
+| defer, no pacing wait | 56.1 | 18.6 | 51.7 ms | 100% | 89.1% |
+| defer, slack 1 / 2 / 4 | 73.2 / 72.8 / 42.7 | 42.3 / 35.2 / 18.8 | 19.9 / 19.9 / 52.4 ms | | |
+
+Why the fallback: with no wait the main thread waits in f_8042cd20's nvnSyncWait for the Presentation thread's previous-frame present
+fence (`HOS_NVN_SYNC_LOG`: two syncs used in turn, lr 0x805903ac / 0x8042cde0, infinite timeout). New diagnostic `vk: fence waits`
+(`RX_VK_FENCE_WAIT_LOG=1`: each one over 5 ms): the fence is 11 values (~1.5 frames) ahead of the GPU, already recorded and submitted,
+no queue stopped, and the wait takes 14 -> 37 ms, growing: the GPU completes ~11 values in 35 ms where it does ~7 values a frame in
+~13 ms with the wait. Pass timing (`RX_VK_PASS_TIMING=1`) with defer: 11.0 ms of timed GPU work a frame (base 9.8; the 2048x1152 pass
+4f0c0b40 0.82 -> 1.34 ms) but nvidia-smi 89% busy at 56 fps (~16 ms busy a frame): ~5 ms of GPU-busy time a frame lies outside the
+timed command buffers. So the host does not complete fences late (they wait on the GPU's own semaphore); the GPU itself slows when
+CPU and GPU overlap. Not identified; candidates: contention on the imported host memory (guest pools the GPU reads and writes over
+PCIe while the CPU writes them), WDDM residency work for the 1.8 GB of imports, the present's untimed blit. The base build's 0 game sync
+waits a run are the wait's doing: the main thread drains the GPU each frame at its first submit.
+
+Correctness: no build with the deferral on was kept or shipped; screenshots and flash detector not run with it (its fps loss made it
+moot). Game folder: backup build restored. Not verified: other GPUs (the semaphore hang and the slowdown may be NVIDIA/WDDM-specific).
+Next: find the untimed GPU time under overlap (Nsight or GPU timestamps around the present and imports) before any overlap scheme.
