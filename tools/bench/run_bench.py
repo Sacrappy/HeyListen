@@ -426,6 +426,15 @@ def run(args: argparse.Namespace) -> dict:
     image = exe.name
     if instances(image):
         raise SystemExit(f"{image} is already running: refusing to start a second instance")
+    # (2026-11-09: a scripted walk left the area, the game autosaved and the user's own save was overwritten) the run must leave
+    # the saves exactly as they were: copied before, put back after
+    save_dir = next((d / "user" / "save" for d in (exe.parent, exe.parent.parent) if (d / "user" / "save").is_dir()), None)
+    save_copy = out / "save-guard"
+    if save_dir is not None and not os.environ.get("BENCH_KEEP_GAME_SAVES"):
+        shutil.rmtree(save_copy, ignore_errors=True)
+        shutil.copytree(save_dir, save_copy)
+    else:
+        save_dir = None
     log = log_path.open("wb")
     try:
         dog.start()
@@ -457,6 +466,11 @@ def run(args: argparse.Namespace) -> dict:
             time.sleep(1)
         if instances(image):
             warnings.append(f"{image} still running after the run")
+        elif save_dir is not None:   # (only once no game can write them any more)
+            shutil.rmtree(save_dir, ignore_errors=True)
+            shutil.copytree(save_copy, save_dir)
+        if save_dir is not None and instances(image):
+            warnings.append(f"saves NOT restored (game still running): the copy is in {save_copy}")
     wall = time.monotonic() - started
     if dog.fired:
         warnings.append("hard watchdog fired")
