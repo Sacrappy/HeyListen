@@ -12,6 +12,7 @@ import argparse
 import atexit
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2  # v2: warm-up counted from launch (warmup_origin, launch_offset_s)
+SCHEMA_VERSION = 3  # v3: fps_1pct_low, fps_0_1pct_low, over_*_ms_pct (TICK-013); v2: warmup_origin, launch_offset_s
 HARD_LIMIT_S = 120.0
 DEFAULT_DURATION_S = 90.0
 # Hookshot, measured on the TICK-004 traces (see README "Warm-up"): gameplay starts
@@ -59,15 +60,48 @@ def percentile(sorted_vals: list[float], q: float) -> float:
     return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo)
 
 
+FRAME_BUDGET_120HZ_MS = 8.33  # 1000 / 120, rounded as in the 120 Hz goal (TICK-013)
+FRAME_BUDGET_144HZ_MS = 6.94  # 1000 / 144
+FRAME_BUDGET_60HZ_MS = 16.7   # the original 60 Hz column
+
+
+def low_fps(sorted_vals: list[float], fraction: float) -> float:
+    """1000 / mean frame time of the slowest `fraction` of frames (TICK-013).
+
+    The slowest ceil(fraction * N) frames, and at least one frame, so a short run
+    still has a 0.1% low (it is then its single worst frame).  sorted_vals ascending.
+    """
+    if not sorted_vals:
+        return 0.0
+    k = max(1, math.ceil(fraction * len(sorted_vals) - 1e-9))
+    slow = sorted_vals[-k:]
+    return 1000.0 / (sum(slow) / len(slow))
+
+
+def over_budget_pct(vals: list[float], budget_ms: float) -> float:
+    """Share of frames whose frame time is strictly above budget_ms, in percent."""
+    if not vals:
+        return 0.0
+    return 100.0 * sum(1 for v in vals if v > budget_ms) / len(vals)
+
+
 def compute_stats(intervals_ms: list[float]) -> dict:
     vals = sorted(v for v in intervals_ms if v > 0)
     if not vals:
         return {"frames": 0, "fps": 0.0,
+                "fps_1pct_low": 0.0, "fps_0_1pct_low": 0.0,
+                "over_8_33_ms_pct": 0.0, "over_6_94_ms_pct": 0.0, "over_16_7_ms_pct": 0.0,
                 "frame_time_ms": {k: 0.0 for k in ("mean", "p50", "p95", "p99", "max")}}
     mean = sum(vals) / len(vals)
     return {
         "frames": len(vals),
         "fps": 1000.0 / mean,
+        # schema 3 (TICK-013): low fps and budget shares, see README "Summary metrics"
+        "fps_1pct_low": low_fps(vals, 0.01),
+        "fps_0_1pct_low": low_fps(vals, 0.001),
+        "over_8_33_ms_pct": over_budget_pct(vals, FRAME_BUDGET_120HZ_MS),
+        "over_6_94_ms_pct": over_budget_pct(vals, FRAME_BUDGET_144HZ_MS),
+        "over_16_7_ms_pct": over_budget_pct(vals, FRAME_BUDGET_60HZ_MS),
         "frame_time_ms": {
             "mean": mean,
             "p50": percentile(vals, 0.50),
@@ -527,8 +561,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     results = run_repeat(args)
     for res in results:
-        print(json.dumps({k: res[k] for k in ("build", "scene", "frames", "fps", "frame_time_ms",
-                                              "wall_clock_s", "warmup_origin", "launch_offset_s")}, indent=2))
+        print(json.dumps({k: res[k] for k in ("build", "scene", "frames", "fps", "fps_1pct_low",
+                                              "fps_0_1pct_low", "frame_time_ms", "wall_clock_s",
+                                              "warmup_origin", "launch_offset_s")}, indent=2))
     if len(results) > 1:
         spread = fps_spread([r["fps"] for r in results])
         sp = "n/a" if spread["spread_pct"] is None else f"{spread['spread_pct']:.1f}%"

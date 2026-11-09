@@ -126,7 +126,8 @@ def test_end_to_end_with_fake_hookshot(tmp_path):
                   "--out", str(out), "--duration", "2", "--warmup-s", "0"])
     assert rc == 0 and time.monotonic() - t0 < 20
     data = json.loads((out / "bench.json").read_text())
-    assert data["schema_version"] == 2 and data["frames"] > 20
+    assert data["schema_version"] == 3 and data["frames"] > 20
+    assert data["fps_1pct_low"] == pytest.approx(100.0) and data["fps_0_1pct_low"] == pytest.approx(100.0)
     assert data["frame_time_ms"]["p50"] == 10.0 and data["killed_by_harness"]
     # The fake game's return_ns is not the perf_counter clock, so the offset falls back
     # to the time its first row was seen: a small positive number, not the trace clock.
@@ -229,7 +230,7 @@ def _synthetic_trace(path: Path, seconds: int = 60, step_ns: int = 10_000_000) -
     n = seconds * 100
     for i in range(1, n + 1):
         lines.append("%d,%d,%d" % (i, base + (i - 1) * step_ns, 0 if i == 1 else step_ns))
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_summarize_warmup_from_launch_and_override(tmp_path, capsys):
@@ -266,3 +267,85 @@ def test_summarize_rejects_empty_dir(tmp_path):
     d.mkdir()
     with pytest.raises(SystemExit):
         sm.summarize_dir(d, None)
+
+
+# ------------------------------------------------------ TICK-013: low fps and budget shares
+def _frames(ms_list: list[float]) -> list[float]:
+    return sorted(ms_list)
+
+
+def test_low_fps_is_mean_of_slowest_share():
+    # 1000 frames: 990 at 10 ms, 10 at 50 ms -> slowest 1% (10 frames) mean 50 ms -> 20 fps
+    vals = _frames([10.0] * 990 + [50.0] * 10)
+    assert rb.low_fps(vals, 0.01) == pytest.approx(20.0)
+    # slowest 0.1% = 1 frame (50 ms) -> 20 fps
+    assert rb.low_fps(vals, 0.001) == pytest.approx(20.0)
+    # 1000 frames, one 100 ms frame among 10 ms: 0.1% low = 10 fps, 1% low (10 frames) mean 19 ms
+    vals = _frames([10.0] * 999 + [100.0])
+    assert rb.low_fps(vals, 0.001) == pytest.approx(10.0)
+    assert rb.low_fps(vals, 0.01) == pytest.approx(1000.0 / ((100.0 + 9 * 10.0) / 10))
+
+
+def test_low_fps_short_run_uses_at_least_one_frame():
+    # 100 frames: 1% = 1 frame, 0.1% = 1 frame (the worst one)
+    vals = _frames([10.0] * 99 + [40.0])
+    assert rb.low_fps(vals, 0.01) == pytest.approx(25.0)
+    assert rb.low_fps(vals, 0.001) == pytest.approx(25.0)
+    assert rb.low_fps([], 0.01) == 0.0
+
+
+def test_low_fps_is_ceiling_of_share():
+    # 250 frames: 1% = ceil(2.5) = 3 frames
+    vals = _frames([10.0] * 247 + [20.0, 30.0, 40.0])
+    assert rb.low_fps(vals, 0.01) == pytest.approx(1000.0 / 30.0)
+
+
+def test_over_budget_shares_120_and_144_and_60():
+    vals = _frames([6.0, 7.0, 8.0, 8.5])
+    assert rb.over_budget_pct(vals, rb.FRAME_BUDGET_120HZ_MS) == pytest.approx(25.0)  # only 8.5
+    assert rb.over_budget_pct(vals, rb.FRAME_BUDGET_144HZ_MS) == pytest.approx(75.0)  # 7.0, 8.0, 8.5
+    assert rb.over_budget_pct(vals, rb.FRAME_BUDGET_60HZ_MS) == 0.0
+    # strictly above: a frame exactly on the budget is not over it
+    assert rb.over_budget_pct([8.33], 8.33) == 0.0
+    assert rb.over_budget_pct([], 8.33) == 0.0
+
+
+def test_compute_stats_new_keys_on_synthetic_trace():
+    # 120 Hz-ish capture: 90 frames at 8.0 ms, 10 frames at 12 ms
+    s = rb.compute_stats([8.0] * 90 + [12.0] * 10)
+    assert s["frames"] == 100
+    assert s["over_8_33_ms_pct"] == 10.0          # the 12 ms frames only
+    assert s["over_6_94_ms_pct"] == 100.0        # every frame is above 6.94 ms
+    assert s["over_16_7_ms_pct"] == 0.0
+    assert s["fps_1pct_low"] == pytest.approx(1000.0 / 12.0)
+    assert set(rb.compute_stats([])) >= {"fps_1pct_low", "fps_0_1pct_low", "over_8_33_ms_pct", "over_6_94_ms_pct"}
+
+
+def _write_trace(path: Path, intervals_ms: list[float]) -> None:
+    """Hookshot-format trace: frame 1 (interval 0), then one row per interval in intervals_ms."""
+    lines = ["frame,return_ns,interval_ns", "1,1000000000000,0"]
+    t = 1_000_000_000_000
+    for i, ms in enumerate(intervals_ms, start=2):
+        t += int(round(ms * 1e6))
+        lines.append("%d,%d,%d" % (i, t, int(round(ms * 1e6))))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_summarize_new_columns_on_synthetic_traces(tmp_path, capsys):
+    import summarize as sm
+    d = tmp_path / "hookshot-120"
+    d.mkdir()
+    # 100 frames: 99 at 8.0 ms and one at 40 ms (frame 1 has no interval and is skipped)
+    _write_trace(d / "present_trace.csv", [8.0] * 98 + [40.0])
+    (d / "bench.json").write_text(json.dumps({"build": "hookshot", "scene": "kokiri-idle",
+                                              "schema_version": 3, "warmup_s": 0.0}))
+    assert sm.main([str(d)]) == 0
+    out = capsys.readouterr().out
+    header = [ln for ln in out.splitlines() if ln.startswith("| Build")][0]
+    for col in ("1% low", "0.1% low", "> 8.33 ms", "> 6.94 ms", "> 16.7 ms"):
+        assert col in header
+    row = [ln for ln in out.splitlines() if "hookshot-120" in ln][0]
+    # 8.0 ms frames are inside the 120 Hz budget but outside the 144 Hz one; the 40 ms frame is over all
+    assert "| 1.0% | 100.0% | 1% |" in row
+    # 1% low and 0.1% low: the single 40 ms frame -> 25.0 fps
+    assert "| 25.0 | 25.0 |" in row

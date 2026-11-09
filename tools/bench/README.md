@@ -22,6 +22,44 @@ Each directory's warm-up comes from its `bench.json`. Directories without one (t
 TICK-004 captures) count from the first present. `--warmup-s 45 --origin first_present`
 reproduces the baseline's Hookshot rows; Lichii rows are the whole capture.
 
+## Summary metrics (TICK-013)
+
+Added to the summary table and to `bench.json` (schema 3). All are computed from the raw
+frame intervals after the warm-up, so bench.json of schema 1, 2 and 3 summarize the same way.
+
+- **1% low fps** / **0.1% low fps**: `1000 / mean(frame time of the slowest 1% / 0.1% of frames)`.
+  The slowest `ceil(share x N)` frames, and at least one frame, so a short run's 0.1% low is
+  its single worst frame. Output keys: `fps_1pct_low`, `fps_0_1pct_low`.
+- **frames > 8.33 ms** (the 120 Hz budget, 1000/120) and **frames > 6.94 ms** (144 Hz,
+  1000/144): share of frames strictly above the budget, in percent. Keys
+  `over_8_33_ms_pct`, `over_6_94_ms_pct`.
+- **frames > 16.7 ms** (60 Hz): unchanged, also in bench.json as `over_16_7_ms_pct`.
+
+The 120/144 shares only mean something when the game is not capped below that rate, so
+bench at the rate you are checking (below).
+
+## Benching at 120 / 144 / 240 Hz
+
+The Hookshot frame cap is `--fps-limit` (sets `HOS_FPS_LIMIT`, default 120). Set it to the
+target rate and read the matching budget column:
+
+```
+python tools/bench/run_bench.py --exe <hookshot.exe> --scene hyrule-walk --out <dir> --fps-limit 120 --duration 115
+python tools/bench/run_bench.py --exe <hookshot.exe> --scene hyrule-walk --out <dir> --fps-limit 144 --duration 115
+python tools/bench/run_bench.py --exe <hookshot.exe> --scene hyrule-walk --out <dir> --fps-limit 240 --duration 115
+python tools/bench/summarize.py <dir> ...
+```
+
+- 120 Hz: `--fps-limit 120`, judge by "frames > 8.33 ms" and "1% low".
+- 144 Hz: `--fps-limit 144`, judge by "frames > 6.94 ms".
+- 240 Hz: `--fps-limit 240`. There is no 240 Hz budget column; read the frame times
+  (p95/p99, 1% low) against 1000/240 = 4.17 ms. Add a column if it is needed.
+
+`--fps-limit` is Hookshot only (`HOS_FPS_LIMIT`). Lichii's cap is set in the emulator, and
+its runs use PresentMon: the budget columns are then the host present intervals, not guest frames.
+Compare runs only at the same `--fps-limit`: a run capped at 120 can never average more than
+120 fps, so its 144 Hz column is not a 144 Hz result.
+
 ## Warm-up (TICK-009)
 
 `--warmup-s` is counted from **game launch** (wall clock), not from the first present.
@@ -93,11 +131,11 @@ membership for ETW. The scene is not controllable: Lichii has no input script, s
 `--scene` is only a label and the user positions the game; this is a gap. These are
 PresentMon's present intervals on the host swap chain, not guest (Switch) frames.
 
-## bench.json (schema_version 2)
+## bench.json (schema_version 3)
 
 | key | type | meaning |
 |---|---|---|
-| schema_version | int | 2 (1 = warm-up counted from the first present) |
+| schema_version | int | 3 (TICK-013: low fps and budget shares added). 2 = launch-based warm-up, 1 = warm-up counted from the first present; both still read |
 | build | "hookshot"/"lichii" | |
 | exe, scene | string | inputs |
 | source | "hos_present_trace"/"presentmon" | where frame times came from |
@@ -112,6 +150,8 @@ PresentMon's present intervals on the host swap chain, not guest (Switch) frames
 | frames | int | frames counted |
 | fps | number | frames / total frame time = 1000 / mean |
 | frame_time_ms | object | `mean`, `p50`, `p95`, `p99`, `max` (percentiles interpolated linearly) |
+| fps_1pct_low, fps_0_1pct_low | number | schema 3: 1000 / mean of the slowest 1% / 0.1% frames (see Summary metrics) |
+| over_8_33_ms_pct, over_6_94_ms_pct, over_16_7_ms_pct | number | schema 3: % of frames above 8.33 / 6.94 / 16.7 ms |
 | log_window_fps | [number] | Hookshot only, see above |
 | warnings | [string] | caveats of this run |
 
@@ -119,5 +159,5 @@ PresentMon's present intervals on the host swap chain, not guest (Switch) frames
 
 `python -m pytest -q tools/bench` - parsers on sample files in `testdata/`, the warm-up and
 launch-offset logic, the fps spread, `summarize.py` on synthetic directories, the
-watchdog, and end-to-end runs (`--repeat 2` included) against a fake game process. No real
-game is started.
+watchdog, the 1% / 0.1% low fps and the 120 / 144 / 60 Hz budget shares on synthetic traces,
+and end-to-end runs (`--repeat 2` included) against a fake game process. No real game is started.
