@@ -229,6 +229,10 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
 /// device-local heaps; false when unknown
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr);
 void vma_log_heaps();
+/// (TICK-019) one log line: which memory type and heap an allocation landed in (device-local / host-visible / cached)
+void log_alloc_where(const char* what, VmaAllocation allocation);
+/// (TICK-019) GPU reads straight from imported guest memory outside the buffer bindings' count: texel buffer views, GPU unswizzles
+extern std::atomic<int64_t> st_import_texel_views, st_import_texel_bytes, st_import_unswizzle_bytes;
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);

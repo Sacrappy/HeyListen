@@ -3428,6 +3428,8 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
         s.size = kStream;
         create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true);
         s.mapped = (uint8_t*)mapped;
+        static int logged;   // (TICK-019: the uniform data, inline data and indices the GPU reads from these)
+        if (logged++ < 1) log_alloc_where("a recording stream", s.alloc);
         r.streams.push_back(s);
     } else {
         vkResetDescriptorPool(dev.device, r.pool, 0);

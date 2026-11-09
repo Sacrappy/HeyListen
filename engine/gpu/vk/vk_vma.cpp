@@ -155,6 +155,17 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     return vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, nullptr) == VK_SUCCESS;
 }
 /// (every heap: what VMA has in blocks and allocations there, what the process uses of it, its budget; one line)
+void log_alloc_where(const char* what, VmaAllocation allocation) {
+    if (!allocation) return;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, allocation, &info);
+    const VkMemoryType& t = dev.memory.memoryTypes[info.memoryType];
+    const VkMemoryPropertyFlags f = t.propertyFlags;
+    logf("vk: %s: %llu KB in memory type %u, heap %u (%s)%s%s%s", what, (unsigned long long)(info.size >> 10), info.memoryType,
+         t.heapIndex, (dev.memory.memoryHeaps[t.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "device" : "system",
+         (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " device-local" : "", (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " host-visible" : "",
+         (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " cached" : "");
+}
 void vma_log_heaps() {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);

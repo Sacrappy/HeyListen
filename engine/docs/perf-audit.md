@@ -482,3 +482,42 @@ waits a run are the wait's doing: the main thread drains the GPU each frame at i
 Correctness: no build with the deferral on was kept or shipped; screenshots and flash detector not run with it (its fps loss made it
 moot). Game folder: backup build restored. Not verified: other GPUs (the semaphore hang and the slowdown may be NVIDIA/WDDM-specific).
 Next: find the untimed GPU time under overlap (Nsight or GPU timestamps around the present and imports) before any overlap scheme.
+
+## TICK-019: GPU reads of imported host memory (2026-11-09)
+
+**Result: the hypothesis does not hold. In Hyrule Field no shader, draw or dispatch reads imported guest memory: every bound pool
+is served from its VRAM mirror already. What crosses PCIe is the engine's own, already-timed copies. No pool to move; the commit
+adds the diagnostics only (behaviour unchanged).** `hyrule-walk`, limit 120, RTX 5070 (PCIe 5.0 x16).
+
+What the GPU reaches in host memory, a frame (log lines every 600 submits; new ones in this ticket marked *):
+- buffer bindings (uniform, storage, vertex, index, indirect, copy sources): all through `gpu_buffer_bind`; the existing
+  "bound in guest memory, by pool" line never printed in a whole walk, and the lock-free path, which it did not count (*"GPU reads of
+  imported guest memory": binds on the lock-free path), 0. Mirrors: 108 pools, 1696-1712 MB, i.e. every live import (63 live, 1744 MB).
+- texel buffer views (`texel_buffer_view`, always the import itself, never a mirror) (*): 0 in the walk; GPU unswizzles from guest
+  memory (*): 0 MB.
+- the guest page table shaders follow pointers through (*`log_alloc_where`): 24 MB in memory type 4, heap 0, device-local
+  host-visible (ReBAR): in VRAM. Recording streams (uniform/inline data, indices) (*): the same, VRAM.
+- capture buffers, the mirror syncs' source (*): system memory, host-cached. The syncs copy ~11.6 MB a frame from them over PCIe
+  (msync, 1.3 ms timed in TICK-016); rbrefresh ~2.1 MB from the imports; write-backs ~14 MB a frame into the imports (wb, 0.4 ms).
+- `nvidia-smi dmon -s ut` (60-110 s): ~1.8-1.95 GB/s host->GPU and ~2.0-2.2 GB/s GPU->host, ~25 / ~28 MB a frame at 73 fps: the
+  copies above plus the CPU's writes into the ReBAR streams. A few % of a PCIe 5.0 x16 link.
+
+So there is nothing hot and read-mostly left in host memory to mirror; VRAM cost of the change: 0. The ~5 ms of untimed GPU-busy
+time under overlap (TICK-017) is not reads of imports by shaders; still unidentified (candidates left: WDDM residency/paging for the
+1.7 GB of mirrors + 1.1 GB of retired imports kept on Windows, the present's blit, copy throughput of the msync regions).
+
+| Run | fps | 1% low | 0.1% low | p99 | > 8.33 ms | log mean 70-110 s | SM busy (dmon) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| base 1 / 2 | 73.8 / 72.4 | 37.4 / 28.5 | 20.4 / 8.7 | 20.0 / 21.2 ms | 100% | 73.6 / 72.3 | 74.0 / 70.3% |
+| defer, slack 1, 1 / 2 | 73.4 / 71.4 | 37.3 / 37.4 | 15.1 / 22.2 | 19.5 / 20.9 ms | 100% | 72.9 / 71.5 | 74.2 / 73.0% |
+| defer, slack 2, 1 / 2 | 72.2 / 73.5 | 36.6 / 42.9 | 17.0 / 31.6 | 20.3 / 20.1 ms | 100% | 72.1 / 73.5 | 72.8 / 73.0% |
+
+(log mean: the "N presents, X fps" lines, time estimated from presents/fps.) Overlap (`RX_VK_CAPTURE_DEFER=1`, slack 1/2) is within
+the runs' spread: neither helps nor hurts now, as in TICK-017 with slack. Left off.
+
+Correctness (this build, diagnostics only): flash detector over two walks 18 and 16 events, all 1-2 blocks at 86 s (motion, as
+TICK-015/016); screenshots every 1200 presents: lighting, fog, grass and HUD as in a base walk (sync5-2; not pixel-equal);
+`HOS_SPEED_LOG=1` mean ratio 60.1 / 60.2 (the seconds of the walk, not the load). Shader cache stamp unchanged (no stamp input touched).
+Not verified: other scenes (a pool over the mirrors' budget, or Kokiri, could still be read over PCIe: the new log line would show it),
+other GPUs (a card without ReBAR puts the page table and the streams in system memory: `log_alloc_where` says where), the RX_VK_MIRROR=0
+A/B (not run: with every pool mirrored there was nothing to compare against), Nsight.
