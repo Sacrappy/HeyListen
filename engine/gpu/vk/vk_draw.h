@@ -62,6 +62,7 @@ void dry_mark_written(NvnState& s, bool compute, bool first);   // (hookshot: th
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipelines);
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
+int64_t draw_pipe_fresh_skips();   // (TICK-008) draws left out for a pipeline in the building, into targets made this frame
 void draw_skip_report(double frames);   // (hookshot) skips by the line that made them
 int64_t draw_desc_reused();
 /// RX_VK_FLASH_RECORD=<key>,...: the last frames' draws of those programs, written to the log for frames around a flash

@@ -695,8 +695,16 @@ def main():
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+        # (TICK-008: what the pipeline notes (hookshot_pipelines.bin) are laid out by: the draw state they hold and the record. Apart from the
+        # shader stamp, so that a change of the shader translation carries the notes over instead of dropping them)
+        layout = hashlib.sha1()
+        for f in [os.path.join(vk, n) for n in ("vk_state.h", "vk_api.h", "vk_draw.h")] + [os.path.join(GPU, "render", "rx_nvn.h")]:
+            if os.path.isfile(f):
+                with open(f, "rb") as src:
+                    layout.update(os.path.basename(f).encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
+            "-DHOOKSHOT_STATE_STAMP=0x%sull" % layout.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",

@@ -711,6 +711,7 @@ void skip_report_impl(double frames) {
     if (any) logf("%s", line);
 }
 std::atomic<int64_t> st_pipelines, st_links, st_link_us;
+std::atomic<int64_t> st_pipe_fresh_skips;   // (TICK-008) draws left out for a pipeline in the building, into targets made this frame
 std::atomic<int64_t> st_pipeline_us;
 double st_wait_ms;
 
@@ -791,22 +792,129 @@ std::string pipe_notes_path() {
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_pipelines.bin";
 }
-/// The notes of this build (hookshot_pipelines.bin), each pipeline once
-std::vector<std::unique_ptr<PipeNote>> pipe_notes_read() {
+
+// (TICK-008) The notes file, format 2. A note is a program (key, variant) with the draw state its pipeline was made for; it holds no
+// compiled code, so a change of the shader translation does not make it wrong, only its pipelines stale. The header says what the
+// notes were written for:
+//   format      this layout of the header and of a record
+//   key_version bumped by hand when pipeline_key() or the way a note is built changes meaning
+//   note_size   sizeof(PipeNote), and state: HOOKSHOT_STATE_STAMP (nx2/build.py: the hash of vk_state.h, vk_api.h, vk_draw.h, rx_nvn.h)
+//   translator  program_cache_stamp() when it was written (HOOKSHOT_SHADER_STAMP: the shader translation)
+// A file whose format, key_version, note_size or state differs is of no use and is started again. One whose translator differs is
+// CARRIED: its notes are kept, every pipeline is made again from them with the new translation (never trusted as built: the
+// precompile recomputes each key from the state) and the file is rewritten with the new translator stamp. The old format (the
+// translator stamp and the size, 16 bytes) is read when its stamp is the current one. RX_VK_NOTES_STRICT=1: a translator
+// that differs drops the notes, as before.
+constexpr uint32_t kNoteFormat = 2, kPipeKeyVersion = 1;
+#ifdef HOOKSHOT_STATE_STAMP
+constexpr uint64_t kStateStamp = HOOKSHOT_STATE_STAMP;
+#else
+constexpr uint64_t kStateStamp = 0;   // (a build that does not say: notes are never carried to another translator)
+#endif
+struct NoteHead {
+    char magic[8];
+    uint32_t format, key_version;
+    uint64_t note_size, state, translator;
+};
+NoteHead note_head_now() {
+    NoteHead h{};
+    std::memcpy(h.magic, "HKPIPES2", 8);
+    h.format = kNoteFormat, h.key_version = kPipeKeyVersion, h.note_size = sizeof(PipeNote), h.state = kStateStamp;
+    h.translator = program_cache_stamp();
+    return h;
+}
+enum class NoteFile { Missing, Current, Carried, Old, Unusable };
+/// What the file at f (positioned at its start) is; first is where its records begin
+NoteFile note_file_state(FILE* f, long* first) {
+    uint8_t buf[sizeof(NoteHead)]{};
+    const size_t got = fread(buf, 1, sizeof buf, f);
+    const NoteHead now = note_head_now();
+    if (got >= sizeof(NoteHead) && !std::memcmp(buf, now.magic, 8)) {
+        NoteHead h;
+        std::memcpy(&h, buf, sizeof h);
+        *first = (long)sizeof(NoteHead);
+        if (h.format != now.format || h.key_version != now.key_version || h.note_size != now.note_size || h.state != now.state ||
+            (now.state == 0 && h.translator != now.translator))
+            return NoteFile::Unusable;
+        if (h.translator == now.translator) return NoteFile::Current;
+        return getenv("RX_VK_NOTES_STRICT") ? NoteFile::Unusable : NoteFile::Carried;
+    }
+    if (got >= 16) {   // (the old header: the translator stamp, sizeof(PipeNote))
+        uint64_t head[2];
+        std::memcpy(head, buf, 16);
+        *first = 16;
+        if (head[0] == now.translator && head[1] == sizeof(PipeNote)) return NoteFile::Old;
+    }
+    return NoteFile::Unusable;
+}
+/// The records of a notes file from where they start, each pipeline (by the key it was written with) once
+std::vector<std::unique_ptr<PipeNote>> note_records(FILE* f, long first) {
     std::vector<std::unique_ptr<PipeNote>> notes;
+    std::unordered_set<uint64_t> seen;
+    fseek(f, first, SEEK_SET);
+    for (;;) {
+        auto rec = std::make_unique<PipeNote>();
+        if (fread(rec.get(), sizeof(PipeNote), 1, f) != 1) break;
+        if (seen.insert(rec->key).second) notes.push_back(std::move(rec));
+    }
+    return notes;
+}
+/// The notes of this build (hookshot_pipelines.bin), each pipeline once; carried is set when they come from another translator
+std::vector<std::unique_ptr<PipeNote>> pipe_notes_read(bool* carried = nullptr) {
+    std::vector<std::unique_ptr<PipeNote>> notes;
+    if (carried) *carried = false;
     if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
-        uint64_t head[2] = {0, 0};
-        if (fread(head, 8, 2, f) == 2 && head[0] == program_cache_stamp() && head[1] == sizeof(PipeNote)) {
-            std::unordered_set<uint64_t> seen;
-            for (;;) {
-                auto rec = std::make_unique<PipeNote>();
-                if (fread(rec.get(), sizeof(PipeNote), 1, f) != 1) break;
-                if (seen.insert(rec->key).second) notes.push_back(std::move(rec));
-            }
+        long first = 0;
+        const NoteFile st = note_file_state(f, &first);
+        if (st == NoteFile::Current || st == NoteFile::Carried || st == NoteFile::Old) {
+            notes = note_records(f, first);
+            if (carried) *carried = st == NoteFile::Carried;
         }
         fclose(f);
     }
     return notes;
+}
+/// The file open for appending, in the current format (note_mu held). A file of the old format or another translator is rewritten
+/// first with its notes (in a file beside it, then moved over it); an unusable one is started again
+void notes_open_locked() {
+    if (note_file) return;
+    const std::string path = pipe_notes_path();
+    long first = 0;
+    NoteFile st = NoteFile::Missing;
+    std::vector<std::unique_ptr<PipeNote>> keep;
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        st = note_file_state(f, &first);
+        if (st == NoteFile::Carried || st == NoteFile::Old || st == NoteFile::Current) keep = note_records(f, first);
+        if (st == NoteFile::Current) {   // (a record cut short by a killed run: the file is rewritten whole, or the next note would be misaligned)
+            fseek(f, 0, SEEK_END);
+            if ((ftell(f) - first) % (long)sizeof(PipeNote)) st = NoteFile::Old;
+        }
+        fclose(f);
+    }
+    for (const auto& n : keep) noted.insert(n->key);
+    if (st == NoteFile::Current) {
+        note_file = fopen(path.c_str(), "ab");
+        if (note_file) return;
+    }
+    const NoteHead head = note_head_now();
+    const std::string tmp = path + ".new";
+    if (FILE* f = fopen(tmp.c_str(), "wb")) {
+        fwrite(&head, sizeof head, 1, f);
+        for (const auto& n : keep) fwrite(n.get(), sizeof(PipeNote), 1, f);
+        const bool ok = fflush(f) == 0;
+        fclose(f);
+        if (ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            if (st == NoteFile::Carried || st == NoteFile::Old)
+                logf("vk: pipeline notes: %zu carried over to this build (%s)", keep.size(),
+                     st == NoteFile::Old ? "old file format" : "the shader translation changed: their pipelines are made again");
+            note_file = fopen(path.c_str(), "ab");
+            return;
+        }
+        remove(tmp.c_str());
+    }
+    noted.clear();   // (could not rewrite: started again)
+    note_file = fopen(path.c_str(), "wb");
+    if (note_file) fwrite(&head, sizeof head, 1, note_file);
 }
 /// A note's targets, as its draw had them
 Targets note_targets(const PipeNote& n) {
@@ -818,6 +926,7 @@ Targets note_targets(const PipeNote& n) {
     for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)n.color_format[k];
     return at;
 }
+/// A note, appended (on a worker: the file is never touched on the replay thread)
 void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
     static const bool off = getenv("RX_VK_NO_PROGRAM_CACHE") != nullptr;
     if (off) return;
@@ -827,32 +936,7 @@ void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
     for (int i = 0; i < 8; i++) rec->color_format[i] = (uint32_t)at.color_format[i];
     rec->s = s;
     std::lock_guard lk(note_mu);
-    static const uint64_t stamp = program_cache_stamp();
-    if (!note_file) {
-        const std::string path = pipe_notes_path();
-        uint64_t head[2] = {0, 0};
-        if (FILE* f = fopen(path.c_str(), "rb")) {
-            if (fread(head, 8, 2, f) != 2) head[0] = 0;
-            fclose(f);
-        }
-        const bool same = head[0] == stamp && head[1] == sizeof(PipeNote);
-        if (same) {
-            if (FILE* f = fopen(path.c_str(), "rb")) {
-                for (int64_t at = 16;; at += sizeof(PipeNote)) {
-                    uint64_t k = 0;
-                    _fseeki64(f, at, SEEK_SET);
-                    if (fread(&k, 8, 1, f) != 1) break;
-                    noted.insert(k);
-                }
-                fclose(f);
-            }
-        }
-        note_file = fopen(path.c_str(), same ? "ab" : "wb");
-        if (note_file && !same) {
-            const uint64_t h[2] = {stamp, sizeof(PipeNote)};
-            fwrite(h, 8, 2, note_file);
-        }
-    }
+    notes_open_locked();
     if (note_file && noted.insert(key).second) fwrite(rec.get(), sizeof(PipeNote), 1, note_file), fflush(note_file);
 }
 
@@ -940,6 +1024,37 @@ struct PipeFast {
 };
 thread_local PipeFast pipe_fast[2];
 
+/// (TICK-008) The identity of a graphics pipeline: what is baked into it (the rest is dynamic state). The precompile makes it again from a note's
+/// state and does not trust the key the note was written with
+uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+    const int topo_c = topology_class(topo);
+    uint64_t key = mix(mix(p.key, p.variant), (uint64_t)topo_c << 8 | (uint64_t)at.samples);
+    const Shader::Info& vs = p.stages[0].info;
+    if (!p.mesh) {
+        for (int i = 0; i < 16; i++)
+            if (vs.loads.Generic(i)) key = mix(key, (uint64_t)s.vattr[i] << 8 | (i < s.nvattr));
+        for (int i = 0; i < 16; i++) key = mix(key, (uint64_t)s.vstream[i].divisor);
+    }
+    for (int i = 0; i < at.n; i++) {
+        key = mix(key, (uint64_t)at.color_format[i]);
+        if (!dev.eds3_blend) {
+            uint64_t b;
+            std::memcpy(&b, &s.blend[i], 8);
+            key = mix(key, (s.color.blend_en >> i & 1) ? b : 0);
+        }
+    }
+    key = mix(key, (uint64_t)at.depth_format);
+    if (!dev.eds3_blend) {
+        uint64_t wm = 0;
+        for (int i = 0; i < at.n; i++) wm |= (uint64_t)target_write_mask(p, s, i) << (4 * i);
+        key = mix(key, wm << 8 | s.color.blend_en);
+    }
+    if (!dev.eds3_polygon) key = mix(key, (uint64_t)s.poly.mode);
+    if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
+    if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
+    return key;
+}
+
 PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
     // the key: what is baked into it (the rest is dynamic state)
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
@@ -975,30 +1090,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         std::memcpy(f.blend, blend, sizeof blend);
         return e;
     };
-    uint64_t key = mix(mix(p.key, p.variant), (uint64_t)topo_c << 8 | (uint64_t)at.samples);
-    const Shader::Info& vs = p.stages[0].info;
-    if (!p.mesh) {
-        for (int i = 0; i < 16; i++)
-            if (vs.loads.Generic(i)) key = mix(key, (uint64_t)s.vattr[i] << 8 | (i < s.nvattr));
-        for (int i = 0; i < 16; i++) key = mix(key, (uint64_t)s.vstream[i].divisor);
-    }
-    for (int i = 0; i < at.n; i++) {
-        key = mix(key, (uint64_t)at.color_format[i]);
-        if (!dev.eds3_blend) {
-            uint64_t b;
-            std::memcpy(&b, &s.blend[i], 8);
-            key = mix(key, (s.color.blend_en >> i & 1) ? b : 0);
-        }
-    }
-    key = mix(key, (uint64_t)at.depth_format);
-    if (!dev.eds3_blend) {
-        uint64_t wm = 0;
-        for (int i = 0; i < at.n; i++) wm |= (uint64_t)target_write_mask(p, s, i) << (4 * i);
-        key = mix(key, wm << 8 | s.color.blend_en);
-    }
-    if (!dev.eds3_polygon) key = mix(key, (uint64_t)s.poly.mode);
-    if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
-    if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
+    const uint64_t key = pipeline_key(p, s, at, topo);
     static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
     if (auto m = mine.find(key); m != mine.end()) return FINE_X(FC_PIPE_MAP, 1), remember(m->second);
     ParLock lk;
@@ -1006,34 +1098,37 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (it != pipelines.end()) return remember(mine[key] = it->second.get());
     pcache_init();
     PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
-    pipeline_note(key, p, s, at, topo);
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
     if (sync) {
+        pipeline_note(key, p, s, at, topo);
         e->pipeline = build_graphics(p, s, at, topo);
         e->ready = true;
         return remember(e);
     }
-    // (linked here, from the libraries: the draw goes ahead, and the worker's full build replaces it when it is done)
-    if (gpl_wanted()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const VkPipeline linked = gpl_link(p, s, at, topo);
-        st_link_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-        st_links++;
-        if (linked) {
-            e->pipeline = linked;
-            e->ready.store(true, std::memory_order_release);
-        }
-    }
+    // (TICK-008) Nothing of the pipeline is done on this thread: a worker notes it, links it from the libraries when they are on
+    // (RX_VK_GPL: the draw goes ahead on the linked pipeline) and builds it whole. A draw that finds it not ready is left out.
     struct Job {
         PipeEntry* e;
         const Program* p;
         NvnState s;
         Targets at;
         VkPrimitiveTopology topo;
+        uint64_t key;
     };
     auto job = std::make_shared<Job>();
-    job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo;
+    job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo, job->key = key;
     jobs_push([job] {
+        pipeline_note(job->key, *job->p, job->s, job->at, job->topo);
+        if (gpl_wanted()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const VkPipeline linked = gpl_link(*job->p, job->s, job->at, job->topo);
+            st_link_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            st_links++;
+            if (linked) {
+                job->e->pipeline = linked;
+                job->e->ready.store(true, std::memory_order_release);
+            }
+        }
         // (over a linked one, which is left alone: draws recorded with it may still be on their way)
         if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
         job->e->ready.store(true, std::memory_order_release);
@@ -1044,6 +1139,10 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
 /// part: -1 the whole pipeline, or the graphics pipeline library it stands for: 0 vertex input, 1 pre-rasterization, 2 fragment
 /// shader, 3 fragment output
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part) {
+    // (TICK-008, a test: RX_VK_PIPE_DELAY_MS=<ms> makes each whole pipeline take that much longer, as a driver with a cold cache would,
+    // to see what the draws do while pipelines are in the building)
+    static const int delay_ms = getenv("RX_VK_PIPE_DELAY_MS") ? atoi(getenv("RX_VK_PIPE_DELAY_MS")) : 0;
+    if (delay_ms > 0 && part < 0 && !driver_cache_only) Sleep((DWORD)delay_ms);
     const Shader::Info& vs = p.stages[0].info;
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
@@ -4619,7 +4718,15 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         pe = graphics_pipeline(p, s, at, topo);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
-        if (may_skip) return void(st_pending_skips++);
+        // (TICK-008) A pipeline still being built is never waited for, whatever the targets: the draw is left out of the frame. Into
+        // targets made this frame the picture lacks it for a frame (counted: st_pipe_fresh_skips). RX_VK_PIPE_WAIT_FRESH=1: those
+        // draws wait, as before (RX_VK_PIPE_SKIP=0: every draw waits)
+        static const bool wait_fresh = getenv("RX_VK_PIPE_WAIT_FRESH") != nullptr;
+        if (may_skip || !(always_wait || wait_fresh)) {
+            st_pending_skips++;
+            if (!may_skip) st_pipe_fresh_skips.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         wait_for(pe->ready);
     }
     const VkPipeline pl = pe->pipeline;
@@ -5589,12 +5696,50 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     return true;
 }
 
-void precompile_run(void (*progress)(size_t done, size_t total)) {
+/// (TICK-008) The precompile waits for its pipelines (the start shows a console until they are built) only when asked: RX_VK_PRECOMPILE_WAIT=1.
+/// Otherwise it queues them and the game starts; the draws that meet one still being built are left out of their frame
+bool precompile_blocking() {
+    static const bool wait = getenv("RX_VK_PRECOMPILE_WAIT") && atoi(getenv("RX_VK_PRECOMPILE_WAIT")) != 0;
+    return wait;
+}
+
+namespace {
+/// The precompile's work, on the heap for good: its threads may go on after precompile_run returns (the background, or a start that
+/// gave up waiting for a pipeline that never finishes: two of 4926 on an RX 5700 XT, "stuck at 99%", Discord 11-08)
+struct Pre {
+    struct Item {
+        std::unique_ptr<PipeNote> note;
+        const Program* program;
+        PipeEntry* entry;
+        Targets at;
+    };
+    std::vector<Item> items;          // graphics pipelines, in the order the notes were written (the order the game first used them)
+    std::vector<Program*> computes;   // the compute programs the cache keeps
+    std::atomic<size_t> next{0}, done{0}, made{0}, failed{0};
+    std::atomic<unsigned> running{0};
+    size_t total = 0;
+    size_t carried = 0, missing = 0;
+    bool background = false;
+    std::chrono::steady_clock::time_point t0;
+    std::string marker;
+};
+void precompile_finished(Pre* pre) {
+    logf("vk: precompile: %zu graphics (%zu made, %zu not) and %zu compute pipelines built in %.0f ms%s", pre->items.size(),
+         pre->made.load(), pre->failed.load(), pre->computes.size(),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre->t0).count(),
+         pre->background ? " (in the background, while the game ran)" : "");
+    remove(pre->marker.c_str());
+}
+}  // namespace
+
+void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
     const auto t0 = std::chrono::steady_clock::now();
     // (a start that dies in here would die in here every time, the notes being what it builds from: a player saw the console reach
     // 542 of 543 and the game close. The file says this step began and did not end: the next start lets the notes go and plays)
     // (two starts in a row, not one: closing the window while it ran counted as a crash, and the next start then skipped the
     // precompile and compiled everything in play: "stuck at 99%, then fine on the second start", 2026-11-08)
+    // (TICK-008: the notes are then moved aside to hookshot_pipelines.bin.dropped, not deleted; the marker is cleared by the last
+    // worker, so a background precompile cut short by closing the game counts as not ended, as a waited one did)
     const std::string running = pipe_notes_path() + ".running";
     int ended_inside = 0;
     if (FILE* f = fopen(running.c_str(), "rb")) {
@@ -5602,47 +5747,70 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         fclose(f);
         if (ended_inside >= 2) {
             remove(running.c_str());
-            remove(pipe_notes_path().c_str());
-            logf("vk: the last two starts did not get through the precompile: its notes are dropped");
+            const std::string dropped = pipe_notes_path() + ".dropped";
+            remove(dropped.c_str());
+            rename(pipe_notes_path().c_str(), dropped.c_str());
+            logf("vk: the last two starts did not get through the precompile: its notes are moved to hookshot_pipelines.bin.dropped");
             return;
         }
         logf("vk: the last start did not get through the precompile (closed, or it crashed there): trying it once more");
     }
     if (FILE* f = fopen(running.c_str(), "wb")) fprintf(f, "%d\n", ended_inside + 1), fclose(f);
-    struct Done { const std::string& path; ~Done() { remove(path.c_str()); } } done_marker{running};
     pcache_init();
-    std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
+    bool carried = false;
+    std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read(&carried);
+    {   // (the file in the current format now: a carried or old one is rewritten here, at the start, not in play)
+        std::lock_guard lk(note_mu);
+        notes_open_locked();
+    }
     std::unordered_set<uint64_t> wanted;
     for (const auto& n : notes) wanted.insert(n->prog);
-    std::vector<Program*> computes;
+    Pre* pre = new Pre;
+    pre->t0 = t0, pre->marker = running, pre->background = !wait;
+    const size_t notes_n = notes.size();
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
-        if (p.compute) computes.push_back(&p);
+        if (p.compute) pre->computes.push_back(&p);
     });
-    const size_t total = notes.size() + computes.size();
-    // (the workers' state on the heap: a start whose last pipelines never finish (two of 4926 on an RX 5700 XT, "stuck at
-    // 99%", Discord 11-08) goes on to the game after PRE_STALL_S seconds with no progress, the stragglers left running; it is
-    // let go then, never freed. RX_VK_PRECOMPILE_STALL_S=<s>, 0: wait for all, as before)
-    struct Pre {
-        std::vector<std::unique_ptr<PipeNote>> notes;
-        std::vector<Program*> computes;
-        std::atomic<size_t> next{0}, done{0};
-        std::mutex mu;
-        bool abandoned = false;
-    };
-    const size_t graphics_n = notes.size(), computes_n = computes.size();
-    Pre* pre = new Pre;
-    pre->notes = std::move(notes), pre->computes = std::move(computes);
-    auto& next = pre->next;
-    auto& done = pre->done;
-    const auto worker = [pre, total] {
-        auto& notes = pre->notes;
-        auto& computes = pre->computes;
+    // The entries are made here, before the game draws: a draw that asks for one finds it (not ready) and does not make another
+    {
+        ParLock lk;
+        for (auto& n : notes) {
+            const Program* p = program_find(n->prog, n->variant);
+            if (!p) {
+                pre->missing++;
+                continue;
+            }
+            Targets at = note_targets(*n);
+            const uint64_t key = pipeline_key(*p, n->s, at, (VkPrimitiveTopology)n->topo);   // (not the note's own: it is made again)
+            if (!pipelines.emplace(key, std::make_unique<PipeEntry>()).second) continue;
+            {
+                std::lock_guard nlk(note_mu);
+                noted.insert(key);
+            }
+            pre->items.push_back({std::move(n), p, pipelines.find(key)->second.get(), at});
+        }
+    }
+    notes.clear();
+    pre->carried = carried ? pre->items.size() : 0;
+    for (Program* p : pre->computes) {
+        int none = 0;
+        p->compute_state.compare_exchange_strong(none, 1);   // (being built: a dispatch that meets it before it is ready is left out)
+    }
+    pre->total = pre->computes.size() + pre->items.size();
+    const size_t total = pre->total;
+    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    // (below normal, half the CPUs, in the background: the game's own threads come first. Waited for: all of them, as before)
+    const unsigned nthreads = wait ? std::min(cpus, 64u) : std::clamp(cpus / 2, 2u, 8u);
+    pre->running = total ? nthreads : 0;
+    if (!total) precompile_finished(pre);
+    const auto worker = [pre, total, wait] {
+        if (!wait) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
             const size_t i = pre->next++;
-            if (i >= total) return;
-            if (i < computes.size()) {
-                Program& p = *computes[i];
+            if (i >= total) break;
+            if (i < pre->computes.size()) {
+                Program& p = *pre->computes[i];
                 VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                 ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                 ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -5651,58 +5819,52 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 pin_subgroup(ci.stage, p.workgroup[0]);
                 ci.layout = p.layout;
                 VkPipeline made = VK_NULL_HANDLE;
-                if (vkCreateComputePipelines(dev.device, pcache, 1, &ci, nullptr, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
-                std::lock_guard lk(pre->mu);
-                if (!pre->abandoned) p.compute_pipeline = made;
-                else if (made) vkDestroyPipeline(dev.device, made, nullptr);   // (the game went on: it builds its own)
-            } else {
-                PipeNote& n = *notes[i - computes.size()];
-                const Program* p = program_find(n.prog, n.variant);
-                if (p) {
-                    const VkPipeline made = build_graphics(*p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo);
-                    std::lock_guard lk(note_mu);
-                    auto it = pipelines.find(n.key);
-                    if (it == pipelines.end()) {
-                        auto e = std::make_unique<PipeEntry>();
-                        e->pipeline = made;
-                        e->ready.store(true, std::memory_order_release);
-                        pipelines.emplace(n.key, std::move(e));
-                    }
+                if (guarded_compute(pcache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
+                if (made) {
+                    p.compute_pipeline = made;
+                    p.compute_state.store(2, std::memory_order_release);
+                } else {
+                    p.compute_state.store(0, std::memory_order_release);   // (a dispatch makes its own, and says why it fails)
                 }
+            } else {
+                Pre::Item& it = pre->items[i - pre->computes.size()];
+                const VkPipeline made = build_graphics(*it.program, it.note->s, it.at, (VkPrimitiveTopology)it.note->topo);
+                if (made) pre->made++;
+                else pre->failed++;
+                if (made) it.entry->pipeline.store(made);
+                it.entry->ready.store(true, std::memory_order_release);   // (a draw leaves out a pipeline that failed, as any)
+                it.note.reset();
             }
             pre->done++;
         }
+        if (--pre->running == 0) precompile_finished(pre);
     };
     std::vector<std::thread> threads;
-    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
+    for (unsigned i = 0; i < (total ? nthreads : 0); i++) threads.emplace_back(worker);
+    for (std::thread& t : threads) t.detach();   // (never joined: they may outlive this call)
+    logf("vk: precompile: %zu programs; %zu graphics pipelines from %zu notes%s (%zu notes name no program) and %zu compute pipelines "
+         "queued in %.0f ms on %u threads, %s", programs_n, pre->items.size(), notes_n,
+         carried ? " carried over from another shader translation" : "", pre->missing, pre->computes.size(),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), total ? nthreads : 0,
+         wait ? "waited for" : "built in the background");
+    if (!wait || !total) return;
+    // (waiting: a start whose last pipelines never finish goes on to the game after PRE_STALL_S seconds with no progress, the
+    // stragglers left running. RX_VK_PRECOMPILE_STALL_S=<s>, 0: wait for all)
     static const int stall_s = getenv("RX_VK_PRECOMPILE_STALL_S") ? atoi(getenv("RX_VK_PRECOMPILE_STALL_S")) : 30;
     size_t last_done = 0;
     auto last_change = std::chrono::steady_clock::now();
-    bool gone_on = false;
-    while (done.load() < total) {
-        if (progress) progress(done.load(), total);
+    while (pre->done.load() < total) {
+        if (progress) progress(pre->done.load(), total);
         Sleep(100);
-        if (next.load() >= total + threads.size()) break;
         const auto now = std::chrono::steady_clock::now();
-        if (done.load() != last_done) last_done = done.load(), last_change = now;
-        else if (stall_s > 0 && next.load() >= total && now - last_change > std::chrono::seconds(stall_s)) {
-            std::lock_guard lk(pre->mu);
-            pre->abandoned = true;
-            gone_on = true;
-            logf("vk: precompile: %zu of %zu done, nothing finished for %d s: the game starts, the rest go on behind it", done.load(),
+        if (pre->done.load() != last_done) last_done = pre->done.load(), last_change = now;
+        else if (stall_s > 0 && pre->next.load() >= total && now - last_change > std::chrono::seconds(stall_s)) {
+            logf("vk: precompile: %zu of %zu done, nothing finished for %d s: the game starts, the rest go on behind it", pre->done.load(),
                  total, stall_s);
+            pre->background = true;
             break;
         }
     }
-    if (gone_on) {
-        for (std::thread& t : threads) t.detach();
-    } else {
-        for (std::thread& t : threads) t.join();
-        delete pre;
-    }
-    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms", programs_n, graphics_n, computes_n,
-         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
 // (hookshot) The pipelines the notes predict for the programs no note names (vk_predict.cpp), after a prepare that prepared: each built
@@ -6138,6 +6300,7 @@ void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* 
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms) {
     *passes = st_passes, *mesh = st_mesh, *pipeline_ms = st_pipeline_us.load() / 1000.0;
 }
+int64_t draw_pipe_fresh_skips() { return st_pipe_fresh_skips.load(std::memory_order_relaxed); }
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms) {
     *pending_skips = st_pending_skips, *waits = st_waits, *wait_ms = st_wait_ms;
 }

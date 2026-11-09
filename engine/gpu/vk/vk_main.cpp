@@ -580,7 +580,7 @@ bool started_up() {
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
         if (prepare_run(progress)) predict_run(progress);
-        precompile_run(progress);
+        precompile_run(progress, precompile_blocking());   // (TICK-008: queued and built behind the game unless waited for)
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
     }
     return true;
