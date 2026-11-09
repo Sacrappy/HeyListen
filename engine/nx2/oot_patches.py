@@ -154,6 +154,8 @@ def patch_text_speed(s):
 
 
 def apply(gen, *, protect_hearts=False):
+    import oot_native_resolution   # (HOS_SCENE_NATIVE=1: the scene's base scale 1.0; off by default since #849's output resolution)
+    oot_native_resolution.apply(gen)
     done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0}
     if protect_hearts:
         done["player heart protection"] = 0
