@@ -34,7 +34,7 @@ repository (the engine under `engine/`).
 
 - **Occlusion is off** (a fixed value, as in Hookshot): real occlusion queries break the picture; some scenes draw more than
   they need.
-- **Rare missing or teal textures while walking** when VRAM is short: textures evicted under pressure can come back late.
+- **Missing ground textures while walking in Castle Town Market** (flat mint/white or teal ground; buildings and people are fine): VRAM runs short there. A fix (smaller texture formats for the game's ASTC textures) is planned. Standing still renders correctly.
 - **12 GB of VRAM recommended.** 8 GB cards may show the issue above more often.
 - **Tested on NVIDIA RTX only.** AMD and Intel cards are untested in HeyListen (see Hookshot's notes for them).
 - **Frame generation is off by default** (turn it on in the Insert menu if you want to try it).
