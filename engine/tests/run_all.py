@@ -27,9 +27,11 @@ OS = "windows" if WINDOWS else "linux"
 # skipped, or fails with --strict. Tests not listed run with no arguments and their own defaults.
 ARGS = {
     "tests/test_system_header_cache.py": ["--cc", "clang"],
+    "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
     "tests/test_input_background.py": ["--cc", "gcc"],
     "nx2/test_import_windows.py": ["--cxx", "g++"],
     "tests/test_lower_depbar.py": ["--cxx", "clang++"],
+    "tests/test_lower_register_markers.py": ["--cxx", "clang++"],
     "tests/test_text_speed.py": ["--cc", "gcc"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
     "tests/test_nvn_buffer_map.py": ["--cc", "gcc"],
@@ -44,6 +46,7 @@ ARGS = {
     "nx2/test_mesh_first_types.py": ["--headers", "{spirv_headers}"],
     "nx2/test_texture_init_barrier.py": ["--headers", "{vulkan_headers}"],
     "nx2/test_default_point_size.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
+    "nx2/test_depth_sample_types.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_draw_parameters.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_coop_spirv.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_spirv_struct_identity.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
@@ -57,6 +60,7 @@ MODULES = {
 
 # Checks that cannot run in CI, with why, by OS. Each still runs with --no-skip (or by name).
 SKIP = {
+    "tests/test_precompile_compute_guard.py": ({"linux"}, "Windows structured exceptions"),
     # (the game: these run the lifted code of a real dump against Unicorn)
     "nx2/test_insn.py": ({"linux", "windows"}, "needs the game's modules (work/dump) and Unicorn"),
     "nx2/test_leaf.py": ({"linux", "windows"}, "needs the game's modules (work/dump) and Unicorn"),
@@ -68,7 +72,7 @@ SKIP = {
     "tests/test_linux_update.py": ({"windows"}, "the Linux builder's update and folder launcher, POSIX files and shell scripts"),
 }
 # (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
-for _name in ("nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
+for _name in ("nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
               "nx2/test_spirv_struct_identity.py"):
     SKIP[_name] = ({"windows"}, "needs spirv-val: checked on Linux")
 
