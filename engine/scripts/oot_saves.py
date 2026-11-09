@@ -50,7 +50,7 @@ EMULATORS = [
                                    "windows": ["{localappdata}/Programs/NX2navi/game", "C:/Games/Ocarina"]},
             ["nx2navi", "ocarina"], []),
 ]
-HOOKSHOT = Program("hookshot", "Hookshot", {"linux": ["{data}/hookshot"], "windows": []}, ["hookshot"], [])
+HOOKSHOT = Program("hookshot", "Hookshot", {"linux": ["{data}/hookshot"], "windows": []}, ["hookshot", "heylisten"], [])   # (HeyListen: its Windows exe)
 FOLDER = Program("folder", "the folder", {"linux": [], "windows": []}, [], [])
 
 # Where the save folders sit under a data folder. "<id>" is one folder per user profile (its name is the id shown).

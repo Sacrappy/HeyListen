@@ -36,11 +36,11 @@ void hos_commit(uint64_t addr, uint64_t size) {
 DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
     (void)unused;
     MessageBoxA(NULL,
-                "Windows has run out of memory (RAM plus the page file), so Hookshot may close.\n\n"
+                "Windows has run out of memory (RAM plus the page file), so HeyListen may close.\n\n"
                 "Close other programs, and in Windows' System > About > Advanced system settings > Performance > Advanced > Virtual "
                 "memory, choose \"Automatically manage paging file size\" (or give it at least 16 GB). A lower Quality preset in the "
                 "Insert menu also uses less memory.",
-                "Hookshot: out of memory", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+                "HeyListen: out of memory", MB_OK | MB_ICONWARNING | MB_TOPMOST);
     return 0;
 }
 

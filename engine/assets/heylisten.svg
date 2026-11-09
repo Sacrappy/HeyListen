@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- HeyListen icon: an original glowing blue fairy orb with four translucent wings (own drawing, GPL-3.0-or-later like the
+     project; not Nintendo artwork). tools/release/make_icon.py draws the same shapes into heylisten.png / heylisten.ico:
+     keep the two in step. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="glow" cx="128" cy="128" r="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#59ADFF" stop-opacity="0.75"/>
+      <stop offset="0.5" stop-color="#59ADFF" stop-opacity="0.19"/>
+      <stop offset="1" stop-color="#59ADFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orb" cx="114" cy="112" r="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.35" stop-color="#9EDBFF"/>
+      <stop offset="0.75" stop-color="#3D8FFA"/>
+      <stop offset="1" stop-color="#1A4DD1"/>
+    </radialGradient>
+    <radialGradient id="wing" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8CD1FF" stop-opacity="0.45"/>
+      <stop offset="0.86" stop-color="#8CD1FF" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#E6FAFF" stop-opacity="0.85"/>
+    </radialGradient>
+  </defs>
+  <circle cx="128" cy="128" r="112" fill="url(#glow)"/>
+  <ellipse cx="66" cy="88" rx="60" ry="28" fill="url(#wing)" transform="rotate(32 66 88)"/>
+  <ellipse cx="190" cy="88" rx="60" ry="28" fill="url(#wing)" transform="rotate(-32 190 88)"/>
+  <ellipse cx="78" cy="168" rx="44" ry="20" fill="url(#wing)" transform="rotate(-28 78 168)"/>
+  <ellipse cx="178" cy="168" rx="44" ry="20" fill="url(#wing)" transform="rotate(28 178 168)"/>
+  <circle cx="128" cy="128" r="44" fill="url(#orb)"/>
+  <ellipse cx="113" cy="110" rx="11" ry="7" fill="#FFFFFF" fill-opacity="0.6"/>
+</svg>

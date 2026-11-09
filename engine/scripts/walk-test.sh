@@ -10,9 +10,11 @@ OUT=${2:-/e/OOT/hookshot-shots/walk$LIMIT}
 GAME=${3:-/e/OOT/hookshot-fork-game}
 mkdir -p "$OUT"
 cd "$GAME" || exit 1
+EXE=./HeyListen.exe; [ -f "$EXE" ] || EXE=./hookshot.exe   # (HeyListen.exe since TICK-034; an older folder has hookshot.exe)
 rm -f "$OUT"/vk_*.png
 EVERY=$((150 * LIMIT / 60))   # (a shot every 2.5 s)
-RX_VK_SHOTS="$(cygpath -w "$OUT")" RX_VK_SHOT_EVERY=${RX_VK_SHOT_EVERY:-$EVERY} HOS_FPS_LIMIT=$LIMIT HOS_AUDIO=0 HOS_WINDOW_NOACTIVATE=1   HOS_INPUT_SCRIPT="${SCRIPT:-30:A,34:A,38:A,42:A,46:A,50:A,54:A,58:A,62:A,66:A,70:A${WALK-,76:LUP/6000,83:LRIGHT/4000,89:LDOWN/5000}}" ./hookshot.exe > "$OUT/log.txt" 2>&1 &
+RX_VK_SHOTS="$(cygpath -w "$OUT")" RX_VK_SHOT_EVERY=${RX_VK_SHOT_EVERY:-$EVERY} HOS_FPS_LIMIT=$LIMIT HOS_AUDIO=0 HOS_WINDOW_NOACTIVATE=1   HOS_INPUT_SCRIPT="${SCRIPT:-30:A,34:A,38:A,42:A,46:A,50:A,54:A,58:A,62:A,66:A,70:A${WALK-,76:LUP/6000,83:LRIGHT/4000,89:LDOWN/5000}}" "$EXE" > "$OUT/log.txt" 2>&1 &
 sleep 95
+taskkill //F //IM HeyListen.exe > /dev/null 2>&1
 taskkill //F //IM hookshot.exe > /dev/null 2>&1
 echo finished

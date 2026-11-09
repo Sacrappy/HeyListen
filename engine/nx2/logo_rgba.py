@@ -11,7 +11,9 @@ import sys
 import zlib
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-SOURCE = os.path.join(ROOT, "assets", "hookshot.png")
+SOURCE = os.path.join(ROOT, "assets", "heylisten.png")   # (HeyListen's fairy, tools/release/make_icon.py; upstream: hookshot.png)
+if not os.path.exists(SOURCE):
+    SOURCE = os.path.join(ROOT, "assets", "hookshot.png")
 
 
 def decode(data):

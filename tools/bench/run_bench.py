@@ -540,7 +540,7 @@ def run_repeat(args: argparse.Namespace) -> list[dict]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--exe", required=True, help="hookshot.exe or lichii.exe")
+    p.add_argument("--exe", required=True, help="the game exe (HeyListen.exe, an older hookshot.exe, or lichii.exe; any name)")
     p.add_argument("--scene", required=True, help="scene name (Hookshot: kokiri-idle, kokiri-walk)")
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--build", choices=("auto", "hookshot", "lichii"), default="auto")

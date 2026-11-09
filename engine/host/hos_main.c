@@ -333,7 +333,7 @@ static const char *saves_dir(const char *beside) {
         snprintf(note, sizeof note, "%.*s" SEP_S "saves-moved.txt", sep ? (int)(sep - beside) : 0, beside);
         FILE *f = fopen(note, "w");
         if (f) {
-            fprintf(f, "Hookshot's saves are now in\n%s\n\nThey moved there from the user folder that was here.\n", dir);
+            fprintf(f, "HeyListen's saves are now in\n%s\n\nThey moved there from the user folder that was here.\n", dir);
             fclose(f);
         }
         hos_log("saves: moved from %s to %s", beside, dir);
@@ -1189,13 +1189,13 @@ static int narrow_paths_ok(int argc, char **argv) {
     if (!quiet) {
         wchar_t text[MAX_PATH * 2 + 640];
         _snwprintf(text, sizeof text / sizeof text[0],
-                   L"Hookshot can't open its files in this folder:\n\n%ls\n\n"
+                   L"HeyListen can't open its files in this folder:\n\n%ls\n\n"
                    L"%ls\n\nMove the game folder somewhere with a shorter name of plain letters and digits (for example C:\\Games\\Hookshot), "
                    L"or update Windows.",
                    w, GetACP() == CP_UTF8 ? L"The path is too long."
                                           : L"Its name has characters this Windows can only give the game from Windows 10 version 1903 on.");
         text[sizeof text / sizeof text[0] - 1] = 0;
-        MessageBoxW(NULL, text, L"Hookshot", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        MessageBoxW(NULL, text, L"HeyListen", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     }
     return 0;
 }

@@ -19,7 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import prof  # noqa: E402
 
-RUN_MODS = ("hookshot.exe", "hookshot_vk.dll")
+RUN_MODS = prof.GAME_EXES + ("hookshot_vk.dll",)
 BACKGROUND = ("OptimizeChangeBanc",)
 
 
@@ -27,7 +27,7 @@ def main():
     path = sys.argv[1]
     top = int(sys.argv[2]) if len(sys.argv) > 2 else 40
     wait_fn = sys.argv[3] if len(sys.argv) > 3 else "f_8007fe60"
-    mp = os.path.join(os.environ.get("RX_MAPS", prof.BUILD), "hookshot.map")
+    mp = prof.game_map(os.environ.get("RX_MAPS", prof.BUILD))
     addrs, names = prof.load_map(mp, 0x140000000)
     cache = {}
 
@@ -36,7 +36,7 @@ def main():
         if r is None:
             mod, _, off = frame.rpartition("+")
             r = mod
-            if mod == "hookshot.exe":
+            if mod in prof.GAME_EXES:
                 i = bisect.bisect_right(addrs, int(off, 16)) - 1
                 r = prof.demangle(names[i]) if i >= 0 else mod
             cache[frame] = r

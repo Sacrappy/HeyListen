@@ -1,11 +1,11 @@
-/* HookshotBuilder-Setup.exe: the one file players download. It reads the latest release's hookshot-setup.txt, downloads
+/* HookshotBuilder-Setup.exe: the one file players download. It reads the latest release's heylisten-setup.txt, downloads
    the parts it names (the builder and its tools from this repository's release, llvm-mingw from its own official
-   release), checks each one's SHA-256, unpacks them with Windows' own tar.exe into %LOCALAPPDATA%\HookshotBuilder\<tag>
+   release), checks each one's SHA-256, unpacks them with Windows' own tar.exe into %LOCALAPPDATA%\HeyListenBuilder\<tag>
    and starts the builder there. Parts already downloaded and checked are used again; a release already installed just
    starts. Files fetched by a program carry no "downloaded from the internet" mark, and the download itself holds no
    scripts, which is what antivirus programs' machine-learning guesses (Trojan:Script/...!ml) fired on.
 
-   hookshot-setup.txt, one item a line:
+   heylisten-setup.txt, one item a line:
        tag <tag>
        part <sha256> <bytes> <folder under the install> <top folder in the zip to rename, or -> <new name, or -> <url>
        run <the builder, relative to the install>
@@ -55,7 +55,7 @@ static void fail(const wchar_t *fmt, ...) {
     va_start(ap, fmt);
     vswprintf(msg, 1024, fmt, ap);
     va_end(ap);
-    MessageBoxW(g_win, msg, L"Hookshot Builder setup", MB_OK | MB_ICONERROR);
+    MessageBoxW(g_win, msg, L"HeyListen Builder setup", MB_OK | MB_ICONERROR);
     PostMessageW(g_win, WM_DONE, 1, 0);
     ExitThread(1);
 }
@@ -71,8 +71,8 @@ static int http_get(const char *url8, Sink sink, void *user, unsigned long long 
     uc.lpszHostName = host, uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path, uc.dwUrlPathLength = 1024;
     if (!WinHttpCrackUrl(url, 0, 0, &uc)) return 0;
-    HINTERNET s = WinHttpOpen(L"HookshotBuilder-Setup/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, 0);
-    if (!s) s = WinHttpOpen(L"HookshotBuilder-Setup/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    HINTERNET s = WinHttpOpen(L"HeyListenBuilder-Setup/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, 0);
+    if (!s) s = WinHttpOpen(L"HeyListenBuilder-Setup/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!s) return 0;
     /* (a stalled download fails after a minute without data, with the message, instead of waiting forever: a GitHub 504 hour) */
     WinHttpSetTimeouts(s, 30000, 30000, 30000, 60000);
@@ -432,8 +432,8 @@ static const char *manifest_url(void) {
     char tag[128];
     wanted_tag(tag, sizeof tag);
     if (e && *e) snprintf(u, sizeof u, "%s", e);
-    else if (tag[0]) snprintf(u, sizeof u, "https://github.com/NotRexed/Hookshot/releases/download/%s/hookshot-setup.txt", tag);
-    else snprintf(u, sizeof u, "%s", "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-setup.txt");
+    else if (tag[0]) snprintf(u, sizeof u, "https://github.com/Sacrappy/HeyListen/releases/download/%s/heylisten-setup.txt", tag);
+    else snprintf(u, sizeof u, "%s", "https://github.com/Sacrappy/HeyListen/releases/latest/download/heylisten-setup.txt");
     return u;
 }
 
@@ -458,7 +458,7 @@ static DWORD WINAPI work(LPVOID unused) {
     swprintf(downloads, MAX_PATH, L"%ls\\downloads", base);
     mkdirs(downloads);
 
-    status(L"Looking for the latest Hookshot Builder...");
+    status(L"Looking for the latest HeyListen Builder...");
     Mem man = {0};
     /* (tried again on a server error or no answer: GitHub's release downloads answered 504 for an hour, 2026-11-08, and every
        start failed at once) */
@@ -471,7 +471,7 @@ static DWORD WINAPI work(LPVOID unused) {
         if (attempt) {
             status(L"GitHub didn't answer (%lu). Trying again in %d s...", g_http_status, waits[attempt - 1]);
             Sleep(waits[attempt - 1] * 1000);
-            status(L"Looking for the latest Hookshot Builder...");
+            status(L"Looking for the latest HeyListen Builder...");
         }
         free(man.p);
         man = (Mem){0};
@@ -489,11 +489,11 @@ static DWORD WINAPI work(LPVOID unused) {
     }
     if (!ok)
         fail(g_http_status == 404
-                 ? L"The latest Hookshot release has no setup files yet. Download HookshotBuilder.zip from the releases page for now: "
-                   L"https://github.com/NotRexed/Hookshot/releases/latest"
+                 ? L"The latest HeyListen release has no setup files yet. Download HookshotBuilder.zip from the releases page for now: "
+                   L"https://github.com/Sacrappy/HeyListen/releases/latest"
              : g_http_status ? L"GitHub's download servers are failing right now (an error 500 or above, tried 8 times over 3 minutes). "
                                L"This is on GitHub's side: try again in a few minutes, or later today."
-                             : L"Could not reach GitHub to get the Hookshot Builder. Check your internet connection and try again.");
+                             : L"Could not reach GitHub to get the HeyListen Builder. Check your internet connection and try again.");
 
     char tag[128] = "", run[260] = "";
     Part parts[MAX_PARTS];
@@ -579,7 +579,7 @@ static DWORD WINAPI work(LPVOID unused) {
                 }
                 if (!got) DeleteFileW(part), fail(retryable(g_http_status)
                     ? L"Downloading part %d of %d failed: GitHub's download servers are failing right now (tried 8 times over 3 "
-                      L"minutes). This is on GitHub's side. The parts already downloaded are kept: run HookshotBuilder.exe again in a "
+                      L"minutes). This is on GitHub's side. The parts already downloaded are kept: run HeyListenBuilder.exe again in a "
                       L"few minutes and it carries on from here."
                     : L"Downloading part %d of %d failed. Check your connection and free space, then try again.", i + 1, nparts);
                 if (strcmp(have, p->sha)) DeleteFileW(part), fail(L"Part %d of %d did not download correctly (its checksum differs). Try again.", i + 1, nparts);
@@ -623,7 +623,7 @@ static DWORD WINAPI work(LPVOID unused) {
     prune(versions, downloads, tag, parts, nparts);
     rmtree(downloads);   /* (installed: its zips are not kept; an update moves unchanged folders over instead, reuse_part) */
 
-    status(L"Starting the Hookshot Builder...");
+    status(L"Starting the HeyListen Builder...");
     wchar_t cmd[4096], dir[MAX_PATH];
     wcscpy(dir, exe);
     wchar_t *slash = wcsrchr(dir, L'\\');
@@ -652,20 +652,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-/* (launch mode) "Hookshot Launcher.exe" in a game folder (nx2/make_game.py puts this file there under that name): the installed
+/* (launch mode) "HeyListen Launcher.exe" in a game folder (nx2/make_game.py puts this file there under that name): the installed
    builder opened as the game's launcher (--launch <that folder>: Play, and Update when a newer release is out), at once, with no
    window, download or network of its own. With no builder installed yet, the setup runs as usual and then opens the launcher. */
 static int launch_installed(const wchar_t *args) {
     wchar_t base[MAX_PATH], cur[MAX_PATH], exe[MAX_PATH], dir[MAX_PATH], cmd[4096];
     if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base) != S_OK) return 0;
     char tag[128] = "";
-    swprintf(cur, MAX_PATH, L"%ls\\HookshotBuilder\\versions\\current.txt", base);
+    swprintf(cur, MAX_PATH, L"%ls\\HeyListenBuilder\\versions\\current.txt", base);
     read_small(cur, tag, sizeof tag);
     if (!tag[0]) return 0;
     wchar_t wtag[128];
     MultiByteToWideChar(CP_UTF8, 0, tag, -1, wtag, 128);
-    swprintf(dir, MAX_PATH, L"%ls\\HookshotBuilder\\versions\\%ls\\HookshotBuilder", base, wtag);
-    swprintf(exe, MAX_PATH, L"%ls\\HookshotBuilder.exe", dir);
+    swprintf(dir, MAX_PATH, L"%ls\\HeyListenBuilder\\versions\\%ls\\HookshotBuilder", base, wtag);
+    swprintf(exe, MAX_PATH, L"%ls\\HeyListenBuilder.exe", dir);
     if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) return 0;
     swprintf(cmd, 4096, L"\"%ls\" %ls", exe, args);
     STARTUPINFOW si = {sizeof si};
@@ -683,14 +683,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         GetModuleFileNameW(NULL, self, MAX_PATH);
         const wchar_t *name = wcsrchr(self, L'\\');
         name = name ? name + 1 : self;
-        if (!_wcsicmp(name, L"hookshot.exe") && !wcsstr(g_cmdline, L"--")) {   /* (the game folder's launcher) */
+        /* (the game folder's launcher: HeyListen.exe; hookshot.exe in a folder built before the rename) */
+        if ((!_wcsicmp(name, L"HeyListen.exe") || !_wcsicmp(name, L"hookshot.exe")) && !wcsstr(g_cmdline, L"--")) {
             wchar_t *slash = wcsrchr(self, L'\\');
             if (slash) *slash = 0;
             swprintf(g_cmdline, 2047, L"--launch \"%ls\"", self);
             if (launch_installed(g_cmdline)) return 0;
             /* (no builder installed on this PC: the game itself, at once; nothing is downloaded to show a Play button) */
             wchar_t game[MAX_PATH], cmd[MAX_PATH + 4];
-            swprintf(game, MAX_PATH, L"%ls\\bin\\hookshot.exe", self);
+            swprintf(game, MAX_PATH, L"%ls\\bin\\%ls", self, name);   /* (the game has the launcher's name: bin\HeyListen.exe) */
             swprintf(cmd, MAX_PATH + 4, L"\"%ls\"", game);
             STARTUPINFOW si = {sizeof si};
             PROCESS_INFORMATION pi;
@@ -698,7 +699,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
                 return 0;
             }
-            MessageBoxW(NULL, L"The game (bin\\hookshot.exe) is missing from this folder. Build it again with the Hookshot Builder.", L"Hookshot",
+            MessageBoxW(NULL, L"The game (bin\\HeyListen.exe) is missing from this folder. Build it again with the HeyListen Builder.", L"HeyListen",
                         MB_ICONERROR);
             return 1;
         }
@@ -713,7 +714,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
     const int ww = 460, wh = 140;
-    g_win = CreateWindowW(L"HookshotSetup", L"Hookshot Builder setup", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+    g_win = CreateWindowW(L"HookshotSetup", L"HeyListen Builder setup", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                           (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2, ww, wh, NULL, NULL, inst, NULL);
     g_text = CreateWindowW(L"STATIC", L"Starting...", WS_CHILD | WS_VISIBLE, 16, 16, ww - 48, 22, g_win, NULL, inst, NULL);
     g_bar = CreateWindowW(PROGRESS_CLASSW, NULL, WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 16, 48, ww - 48, 20, g_win, NULL, inst, NULL);

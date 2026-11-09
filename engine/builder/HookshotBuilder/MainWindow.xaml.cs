@@ -47,7 +47,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        OutPath.Text = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Games", "Hookshot");
+        OutPath.Text = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Games", "HeyListen");
         LanguageBox.ItemsSource = Strings.All;
         LanguageBox.SelectedItem = lang;
         WorkerBox.ItemsSource = BuildWorkers.Choices(Environment.ProcessorCount);
@@ -65,8 +65,8 @@ public partial class MainWindow : Window
         Loaded += (_, _) => Start();
         var tools = Tools.Find();
         ToolsNote.Text = tools != null
-            ? "Nothing else to install: Hookshot's own build tools are here, downloaded and checked by its setup."
-            : "Hookshot's build tools are missing from its folder. Press Build and Hookshot offers to download them again.";
+            ? "Nothing else to install: HeyListen's own build tools are here, downloaded and checked by its setup."
+            : "HeyListen's build tools are missing from its folder. Press Build and HeyListen offers to download them again.";
         SetStep(0);
         Refresh();
     }
@@ -94,9 +94,9 @@ public partial class MainWindow : Window
             Updater.FromCommandLine(this);
             return;
         }
-        if (LaunchArg() is { } launchFolder)   // (Hookshot Launcher.exe in the game folder)
+        if (LaunchArg() is { } launchFolder)   // (HeyListen Launcher.exe in the game folder)
         {
-            SplashText.Text = "Starting Hookshot…";
+            SplashText.Text = "Starting HeyListen…";
             await Task.Delay(700);
             ShowMain();
             ShowLauncher(launchFolder);
@@ -154,7 +154,7 @@ public partial class MainWindow : Window
         {
             case Mode.UpdateGame:
                 FilesTitle.Text = "Update available";
-                FilesSub.Text = $"Hookshot {updateTarget} is available. Your game is {game}: Update builds it again from the game files kept in " +
+                FilesSub.Text = $"HeyListen {updateTarget} is available. Your game is {game}: Update builds it again from the game files kept in " +
                                 "its folder, compiling only what changed.";
                 BuildButton.Content = "Update";
                 break;
@@ -167,12 +167,12 @@ public partial class MainWindow : Window
                 break;
             case Mode.UpdateBuilder:
                 FilesTitle.Text = "Build your game";
-                FilesSub.Text = $"Hookshot Builder {latestTag} is available (this one is {builder}): update it first, then build.";
+                FilesSub.Text = $"HeyListen Builder {latestTag} is available (this one is {builder}): update it first, then build.";
                 BuildButton.Content = "Update builder";
                 break;
             default:
                 FilesTitle.Text = "Build your game";
-                FilesSub.Text = "Pick your game files and where the game goes. Hookshot does the rest, once.";
+                FilesSub.Text = "Pick your game files and where the game goes. HeyListen does the rest, once.";
                 BuildButton.Content = "Build the game";
                 break;
         }
@@ -180,7 +180,7 @@ public partial class MainWindow : Window
         AboutText.Visibility = mode is Mode.Build ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    // ---- the launcher: Hookshot Launcher.exe in a game folder starts this with --launch <folder> (builder/setup/setup.c) ----
+    // ---- the launcher: HeyListen Launcher.exe in a game folder starts this with --launch <folder> (builder/setup/setup.c) ----
     string launchFolder = "";
 
     static string? LaunchArg()
@@ -196,7 +196,7 @@ public partial class MainWindow : Window
         OutPath.Text = folder;
         StepPill.Visibility = Visibility.Collapsed;
         var game = GameVersion(folder) ?? ReadVersion(folder);
-        LaunchVersion.Text = (game != null ? $"Hookshot {game}" : "Hookshot") + " · " + folder;
+        LaunchVersion.Text = (game != null ? $"HeyListen {game}" : "HeyListen") + " · " + folder;
         LaunchPlay.IsEnabled = File.Exists(GameExe(folder));
         ShowPage(LaunchPage);
         latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag();
@@ -210,7 +210,7 @@ public partial class MainWindow : Window
             LaunchUpdate.Visibility = Visibility.Visible;
         }
         else if (game != null && game != updateTarget)
-            LaunchStatus.Text = $"{updateTarget} is out: build this folder again with the Hookshot Builder to get it";
+            LaunchStatus.Text = $"{updateTarget} is out: build this folder again with the HeyListen Builder to get it";
         else LaunchStatus.Text = latestTag == null ? "Up to date with this builder (GitHub did not answer)" : "Up to date";
     }
 
@@ -226,11 +226,21 @@ public partial class MainWindow : Window
         return null;
     }
 
-    /// The game in a folder: bin\hookshot.exe below its launcher (hookshot.exe), or hookshot.exe in a folder built before the launcher
+    /// The game in a folder: bin\HeyListen.exe below its launcher (HeyListen.exe), or HeyListen.exe in a folder built before the
+    /// launcher; a folder built before HeyListen named its exe (hookshot.exe, in the same places) until it is built again
     static string GameExe(string folder)
     {
-        var game = System.IO.Path.Combine(folder, "bin", "hookshot.exe");
-        return File.Exists(game) ? game : System.IO.Path.Combine(folder, "hookshot.exe");
+        foreach (var name in Finder.GameExeNames)
+        {
+            var game = System.IO.Path.Combine(folder, "bin", name);
+            if (File.Exists(game)) return game;
+        }
+        foreach (var name in Finder.GameExeNames)
+        {
+            var game = System.IO.Path.Combine(folder, name);
+            if (File.Exists(game)) return game;
+        }
+        return System.IO.Path.Combine(folder, "bin", Finder.GameExeNames[0]);
     }
 
     /// (the launcher already checked for updates: the game does not ask again)
@@ -261,7 +271,7 @@ public partial class MainWindow : Window
         public string? Exefs { get; set; }
     }
     static string SettingsPath => System.IO.Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "builder-settings.json");
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HeyListenBuilder", "builder-settings.json");
 
     void ApplySettings()
     {
@@ -579,7 +589,7 @@ public partial class MainWindow : Window
     {
         if (!File.Exists(System.IO.Path.Combine(x, "main")))
         {
-            MessageBox.Show(this, "That exefs folder has no file named main.", "Hookshot");
+            MessageBox.Show(this, "That exefs folder has no file named main.", "HeyListen");
             return;
         }
         sourcePicked = true;
@@ -601,7 +611,7 @@ public partial class MainWindow : Window
 
     void BrowseWork(object sender, RoutedEventArgs e)
     {
-        if (PickFolder("Choose where Hookshot keeps its build files") is not { } picked) return;
+        if (PickFolder("Choose where HeyListen keeps its build files") is not { } picked) return;
         ChangeWork(picked);
     }
 
@@ -612,7 +622,7 @@ public partial class MainWindow : Window
         try { Storage.MoveWork(picked); }
         catch (Exception x) when (x is IOException or UnauthorizedAccessException)
         {
-            MessageBox.Show(this, $"Hookshot cannot keep its build files there: {x.Message}", "Hookshot");
+            MessageBox.Show(this, $"HeyListen cannot keep its build files there: {x.Message}", "HeyListen");
         }
         Refresh();
     }
@@ -672,7 +682,7 @@ public partial class MainWindow : Window
                 try { await Updater.RunLatestSetup(this, Array.Empty<string>()); }
                 catch (Exception ex)
                 {
-                    MessageBox.Show(this, ex.Message + " You can also download HookshotBuilder.exe from the releases page.", "Hookshot");
+                    MessageBox.Show(this, ex.Message + " You can also download HeyListenBuilder.exe from the releases page.", "HeyListen");
                     RefreshMode();
                 }
                 return;
@@ -681,7 +691,7 @@ public partial class MainWindow : Window
         var tools = Tools.Find();
         if (tools == null)
         {
-            ShowProblem("The build tools are not in Hookshot's folder.", tools: true);
+            ShowProblem("The build tools are not in HeyListen's folder.", tools: true);
             return;
         }
         var args = new List<string>();
@@ -725,7 +735,7 @@ public partial class MainWindow : Window
         try { workers = BuildWorkers.Selected(WorkerBox.SelectedItem); }
         catch (ArgumentException e)
         {
-            MessageBox.Show(this, e.Message, "Hookshot");
+            MessageBox.Show(this, e.Message, "HeyListen");
             return;
         }
         if (!keepRows)
@@ -755,7 +765,7 @@ public partial class MainWindow : Window
         compileClock.Reset();
         clock.Start();
         Tick();
-        if (Storage.WorkChosen && !args.Contains("--work")) args.AddRange(new[] { "--work", Storage.Work });   // (the build files where the player chose)
+        if (!args.Contains("--work")) args.AddRange(new[] { "--work", Storage.Work });   // (HeyListen: always, so make_game.py never falls back to its default, the Hookshot Builder folder)
         runner = new Runner(tools, args, workers);
         runner.Line += l => Dispatcher.BeginInvoke(() => Line(l));
         runner.Finished += failure => Dispatcher.BeginInvoke(() => Ended(failure));
@@ -956,9 +966,9 @@ public partial class MainWindow : Window
         var (total, freeable) = await Task.Run(Storage.Measure);
         if (total < 100L << 20) return;
         StorageNote.Text = freeable >= 100L << 20
-            ? $"Hookshot Builder keeps {Storage.Gb(total)} on this PC ({Storage.Base}). {Storage.Gb(freeable)} of it only makes the next " +
+            ? $"HeyListen Builder keeps {Storage.Gb(total)} on this PC ({Storage.Base}). {Storage.Gb(freeable)} of it only makes the next " +
               "update quicker and can be freed: your game keeps playing, and the next update then takes about as long as this build."
-            : $"Hookshot Builder keeps {Storage.Gb(total)} on this PC ({Storage.Base}): the builder itself.";
+            : $"HeyListen Builder keeps {Storage.Gb(total)} on this PC ({Storage.Base}): the builder itself.";
         FreeButton.Visibility = freeable >= 100L << 20 ? Visibility.Visible : Visibility.Collapsed;
         FreeButton.IsEnabled = true;
         FreeButton.Content = "Free up space";
@@ -1010,6 +1020,12 @@ public partial class MainWindow : Window
         return $" · last time {Span(last)} ({how})";
     }
 
+    // (HeyListen) saves to and from an emulator (Saves.cs)
+    void ImportSavesDone(object sender, RoutedEventArgs e) => Saves.Run(this, finished, import: true);
+    void ExportSavesDone(object sender, RoutedEventArgs e) => Saves.Run(this, finished, import: false);
+    void ImportSavesLaunch(object sender, RoutedEventArgs e) => Saves.Run(this, launchFolder, import: true);
+    void ExportSavesLaunch(object sender, RoutedEventArgs e) => Saves.Run(this, launchFolder, import: false);
+
     void OpenFolder(object sender, RoutedEventArgs e) =>
         Process.Start(new ProcessStartInfo("explorer.exe", $"\"{finished}\"") { UseShellExecute = true });
 
@@ -1034,12 +1050,12 @@ public partial class MainWindow : Window
             ProblemTitle.Text = "The build tools need repairing";
             ProblemHead.Text = "Your antivirus removed part of the build tools";
             ProblemText.Text = why + "\n\nAntivirus programs sometimes flag unsigned developer tools by mistake.";
-            var base_ = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder");
+            var base_ = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HeyListenBuilder");
             foreach (var (n, s) in new[]
                      {
                          (1, "Open Windows Security → Protection history, and restore the removed files."),
                          (2, $"Or add {base_} to its exclusions."),
-                         (3, "Then press Repair: Hookshot downloads the tools again from their official releases and checks each one."),
+                         (3, "Then press Repair: HeyListen downloads the tools again from their official releases and checks each one."),
                      })
                 ProblemSteps.Children.Add(new TextBlock { Text = $"{n}.  {s}", Style = (Style)FindResource("Note"), FontSize = 14, Margin = new Thickness(0, 6, 0, 0) });
         }
@@ -1070,7 +1086,7 @@ public partial class MainWindow : Window
     void CopyForReport(object sender, RoutedEventArgs e)
     {
         var lines = log.ToString().Split('\n');
-        var text = $"Hookshot Builder {Tools.Find()?.Version ?? "(source)"} on Windows {Environment.OSVersion.Version}\n" +
+        var text = $"HeyListen Builder {Tools.Find()?.Version ?? "(source)"} on Windows {Environment.OSVersion.Version}\n" +
                    $"{ProblemTitle.Text}: {lastFailure}\n\n" + string.Join("\n", lines.Skip(Math.Max(0, lines.Length - 200)));
         try { Clipboard.SetText(text); CopyReport.Content = "Copied"; } catch (Exception) { }
     }
@@ -1091,7 +1107,7 @@ public partial class MainWindow : Window
             Application.Current.Shutdown();
             return;
         }
-        Process.Start(new ProcessStartInfo("https://github.com/NotRexed/Hookshot/releases/latest") { UseShellExecute = true });
+        Process.Start(new ProcessStartInfo("https://github.com/Sacrappy/HeyListen/releases/latest") { UseShellExecute = true });
     }
 
     // ================= the update (Updater.cs): the game started this app with --update <folder> =================
@@ -1155,7 +1171,7 @@ public partial class MainWindow : Window
 
     void CloseWindow(object sender, RoutedEventArgs e)
     {
-        if (runner != null && MessageBox.Show(this, T(S.CloseQuestion), "Hookshot", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
+        if (runner != null && MessageBox.Show(this, T(S.CloseQuestion), "HeyListen", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
         runner?.Cancel();
         Close();
     }

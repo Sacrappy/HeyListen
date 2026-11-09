@@ -44,8 +44,23 @@ try {
     & "$Tools\python\python.exe" -I nx2/build.py --standalone --jobs $Jobs
     if ($LASTEXITCODE) { throw "build failed" }
     $built = Join-Path $Work "sa\build"
-    foreach ($n in "hookshot.exe", "hookshot_vk.dll") {
-        Copy-Item "$built\$n" "$Game\$n" -Force
+    # (HeyListen.exe since TICK-034. Into bin\ when the folder has the launcher layout, else beside image.bin. An older hookshot.exe
+    # in the same place is removed, so the folder never has two games; it cannot be while it runs: close it first)
+    $dest = if ((Test-Path "$Game\bin\HeyListen.exe") -or (Test-Path "$Game\bin\hookshot.exe")) { "$Game\bin" } else { $Game }
+    if (Get-Process hookshot, HeyListen -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Game, [StringComparison]::OrdinalIgnoreCase) }) {
+        throw "the game in $Game is running: close it first"
+    }
+    foreach ($n in "HeyListen.exe", "hookshot_vk.dll") {
+        Copy-Item "$built\$n" "$dest\$n" -Force
         Write-Host "copied $n"
+    }
+    foreach ($old in "hookshot.exe", "hookshot.map") {
+        if (Test-Path "$dest\$old") { Remove-Item "$dest\$old" -Force; Write-Host "removed the old $old (the game is HeyListen.exe now)" }
+    }
+    if ($dest -ne $Game) {   # (launcher layout: the old launcher hookshot.exe beside it; the new one comes with a builder build)
+        if ((Test-Path "$Game\hookshot.exe") -and -not (Test-Path "$Game\HeyListen.exe")) {
+            Copy-Item "$Game\hookshot.exe" "$Game\HeyListen.exe"; Remove-Item "$Game\hookshot.exe" -Force
+            Write-Host "renamed the launcher to HeyListen.exe"
+        }
     }
 } finally { Pop-Location }

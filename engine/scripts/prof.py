@@ -9,6 +9,20 @@ Prints the functions by inclusive share (in the stack at all) and by self share 
 """
 import bisect, collections, os, re, sys
 
+# (HeyListen: the game exe is HeyListen.exe since TICK-034; hookshot.exe in older builds and traces)
+GAME_EXES = ("HeyListen.exe", "hookshot.exe")
+
+
+def game_map(folder=None):
+    """the game exe's linker map in folder (default BUILD): HeyListen.map, else an older build's hookshot.map"""
+    folder = folder or BUILD
+    for exe in GAME_EXES:
+        mp = os.path.join(folder, exe[:-4] + ".map")
+        if os.path.exists(mp):
+            return mp
+    return os.path.join(folder, GAME_EXES[0][:-4] + ".map")
+
+
 BUILD = os.environ.get("HOOKSHOT_BUILD") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work", "sa", "build")
 
 
@@ -38,7 +52,7 @@ def main():
     skip = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
     only = sys.argv[4] if len(sys.argv) > 4 else None
     maps = {}
-    for mod in ("hookshot_vk.dll", "hookshot.exe"):
+    for mod in ("hookshot_vk.dll",) + GAME_EXES:
         mp = os.path.join(BUILD, mod[:-4] + ".map")
         if os.path.exists(mp):
             base = 0x180000000 if mod.endswith(".dll") else 0x140000000

@@ -3,7 +3,7 @@
 # -Sound, screenshots every -ShotEvery presents into work\runs\<name>\shots. Extra environment: -Env "A=1;B=2".
 #
 # Guards (the PC is the user's, and one game runs at a time): no run while Rainbow Six Siege is open, nor while
-# another session's mkw.exe or hookshot.exe runs (-Force overrides both); the game is stopped when its working set passes
+# another session's mkw.exe, hookshot.exe or HeyListen.exe runs (-Force overrides both); the game is stopped when its working set passes
 # -MaxGB. Delete work\runs\<name>\shots once the shots are looked at: they reach gigabytes.
 param([int]$Seconds = 120, [string]$Name = "vk", [int]$ShotEvery = 300, [string]$Env = "", [switch]$Window,
       [int]$MaxGB = 10, [switch]$Force, [switch]$Sound, [string]$Romfs = "", [string]$Priority = "High")
@@ -13,7 +13,7 @@ if (-not $Force) {
     if (Get-Process RainbowSix, RainbowSix_BE, RainbowSix_Vulkan -ErrorAction SilentlyContinue) {
         "a game is running (Rainbow Six): no test run now"; exit 2
     }
-    $other = Get-Process mkw, hookshot -ErrorAction SilentlyContinue
+    $other = Get-Process mkw, hookshot, HeyListen -ErrorAction SilentlyContinue
     if ($other) { "another game run is going ($(($other | ForEach-Object { "$($_.Name).exe $($_.Id)" }) -join ', ')): one at a time"; exit 2 }
 }
 if (-not $Romfs) {   # (the dump's romfs, from work\dump.txt: nx2/dump.py --set)
@@ -22,7 +22,7 @@ if (-not $Romfs) {   # (the dump's romfs, from work\dump.txt: nx2/dump.py --set)
     $dump = (Get-Content $cfg | Where-Object { $_ -and -not $_.StartsWith("#") } | Select-Object -First 1).Trim()
     $Romfs = Join-Path $dump "romfs"
 }
-$exe = Join-Path $root "work\sa\build\hookshot.exe"
+$exe = Join-Path $root "work\sa\build\HeyListen.exe"
 $image = Join-Path $root "work\sa\image\image.bin"
 $user = Join-Path $root "work\sa\user"
 $out = Join-Path $root "work\runs\$Name"

@@ -14,7 +14,7 @@ import collections, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import prof  # noqa: E402
 
-RUN_MODS = ("hookshot.exe", "hookshot_vk.dll")
+RUN_MODS = prof.GAME_EXES + ("hookshot_vk.dll",)
 
 
 def main():

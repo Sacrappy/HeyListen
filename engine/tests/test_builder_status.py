@@ -28,10 +28,10 @@ class BuilderStatusTests(unittest.TestCase):
         self.assertEqual(make_game.reported("@@error no output"), "no output")
 
     def test_check_keeps_the_sentence_after_ok_or_bad(self):
-        ok = "@@check ok This is the version Hookshot supports (build e0f3ccfa)."
-        bad = "@@check bad This is build abcdef01. Hookshot supports build e0f3ccfa."
-        self.assertEqual(make_game.reported(ok), "This is the version Hookshot supports (build e0f3ccfa).")
-        self.assertEqual(make_game.reported(bad), "This is build abcdef01. Hookshot supports build e0f3ccfa.")
+        ok = "@@check ok This is the version HeyListen supports (build e0f3ccfa)."
+        bad = "@@check bad This is build abcdef01. HeyListen supports build e0f3ccfa."
+        self.assertEqual(make_game.reported(ok), "This is the version HeyListen supports (build e0f3ccfa).")
+        self.assertEqual(make_game.reported(bad), "This is build abcdef01. HeyListen supports build e0f3ccfa.")
         self.assertEqual(old_split(ok), make_game.reported(ok))
 
     def test_other_lines_are_not_status(self):

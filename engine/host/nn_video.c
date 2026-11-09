@@ -61,7 +61,7 @@ static DWORD WINAPI av1_notice(LPVOID unused) {
     (void)unused;
     if (MessageBoxA(NULL, "The game's movies need Microsoft's free \"AV1 Video Extension\", which this PC doesn't have, so they "
                           "show black (the sound plays).\n\nOpen its page in the Microsoft Store now? Install it, then start the game again.",
-                    "Hookshot", MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES)
+                    "HeyListen", MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES)
         ShellExecuteA(NULL, "open", "ms-windows-store://pdp/?ProductId=9MVZQVXJBQ9V", NULL, NULL, SW_SHOWNORMAL);
     return 0;
 }

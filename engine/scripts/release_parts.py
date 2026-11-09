@@ -42,7 +42,7 @@ PREBUILT_EXT = (".dll", ".lib", ".exe", ".sha1")
 
 
 def get(url, api=False, tries=5):
-    headers = {"User-Agent": "hookshot-ci"}
+    headers = {"User-Agent": "heylisten-release"}
     if api:
         headers["Accept"] = "application/vnd.github+json"
         if os.environ.get("GH_TOKEN"):
@@ -71,13 +71,13 @@ def previous(a):
         for r in releases:
             if r["draft"] or r["prerelease"] or r["tag_name"] == a.skip_tag:
                 continue
-            url = next((x["browser_download_url"] for x in r["assets"] if x["name"] == "hookshot-setup.txt"), None)
+            url = next((x["browser_download_url"] for x in r["assets"] if x["name"] in ("heylisten-setup.txt", "hookshot-setup.txt")), None)
             if url:
                 with open(a.out, "wb") as f:
                     f.write(get(url))
                 print(r["tag_name"])
                 return 0
-    print("no release with a hookshot-setup.txt in %s" % ", ".join(a.repo), file=sys.stderr)
+    print("no release with a heylisten-setup.txt or hookshot-setup.txt in %s" % ", ".join(a.repo), file=sys.stderr)
     return 1
 
 
@@ -111,7 +111,7 @@ def sha256(path):
 
 def named_part(list_path, name):
     for w in part_lines(list_path):
-        if w[6].rsplit("/", 1)[-1].startswith("HookshotBuilder-%s-" % name):
+        if w[6].rsplit("/", 1)[-1].startswith(("HookshotBuilder-%s-" % name, "HeyListenBuilder-%s-" % name)):
             return fetch_part(w[1], int(w[2]), w[6])
     return None
 
@@ -182,7 +182,7 @@ def package(a):
     copy(a.setup, os.path.join(out, "HookshotBuilder-Setup.exe"))   # (the builder's Repair runs it)
     copy(os.path.join(ROOT, "LICENSE"), os.path.join(out, "LICENSE"))
     tools = os.path.join(out, "tools")
-    for f in tracked("gpu", "host", "nx2", "scripts", "third_party"):
+    for f in tracked("assets", "gpu", "host", "nx2", "scripts", "third_party"):   # (assets: HeyListen's icon resource, nx2/build.py)
         copy(os.path.join(ROOT, f), os.path.join(tools, *f.split("/")))
     if a.list:
         if not profile(argparse.Namespace(list=a.list, work=os.path.join(tools, "work"))) == 0:

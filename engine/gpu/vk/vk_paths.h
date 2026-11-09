@@ -1,5 +1,5 @@
 // The game folder's path for the files the game keeps there (caches, the shader list, settings): host/hos_paths.h's rule, for
-// this DLL. The game is bin\hookshot.exe beside its launcher since the launcher came; its files stay in the folder above bin.
+// this DLL. The game is bin\HeyListen.exe beside its launcher since the launcher came; its files stay in the folder above bin.
 // game_module_path answers as GetModuleFileNameA(nullptr, ...) does, with the folder's path when the exe is in a "bin" folder
 // beside image.bin.
 #pragma once

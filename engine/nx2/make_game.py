@@ -44,7 +44,9 @@ import toolchain as _toolchain
 LINUX, CROSS = not _toolchain.windows(), _toolchain.windows() and os.name != "nt"
 # (SDL2.dll is sdl2-compat: it loads SDL3.dll from beside the exe. Left out of bin\ since v2.0.0, it said "Failed loading SDL3
 # library" three times and no controller worked: Discord #bug-reporting, 11-08)
-BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
+BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["HeyListen.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
+# (HeyListen: the Windows game and its launcher were hookshot.exe before; a folder built then has them, removed once the new ones are in)
+OLD_EXES = [] if LINUX else ["hookshot.exe", "hookshot.map"]
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
              ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh-Hans", "Chinese (Simplified)"),
@@ -253,13 +255,13 @@ def check_modules(exefs):
                 head = f.read(16)
             if head[:4] != b"NSO0":
                 fail("The file %s in this dump is not a game module (it starts %s). Try another dump of the game, or send this message to the "
-                     "Hookshot developers." % (name, head.hex()))
+                     "HeyListen developers." % (name, head.hex()))
 
 
 def check_supported_build(exefs):
     bid = build_id(os.path.join(exefs, "main"))
     if not bid.startswith(BUILD_ID):
-        fail("This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
+        fail("This is build %s. HeyListen supports build %s." % (bid[:8], BUILD_ID))
 
 
 def check_cache_paths(out, paths):
@@ -288,7 +290,7 @@ def check_cpu():
     from host_cpu import host_march
     m = host_march()
     if m != "x86-64-v3":
-        fail("Your processor has no AVX2 (it runs %s), and the AppImage's renderer needs it. Build Hookshot from source "
+        fail("Your processor has no AVX2 (it runs %s), and the AppImage's renderer needs it. Build HeyListen from source "
              "instead (see the readme): a source build follows your processor." % m)
 
 
@@ -305,9 +307,9 @@ def check(a, work):
     else:
         bid = build_id(os.path.join(a.exefs, "main"))
     if bid.startswith(BUILD_ID):
-        say("check", "ok", "This is the version Hookshot supports (build %s)." % bid[:8])
+        say("check", "ok", "This is the version HeyListen supports (build %s)." % bid[:8])
     else:
-        say("check", "bad", "This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
+        say("check", "bad", "This is build %s. HeyListen supports build %s." % (bid[:8], BUILD_ID))
 
 
 def visual_studio_environment():
@@ -410,7 +412,7 @@ def check_linux_compiler():
     import toolchain
     cc = toolchain.find("clang")
     if not os.path.isfile(cc):
-        fail("No C compiler was found. Install clang (and lld), or use the Hookshot AppImage, which brings its own.")
+        fail("No C compiler was found. Install clang (and lld), or use the HeyListen AppImage, which brings its own.")
     sysroot = os.environ.get("HOOKSHOT_SYSROOT")
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "t.c")
@@ -473,7 +475,7 @@ def bundled_mingw():
             missing = [n for n in ("clang.exe", "clang++.exe", "ld.lld.exe")
                        if not os.path.isfile(os.path.join(here, "bin", n))]
             fail("Files of the builder's own compiler are missing (%s in %s). Your antivirus most likely removed them "
-                 "(a false alarm on unsigned programs): restore them from its quarantine or allow the Hookshot Builder folder, "
+                 "(a false alarm on unsigned programs): restore them from its quarantine or allow the HeyListen Builder folder, "
                  "then unzip HookshotBuilder.zip again and build. Visual Studio is not needed."
                  % (", ".join(missing) or "bin", os.path.join(here, "bin")))
     return os.environ.get("HOOKSHOT_MINGW", "")
@@ -486,7 +488,7 @@ def check_mingw():
     cc = toolchain.find("clang")   # (HOOKSHOT_MINGW's, else the one toolchain.py finds: the same as the build uses)
     if not os.path.isfile(cc):   # (HOOKSHOT_MINGW set to a folder without the compiler: said here, not as a silent SystemExit)
         fail("The builder's own compiler was not found at %s. Set HOOKSHOT_MINGW to an llvm-mingw folder, or unpack the "
-             "Hookshot Builder zip again into a folder your antivirus allows." % cc)
+             "HeyListen Builder zip again into a folder your antivirus allows." % cc)
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "t.c")
         with open(src, "w") as f:
@@ -926,7 +928,7 @@ def main(a=None):
     if a.update:
         if not os.path.isdir(kept) or not os.path.isdir(romfs):
             fail("This game folder has no copy of the game files to update from: it was built before updates came in. Choose your game files "
-                 "in Hookshot Builder and build into the same folder once; updates after that work by themselves.")
+                 "in HeyListen Builder and build into the same folder once; updates after that work by themselves.")
         check_cache_paths(out, (kept, romfs))
         shutil.copytree(kept, exefs)
         check_modules(exefs)
@@ -1086,10 +1088,10 @@ def main(a=None):
     built = os.path.join(work, "sa", "build")
     # (the new files are copied in beside the old ones as <name>.new and swapped in only once all are complete: a build stopped while
     # copying, or a full disk, left a half-written 460 MB hookshot.exe and no game to play. The old game stays playable until the swap)
-    # (Windows) hookshot.exe in the folder is the game's launcher: the builder's small setup, which opens the installed builder as a
+    # (Windows) HeyListen.exe in the folder is the game's launcher: the builder's small setup, which opens the installed builder as a
     # launcher for this folder (Play, and Update left of it when a newer release is out: builder/setup/setup.c launch mode), or starts
     # the game when no builder is installed. The game and its DLLs are in bin\; its files (image.bin, romfs, saves, settings, caches)
-    # stay in the folder (host/hos_paths.h). Without the setup (a development build) the game stays hookshot.exe in the folder
+    # stay in the folder (host/hos_paths.h). Without the setup (a development build) the game stays HeyListen.exe in the folder
     staged = []
     # (Linux) the same launcher, as a script, when this is a packaged builder (the AppImage sets HOOKSHOT_TOOLS). A source
     # checkout leaves hookshot in the folder, as a development build on Windows does when the setup exe is not beside it
@@ -1122,8 +1124,17 @@ def main(a=None):
         try:
             os.replace(dst + ".new", dst)   # (linux: a running copy keeps its own file; windows: a running exe cannot be replaced)
         except PermissionError:
-            fail("Could not replace %s. Close any running copy of Hookshot and check that the file and folder are writable, then retry. "
+            fail("Could not replace %s. Close any running copy of HeyListen and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
+    for d in ([out, os.path.join(out, "bin")] if OLD_EXES else []):   # (the old hookshot.exe game and launcher: never two games in a folder)
+        for n in OLD_EXES:
+            if n in BESIDE:
+                continue
+            try:
+                if os.path.isfile(os.path.join(d, n)):
+                    os.remove(os.path.join(d, n))
+            except OSError:
+                pass
     if launcher:   # (a folder built before the launcher: its libraries left the folder for bin\; hookshot is the launcher now)
         stale = [] if LINUX else sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
         for n in BESIDE[1:] + stale + ["hookshot.map", "hookshot-game.exe"]:
@@ -1204,7 +1215,7 @@ def cli():
             import traceback
             print(traceback.format_exc(), flush=True)
             say("error", "The builder stopped on an error it did not expect: %s: %s. Please send the text under Show details to the "
-                "Hookshot issues page." % (type(e).__name__, str(e)[:300]))
+                "HeyListen issues page." % (type(e).__name__, str(e)[:300]))
             sys.exit(1)
 
 

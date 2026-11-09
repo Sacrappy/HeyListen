@@ -820,7 +820,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HFONT title = font(20 * s, FW_SEMIBOLD), body = font(16 * s, FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, title);
     SetTextColor(dc, RGB(236, 240, 236));
-    const char* heading = page == 4 ? "Inventory" : page == 3 ? "Teleport" : page == 2 ? "Cheats" : "Hookshot";
+    const char* heading = page == 4 ? "Inventory" : page == 3 ? "Teleport" : page == 2 ? "Cheats" : "HeyListen";
     TextOutA(dc, 16 * s, 12 * s, heading, (int)strlen(heading));
     {   // (which build, beside the title, so a report can say it without opening the log; the release alone when the whole
         // line would run into the title)

@@ -13,8 +13,8 @@
 #include <string.h>
 
 #define UPDATE_HOST L"api.github.com"
-#define UPDATE_PATH L"/repos/NotRexed/Hookshot/releases/latest"
-#define RELEASES_PAGE L"https://github.com/NotRexed/Hookshot/releases/latest"
+#define UPDATE_PATH L"/repos/Sacrappy/HeyListen/releases/latest"
+#define RELEASES_PAGE L"https://github.com/Sacrappy/HeyListen/releases/latest"
 
 /* (a line "name=value" of a small text file, in UTF-8: its value, trimmed) */
 static int read_value(const wchar_t *path, const char *name, char *out, size_t cap) {
@@ -42,7 +42,7 @@ static int read_value(const wchar_t *path, const char *name, char *out, size_t c
 /* (the latest release's tag, from GitHub's API: "tag_name":"...") */
 static int latest_tag(char *tag, size_t cap) {
     int ok = 0;
-    HINTERNET s = WinHttpOpen(L"Hookshot-update-check", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET s = WinHttpOpen(L"HeyListen-update-check", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) return 0;
     WinHttpSetTimeouts(s, 2500, 2500, 2500, 3000);
     HINTERNET c = WinHttpConnect(s, UPDATE_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -110,18 +110,18 @@ void hos_update_check(void) {
                             GetFileAttributesW(wbuilder) != INVALID_FILE_ATTRIBUTES;
     if (has_builder)
         _snwprintf(text, 2048,
-                   L"A new version of Hookshot is out: %ls (this game is %ls).\n\n"
-                   L"Update now? The game closes, and Hookshot Builder downloads the new version and builds this game folder again from the "
+                   L"A new version of HeyListen is out: %ls (this game is %ls).\n\n"
+                   L"Update now? The game closes, and HeyListen Builder downloads the new version and builds this game folder again from the "
                    L"game files it keeps. That takes about as long as your first build. Your saves and settings stay.\n\n"
                    L"Yes: update now\nNo: not now (asked again next time)\nCancel: skip this version",
                    wtag, whave);
     else
         _snwprintf(text, 2048,
-                   L"A new version of Hookshot is out: %ls (this game is %ls).\n\n"
-                   L"The Hookshot Builder that made this folder was not found, so it can't update by itself. Open the download page?\n\n"
+                   L"A new version of HeyListen is out: %ls (this game is %ls).\n\n"
+                   L"The HeyListen Builder that made this folder was not found, so it can't update by itself. Open the download page?\n\n"
                    L"Yes: open the page\nNo: not now (asked again next time)\nCancel: skip this version",
                    wtag, whave);
-    const int answer = MessageBoxW(NULL, text, L"Hookshot update", MB_YESNOCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    const int answer = MessageBoxW(NULL, text, L"HeyListen update", MB_YESNOCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
     if (answer == IDCANCEL) {
         wchar_t user[MAX_PATH + 16];
         _snwprintf(user, MAX_PATH + 16, L"%ls\\user", dir);
@@ -145,11 +145,11 @@ void hos_update_check(void) {
     if ((INT_PTR)ShellExecuteW(NULL, L"open", wbuilder, args, slash ? wdir : NULL, SW_SHOWNORMAL) > 32) {
         void hos_log_flush(void);
         hos_log_flush();   /* (the lines logged before, queued: host/hos_thread.c log_queue) */
-        fprintf(stderr, "update: Hookshot Builder started to update to %s; the game closes\n", tag);
+        fprintf(stderr, "update: HeyListen Builder started to update to %s; the game closes\n", tag);
         fflush(stderr);
         ExitProcess(0);
     }
-    MessageBoxW(NULL, L"Hookshot Builder could not be started. The game starts as it is.", L"Hookshot update", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+    MessageBoxW(NULL, L"HeyListen Builder could not be started. The game starts as it is.", L"HeyListen update", MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
 #elif defined(__linux__)
 #include "hos_paths.h"
@@ -218,12 +218,12 @@ static int pipe_tag(const char *cmd, char *tag, size_t cap) {
 }
 
 static int latest_tag(char *tag, size_t cap) {
-    if (pipe_tag("curl -fsSL --max-time 4 --retry 2 -A Hookshot-update-check "
+    if (pipe_tag("curl -fsSL --max-time 4 --retry 2 -A HeyListen-update-check "
                  "-H \"Accept: application/vnd.github+json\" "
-                 "https://api.github.com/repos/NotRexed/Hookshot/releases/latest 2>/dev/null", tag, cap))
+                 "https://api.github.com/repos/Sacrappy/HeyListen/releases/latest 2>/dev/null", tag, cap))
         return 1;
-    return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A Hookshot-update-check "
-                    "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-linux.txt 2>/dev/null", tag, cap);
+    return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A HeyListen-update-check "
+                    "https://github.com/Sacrappy/HeyListen/releases/latest/download/hookshot-linux.txt 2>/dev/null", tag, cap);
 }
 
 /* the builder an update installed (builder/linux/linux_update.py): <data>/hookshot/builder/versions/<current>/AppRun. The
@@ -275,10 +275,10 @@ void hos_update_check(void) {
     char text[1600], cmd[4096];
     snprintf(text, sizeof text,
              has_builder
-                 ? "A new version of Hookshot is out: %s (this game is %s). Update now? The game closes, and Hookshot Builder downloads only what changed and builds this folder again. Your saves and settings stay."
-                 : "A new version of Hookshot is out: %s (this game is %s). The builder that made this folder was not found. Open the download page?",
+                 ? "A new version of HeyListen is out: %s (this game is %s). Update now? The game closes, and HeyListen Builder downloads only what changed and builds this folder again. Your saves and settings stay."
+                 : "A new version of HeyListen is out: %s (this game is %s). The builder that made this folder was not found. Open the download page?",
              tag, have);
-    snprintf(cmd, sizeof cmd, "zenity --list --title=Hookshot --hide-header --column= --text='%s' 'Update now' 'Not now' 'Skip this version'", text);
+    snprintf(cmd, sizeof cmd, "zenity --list --title=HeyListen --hide-header --column= --text='%s' 'Update now' 'Not now' 'Skip this version'", text);
     FILE *pick = popen(cmd, "r");
     if (!pick) return;
     char answer[64] = "";
@@ -295,7 +295,7 @@ void hos_update_check(void) {
     if (strncmp(answer, "Update", 6)) return;
     if (!has_builder) {
         if (fork() == 0) {
-            execlp("xdg-open", "xdg-open", "https://github.com/NotRexed/Hookshot/releases/latest", (char *)0);
+            execlp("xdg-open", "xdg-open", "https://github.com/Sacrappy/HeyListen/releases/latest", (char *)0);
             _exit(127);
         }
         return;
@@ -306,7 +306,7 @@ void hos_update_check(void) {
         _exit(127);
     }
     if (pid > 0) {
-        fprintf(stderr, "update: Hookshot Builder started to update to %s; the game closes\n", tag);
+        fprintf(stderr, "update: HeyListen Builder started to update to %s; the game closes\n", tag);
         fflush(stderr);
         _exit(0);
     }

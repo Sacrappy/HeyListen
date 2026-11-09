@@ -13,7 +13,7 @@ check that the whole lifted game closes over itself: any unresolved symbol fails
 Heavy: 44 chunks of ~25 MB, ~100-200 s and ~2-3.5 GB each at -O1. The PC is shared with games: run it when the
 machine is idle, and keep --jobs low otherwise.
 
---standalone builds work/sa/build/hookshot.exe instead: the standalone lift (work/sa/gen, `lift.py --standalone --write`)
+--standalone builds work/sa/build/HeyListen.exe (Linux: hookshot) instead: the standalone lift (work/sa/gen, `lift.py --standalone --write`)
 + the native runtime in host/ (TOTKPort's hos/, adapted). Objects are cached by their key in work/objcache, shared by
 both builds: the two lifts share their chunk boundaries, so every chunk without a hooked function is the same source
 and is not compiled twice.
@@ -59,8 +59,18 @@ PGO = os.environ.get("RX_PGO", "")
 LINUX = not toolchain.windows()   # (hookshot: RX_TARGET=windows on Linux builds the Windows game, with llvm-mingw)
 POSIX = os.path.join(kit.HERE, "..", "host", "posix")
 SYSROOT = os.environ.get("HOOKSHOT_SYSROOT", "")
-EXE = "hookshot" if LINUX else "hookshot.exe"
+EXE = "hookshot" if LINUX else "HeyListen.exe"   # (HeyListen: the Windows game is HeyListen.exe; Linux keeps hookshot)
 VK_LIB = "hookshot_vk.so" if LINUX else "hookshot_vk.dll"
+
+
+def icon_res():
+    """The game exe's icon resource: HeyListen's own (assets/heylisten.res, tools/release/make_icon.py), else a work/hookshot.res
+    nx2/make_icon.py made (a release's play profile can bring upstream's), else none"""
+    for p in (os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "heylisten.res"),
+              os.path.join(kit.WORK, "hookshot.res")):
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def check_vk_symbols(so):
@@ -877,12 +887,12 @@ def main():
             import shutil
             shutil.copyfile(sdl, os.path.join(out, "libSDL2-2.0.so.0"))
     elif a.standalone and not a.only and not vk_only:
-        exe = os.path.join(out, "hookshot.exe")   # (+ hookshot.map: crash offsets -> f_<guest address>)
+        exe = os.path.join(out, EXE)   # (+ HeyListen.map: crash offsets -> f_<guest address>)
         t = time.time()
         r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
                            ["-o", exe, toolchain.link_opt("/map:" + exe[:-4] + ".map"), toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
                            ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if PGO == "gen" else []) +
-                           ([os.path.join(kit.WORK, "hookshot.res")] if os.path.exists(os.path.join(kit.WORK, "hookshot.res")) else []) +   # (nx2/make_icon.py)
+                           ([icon_res()] if icon_res() else []) +   # (HeyListen's icon, assets/heylisten.res; else nx2/make_icon.py's)
                            [win_manifest.write(os.path.join(out, "hookshot_manifest.res"))] +   # (UTF-8 paths: nx2/win_manifest.py)
                            ([toolchain.link_opt("/subsystem:windows"), toolchain.link_opt("/entry:mainCRTStartup")] if os.environ.get("RX_RELEASE") == "1" else []) +   # (no console window)
                            ([os.path.join(WGPU, "lib", "wgpu_native.dll.lib")] if wgpu else []) +

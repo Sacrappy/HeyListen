@@ -4,14 +4,14 @@ using Microsoft.Win32.SafeHandles;
 
 namespace HookshotBuilder;
 
-/// What the builder keeps on the PC, and letting it go. In %LOCALAPPDATA%\HookshotBuilder: the builder itself (versions\: the one
+/// What the builder keeps on the PC, and letting it go. In %LOCALAPPDATA%\HeyListenBuilder: the builder itself (versions\: the one
 /// installed last, and the one before it), the setup's downloaded parts (the next builder update downloads only those that changed).
 /// In the build files folder (that same folder, or one the player chose: make_game.py --work): the translated code and its compiled
 /// objects (sa\, objcache\: the next update compiles only what changed). None of it is needed to play: the game folder holds all the
 /// game uses, and its copy of the game files (.hookshot_exefs) is what updates build from
 static class Storage
 {
-    public static string Base => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder");
+    public static string Base => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HeyListenBuilder");
 
     /// About what a build leaves in the build files folder (the translated code and its compiled objects): said before the build
     public const long BuildFilesBytes = 4L << 30;
@@ -41,7 +41,7 @@ static class Storage
     public static void MoveWork(string? picked)
     {
         var old = Work;
-        var to = picked == null ? Base : Path.Combine(picked, "Hookshot build files");
+        var to = picked == null ? Base : Path.Combine(picked, "HeyListen build files");
         if (Same(old, to)) return;
         Directory.CreateDirectory(to);
         Directory.CreateDirectory(Base);
