@@ -133,7 +133,7 @@ inline void paint_startup_view(HDC dc, uint32_t w, uint32_t h, int pct, const St
     GdiFlush();
     blit_logo(bits, (int)w, (int)h, cx, 0, S(kLogoH));
     SetTextColor(dc, ink);
-    spaced(dc, "HOOKSHOT", cx, Y(0), S(7), true);
+    spaced(dc, "HEYLISTEN", cx, Y(0), S(7), true);
     SelectObject(dc, ver);
     SetTextColor(dc, dim);
     SetTextAlign(dc, TA_CENTER | TA_TOP);

@@ -8,6 +8,8 @@ Draws the same shapes as engine/assets/heylisten.svg (the editable source; keep 
     engine/assets/heylisten.ico                      16, 32, 48 (32-bit DIB) and 256 (PNG)
     engine/builder/HookshotBuilder/Images/heylisten.png   (the builder window's splash/header image)
     engine/builder/setup/heylisten.ico               (the setup exe's icon, builder/setup/setup.rc)
+    engine/assets/heylisten.res                      (the same icon as a resource the game's HeyListen.exe links in,
+                                                      nx2/build.py; group icon 1, as nx2/make_icon.py writes it)
 """
 import math
 import os
@@ -145,6 +147,22 @@ def ico(images):
     return head + entries + blobs
 
 
+def res_entry(kind, name, data, flags=0x1010):
+    header = struct.pack("<II", len(data), 32) + struct.pack("<HHHH", 0xFFFF, kind, 0xFFFF, name)
+    header += struct.pack("<IHHII", 0, flags, 0x0409, 0, 0)
+    return header + data + b"\0" * (-len(data) & 3)
+
+
+def res(images):
+    """A .res with RT_ICON 1..n and RT_GROUP_ICON 1 (what the game's window class loads)"""
+    group = struct.pack("<HHH", 0, 1, len(images))
+    out = res_entry(0, 0, b"", 0)
+    for i, (n, data) in enumerate(images):
+        group += struct.pack("<BBBBHHIH", n % 256, n % 256, 0, 0, 1, 32, len(data), i + 1)
+        out += res_entry(3, i + 1, data)
+    return out + res_entry(14, 1, group, 0x1030)
+
+
 def main():
     big = render()
     # (16 and 32 divide 256: area averages; 48 does not: 256 -> 192 bilinear, then an area average)
@@ -154,11 +172,14 @@ def main():
     for p in out:
         with open(p, "wb") as f:
             f.write(png(big, 256))
-    data = ico([(16, dib(sizes[16], 16)), (32, dib(sizes[32], 32)), (48, dib(sizes[48], 48)), (256, png(big, 256))])
+    images = [(16, dib(sizes[16], 16)), (32, dib(sizes[32], 32)), (48, dib(sizes[48], 48)), (256, png(big, 256))]
+    data = ico(images)
+    with open(os.path.join(ROOT, "engine", "assets", "heylisten.res"), "wb") as f:
+        f.write(res(images))
     for p in (os.path.join(ROOT, "engine", "assets", "heylisten.ico"), os.path.join(ROOT, "engine", "builder", "setup", "heylisten.ico")):
         with open(p, "wb") as f:
             f.write(data)
-    for p in out + ["engine/assets/heylisten.ico", "engine/builder/setup/heylisten.ico"]:
+    for p in out + ["engine/assets/heylisten.ico", "engine/builder/setup/heylisten.ico", "engine/assets/heylisten.res"]:
         print(os.path.relpath(os.path.join(ROOT, p), ROOT), os.path.getsize(os.path.join(ROOT, p)))
 
 

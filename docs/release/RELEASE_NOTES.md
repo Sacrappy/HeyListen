@@ -27,7 +27,8 @@ repository (the engine under `engine/`).
 - **Builder**: the HeyListen Builder builds this fork (its own releases and updates, its own work folder), and copies Ocarina
   of Time saves **from and to emulators** (Lichii, Eden and its forks, NX2navi, or any folder) with a backup first
   (upstream Hookshot's `oot_saves.py`).
-- An original icon (a blue fairy orb).
+- An original icon (a blue fairy orb), on the builder, the setup and the game; the game is `HeyListen.exe` (a folder built
+  with an earlier build had `hookshot.exe`: rebuilding it replaces that).
 
 ## Known issues
 

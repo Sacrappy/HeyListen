@@ -13,7 +13,7 @@ import prof  # noqa: E402
 top = int(sys.argv[2]) if len(sys.argv) > 2 else 40
 prefix = sys.argv[3] if len(sys.argv) > 3 else "mkw_vk"
 maps = {}
-for mod in ("hookshot.exe", "hookshot_vk.dll"):
+for mod in prof.GAME_EXES + ("hookshot_vk.dll",):
     mp = os.path.join(os.environ.get("RX_MAPS", prof.BUILD), mod[:-4] + ".map")
     if os.path.exists(mp):
         maps[mod] = prof.load_map(mp, 0x180000000 if mod.endswith(".dll") else 0x140000000)
@@ -34,7 +34,7 @@ def name(f):
     return r
 
 
-RUN = ("hookshot_vk.dll", "hookshot.exe", "nvoglv64.dll")
+RUN = ("hookshot_vk.dll",) + prof.GAME_EXES + ("nvoglv64.dll",)
 seen, running = collections.Counter(), collections.Counter()
 incl, self_ = collections.Counter(), collections.Counter()
 nrun = 0

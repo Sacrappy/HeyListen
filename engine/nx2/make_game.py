@@ -44,7 +44,9 @@ import toolchain as _toolchain
 LINUX, CROSS = not _toolchain.windows(), _toolchain.windows() and os.name != "nt"
 # (SDL2.dll is sdl2-compat: it loads SDL3.dll from beside the exe. Left out of bin\ since v2.0.0, it said "Failed loading SDL3
 # library" three times and no controller worked: Discord #bug-reporting, 11-08)
-BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
+BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["HeyListen.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
+# (HeyListen: the Windows game and its launcher were hookshot.exe before; a folder built then has them, removed once the new ones are in)
+OLD_EXES = [] if LINUX else ["hookshot.exe", "hookshot.map"]
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
              ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh-Hans", "Chinese (Simplified)"),
@@ -1086,10 +1088,10 @@ def main(a=None):
     built = os.path.join(work, "sa", "build")
     # (the new files are copied in beside the old ones as <name>.new and swapped in only once all are complete: a build stopped while
     # copying, or a full disk, left a half-written 460 MB hookshot.exe and no game to play. The old game stays playable until the swap)
-    # (Windows) hookshot.exe in the folder is the game's launcher: the builder's small setup, which opens the installed builder as a
+    # (Windows) HeyListen.exe in the folder is the game's launcher: the builder's small setup, which opens the installed builder as a
     # launcher for this folder (Play, and Update left of it when a newer release is out: builder/setup/setup.c launch mode), or starts
     # the game when no builder is installed. The game and its DLLs are in bin\; its files (image.bin, romfs, saves, settings, caches)
-    # stay in the folder (host/hos_paths.h). Without the setup (a development build) the game stays hookshot.exe in the folder
+    # stay in the folder (host/hos_paths.h). Without the setup (a development build) the game stays HeyListen.exe in the folder
     staged = []
     # (Linux) the same launcher, as a script, when this is a packaged builder (the AppImage sets HOOKSHOT_TOOLS). A source
     # checkout leaves hookshot in the folder, as a development build on Windows does when the setup exe is not beside it
@@ -1124,6 +1126,15 @@ def main(a=None):
         except PermissionError:
             fail("Could not replace %s. Close any running copy of HeyListen and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
+    for d in ([out, os.path.join(out, "bin")] if OLD_EXES else []):   # (the old hookshot.exe game and launcher: never two games in a folder)
+        for n in OLD_EXES:
+            if n in BESIDE:
+                continue
+            try:
+                if os.path.isfile(os.path.join(d, n)):
+                    os.remove(os.path.join(d, n))
+            except OSError:
+                pass
     if launcher:   # (a folder built before the launcher: its libraries left the folder for bin\; hookshot is the launcher now)
         stale = [] if LINUX else sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
         for n in BESIDE[1:] + stale + ["hookshot.map", "hookshot-game.exe"]:

@@ -18,7 +18,7 @@ def main():
     leaf_mod = sys.argv[3] if len(sys.argv) > 3 else "nvoglv64.dll"
     top = int(sys.argv[4]) if len(sys.argv) > 4 else 30
     maps = {}
-    for mod in ("hookshot_vk.dll", "hookshot.exe"):
+    for mod in ("hookshot_vk.dll",) + prof.GAME_EXES:
         mp = os.path.join(prof.BUILD, mod[:-4] + ".map")
         if os.path.exists(mp):
             maps[mod] = prof.load_map(mp, 0x180000000 if mod.endswith(".dll") else 0x140000000)

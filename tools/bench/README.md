@@ -1,7 +1,7 @@
 # tools/bench - frametime benchmark harness (TICK-001)
 
 ```
-python tools/bench/run_bench.py --exe <hookshot.exe|lichii.exe> --scene <name> --out <dir>
+python tools/bench/run_bench.py --exe <HeyListen.exe|lichii.exe> --scene <name> --out <dir>
         [--duration 90] [--warmup-s N] [--repeat N] [--fps-limit 120] [--input-script S]
         [--presentmon <PresentMon.exe>] [--game <file for lichii -g>] [--build auto|hookshot|lichii]
 python tools/bench/summarize.py [--warmup-s N] [--origin launch|first_present] <dir> [<dir> ...]
@@ -44,9 +44,9 @@ The Hookshot frame cap is `--fps-limit` (sets `HOS_FPS_LIMIT`, default 120). Set
 target rate and read the matching budget column:
 
 ```
-python tools/bench/run_bench.py --exe <hookshot.exe> --scene hyrule-walk --out <dir> --fps-limit 120 --duration 115
-python tools/bench/run_bench.py --exe <hookshot.exe> --scene hyrule-walk --out <dir> --fps-limit 144 --duration 115
-python tools/bench/run_bench.py --exe <hookshot.exe> --scene hyrule-walk --out <dir> --fps-limit 240 --duration 115
+python tools/bench/run_bench.py --exe <HeyListen.exe> --scene hyrule-walk --out <dir> --fps-limit 120 --duration 115
+python tools/bench/run_bench.py --exe <HeyListen.exe> --scene hyrule-walk --out <dir> --fps-limit 144 --duration 115
+python tools/bench/run_bench.py --exe <HeyListen.exe> --scene hyrule-walk --out <dir> --fps-limit 240 --duration 115
 python tools/bench/summarize.py <dir> ...
 ```
 

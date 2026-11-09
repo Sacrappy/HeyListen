@@ -1,4 +1,4 @@
-"""hookshot.exe offset -> lifted function (f_<guest address>) + offset, from work/sa/build/hookshot.map (build.py --standalone).
+"""HeyListen.exe (hookshot.exe before) offset -> lifted function (f_<guest address>) + offset, from work/sa/build/hookshot.map (build.py --standalone).
 
 Usage:  python -I nx2/samap.py <hex offset> [...]
 """
@@ -11,7 +11,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kit
 
 rows = []
-for line in open(os.path.join(kit.WORK, "sa", "build", "hookshot.map"), errors="replace"):
+_build = os.path.join(kit.WORK, "sa", "build")
+_map = next((os.path.join(_build, m) for m in ("HeyListen.map", "hookshot.map") if os.path.exists(os.path.join(_build, m))),
+            os.path.join(_build, "HeyListen.map"))   # (HeyListen.exe since TICK-034; hookshot.map in older builds)
+for line in open(_map, errors="replace"):
     m = re.match(r"\s*[0-9a-f]{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{16})", line)
     if m:
         rows.append((int(m.group(2), 16), m.group(1)))

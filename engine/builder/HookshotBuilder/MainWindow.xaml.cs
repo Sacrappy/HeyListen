@@ -226,11 +226,21 @@ public partial class MainWindow : Window
         return null;
     }
 
-    /// The game in a folder: bin\hookshot.exe below its launcher (hookshot.exe), or hookshot.exe in a folder built before the launcher
+    /// The game in a folder: bin\HeyListen.exe below its launcher (HeyListen.exe), or HeyListen.exe in a folder built before the
+    /// launcher; a folder built before HeyListen named its exe (hookshot.exe, in the same places) until it is built again
     static string GameExe(string folder)
     {
-        var game = System.IO.Path.Combine(folder, "bin", "hookshot.exe");
-        return File.Exists(game) ? game : System.IO.Path.Combine(folder, "hookshot.exe");
+        foreach (var name in Finder.GameExeNames)
+        {
+            var game = System.IO.Path.Combine(folder, "bin", name);
+            if (File.Exists(game)) return game;
+        }
+        foreach (var name in Finder.GameExeNames)
+        {
+            var game = System.IO.Path.Combine(folder, name);
+            if (File.Exists(game)) return game;
+        }
+        return System.IO.Path.Combine(folder, "bin", Finder.GameExeNames[0]);
     }
 
     /// (the launcher already checked for updates: the game does not ask again)

@@ -683,14 +683,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         GetModuleFileNameW(NULL, self, MAX_PATH);
         const wchar_t *name = wcsrchr(self, L'\\');
         name = name ? name + 1 : self;
-        if (!_wcsicmp(name, L"hookshot.exe") && !wcsstr(g_cmdline, L"--")) {   /* (the game folder's launcher) */
+        /* (the game folder's launcher: HeyListen.exe; hookshot.exe in a folder built before the rename) */
+        if ((!_wcsicmp(name, L"HeyListen.exe") || !_wcsicmp(name, L"hookshot.exe")) && !wcsstr(g_cmdline, L"--")) {
             wchar_t *slash = wcsrchr(self, L'\\');
             if (slash) *slash = 0;
             swprintf(g_cmdline, 2047, L"--launch \"%ls\"", self);
             if (launch_installed(g_cmdline)) return 0;
             /* (no builder installed on this PC: the game itself, at once; nothing is downloaded to show a Play button) */
             wchar_t game[MAX_PATH], cmd[MAX_PATH + 4];
-            swprintf(game, MAX_PATH, L"%ls\\bin\\hookshot.exe", self);
+            swprintf(game, MAX_PATH, L"%ls\\bin\\%ls", self, name);   /* (the game has the launcher's name: bin\HeyListen.exe) */
             swprintf(cmd, MAX_PATH + 4, L"\"%ls\"", game);
             STARTUPINFOW si = {sizeof si};
             PROCESS_INFORMATION pi;
@@ -698,7 +699,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
                 return 0;
             }
-            MessageBoxW(NULL, L"The game (bin\\hookshot.exe) is missing from this folder. Build it again with the HeyListen Builder.", L"HeyListen",
+            MessageBoxW(NULL, L"The game (bin\\HeyListen.exe) is missing from this folder. Build it again with the HeyListen Builder.", L"HeyListen",
                         MB_ICONERROR);
             return 1;
         }

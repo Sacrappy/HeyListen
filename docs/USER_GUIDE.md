@@ -37,7 +37,8 @@ quick. The builder keeps its build files in `%LOCALAPPDATA%\HeyListenBuilder` so
 
 ## 4. Play
 
-Press **Play**, or use the *HeyListen* shortcut on the desktop or in the Start menu. **Insert** opens the in-game menu
+Press **Play**, or use the *HeyListen* shortcut on the desktop or in the Start menu. The game folder's `HeyListen.exe` starts it too
+(the game itself is `bin\HeyListen.exe`, which is what Task Manager shows). **Insert** opens the in-game menu
 (graphics, controls, frame rate, cheats). Frame generation is off by default.
 
 ## Saves

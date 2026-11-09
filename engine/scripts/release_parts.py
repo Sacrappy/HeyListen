@@ -182,7 +182,7 @@ def package(a):
     copy(a.setup, os.path.join(out, "HookshotBuilder-Setup.exe"))   # (the builder's Repair runs it)
     copy(os.path.join(ROOT, "LICENSE"), os.path.join(out, "LICENSE"))
     tools = os.path.join(out, "tools")
-    for f in tracked("gpu", "host", "nx2", "scripts", "third_party"):
+    for f in tracked("assets", "gpu", "host", "nx2", "scripts", "third_party"):   # (assets: HeyListen's icon resource, nx2/build.py)
         copy(os.path.join(ROOT, f), os.path.join(tools, *f.split("/")))
     if a.list:
         if not profile(argparse.Namespace(list=a.list, work=os.path.join(tools, "work"))) == 0:

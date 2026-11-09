@@ -10,7 +10,7 @@ import bisect, collections, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import prof  # noqa: E402
 
-addrs, names = prof.load_map(os.path.join(prof.BUILD, "hookshot.map"), 0x140000000)
+addrs, names = prof.load_map(prof.game_map(), 0x140000000)
 share = float(sys.argv[3]) if len(sys.argv) > 3 else 0.85
 cap = int(sys.argv[4]) if len(sys.argv) > 4 else 1500
 c = collections.Counter()
@@ -20,11 +20,11 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     if not st or head.split(" ", 1)[-1].startswith("mkw_vk"):
         continue
     frames = st.split(";")
-    if not frames[0].startswith("hookshot.exe+"):
+    if not frames[0].startswith(tuple(e + "+" for e in prof.GAME_EXES)):
         continue
     for f in frames:
         mod, _, off = f.rpartition("+")
-        if mod != "hookshot.exe":
+        if mod not in prof.GAME_EXES:
             continue
         i = bisect.bisect_right(addrs, int(off, 16)) - 1
         n = names[i] if i >= 0 else ""

@@ -73,6 +73,9 @@ static class Finder
 
     // ---- shortcuts to the built game ----
 
+    /// The game's (and its launcher's) exe name: HeyListen.exe; hookshot.exe in a folder built before HeyListen renamed it
+    public static readonly string[] GameExeNames = { "HeyListen.exe", "hookshot.exe" };
+
     public static string DesktopLink => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "HeyListen.lnk");
     public static string StartLink => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "HeyListen.lnk");
 
@@ -82,10 +85,10 @@ static class Finder
 
     public static void Shortcuts(string gameFolder, bool desktop, bool start)
     {
-        // (hookshot.exe: the game's launcher in a folder built since it came (Play, and Update when a newer release is out), else the
-        // game. The icon is the game's own: bin\hookshot.exe when it is there)
-        var exe = Path.Combine(gameFolder, "hookshot.exe");
-        var icon = File.Exists(Path.Combine(gameFolder, "bin", "hookshot.exe")) ? Path.Combine(gameFolder, "bin", "hookshot.exe") : exe;
+        // (HeyListen.exe: the game's launcher in a folder built since it came (Play, and Update when a newer release is out), else the
+        // game. The icon is the game's own: bin\HeyListen.exe when it is there. hookshot.exe: a folder built before the rename)
+        var exe = GameExeNames.Select(n => Path.Combine(gameFolder, n)).FirstOrDefault(File.Exists) ?? Path.Combine(gameFolder, GameExeNames[0]);
+        var icon = GameExeNames.Select(n => Path.Combine(gameFolder, "bin", n)).FirstOrDefault(File.Exists) ?? exe;
         foreach (var (link, want) in new[] { (DesktopLink, desktop), (StartLink, start) })
         {
             try
