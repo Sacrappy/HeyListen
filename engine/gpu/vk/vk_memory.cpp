@@ -30,6 +30,7 @@
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
+#include "mirror_inherit.h"   // (TICK-036: what a new mirror takes from the retired pools' mirrors)
 #include "shaders/msync_scatter_comp_spv.h"   // (TICK-021: the mirror syncs' scatter copy)
 #ifdef __linux__
 #include <cerrno>
@@ -59,6 +60,7 @@ struct Pool {
     uint32_t synced_gen = 0;     // every page stamped up to this generation is in the mirror
     uint64_t synced_epoch = 0;   // the submission that last brought it up to date
     uint64_t sync_seg = 0;       // (and the parallel replay's segment whose uploads did)
+    uint64_t made_epoch = 0, made_seg = 0;   // (TICK-036: the submission and segment whose uploads filled its mirror)
     uint64_t last_value = 0;     // (the newest submission that bound it: its mirror is in use until that one is done)
     uint64_t direct_write_epoch = 0;   // (the part that last wrote it in guest memory, before it had a mirror)
     uint64_t retired_value = 0;  // (retired: the submission that may still use it)
@@ -605,8 +607,14 @@ inline uint32_t page_gen(uint64_t p) {
 uint32_t gen_now = 1;
 uint64_t pages_collected = 0;
 
+// (TICK-036, RX_VK_LOG_INHERIT=<hex guest address>: that page's stamps and the retired mirrors a new mirror takes over it)
+uint64_t inherit_watch_page() {
+    static const uint64_t v = getenv("RX_VK_LOG_INHERIT") ? strtoull(getenv("RX_VK_LOG_INHERIT"), nullptr, 16) >> kPageShift : ~0ull;
+    return v;
+}
 void stamp_page(uint64_t p, uint32_t g) {
     if (p >= kPages) return;
+    if (p == inherit_watch_page()) logf("vk: inherit watch: page %#llx stamped, gen %u", (unsigned long long)(p << kPageShift), g);
     auto& c = gen_chunks[p / kChunkPages];
     if (!c) {
         c.reset(new uint32_t[kChunkPages]);
@@ -747,6 +755,8 @@ void memory_stamp(uint64_t guest, uint64_t size) {
     const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
     for (uint64_t p = p0; p <= p1;) {
         if (p % kRegionPages == 0 && p + kRegionPages - 1 <= p1) {   // (a whole region)
+            if (inherit_watch_page() / kRegionPages == p / kRegionPages)
+                logf("vk: inherit watch: region of page %#llx stamped whole, gen %u", (unsigned long long)(inherit_watch_page() << kPageShift), g);
             store_u32(region_full[p / kRegionPages], g);
             region_gen[p / kRegionPages] = g;
             p += kRegionPages;
@@ -1509,9 +1519,24 @@ const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged() {
     }
     return merged;
 }
+// (TICK-036, RX_VK_LOG_INHERIT) 64 bytes at the watched address: the retired mirror, guest memory and the new mirror, read back
+VkBuffer iw_buf = VK_NULL_HANDLE;
+VmaAllocation iw_alloc = nullptr;
+void* iw_map = nullptr;
+uint64_t iw_value = 0;   // (the submission whose uploads copied them: printed once it is done)
+void inherit_watch_print() {
+    if (!iw_value || mem_completed < iw_value || !iw_map) return;
+    iw_value = 0;
+    for (int k = 0; k < 3; k++) {
+        const uint32_t* w = (const uint32_t*)iw_map + k * 16;
+        logf("vk: inherit watch: %s: %08x %08x %08x %08x %08x %08x %08x %08x", k == 0 ? "retired mirror" : k == 1 ? "guest memory  " : "new mirror    ",
+             w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+}
 void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
     if (completed > mem_completed) mem_completed = completed;
+    inherit_watch_print();
 }
 bool memory_is_rb_page_locked(uint32_t page);
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
@@ -2203,6 +2228,9 @@ std::deque<std::map<uint64_t, Pool>::node_type> retired_pools;
 
 void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     Pool* old = &it->second;
+    if (inherit_watch_page() != ~0ull && (inherit_watch_page() << kPageShift) >= old->lo && (inherit_watch_page() << kPageShift) < old->hi)
+        logf("vk: inherit watch: pool %#llx..%#llx retired (mirror state %d, synced gen %u, gen now %u)", (unsigned long long)old->lo,
+             (unsigned long long)old->hi, (int)old->mstate, (unsigned)old->synced_gen, gen_now);
     shadow_free(*old);   // (its write-backs in this submission, if any, copied whole)
     guest_pages_set(old->lo, old->hi, 0);
     old->retired_value = std::max(old->last_value, mem_rec_value);
@@ -2223,6 +2251,7 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
         logf("vk: pool %#llx remade larger (%zu retired)", (unsigned long long)old->lo, retired_pools.size());
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
+int64_t st_inherit_kept, st_inherit_newer, st_inherit_unfilled;   // (TICK-036: bytes a new mirror took from retired mirrors / from guest memory instead)
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
@@ -3123,6 +3152,9 @@ void memory_sync_mirrors_before_segments() {
 /// given back) or over 1 GB (never)
 bool mirror_make(Pool& pool) {
     Pool* p = &pool;
+    if (inherit_watch_page() != ~0ull && (inherit_watch_page() << kPageShift) >= p->lo && (inherit_watch_page() << kPageShift) < p->hi)
+        logf("vk: inherit watch: mirror of %#llx..%#llx made, gen now %u, watched page gen %u", (unsigned long long)p->lo,
+             (unsigned long long)p->hi, gen_now, page_gen(inherit_watch_page()));
     {
         const uint64_t n = p->hi - p->lo;
         // (hookshot: RX_VK_MIRROR_TIGHT=1, none while VRAM is 90% full. Off: 8 GB cards sit there all the time, and without their mirrors
@@ -3165,6 +3197,21 @@ bool mirror_make(Pool& pool) {
             for (auto& nh : retired_pools) {
                 Pool& r = nh.mapped();
                 if (!r.inherit_pending || r.mstate != Pool::MIRROR_ON || !r.mirror || r.hi <= p->lo || r.lo >= p->hi) continue;
+                // (TICK-036) a mirror made in this submission by a later segment of the parallel replay is filled by that
+                // segment's uploads, which the queue runs after this one's: copied now it is still empty, and its zeros went
+                // over the new mirror (Castle Town Market's ground and fountain: the vertices and indices of two pools taken
+                // in at the scene load, 0 in VRAM, every triangle clipped). It holds guest memory as of this submission and
+                // nothing the GPU wrote before this segment: the new mirror's own copy has all of it
+                if (r.made_epoch == mirror_epoch && r.made_seg > texture_segment()) {
+                    r.inherit_pending = false;
+                    r.retired_value = std::max(r.retired_value, mem_rec_value);
+                    st_inherit_unfilled++;
+                    if (inherit_watch_page() != ~0ull)
+                        logf("vk: inherit watch: retired %#llx..%#llx left out: its mirror is filled by a later segment (%llu > %llu)",
+                             (unsigned long long)r.lo, (unsigned long long)r.hi, (unsigned long long)r.made_seg,
+                             (unsigned long long)texture_segment());
+                    continue;
+                }
                 if (!barrier_done) {   // (after the full copy, and after the shaders of earlier submissions wrote the old mirror)
                     VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
                     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -3177,8 +3224,47 @@ bool mirror_make(Pool& pool) {
                     barrier_done = true;
                 }
                 const uint64_t a = std::max(r.lo, p->lo), b = std::min(r.hi, p->hi);
-                const VkBufferCopy part{a - r.lo, a - p->lo, b - a};
-                vkCmdCopyBuffer(upload_command_buffer(), r.mirror, p->mirror, 1, &part);
+                // (TICK-036) only the pages the CPU has not written since the retired mirror's last sync: the others are
+                // newer in guest memory (and the captures below), as its next sync would have copied them. Copied whole,
+                // a scene's vertices and indices the CPU wrote after that sync (Castle Town Market's ground and fountain,
+                // in a pool remade larger while the scene loaded) came back as the old mirror held them, zeros: every
+                // triangle clipped, the ground flat white. The pages a shader wrote that RX_VK_PROTECT_BARE keeps stay
+                // the GPU's, as in mirror_sync. RX_VK_INHERIT_ALL=1: the whole range, as before
+                static const bool inherit_all = getenv("RX_VK_INHERIT_ALL") != nullptr;
+                static thread_local std::vector<std::pair<uint64_t, uint64_t>> keep;
+                keep.clear();
+                if (inherit_all) keep.push_back({a, b});
+                else
+                    mirror_inherit::runs(
+                        a, b, (unsigned)kPageShift, kRegionPages,
+                        [&r](uint64_t page) {
+                            return page_gen(page) > r.synced_gen && !(protect_bare_on() && prot_page_since(page, r.synced_gen));
+                        },
+                        [&r](uint64_t region) { return region_gen[region] <= r.synced_gen; }, keep);
+                static thread_local std::vector<VkBufferCopy> parts;
+                parts.clear();
+                uint64_t kept = 0;
+                for (const auto& [lo, hi] : keep) parts.push_back({lo - r.lo, lo - p->lo, hi - lo}), kept += hi - lo;
+                st_inherit_kept += (int64_t)kept, st_inherit_newer += (int64_t)((b - a) - kept);
+                if (inherit_watch_page() != ~0ull)
+                    logf("vk: inherit watch: pool %#llx..%#llx takes retired %#llx..%#llx (synced gen %u epoch %llu; now gen %u epoch %llu): "
+                         "%#llx kept, %#llx newer; watched page gen %u%s", (unsigned long long)p->lo, (unsigned long long)p->hi,
+                         (unsigned long long)r.lo, (unsigned long long)r.hi, (unsigned)r.synced_gen, (unsigned long long)r.synced_epoch,
+                         gen_now, (unsigned long long)mirror_epoch, (unsigned long long)kept, (unsigned long long)((b - a) - kept),
+                         page_gen(inherit_watch_page()), (inherit_watch_page() << kPageShift) >= a && (inherit_watch_page() << kPageShift) < b ? " (in it)" : "");
+                if (!parts.empty()) vkCmdCopyBuffer(upload_command_buffer(), r.mirror, p->mirror, (uint32_t)parts.size(), parts.data());
+                if (const uint64_t wa = inherit_watch_page() << kPageShift; inherit_watch_page() != ~0ull && wa >= a && wa < b) {
+                    static const uint64_t at = getenv("RX_VK_LOG_INHERIT") ? strtoull(getenv("RX_VK_LOG_INHERIT"), nullptr, 16) & ~15ull : 0;
+                    if (!iw_buf) create_buffer(4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, iw_buf, iw_alloc, &iw_map);
+                    if (iw_buf && at >= a && at + 64 <= b) {
+                        const VkBufferCopy c0{at - r.lo, 0, 64}, c1{at - p->lo, 64, 64}, c2{at - p->lo, 128, 64};
+                        vkCmdCopyBuffer(upload_command_buffer(), r.mirror, iw_buf, 1, &c0);
+                        vkCmdCopyBuffer(upload_command_buffer(), p->buffer, iw_buf, 1, &c1);
+                        full_barrier(upload_command_buffer());
+                        vkCmdCopyBuffer(upload_command_buffer(), p->mirror, iw_buf, 1, &c2);
+                        iw_value = mem_rec_value;
+                    }
+                }
                 r.inherit_pending = false;
                 if (r.lazy_held) p->lazy_held = true, r.lazy_held = false;   // (TICK-015: its GPU writes are in the new mirror now)
                 r.retired_value = std::max(r.retired_value, mem_rec_value);   // (in use by this upload until it is done)
@@ -3187,8 +3273,10 @@ bool mirror_make(Pool& pool) {
             if (inherited) {
                 static int logged;
                 if (logged++ < 16)
-                    logf("vk: pool %#llx..%#llx: mirror made with the GPU's contents of %d retired pool(s)", (unsigned long long)p->lo,
-                         (unsigned long long)p->hi, inherited);
+                    logf("vk: pool %#llx..%#llx: mirror made with the GPU's contents of %d retired pool(s) (so far %.1f MB of "
+                         "theirs kept, %.1f MB the CPU wrote since taken from guest memory; %lld retired mirrors left out, filled by a later "
+                         "segment)", (unsigned long long)p->lo, (unsigned long long)p->hi, inherited, st_inherit_kept / 1048576.0,
+                         st_inherit_newer / 1048576.0, (long long)st_inherit_unfilled);
             }
         }
         {   // (then the pages a capture holds as they were at their submit: guest memory is the game's frame ahead)
@@ -3220,6 +3308,7 @@ bool mirror_make(Pool& pool) {
         p->synced_gen = gen_now;
         p->synced_epoch = mirror_epoch;
         p->sync_seg = texture_segment();
+        p->made_epoch = mirror_epoch, p->made_seg = texture_segment();
         mirror_synced.push_back(p);
         mirror_bytes += n;
         st_mirrors++;

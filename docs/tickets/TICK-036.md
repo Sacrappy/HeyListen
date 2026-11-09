@@ -4,3 +4,5 @@
 **Goal**: find which draw/program produces the ground in the Market (RX_VK_DRAW_STATS / pass trace at a present in the Market, capture the program and its bindings), why its output is flat (unbound storage buffer, wrong texture, wrong descriptor, lighting input), and fix it.
 **Acceptance**: cobblestone ground in Castle Town Market standing and walking (windowed shots), no regression in Kokiri/Hyrule.
 **Branch**: `feature/TICK-036-market-ground`
+
+**Resolved** (2026-11-09): the cause was a parallel-replay ordering bug, not shading. A new pool mirror took over a retired pool's mirror that a later segment's uploads had not filled yet. The Market's ground and fountain vertex and index buffers came out as zeros in VRAM, every triangle was clipped, and the background showed through. Fixed in `vk_memory.cpp` `mirror_make` (with `mirror_inherit.h`). Details, A/B and shots: engine/docs/perf-audit.md, TICK-036.

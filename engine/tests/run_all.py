@@ -41,6 +41,7 @@ ARGS = {
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],
+    "tests/test_mirror_inherit.py": ["--cxx", "{cxx}"],
     "tests/test_menu_hit.py": ["--cxx", "g++"],
     "tests/test_output_resolution.py": ["--cxx", "{cxx}"],
     "tests/test_nvn_buffer_map.py": ["--cc", "gcc"],
