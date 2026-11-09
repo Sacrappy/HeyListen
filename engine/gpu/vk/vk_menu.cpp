@@ -1180,7 +1180,7 @@ void menu_tick() {
     bool changed = scale != cur_scale || menu_refresh;
     menu_refresh = false;
     cur_scale = scale;
-    if (press[13]) {
+    if (press[17]) {   // (F10; 13-16 are Page Up/Down, Home, End)
         opts.show_fps = (opts.show_fps + 1) % 3;
         menu_refresh = true;
         save();
