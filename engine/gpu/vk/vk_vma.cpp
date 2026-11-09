@@ -63,6 +63,7 @@ VmaPool images_pool() {
     return image_pool;
 }
 
+std::atomic<int> vram_alloc_failures{0};   // (TICK-023: images VRAM refused, read by the texture budget)
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -70,6 +71,12 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     // and takes the RAM the game and everything else on the machine need)
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    // (TICK-023) a large image (16 MB and up at 4 bytes a texel: the 4096 x 4096 render targets, the terrain's arrays) gets a memory
+    // object of its own: in the 128 MB blocks, the ones evicted left their space free in blocks still holding others (4 GB free in
+    // the blocks after a walk in Kokiri, the driver's count unchanged), so evicting them gave nothing back. RX_VK_BIG_IMAGE_MB=<n>
+    // (0: in the pool, as before)
+    static const uint64_t big = (uint64_t)(getenv("RX_VK_BIG_IMAGE_MB") ? std::max(0, atoi(getenv("RX_VK_BIG_IMAGE_MB"))) : 16) << 20;
+    if (big && (uint64_t)ci.extent.width * ci.extent.height * ci.extent.depth * ci.arrayLayers * 4 >= big) dedicated = true;
     if (dedicated) {   // (a memory object of its own, which freeing gives back whole: a pool's block is kept by VMA when it empties)
         VmaAllocationCreateInfo dai = ai;
         dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
@@ -83,6 +90,9 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
         if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    // (TICK-023) noted for the texture budget: the next check (texture_end_frame, every 10 presents) evicts the least recently
+    // used before the next image is refused too, instead of waiting for the driver's count
+    vram_alloc_failures.fetch_add(1, std::memory_order_relaxed);
     // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
     // to system memory instead, slow but drawn
     if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;

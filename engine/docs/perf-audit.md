@@ -805,3 +805,37 @@ Measured and left:
 Correctness: HOS_SPEED_LOG ratio 59.8-60.1 (base and fp). Screenshots at frames 1200..9600 (RX_VK_SHOT_EVERY=1200): the same walk, Link on
 the same path. Shots are per frame, so the positions differ only by the fps at that frame. The flash detector over 2 walks (fp, 30 s
 each): 13 and 12 small events (1-2 blocks, at the same spot ~20 s in), 0 on made frames. No base framelog in this ticket for comparison.
+
+## TICK-023: VRAM saturation (2026-11-09)
+
+RTX 5070 12 GB, kokiri-walk (title -> load of the Kokiri Forest save, then the walk), 115 s, nvidia-smi every second.
+A periodic line now gives the breakdown every 600 presents: `vk: VRAM breakdown: heaps U of A MB (P%); textures (ASTC decoded,
+rendered live, rendered finalized, uploaded); mirrors; free in VMA blocks; other (staging, pipelines, streams, swapchain, upscaler)`.
+
+| run | nvidia-smi peak | heaps (driver) at end | textures | mirrors | free in blocks | fps (60 s cut) |
+|---|---:|---:|---:|---:|---:|---:|
+| base | 10667 MB | 9600 / 10862 (88%) | 5704 (budget fixed 6144) | 1440 | 1678 | 64.7 |
+| fix (budget only) | 10624 MB | 9740 / 10939 (89%) | 3643 (budget fell to 2654) | 1312 | 3960 | 79.2 |
+| fix2 (+ big images dedicated) | 9972 MB | 8401-9068 (77-83%) | 5378-6003 | 1328 | 473-1468 | 82.1 |
+| fix3 (+ mirrors under pressure) | 10507 MB | 8819-9494 (81-87%) | 5492-5875 | 1360 | 984-1665 | 81.3 |
+
+Kept without need: (1) evicted textures' space stayed in VMA's 128 MB blocks (big render targets and arrays sharing blocks), so
+eviction never lowered the driver's count (4 GB free in the blocks); (2) a fixed 6 GB texture budget whatever the rest held;
+(3) render targets of a course left behind kept 3600 presents even over budget; (4) TICK-015 mirrors holding left-out write-backs,
+never given back.
+
+Fixes: images of 16 MB and up (4 bytes a texel estimate) get dedicated memory (RX_VK_BIG_IMAGE_MB, 0: as before); the texture
+budget is min(old, 80% of the driver's allowance (RX_VK_VRAM_TARGET_PCT) - what the rest holds), block free space counted up to
+512 MB only (counted whole, the first try ratcheted the budget down: each eviction moved bytes into "rest"); an image VRAM refuses
+(placed in system memory) drops the budget to 7/8 of the textures at the next check (evict before the next refusal); over budget,
+rendered textures that can be written back go after 600 unused presents instead of 3600 (written back first, as before);
+idle lazy-held mirrors are listed, their left-out pages (minus the CPU's pages/words and texture storage) copied mirror -> guest at
+the end of the next submission, then the mirror freed after that copy (RX_VK_KEEP_LAZY_MIRRORS=1: as before); past 80% of the
+allowance, mirrors idle 600 submissions go as if their budget were short.
+
+Result: the target (< 80% of the allowance) is NOT met steadily: 77-87% at the end of runs, smi peak 9.97-10.5 GB vs 10.67 GB.
+What is left is live rendered textures (2-3.8 GB, not flushable or used within 600 presents, kept for correctness) and mirrors of
+pools in use (1.3 GB). No "refused images", no mirrors given back in these runs (none idle long enough). fps 64.7 -> 79-82 (one
+base run; variance between runs not measured). HOS_SPEED_LOG ratio ~60. Screenshots every 600 presents across title, load and walk:
+normal. Not verified: long sessions, several area changes (Hyrule Field <-> Kokiri: no scripted path), the lazy-mirror write-back
+path (did not trigger), flash detector.

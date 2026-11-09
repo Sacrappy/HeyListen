@@ -51,6 +51,7 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+extern std::atomic<int> vram_alloc_failures;   // (TICK-023, vk_vma.cpp)
 namespace {
 
 uint64_t mix(uint64_t h, uint64_t v) {
@@ -2959,12 +2960,57 @@ void texture_frame(uint64_t completed) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
+    // (TICK-023) from what the driver allows (VK_EXT_memory_budget), less a margin: the whole process held to
+    // RX_VK_VRAM_TARGET_PCT of it (80), the textures getting what the rest (mirrors, pools, pipelines, streams, swapchain and the
+    // free space VMA's blocks hold) leaves. A 12 GB card ran at 9.8 of 10.9 GB allowed with the textures at 5.6 GB under the
+    // fixed 6 GB, and 11.6 GB in the overlay. Large images have memory of their own (vk_vma.cpp), so evicting them lowers `used`. Not below 1 GB
+    static const uint64_t target_pct = getenv("RX_VK_VRAM_TARGET_PCT") ? (uint64_t)std::clamp(atoi(getenv("RX_VK_VRAM_TARGET_PCT")), 40, 95) : 80;
+    if (known && !getenv("RX_VK_VRAM_MB")) {
+        const uint64_t target = allowed / 100 * target_pct;
+        // (the free space in VMA's blocks counted up to 512 MB: evicting a pooled texture moves its bytes there, and counted whole
+        // the budget fell by what each eviction freed, down to 2.6 GB with 4 GB free in the blocks)
+        const uint64_t held = used - std::min(used, block_free) + std::min<uint64_t>(block_free, 512ull << 20);
+        const uint64_t rest = held > total_bytes ? held - total_bytes : 0;
+        budget = std::min(budget, std::max<uint64_t>(target > rest ? target - rest : 0, 1024ull << 20));
+    }
+    // (TICK-023) an image VRAM refused since the last check (it went to system memory, read over PCIe): down to 7/8 of what
+    // the textures hold now, the least recently used going before the next one is refused too
+    static int failures_seen = 0;
+    const int failures = vram_alloc_failures.load(std::memory_order_relaxed);
+    if (failures != failures_seen) {
+        failures_seen = failures;
+        budget = std::min(budget, total_bytes / 8 * 7);
+        static int logged;
+        if (logged++ < 20) logf("vk: VRAM refused an image (%d so far): textures %llu MB, budget now %llu MB", failures,
+                                (unsigned long long)(total_bytes >> 20), (unsigned long long)(budget >> 20));
+    }
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         logf("vk: VRAM: %llu MB used of %llu MB allowed (%llu MB of it free in the blocks); textures %llu MB (budget %llu "
              "MB), %zu textures", (unsigned long long)(used >> 20), (unsigned long long)(allowed >> 20),
              (unsigned long long)(block_free >> 20), (unsigned long long)(total_bytes >> 20),
              (unsigned long long)(budget >> 20), textures.size());
+        {   // (TICK-023) by category: textures by kind, the mirrors, the rest (pools' staging, pipelines, streams, swapchain,
+            // upscaler, VMA's free block space), against the heaps' budget
+            uint64_t k_astc = 0, k_rt = 0, k_fin = 0, k_other = 0;
+            for (auto& kv : textures) {
+                const Texture* t = kv.second.get();
+                (t->astc ? k_astc : t->gpu_written ? (t->released ? k_fin : k_rt) : k_other) += t->bytes + t->pad;
+            }
+            int64_t mn = 0, sb = 0, sc = 0, wb = 0;
+            uint64_t mirror_mb = 0;
+            memory_stats(&mn, &mirror_mb, &sb, &sc, &wb);
+            const uint64_t tex_mb = (k_astc + k_rt + k_fin + k_other) >> 20;
+            const uint64_t used_mb = used >> 20;
+            const uint64_t accounted = tex_mb + mirror_mb + (block_free >> 20);
+            logf("vk: VRAM breakdown: heaps %llu of %llu MB (%.0f%%); textures %llu MB (ASTC decoded %llu, rendered live %llu, "
+                 "rendered finalized %llu, uploaded %llu); mirrors %llu MB; free in VMA blocks %llu MB; other (staging, pipelines, "
+                 "streams, swapchain, upscaler) %llu MB; refused images %d", (unsigned long long)used_mb,
+                 (unsigned long long)(allowed >> 20), allowed ? 100.0 * (double)used / (double)allowed : 0.0, (unsigned long long)tex_mb,
+                 (unsigned long long)(k_astc >> 20), (unsigned long long)(k_rt >> 20), (unsigned long long)(k_fin >> 20),
+                 (unsigned long long)(k_other >> 20), (unsigned long long)mirror_mb, (unsigned long long)(block_free >> 20),
+                 (unsigned long long)(used_mb > accounted ? used_mb - accounted : 0), vram_alloc_failures.load());
+        }
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
         uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
         size_t baked_n = 0;
@@ -3110,7 +3156,9 @@ void texture_frame(uint64_t completed) {
         // (one unused for 3600 presents (a minute) goes: a course left behind; the game draws it again when it comes
         // back to that course. Without it a course change kept 1.4 GB arrays and VRAM ran over)
         // (600 presents when the process is over what the driver allows: then the driver pages VRAM to system memory)
-        const uint64_t keep_rendered = known && used > allowed ? 600 : 3600;
+        // (TICK-023: and 600 over the texture budget, for one that can be written back: a course left behind 10 s ago goes, written back first below, before
+        // the VRAM fills; with 3600 an area change kept the last area's 3 GB of render targets for a minute)
+        const uint64_t keep_rendered = (known && used > allowed) || (!sweep && flushable(*tex)) ? 600 : 3600;
         const bool overwritten = drawn_over(tex);   // (above)
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
             if (finalized_kept <= keep_finalized_max) continue;
