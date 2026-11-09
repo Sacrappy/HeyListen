@@ -1149,3 +1149,67 @@ HOS_SPEED_LOG ratio was 60.0 in every run.
 - Long sessions.
 - PSNR of the encoder.
 - Headless runs.
+
+## TICK-036: white/mint ground in Castle Town Market (2026-11-09)
+
+**Cause: a new pool mirror took over a retired pool's mirror before that mirror had been filled.** This happens under the parallel replay (TICK-006). It has nothing to do with VRAM, textures, occlusion or an unbound storage buffer.
+
+Setup: the user's Market save near the fountain, `kokiri-idle` and `castle-move`, windowed, RTX 5070.
+
+**What was missing**
+- A frame dump (`RX_VK_DUMP=6000`) showed the depth prepass with no ground at all: depth stays at the far plane over the bottom third of the frame. The fountain basin, the plaza's trees and the cobblestone streets near Link were missing too.
+- What showed there instead was the scene's background fill (the mint), brightened by fog and bloom (the white). The green box was the fountain's water volume, with no basin under it.
+- `RX_VK_DRAW_STATS` listed the ground draws: forward programs `8b007d458ae6d820` (it samples the game's baked ground textures, BC6H/BC7 1532x1328x3 and BC5 3064x2656) and `1023e9b9927eced0`. They ran, but every primitive was clipped: 999 primitives in and 0 out, and 6432 in and 0 out.
+- `RX_VK_DUMP_ARGS` showed that their vertex and index buffers live at `0x7fd1c470fa`, `0x7fd21d3800` and `0x7fd3...`. Those addresses are in pools that were "taken in" at the scene load (`pool 0x7fd1000000..0x7fd3000000 took in 2 pools: mirror made with the GPU's contents of 2 retired pool(s)`).
+
+**Leads checked and ruled out**
+- `HOOKSHOT_OCCLUSION_OFF=1`: still white.
+- The empty "camera within 1 m" list of the mesh culling (record 4 of `0x117b40b000`, programs `9d8403e2e566c773` and `c36a4f3f667c886a`): that list is empty by design, because no object's centre is that close to the camera.
+- The heightmap the culling reads (`#206`, R16 1775x1175x8): it decodes correctly.
+- No `storage buffer NOT bound` lines in the Market. The two programs that log it in Hyrule (TICK-016) are not the ground here.
+
+**A/B**
+- `RX_VK_NO_INHERIT=1` (new mirrors filled from guest memory only): cobblestones, the fountain and the trees are back (`build/shots/noinherit/vk_006600.png`).
+- `RX_VK_LOG_INHERIT=<address>` (new, diagnostic) reads back 64 bytes at an address when a new mirror takes over a retired one. At the ground's vertex page it showed:
+  - retired mirror: all zero;
+  - guest memory: the vertices;
+  - new mirror after the takeover: all zero.
+- The page was stamped only once, at gen ~3900 (long before). The retired mirror had been made in the same submission (epoch) as the takeover.
+
+**Mechanism** (`vk_memory.cpp` `mirror_make`)
+- Each segment of a parallel recording has its own upload command buffer (`vk_texture.cpp` `up_cmd`, thread_local), and the queue runs them in segment order.
+- A segment-4 worker bound the old 16 MB pool and made its mirror: the fill copy went into segment 4's uploads.
+- A segment-2 worker then needed the larger pool. It imported that pool, retired the old one, made the new mirror, and copied the old mirror over it.
+- That copy went into segment 2's uploads, which run before segment 4's. So it copied an empty mirror, and the vertices and indices became zeros in VRAM for the rest of the scene.
+- Which pools are hit depends on the order the workers reach them. That explains why the bug looked tied to a place (the Market from this save) and came and went (TICK-027's walking ground).
+
+**Fix**
+- `mirror_make` records the epoch and segment that filled each mirror (`made_epoch`, `made_seg`).
+- A retired mirror that a later segment of the same submission fills is not taken over. It only holds guest memory as of this submission, which the new mirror's own copy already has.
+- The takeover now copies only the pages the CPU has not written since the retired mirror's last sync (`mirror_inherit.h`, the same rule as `mirror_sync`, `RX_VK_PROTECT_BARE` pages kept). Before, it copied the whole range, so a retired mirror whose sync of this submission sits in a later segment (or that was never synced after a CPU write) put back what it held before the CPU wrote.
+- What the takeover exists for is unchanged: GPU results that only the old mirror holds, such as Kokiri's foliage records.
+- `RX_VK_INHERIT_ALL=1` restores the whole-range copy (the later-segment rule stays). Test: `tests/test_mirror_inherit.py`.
+- Log line: `mirror made with the GPU's contents of N retired pool(s) (... MB kept, ... MB the CPU wrote since taken from guest memory; N retired mirrors left out, filled by a later segment)`. In the Market runs, ~30 retired mirrors were left out at the load, and 31.7 MB of CPU-newer pages were taken from guest memory.
+- Shader stamp: unchanged (no translator file touched). The program and pipeline caches are kept.
+
+**Result**
+- Ground, fountain and plaza trees are drawn from the Market's first frame, standing and walking. Shots:
+  - `build/shots/fix-idle/vk_006600.png` (standing);
+  - `build/shots/fix-move/vk_005700.png`, `vk_007200.png`, `vk_007800.png` (castle-move);
+  - `build/shots/fix-hyrule/vk_007200.png` (running down the street to the gate).
+- Before, for comparison: `build/shots/base/vk_006000.png`.
+
+FPS (`run_bench.py`, 60 s warm-up, one run each, no shots; before = the game folder's previous build, `backup-tick036`):
+
+| scene | before fps / 1% low / p99 | after fps / 1% low / p99 |
+|---|---|---|
+| kokiri-idle (Market, standing) | 65.3 / 9.5 / 29.1 ms | 67.3 / 9.9 / 26.9 ms |
+| castle-move (Market, walking) | 64.1 / 27.2 / 27.6 ms | 63.6 / 26.7 / 28.6 ms |
+
+The ground, fountain and trees now drawn cost nothing measurable: both rows are within the run-to-run spread (2-4 fps).
+
+**Not verified**
+- Hyrule Field and Kokiri: the walk to the gate reached the loading screen at the 115 s limit, so the foliage records that the takeover was made for were not re-checked in Kokiri.
+- Other GPUs.
+- `RX_VK_PARALLEL` off (the bug needs segments, so it should not occur there).
+- Whether other pools taken in at other loads were broken in the same way elsewhere. This is likely, given the mechanism; the floating trees and missing meshes of Hookshot #994 are candidates.
