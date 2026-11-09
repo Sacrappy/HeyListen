@@ -227,7 +227,8 @@ PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 bool create_swapchain(uint32_t width, uint32_t height);
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
-void precompile_run(void (*progress)(size_t done, size_t total));
+bool precompile_blocking();                   // vk_draw.cpp: RX_VK_PRECOMPILE_WAIT=1 (else the pipelines are built while the game runs)
+void precompile_run(void (*progress)(size_t done, size_t total), bool wait = true);
 bool prepare_run(void (*progress)(size_t done, size_t total));
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp

@@ -2415,10 +2415,13 @@ void log_frame_stats() {
         static int64_t l_reused;
         logf("vk: a frame: %.0f draws kept their neighbour's descriptors", (draw_desc_reused() - l_reused) / 120.0);
         l_reused = draw_desc_reused();
-        logf("vk: a frame: %.1f draws left out (not ready), %.2f waits for shaders or pipelines (%.1f ms); "
-             "translation %.0f ms in all, %d jobs queued",
-             (pskip - l_pskip) / 120.0, (pwaits - l_pwaits) / 120.0, (pwait_ms - l_pwait_ms) / 120.0,
+        static int64_t l_fresh;
+        const int64_t fresh = draw_pipe_fresh_skips();
+        logf("vk: a frame: %.1f draws left out (not ready; %.2f of them for a pipeline, into targets made that frame), %.2f waits for "
+             "shaders or pipelines (%.1f ms); translation %.0f ms in all, %d jobs queued",
+             (pskip - l_pskip) / 120.0, (fresh - l_fresh) / 120.0, (pwaits - l_pwaits) / 120.0, (pwait_ms - l_pwait_ms) / 120.0,
              shader_translate_ms(), jobs_pending());
+        l_fresh = fresh;
         const double overlay_wait_ms = (pwait_ms - l_pwait_ms) / 120.0;   // (the overlay's lines: vk_overlay.cpp)
         double overlay_replay_ms = -1;
         l_pskip = pskip, l_pwaits = pwaits, l_pwait_ms = pwait_ms;
