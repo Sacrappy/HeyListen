@@ -936,3 +936,38 @@ the default is turned on. **The default stays off.**
 Not verified: screenshots (RX_VK_SHOTS only writes in headless mode and no headless run was made). NPC behaviour was
 checked only through the differential run and the speed ratio. Hyrule Field was not run. No profile was taken with
 the replacement on.
+
+## TICK-030: teal ground in Castle Town after TICK-023 (2026-11-09)
+
+**Cause: TICK-023's "big images in dedicated memory", not the evictions.** kokiri-idle (Castle Town Market save), 110 s,
+`HOS_HEADLESS=1` + `RX_VK_SHOTS` every 600 presents (headless reaches the same VRAM: heaps 77-80%, textures ~5 GB). The
+main build showed the flat teal ground and the cyan glow from the scene's first frame (5400 presents), with no texture
+evicted before it, so the user's "ASTC decoded" collapse (a low-draw phase: 263 draws, 273 MB used in 8 presents) was
+not it. Bisected with `RX_VK_BIG_IMAGE_MB` on the same build: 16 (default) and 32 teal, 64, 300 and 0 right. Logging the
+images given memory of their own (`RX_VK_LOG_DEDICATED=1`, new) showed the 32-64 MB set (by TICK-023's 4-bytes-a-texel
+estimate) is the game's own block-compressed ground textures: BC5/BC6H/BC7 3064 x 2656, 2288 x 6112, 1144 x 3056 x 3
+(8-14 MB really), created MUTABLE | BLOCK_TEXEL_VIEW_COMPATIBLE | EXTENDED_USAGE with storage use (shaders write their
+blocks through raw R32G32(B32A32)_UINT views). In a dedicated allocation (NVIDIA RTX 5070) they render flat teal; in the
+pool, right. Why the driver differs is not established; the images are not aliased anywhere in the engine.
+
+Fix: `create_image` (vk_vma.cpp) no longer forces dedicated memory for BLOCK_TEXEL_VIEW_COMPATIBLE images; the big ASTC
+textures re-encoded as BC3 (written by buffer copies, the 1365 x 1365 x 90 terrain arrays and the 128 x 128 x ~390 arrays)
+ask for it from vk_texture.cpp by their real size (a byte a texel). Budget (texture_end_frame): VMA's block free space now
+counted as reusable whole (TICK-023's 512 MB cap: `RX_VK_BUDGET_FREE_CAPPED=1`); the budget never falls below what the
+last 8 presents used plus an eighth (the user's log had 6.2 GB of textures against a 5.25 GB budget, 630 retired at once);
+`RX_VK_EVICT_MIN_UNUSED` clamped to >= 3. Mirrors (RX_VK_KEEP_LAZY_MIRRORS) unchanged: not implicated by the bisection.
+
+| run | ground | nvidia-smi peak | heaps at end | textures (ASTC decoded) | retired | fps in Castle Town |
+|---|---|---:|---:|---:|---:|---:|
+| pre-TICK-023 (backup-tick023) | right | 10188 MB | 8317 / 10753 | 5459 | - | 58.1 |
+| main (TICK-023) | teal | 9844 MB | 8334 / 10757 (77%) | 5330 (2323) | 714 | 56.6 |
+| main, RX_VK_BIG_IMAGE_MB=0 | right | - | 8281 / 10781 (77%) | 5450 (1903) | 799 | 56.8 |
+| fix run 1 | right | 9880 MB | 8354 / 10779 (78%) | 5948 (2966) | 676 | 60.8 |
+| fix run 2 | right | 9730 MB | 8407 / 10707 (79%) | 5097 (2251) | 682 | 57.6 |
+| fix run 3 | right | 10012 MB | 8455 / 10692 (79%) | 5060 (2234) | 683 | 57.1 |
+| fix, RX_VK_VRAM_TARGET_PCT=50 | right | 8625 MB | 6614 / 11175 (59%) | 3308 (1804) | 2423 | 56.8 |
+
+fps: mean of the log's 120-present windows from present 6000 (Castle Town), one run each, variance ~2-4 fps. Under forced
+pressure the budget sat at the recent-use floor (3.3 GB) and the ground stayed right. Not verified: windowed (non-headless)
+play, walking/area changes, other GPUs (AMD/Intel) for the dedicated BC case, the lazy-mirror free path (no mirror freed
+while drawn was seen, not proven safe either), why NVIDIA's dedicated allocation breaks raw-view-written BC images.

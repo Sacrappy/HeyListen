@@ -1629,7 +1629,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.formatProperties.imageGranularity.width, x.sparse_req.formatProperties.imageGranularity.height,
              x.sparse_req.imageMipTailFirstLod, (unsigned long long)(x.sparse_req.imageMipTailSize >> 10),
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
-    } else if (!create_image(ci, x.image, x.allocation)) {
+    } else if (!create_image(ci, x.image, x.allocation, x.bc && big_image_bytes() && [&] {
+                   // (TICK-030: big ASTC re-encoded as BC3, written by buffer copies, by its real size: a byte a texel)
+                   uint64_t px = 0;
+                   for (uint32_t l = 0; l < x.levels; l++)
+                       px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
+                   return px * x.layers >= big_image_bytes();
+               }())) {
         static int logged;
         if (logged++ < 16)
             logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,
@@ -2969,7 +2975,10 @@ void texture_frame(uint64_t completed) {
         const uint64_t target = allowed / 100 * target_pct;
         // (the free space in VMA's blocks counted up to 512 MB: evicting a pooled texture moves its bytes there, and counted whole
         // the budget fell by what each eviction freed, down to 2.6 GB with 4 GB free in the blocks)
-        const uint64_t held = used - std::min(used, block_free) + std::min<uint64_t>(block_free, 512ull << 20);
+        // (TICK-030: counted whole as reusable, which it is: new images take it before VMA makes a block. Evicting a pooled
+        // texture moves its bytes from the textures to the free space, so `rest` does not move and the budget does not ratchet)
+        static const bool free_capped = getenv("RX_VK_BUDGET_FREE_CAPPED") != nullptr;   // (TICK-023's 512 MB cap)
+        const uint64_t held = used - std::min(used, block_free) + (free_capped ? std::min<uint64_t>(block_free, 512ull << 20) : 0);
         const uint64_t rest = held > total_bytes ? held - total_bytes : 0;
         budget = std::min(budget, std::max<uint64_t>(target > rest ? target - rest : 0, 1024ull << 20));
     }
@@ -2983,6 +2992,15 @@ void texture_frame(uint64_t completed) {
         static int logged;
         if (logged++ < 20) logf("vk: VRAM refused an image (%d so far): textures %llu MB, budget now %llu MB", failures,
                                 (unsigned long long)(total_bytes >> 20), (unsigned long long)(budget >> 20));
+    }
+    // (TICK-030) never below what the last presents drew from, and an eighth more: under it every check evicted what the
+    // next frames made again (the user's log: 5.2 GB budget, 6.2 GB of textures, 630 textures retired at once, every 10
+    // presents). What goes then is only what has not been used for a while (min_unused below)
+    {
+        uint64_t recent = 0;
+        for (auto& kv : textures)
+            if (frame_no - kv.second->last_frame < 8) recent += kv.second->bytes + kv.second->pad;
+        budget = std::max(budget, std::min(recent + recent / 8, total_bytes));
     }
     if (frame_no % 600 == 0) {
         vma_log_heaps();
@@ -3095,7 +3113,7 @@ void texture_frame(uint64_t completed) {
     // 40 frames came back empty each time (22 times; the lit ground black for a frame, a tiled pattern over the ground).
     // With 60: 2. The textures that are really done with still go, 52 frames later)
     static const uint64_t min_unused =
-        getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_UNUSED"))) : 60;
+        getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(3, atoi(getenv("RX_VK_EVICT_MIN_UNUSED"))) : 60;   // (TICK-030: never under 3)
     // (hookshot) a render target another image has since been drawn over (same storage, another size or format:
     // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
     // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the
