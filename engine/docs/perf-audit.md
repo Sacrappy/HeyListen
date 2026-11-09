@@ -839,3 +839,64 @@ pools in use (1.3 GB). No "refused images", no mirrors given back in these runs 
 base run; variance between runs not measured). HOS_SPEED_LOG ratio ~60. Screenshots every 600 presents across title, load and walk:
 normal. Not verified: long sessions, several area changes (Hyrule Field <-> Kokiri: no scripted path), the lazy-mirror write-back
 path (did not trigger), flash detector.
+
+## TICK-025: Castle Town Market, CPU-bound at ~57 fps (2026-11-09)
+
+**Result: no host change. "OptimizeChangeBanc" is real guest work, not a spin, and it is not on the frame's path. The frame
+is the game's job group (as in TICK-011) plus a GPU wait. The replay threads are idle when the main thread waits, so per-draw
+replay cost does not limit this spot either.** kokiri-idle at the most recent save (Castle Town Market), limit 120, Ryzen 7
+7800X3D, RTX 5070. Game-folder build as found (no build made, game folder untouched).
+
+**OptimizeChangeBanc** (guest priority 27, core mask 3-5). Its loop is f_834a2e50 -> f_80df2680: `while (msg != quit) { calc();
+msg = receive(+152 ? TryReceive : Receive); }` (f_834a3060 = ReceiveLightMessageQueue / TryReceive). The flag is set, so the
+thread polls its queue without blocking and runs its calc continuously. This is how the game made it, a background thread
+at low priority. On Horizon it would get only the time the priority-16 threads on cores 3-5 leave. Here it gets the same
+from the virtual cores: the executors kick it, and BaseProcExecutor3-5 wait 0.2-0.5 ms a second for a core. The calc's
+f_805aeea0 (82% self, 5,300 lifted lines) spreads its samples over many addresses. The hottest block (host 0x14196221e..,
+guest ~0x805afbc0-0x805afda4) is a binary search over a sorted table with an inlined 8-byte-unrolled strcmp. It runs
+no exclusives, no yield/WFE and no host primitive (ntdll is 2% of its leaves). So it is real lookups, not a wait. It also
+records NVN command buffers (its thread logs `nvn:` recording lines).
+
+**The frame** (slow1.txt, 4,797 instants; `crit.py`):
+
+| thread | running |
+|---|---:|
+| OptimizeChangeBanc | 97.9% |
+| BaseProcExecutor0-5 | 34-39% |
+| sead::MainThread | 23% |
+| NavMeshCAStepDepWorker1 | 23% |
+| ModuleSystemWorker1-5 | 14-17% |
+| Presentation Thread | 17% |
+| replay workers | 10.5% (84.5% of their leaves in ntdll: idle) |
+
+The main thread is blocked 77% of instants: the job group (WaitLightEvent in f_8007fe60) 63%, f_806668b0's capture/GPU wait
+13%, f_83acfb90's event 10%, SleepThread 7%. In every instant where main waits in f_806668b0 (480) or f_83acfb90 (370), the
+Presentation thread is idle in its message queue. The replay is not what main waits for. "f_805aeea0 innermost in 83%
+of main-blocked instants" is OptimizeChangeBanc, which always runs. The job threads were all idle (waiting for their next
+message) while main waited for the group in 209 instants (4.4%). The rest is the game's dependent job chain. Virtual cores
+(`HOS_VCORE_LOG=1`): core 1 is contended (NavMeshCAStepDepWorker1, priority 22, waits 114 ms a second behind
+ModuleSystemWorker1, priority 16; aglTextureDataMgr::Compaction 316 ms/s). That is Horizon's priority order, kept.
+
+**Oversubscription.** About 5 logical CPUs busy on average (OptimizeChangeBanc 1, executors 6 x 0.37, the rest < 2) of the
+14 the game threads may use (the last physical core is reserved). Not oversubscribed.
+
+Experiments (env only, the game-folder build; fps / 1% low / p99 / log mean 70-100 s):
+
+| run | fps | 1% low | p99 | log mean |
+|---|---:|---:|---:|---:|
+| base (HOS_VCORE_LOG=1) | 58.5 | 33.8 | 23.1 ms | 58.3 |
+| base | 60.9 | 36.3 | 23.8 ms | 60.9 |
+| `HOS_PRIO=OptimizeChangeBanc=-2` | 58.3 / 54.2 | 35.6 / 26.2 | 24.7 / 27.8 ms | 58.1 / 54.6 |
+| `HOS_PIN=OptimizeChangeBanc=c000` (on the reserved core) | 59.7 | 34.6 | 24.6 ms | 59.6 |
+
+The ticket's baseline was 56.6. The run-to-run spread here is 54-61 fps. Neither lowering OptimizeChangeBanc's Windows
+priority nor moving it off the game's cores moves the frame. Nothing was kept.
+
+Replay per-draw cost: across the workers, build_descriptors is the largest self function (~13% of their running samples),
+then draw and gpu_buffer_bind. It is spread, and off the path at this spot (above), so it was not changed.
+
+What would move this spot: the job chain's guest code (TICK-011/022: lifter-level gains, or the unmerged FMA fast path:
+`a64_fpx_mul32_fma32` + `recomp_fpe_fma32` are ~9% of the leaves running while main waits here, more than in the Hyrule
+walk) and the GPU wait in f_806668b0 (~2.3 ms a frame).
+
+Not verified: a build with the FMA fast path at this spot; GPU-side cost at this spot (Nsight); Hyrule Field (nothing changed).
