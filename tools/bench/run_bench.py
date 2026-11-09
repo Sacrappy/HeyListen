@@ -46,6 +46,13 @@ HOOKSHOT_SCENES = {
     # Same inputs; the scene is whichever save the title selects (the last one used).
     "hyrule-idle": LOAD_SAVE,
     "hyrule-walk": LOAD_SAVE + ",76:LUP/6000,83:LRIGHT/4000,89:LDOWN/5000",
+    # Castle Town Market (the most recent save): short walks out and back (so Link stays in the square) with
+    # camera turns (right stick) from 76 s to ~105 s (TICK-027: the user's 60 -> 30 fps drop while moving).
+    # (B at 72-75 s closes the talk the last A presses start when the market is already up: the dancing couple
+    # stands beside the spawn point)
+    "castle-move": LOAD_SAVE + ",72:B,73:B,74:B,75:B," + ",".join(
+        f"{76 + 6 * i}:LUP+RLEFT/1500,{77.5 + 6 * i}:RLEFT/1400,{79 + 6 * i}:LDOWN+RRIGHT/1500,{80.5 + 6 * i}:RRIGHT/1400"
+        for i in range(5)),
 }
 
 
