@@ -137,6 +137,12 @@ struct ParLock {
     ParLock& operator=(const ParLock&) = delete;
 };
 void memory_pool_created(uint64_t gpu, uint64_t size);
+/// (TICK-015) a game pool made, with its NVNmemoryPoolFlags (the export mkwvk_pool_flags)
+void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags);
+/// (TICK-015) the CPU is about to read [guest, guest + size) (invalidate): its game pool's write-backs are made from now on
+void memory_cpu_reads(uint64_t guest, uint64_t size);
+/// (vk_replay.cpp) whether a live texture's storage lies in [gpu, gpu + size)
+bool replay_tex_storage_in(uint64_t gpu, uint64_t size);
 /// Whether guest memory in [lo, hi) is in an imported pool, live or retired (the GPU may read or write it)
 int memory_guest_imported(uint64_t lo, uint64_t hi);
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes);

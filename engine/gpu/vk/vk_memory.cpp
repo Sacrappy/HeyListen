@@ -19,6 +19,7 @@
 #include "vk_menu.h"
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 
 #define NOMINMAX
@@ -65,6 +66,7 @@ struct Pool {
     bool inherit_pending = false;
     uint64_t retired_epoch = 0;
     bool prefetched = false;     // (amd-fix) imported ahead by the background thread, not bound yet
+    bool lazy_held = false;      // (TICK-015) its mirror holds GPU writes not written back: kept (see "write-backs left out")
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -1867,6 +1869,136 @@ struct WriteBack {
     uint64_t lo, hi;   // offsets in the pool
 };
 std::vector<WriteBack> writebacks;
+
+// ---- (TICK-015) Write-backs left out: the game's pools the CPU does not read. Every range a submission's shaders write is
+// copied from the mirror back to guest memory (69 MB a frame in Hyrule Field, 1.6 ms of GPU time), almost all of it into
+// CPU_CACHED pools (NVN flags 0x24) the CPU never reads back: on the console a CPU read of GPU results in a cached pool needs
+// nvnMemoryPoolInvalidateMappedRange first, and CPU_NO_ACCESS pools cannot be read at all. So a game pool's write-backs are
+// left in the mirror once it has been written back for kLazyWarm submissions with neither an invalidate of it (the CPU reads
+// it: memory_cpu_reads) nor a CPU write to it (a mirror sync's dirty page: a stale page from guest memory would go over the
+// GPU's words). Either makes the pool eager for good. Not left out: CPU_UNCACHED pools (read without an invalidate), ranges
+// outside any game pool, ranges where a live texture's storage lies (re-uploaded from guest memory). A mirror holding such
+// writes is kept (not given back: the GPU would read stale guest memory). The counters (every 600 submissions) say how often
+// a read or a write came after a range was left out (once each per pool at most: then eager). RX_VK_WB_EAGER=1: all, as before
+struct NvnPool {
+    uint64_t hi = 0;
+    uint32_t flags = 0;
+    uint64_t first_wb = 0;   // (mirror_epoch + 1 of its first write-back)
+    bool eager = false, skipped = false;
+    uint8_t why = 0;   // (eager: 1 read by the CPU, 2 written by it)
+};
+std::mutex nvn_pools_mu;   // (after pools_mu when both)
+std::map<uint64_t, NvnPool> nvn_pools;   // by guest lo
+std::unordered_set<uint32_t> cpu_pages, skipped_pages;   // (guest pages the CPU writes, and the ones whose GPU writes were left out; nvn_pools_mu held)
+constexpr uint64_t kLazyWarm = 600;
+std::atomic<uint64_t> nvn_pools_gen{1};   // (bumped when a pool is made: lazy_cpu_page's cache)
+int64_t st_lazy_bytes = 0, st_lazy_late = 0, st_lazy_cpu = 0, st_lazy_pools = 0;
+std::atomic<int64_t> st_lazy_direct{0};
+int64_t st_kept_by[6];   // (bytes written back, by why: 0 no game pool, 1 read, 2 written by the CPU, 3 uncached, 4 warming, 5 texture)   // (bindings without the lock too)
+bool wb_lazy_on() {
+    static const bool v = !getenv("RX_VK_WB_EAGER") || getenv("RX_VK_WB_EAGER")[0] == '0';
+    return v;
+}
+NvnPool* nvn_pool_at(uint64_t g, uint64_t* lo) {   // (nvn_pools_mu held)
+    auto it = nvn_pools.upper_bound(g);
+    if (it == nvn_pools.begin()) return nullptr;
+    --it;
+    if (g >= it->second.hi) return nullptr;
+    if (lo) *lo = it->first;
+    return &it->second;
+}
+void nvn_pools_eager(uint64_t lo, uint64_t hi, bool cpu_write) {   // (nvn_pools_mu held)
+    auto it = nvn_pools.upper_bound(lo);
+    if (it != nvn_pools.begin()) --it;
+    for (; it != nvn_pools.end() && it->first < hi; ++it) {
+        NvnPool& np = it->second;
+        if (np.hi <= lo || np.eager) continue;
+        np.eager = true;
+        np.why = cpu_write ? 2 : 1;
+        if (np.skipped) (cpu_write ? st_lazy_cpu : st_lazy_late)++;
+        for (uint64_t q = std::max(lo, it->first) >> kPageShift; q < (std::min(hi, np.hi) + 4095) >> kPageShift; q++)
+            skipped_pages.erase((uint32_t)q);
+        static int logged;
+        if (logged++ < 40 || np.skipped)
+            logf("vk: write-backs: pool %#llx (+%#llx, flags %#x) %s%s: written back from now on",
+                 (unsigned long long)it->first, (unsigned long long)(np.hi - it->first), np.flags,
+                 cpu_write ? "written by the CPU" : "read by the CPU (invalidate)",
+                 np.skipped ? " AFTER its write-backs were left out" : "");
+    }
+}
+// (a mirror sync copies a page the CPU wrote: that page is written back from now on; if its GPU writes were left out, the
+// copy from guest memory goes over them (counted). pools_mu held)
+
+void lazy_cpu_page(uint64_t page) {
+    std::lock_guard lk(nvn_pools_mu);
+    NvnPool* np = nvn_pool_at(page << kPageShift, nullptr);
+    if (!np || np->eager) return;
+    cpu_pages.insert((uint32_t)page);
+    if (skipped_pages.erase((uint32_t)page)) {
+        st_lazy_cpu++;
+        static int logged;
+        if (logged++ < 16)
+            logf("vk: write-backs: page %#llx (pool flags %#x) written by the CPU after its GPU writes were left out: written back "
+                 "from now on", (unsigned long long)(page << kPageShift), np->flags);
+    }
+}
+// (the runs of p to copy back: the parts left out removed)
+void lazy_filter(Pool& p, std::vector<VkBufferCopy>& runs) {
+    std::lock_guard lk(nvn_pools_mu);
+    if (nvn_pools.empty()) return;
+    std::vector<VkBufferCopy> out;
+    for (const VkBufferCopy& r : runs) {
+        uint64_t g = p.lo + r.srcOffset;
+        const uint64_t end = g + r.size;
+        while (g < end) {
+            uint64_t lo = 0;
+            NvnPool* np = nvn_pool_at(g, &lo);
+            uint64_t seg_end;
+            bool keep = true;
+            int why = 0;
+            if (!np) {
+                auto nx = nvn_pools.upper_bound(g);
+                seg_end = nx == nvn_pools.end() ? end : std::min(end, nx->first);
+            } else {
+                why = np->eager ? np->why : 3;
+                seg_end = std::min(end, np->hi);
+                // (CPU_NO_ACCESS 0x1 or CPU_CACHED 0x4, not CPU_UNCACHED 0x2)
+                const bool may_defer = (np->flags & (0x1u | 0x4u)) &&
+                                      !(np->flags & 0x2u);
+                if (!np->eager && may_defer) {
+                    if (!np->first_wb) np->first_wb = mirror_epoch + 1;
+                    why = mirror_epoch + 1 - np->first_wb < kLazyWarm ? 4 : 5;
+                    if (why == 5 && !replay_tex_storage_in(g, seg_end - g)) {
+                        // (page by page: the pages the CPU writes are written back)
+                        const uint64_t pg_end = std::min(seg_end, ((g >> kPageShift) + 1) << kPageShift);
+                        if (cpu_pages.count((uint32_t)(g >> kPageShift))) {
+                            why = 2, seg_end = pg_end;
+                        } else {
+                            uint64_t e = pg_end;
+                            while (e < seg_end && !cpu_pages.count((uint32_t)(e >> kPageShift))) e = std::min(seg_end, e + 4096);
+                            seg_end = e;
+                            keep = false;
+                            if (!np->skipped) st_lazy_pools++;
+                            np->skipped = true;
+                            for (uint64_t q = g >> kPageShift; q <= (seg_end - 1) >> kPageShift; q++) skipped_pages.insert((uint32_t)q);
+                        }
+                    }
+                }
+            }
+            if (keep) {
+                st_kept_by[why] += (int64_t)(seg_end - g);
+                const uint64_t a = g - p.lo;
+                if (!out.empty() && out.back().srcOffset + out.back().size == a) out.back().size += seg_end - g;
+                else out.push_back({a, a, seg_end - g});
+            } else {
+                st_lazy_bytes += (int64_t)(seg_end - g);
+                p.lazy_held = true;
+            }
+            g = seg_end;
+        }
+    }
+    runs.swap(out);
+}
 // (hookshot, 11-07) The counter reports the replay writes into guest memory on the CPU (vk_replay.cpp NOP_REPORT_COUNTER), by
 // guest address: a mirrored pool's write-back copied the GPU's mirror over them at the end of the submission, the mirror's
 // stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
@@ -1887,6 +2019,11 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
     cpu_words_new.clear();
 }
 } // namespace
+void memory_cpu_reads(uint64_t guest, uint64_t size) {
+    if (!guest || !size || !wb_lazy_on()) return;
+    std::lock_guard lk(nvn_pools_mu);
+    nvn_pools_eager(guest, guest + size, false);
+}
 void memory_cpu_owned(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
     if (off || !guest) return;
@@ -1973,6 +2110,7 @@ void mirror_sync(Pool& p) {
         }
         const uint32_t pg = page_gen(page);
         const bool dirty = pg > p.synced_gen;
+        if (dirty && wb_lazy_on()) lazy_cpu_page(page);   // (TICK-015: the CPU writes this pool: written back)
         if (dirty && gpu_page(page)) {   // (diagnostic: see memory_stamp_gpu)
             st_sync_gpu_pages++;
             const CapEntry e0 = cap_entry(page);
@@ -1995,8 +2133,14 @@ void mirror_sync(Pool& p) {
                 auto b = cap_bufs.find(e.gen);
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
-                    cap_runs[b->second.buffer].push_back(
-                        {(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
+                    // (TICK-015: a page next to the last one in both the capture and the pool extends its copy: fewer regions)
+                    auto& rs = cap_runs[b->second.buffer];
+                    const VkBufferCopy c{(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga};
+                    if (!rs.empty() && rs.back().srcOffset + rs.back().size == c.srcOffset &&
+                        rs.back().dstOffset + rs.back().size == c.dstOffset)
+                        rs.back().size += c.size;
+                    else
+                        rs.push_back(c);
                     b->second.last_use = std::max(b->second.last_use, cur_cap_value);
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
                     page++;
@@ -2112,6 +2256,17 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
 
+void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {   // (TICK-015: the game's pools and their flags, for the write-backs left out)
+    if (!size || gpu >= (1ull << 40)) return;
+    std::lock_guard lk(nvn_pools_mu);
+    auto it = nvn_pools.upper_bound(gpu);
+    if (it != nvn_pools.begin() && std::prev(it)->second.hi > gpu) --it;
+    while (it != nvn_pools.end() && it->first < gpu + size) it = nvn_pools.erase(it);   // (memory reused)
+    NvnPool np;
+    np.hi = gpu + size, np.flags = flags;
+    nvn_pools[gpu] = np;
+    nvn_pools_gen.fetch_add(1, std::memory_order_relaxed);
+}
 void memory_pool_created(uint64_t gpu, uint64_t size) {
     // (RX_VK_BG_IMPORT=1 only: imported eagerly, every pool the game made, most never used by the GPU, the thread's
     // page locking stalled the game's threads (3-7 fps); chunked imports at first use are the default)
@@ -2266,8 +2421,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
-        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED)
+        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) {
+            if (p->lazy_held) st_lazy_direct.fetch_add(1, std::memory_order_relaxed);   // (a diagnostic: guest memory without the GPU writes left in the mirror)
             return remember({p->buffer, off, size, 0});
+        }
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
             return remember({p->mirror, off, size, 0});
     }
@@ -2280,6 +2437,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
+        if (p->lazy_held) st_lazy_direct.fetch_add(1, std::memory_order_relaxed);
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
         return remember({p->buffer, off, size, 0});
     }
@@ -2411,12 +2569,12 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     for (auto& nh : retired_pools) {
         Pool& p = nh.mapped();
         // (EvilOOT: kept while the pool that took it in has not made its mirror, for 600 submissions at most)
-        if (p.inherit_pending && mirror_epoch - p.retired_epoch > kIdleEpochs) p.inherit_pending = false;
+        if (p.inherit_pending && !p.lazy_held && mirror_epoch - p.retired_epoch > kIdleEpochs) p.inherit_pending = false;
         if (p.mstate == Pool::MIRROR_ON && p.retired_value <= mem_completed && !p.inherit_pending) mirror_free(p);
     }
     std::vector<Pool*> idle;
     for (auto& [lo, p] : imported)
-        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
+        if (p.mstate == Pool::MIRROR_ON && !p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
             idle.push_back(&p);
     std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
     for (Pool* p : idle)
@@ -2620,6 +2778,7 @@ bool mirror_make(Pool& pool) {
                 const VkBufferCopy part{a - r.lo, a - p->lo, b - a};
                 vkCmdCopyBuffer(upload_command_buffer(), r.mirror, p->mirror, 1, &part);
                 r.inherit_pending = false;
+                if (r.lazy_held) p->lazy_held = true, r.lazy_held = false;   // (TICK-015: its GPU writes are in the new mirror now)
                 r.retired_value = std::max(r.retired_value, mem_rec_value);   // (in use by this upload until it is done)
                 inherited++;
             }
@@ -2721,6 +2880,19 @@ void memory_end_submission(VkCommandBuffer cmd) {
                      "%.1f MB in all, a range counted once a submit): %s", all / 1048576.0, ds.c_str());
             }
             direct_by_pool.clear(), direct_bytes_by_pool.clear();
+            if (wb_lazy_on()) {
+                static int64_t l_lazy, l_wb;
+                logf("vk: write-backs (600 submits): %.1f MB a submit copied, %.1f MB left in the mirrors (pools the CPU does not "
+                     "read); %lld pools left out so far, of them read later %lld, written later %lld; bound in guest memory while "
+                     "holding such writes %lld", (st_wb_bytes - l_wb) / 600.0 / 1048576, (st_lazy_bytes - l_lazy) / 600.0 / 1048576,
+                     (long long)st_lazy_pools, (long long)st_lazy_late, (long long)st_lazy_cpu, (long long)st_lazy_direct.load());
+                l_lazy = st_lazy_bytes, l_wb = st_wb_bytes;
+                logf("vk:   written back, MB a submit: outside the game's pools %.2f, pools the CPU reads %.2f, writes %.2f, "
+                     "uncached %.2f, not left out yet %.2f, texture storage %.2f", st_kept_by[0] / 600.0 / 1048576,
+                     st_kept_by[1] / 600.0 / 1048576, st_kept_by[2] / 600.0 / 1048576, st_kept_by[3] / 600.0 / 1048576,
+                     st_kept_by[4] / 600.0 / 1048576, st_kept_by[5] / 600.0 / 1048576);
+                for (int64_t& k : st_kept_by) k = 0;
+            }
         }
     }
     static const bool no_writeback = getenv("RX_VK_NO_WRITEBACK") != nullptr;   // (an experiment: none)
@@ -2745,6 +2917,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
                     runs.push_back({w.lo, w.lo, w.hi - w.lo});
             }
             cut_cpu_words(*p, runs);
+            if (wb_lazy_on()) lazy_filter(*p, runs);   // (TICK-015)
             if (runs.empty()) continue;
             checkpoint_mark(cmd, p->lo, 'b');
             vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
@@ -2792,3 +2965,13 @@ void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, in
     *wb_bytes = st_wb_bytes;
 }
 } // namespace mkwvk
+
+// (TICK-015) a second export, resolved by host/rx_backend.c if present: a game pool made, with its NVNmemoryPoolFlags (outside
+// MkwVkRenderer, whose header (vk_api.h) is in the shader caches' stamp)
+#ifdef _WIN32
+extern "C" __declspec(dllexport) void mkwvk_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
+#else
+extern "C" __attribute__((visibility("default"))) void mkwvk_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
+#endif
+    mkwvk::memory_pool_flags(gpu, size, flags);
+}
