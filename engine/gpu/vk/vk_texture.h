@@ -42,7 +42,8 @@ struct Texture {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
-    bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc = false;          // (and kept as BC1 / BC7 (TICK-031), or BC3: re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool remake = false;      // (TICK-031: kept as BC1, and an upload brought alpha: made again as BC7 by texture_frame)
     bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
@@ -75,6 +76,7 @@ struct Texture {
     uint64_t last_value = 0;  // the timeline value of the last submission that used it
     uint64_t bytes = 0;       // device memory it holds (the texels', or a sparse image's chunks)
     uint64_t pad = 0;         // (what the allocator gave it beyond that: padding and alignment; counted in the budget with bytes)
+    uint64_t ci_key = 0;      // (TICK-031: its image's create info, for spare images: vk_texture.cpp)
     uint32_t id = 0;          // (its creation number: diagnostics tell images at one address apart)
     uint64_t first_seen = 0;  // (the present it was made at)
     uint64_t owned_frame = 0; // (the present its storage was last noted as render targets' (gpu_owned))

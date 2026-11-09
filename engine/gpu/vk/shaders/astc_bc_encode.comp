@@ -1,0 +1,344 @@
+#version 450
+// (TICK-031) Decoded ASTC texels (RGBA8 in the BC scratch, vk_texture.cpp) encoded as BC1 or BC7, written for this engine.
+// A thread a 4x4 block. Values are the stored bytes (sRGB textures are encoded in their sRGB bytes, as BC's own are).
+//   mode 1, BC1 (4 bits a texel, for textures whose ASTC blocks have no alpha): the colours' principal axis, endpoints
+//     refined by least squares on the chosen indices (two rounds, the best kept). A block with texels under half alpha
+//     (a later upload that brought some) is encoded in BC1's 3-colour mode with them transparent.
+//   mode 7, BC7 (8 bits a texel): mode 6 (one RGBA line, 7-bit endpoints with a p-bit each, 4-bit indices), and for a
+//     block whose alpha varies also mode 5 (RGB and alpha apart, 2-bit indices each): the one with less error.
+// Push constants and bindings are the BC3 encoder's (bc_encoder.comp), so both use one pipeline layout.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) uniform readonly image2DArray source;
+layout(binding = 1, std430) writeonly buffer Output { uint words[]; } dst;
+layout(push_constant) uniform PushConstants {
+    uint blocks_x;
+    uint blocks_y;
+    uint width;
+    uint height;
+    uint mode;        // 1: BC1, 7: BC7
+    uint out_offset;  // (in blocks)
+} pc;
+
+const float W4[16] = float[16](0., 4., 9., 13., 17., 21., 26., 30., 34., 38., 43., 47., 51., 55., 60., 64.);
+const float W2[4] = float[4](0., 21., 43., 64.);
+
+vec4 px[16];
+
+// ---- bit writer (LSB first, 128 bits) ----
+uvec4 bits;
+uint bitpos;
+void put(uint v, uint n) {
+    v &= (n == 32u) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    const uint w = bitpos >> 5, o = bitpos & 31u;
+    bits[w] |= v << o;
+    if (o + n > 32u && w < 3u) bits[w + 1u] |= v >> (32u - o);
+    bitpos += n;
+}
+
+// principal axis of the texels' first n channels (n 3 or 4) around their mean, by power iteration from the column of the
+// covariance with the largest variance (never orthogonal to the axis unless the block is flat)
+vec4 principal_axis(vec4 mean, bool rgba) {
+    mat4 cov = mat4(0.0);
+    for (int i = 0; i < 16; i++) {
+        vec4 d = px[i] - mean;
+        if (!rgba) d.w = 0.0;
+        cov += outerProduct(d, d);
+    }
+    int k = 0;
+    float best = cov[0][0];
+    for (int c = 1; c < 4; c++)
+        if (cov[c][c] > best) best = cov[c][c], k = c;
+    if (best <= 0.0) return vec4(0.0);
+    vec4 v = cov[k];
+    for (int it = 0; it < 8; it++) {
+        const vec4 nv = cov * v;
+        const float l = length(nv);
+        if (l <= 1e-12) break;
+        v = nv / l;
+    }
+    const float l = length(v);
+    return l > 0.0 ? v / l : vec4(0.0);
+}
+
+// the texels' extent along an axis: the line's two ends
+void line_ends(vec4 mean, vec4 axis, out vec4 e0, out vec4 e1) {
+    float lo = 1e30, hi = -1e30;
+    for (int i = 0; i < 16; i++) {
+        const float t = dot(px[i] - mean, axis);
+        lo = min(lo, t), hi = max(hi, t);
+    }
+    if (lo > hi) lo = hi = 0.0;
+    e0 = clamp(mean + axis * lo, 0.0, 255.0);
+    e1 = clamp(mean + axis * hi, 0.0, 255.0);
+}
+
+// least squares endpoints for fixed interpolation weights (w[i] in 0..1); false when the system is singular
+bool refine(float w[16], vec4 mask, inout vec4 e0, inout vec4 e1) {
+    float a = 0.0, b = 0.0, c = 0.0;
+    vec4 va = vec4(0.0), vb = vec4(0.0);
+    for (int i = 0; i < 16; i++) {
+        const float t = w[i], s = 1.0 - t;
+        a += s * s, b += s * t, c += t * t;
+        va += s * px[i], vb += t * px[i];
+    }
+    const float det = a * c - b * b;
+    if (abs(det) < 1e-6) return false;
+    const vec4 n0 = clamp((c * va - b * vb) / det, 0.0, 255.0), n1 = clamp((a * vb - b * va) / det, 0.0, 255.0);
+    e0 = mix(e0, n0, mask), e1 = mix(e1, n1, mask);
+    return true;
+}
+
+// ---- BC7 mode 6: one RGBA line, 7-bit endpoints and a p-bit each, 4-bit indices ----
+uvec4 quant6(vec4 e, bool opaque, out uint p) {
+    uvec4 best_q = uvec4(0);
+    float best = 1e30;
+    p = 0u;
+    for (uint pb = opaque ? 1u : 0u; pb < 2u; pb++) {
+        const uvec4 q = uvec4(clamp(round((e - float(pb)) * 0.5), 0.0, 127.0));
+        const vec4 d = e - vec4(q * 2u + pb);
+        const float err = dot(d, d);
+        if (err < best) best = err, best_q = q, p = pb;
+    }
+    return best_q;
+}
+
+float mode6(bool opaque, out uvec4 block) {
+    vec4 mean = vec4(0.0);
+    for (int i = 0; i < 16; i++) mean += px[i];
+    mean /= 16.0;
+    vec4 e0, e1;
+    line_ends(mean, principal_axis(mean, true), e0, e1);
+    float best = 1e30;
+    uint bq[8];
+    uint bp0 = 0u, bp1 = 0u;
+    uint bidx[16];
+    for (int round_ = 0; round_ < 3; round_++) {
+        uint p0, p1;
+        const uvec4 q0 = quant6(e0, opaque, p0), q1 = quant6(e1, opaque, p1);
+        const vec4 E0 = vec4(q0 * 2u + p0), E1 = vec4(q1 * 2u + p1);
+        vec4 pal[16];
+        for (int k = 0; k < 16; k++) pal[k] = floor(((64.0 - W4[k]) * E0 + W4[k] * E1 + 32.0) / 64.0);
+        float err = 0.0;
+        uint idx[16];
+        float w[16];
+        for (int i = 0; i < 16; i++) {
+            float be = 1e30;
+            uint bk = 0u;
+            for (int k = 0; k < 16; k++) {
+                const vec4 d = px[i] - pal[k];
+                const float e = dot(d, d);
+                if (e < be) be = e, bk = uint(k);
+            }
+            idx[i] = bk, w[i] = W4[bk] / 64.0, err += be;
+        }
+        if (err < best) {
+            best = err;
+            bq[0] = q0.r, bq[1] = q1.r, bq[2] = q0.g, bq[3] = q1.g, bq[4] = q0.b, bq[5] = q1.b, bq[6] = q0.a, bq[7] = q1.a;
+            bp0 = p0, bp1 = p1;
+            for (int i = 0; i < 16; i++) bidx[i] = idx[i];
+        }
+        if (err == 0.0 || !refine(w, vec4(1.0), e0, e1)) break;
+    }
+    if (bidx[0] >= 8u) {   // (the anchor's top bit is implied 0: the other way round)
+        for (int c = 0; c < 4; c++) {
+            const uint t = bq[2 * c];
+            bq[2 * c] = bq[2 * c + 1], bq[2 * c + 1] = t;
+        }
+        const uint t = bp0;
+        bp0 = bp1, bp1 = t;
+        for (int i = 0; i < 16; i++) bidx[i] = 15u - bidx[i];
+    }
+    bits = uvec4(0u), bitpos = 0u;
+    put(1u << 6, 7u);
+    for (int k = 0; k < 8; k++) put(bq[k], 7u);
+    put(bp0, 1u), put(bp1, 1u);
+    put(bidx[0], 3u);
+    for (int i = 1; i < 16; i++) put(bidx[i], 4u);
+    block = bits;
+    return best;
+}
+
+// ---- BC7 mode 5: RGB (7-bit endpoints, 2-bit indices) and alpha (8-bit endpoints, 2-bit indices) apart ----
+float mode5(out uvec4 block) {
+    vec4 mean = vec4(0.0);
+    float alo = 255.0, ahi = 0.0;
+    for (int i = 0; i < 16; i++) mean += px[i], alo = min(alo, px[i].a), ahi = max(ahi, px[i].a);
+    mean /= 16.0;
+    vec4 axis = principal_axis(mean, false);
+    axis.w = 0.0;
+    vec4 e0, e1;
+    line_ends(mean, axis, e0, e1);
+    e0.w = alo, e1.w = ahi;
+    float best_c = 1e30, best_a = 1e30;
+    uvec3 bc0 = uvec3(0), bc1 = uvec3(0);
+    uint ba0 = 0u, ba1 = 0u;
+    uint bci[16], bai[16];
+    for (int round_ = 0; round_ < 3; round_++) {
+        const uvec3 c0 = uvec3(clamp(round(e0.rgb * (127.0 / 255.0)), 0.0, 127.0));
+        const uvec3 c1 = uvec3(clamp(round(e1.rgb * (127.0 / 255.0)), 0.0, 127.0));
+        const uint a0 = uint(clamp(round(e0.a), 0.0, 255.0)), a1 = uint(clamp(round(e1.a), 0.0, 255.0));
+        const vec3 C0 = vec3((c0 << 1) | (c0 >> 6)), C1 = vec3((c1 << 1) | (c1 >> 6));
+        vec3 cp[4];
+        float ap[4];
+        for (int k = 0; k < 4; k++) {
+            cp[k] = floor(((64.0 - W2[k]) * C0 + W2[k] * C1 + 32.0) / 64.0);
+            ap[k] = floor(((64.0 - W2[k]) * float(a0) + W2[k] * float(a1) + 32.0) / 64.0);
+        }
+        float ec = 0.0, ea = 0.0;
+        uint ci[16], ai[16];
+        float wc[16], wa[16];
+        for (int i = 0; i < 16; i++) {
+            float be = 1e30, bea = 1e30;
+            uint bk = 0u, bka = 0u;
+            for (int k = 0; k < 4; k++) {
+                const vec3 d = px[i].rgb - cp[k];
+                const float e = dot(d, d);
+                if (e < be) be = e, bk = uint(k);
+                const float da = px[i].a - ap[k];
+                if (da * da < bea) bea = da * da, bka = uint(k);
+            }
+            ci[i] = bk, ai[i] = bka, wc[i] = W2[bk] / 64.0, wa[i] = W2[bka] / 64.0;
+            ec += be, ea += bea;
+        }
+        if (ec < best_c) {
+            best_c = ec, bc0 = c0, bc1 = c1;
+            for (int i = 0; i < 16; i++) bci[i] = ci[i];
+        }
+        if (ea < best_a) {
+            best_a = ea, ba0 = a0, ba1 = a1;
+            for (int i = 0; i < 16; i++) bai[i] = ai[i];
+        }
+        if (ec + ea == 0.0) break;
+        refine(wc, vec4(1.0, 1.0, 1.0, 0.0), e0, e1);
+        refine(wa, vec4(0.0, 0.0, 0.0, 1.0), e0, e1);
+    }
+    if (bci[0] >= 2u) {
+        const uvec3 t = bc0;
+        bc0 = bc1, bc1 = t;
+        for (int i = 0; i < 16; i++) bci[i] = 3u - bci[i];
+    }
+    if (bai[0] >= 2u) {
+        const uint t = ba0;
+        ba0 = ba1, ba1 = t;
+        for (int i = 0; i < 16; i++) bai[i] = 3u - bai[i];
+    }
+    bits = uvec4(0u), bitpos = 0u;
+    put(1u << 5, 6u);
+    put(0u, 2u);   // (no rotation)
+    put(bc0.r, 7u), put(bc1.r, 7u), put(bc0.g, 7u), put(bc1.g, 7u), put(bc0.b, 7u), put(bc1.b, 7u);
+    put(ba0, 8u), put(ba1, 8u);
+    put(bci[0], 1u);
+    for (int i = 1; i < 16; i++) put(bci[i], 2u);
+    put(bai[0], 1u);
+    for (int i = 1; i < 16; i++) put(bai[i], 2u);
+    block = bits;
+    return best_c + best_a;
+}
+
+// ---- BC1 ----
+uint pack565(vec3 c) {
+    const uvec3 q = uvec3(clamp(round(c * vec3(31.0, 63.0, 31.0) / 255.0), vec3(0.0), vec3(31.0, 63.0, 31.0)));
+    return (q.r << 11) | (q.g << 5) | q.b;
+}
+vec3 unpack565(uint v) {
+    const uvec3 q = uvec3((v >> 11) & 31u, (v >> 5) & 63u, v & 31u);
+    return vec3((q.r << 3) | (q.r >> 2), (q.g << 2) | (q.g >> 4), (q.b << 3) | (q.b >> 2));
+}
+
+uvec2 bc1() {
+    bool transparent = false;
+    vec4 mean = vec4(0.0);
+    float n = 0.0;
+    for (int i = 0; i < 16; i++) {
+        if (px[i].a < 128.0) { transparent = true; continue; }
+        mean += px[i], n += 1.0;
+    }
+    if (n == 0.0) return uvec2(0u, 0xFFFFFFFFu);   // (all transparent: 3-colour mode, every index 3)
+    mean /= n;
+    // (the transparent texels take the mean: they pull neither the axis nor the ends)
+    vec4 keep[16];
+    for (int i = 0; i < 16; i++) {
+        keep[i] = px[i];
+        if (px[i].a < 128.0) px[i] = vec4(mean.rgb, px[i].a);
+    }
+    vec4 axis = principal_axis(mean, false);
+    axis.w = 0.0;
+    vec4 e0, e1;
+    line_ends(mean, axis, e0, e1);
+    float best = 1e30;
+    uint b0 = 0u, b1 = 0u, bind = 0u;
+    for (int round_ = 0; round_ < 3; round_++) {
+        uint c0 = pack565(e1.rgb), c1 = pack565(e0.rgb);   // (4 colours: c0 > c1; 3 and transparent: c0 <= c1)
+        if (transparent ? c0 > c1 : c0 < c1) {
+            const uint t = c0;
+            c0 = c1, c1 = t;
+        }
+        vec3 pal[4];
+        pal[0] = unpack565(c0), pal[1] = unpack565(c1);
+        const bool three = transparent || c0 == c1;
+        if (three) pal[2] = floor((pal[0] + pal[1]) * 0.5), pal[3] = vec3(0.0);
+        else pal[2] = floor((2.0 * pal[0] + pal[1]) / 3.0), pal[3] = floor((pal[0] + 2.0 * pal[1]) / 3.0);
+        float err = 0.0;
+        uint ind = 0u;
+        float w[16];
+        for (int i = 0; i < 16; i++) {
+            uint bk = 0u;
+            if (keep[i].a < 128.0) {
+                bk = 3u;
+                w[i] = 0.5;   // (a transparent texel sits at the mean: it weighs both ends alike)
+            } else {
+                float be = 1e30;
+                for (int k = 0; k < (three ? 3 : 4); k++) {
+                    const vec3 d = px[i].rgb - pal[k];
+                    const float e = dot(d, d);
+                    if (e < be) be = e, bk = uint(k);
+                }
+                err += be;
+                w[i] = bk == 2u ? (three ? 0.5 : 1.0 / 3.0) : bk == 3u ? 2.0 / 3.0 : float(bk);
+            }
+            ind |= bk << (2 * i);
+        }
+        if (err < best) best = err, b0 = c0, b1 = c1, bind = ind;
+        if (err == 0.0) break;
+        // (least squares in the colours' order c1 -> c0: index 1 is c1's end, weight 1 there; e0 maps to c1)
+        vec4 f0 = vec4(unpack565(c0), 0.0), f1 = vec4(unpack565(c1), 0.0);
+        if (!refine(w, vec4(1.0, 1.0, 1.0, 0.0), f0, f1)) break;
+        e1 = f0, e0 = f1;
+    }
+    return uvec2(b0 | (b1 << 16), bind);
+}
+
+void main() {
+    const uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= pc.blocks_x || id.y >= pc.blocks_y) return;
+    const ivec2 base = ivec2(id.xy) * 4;
+    const ivec2 last = ivec2(int(pc.width), int(pc.height)) - 1;
+    bool opaque = true;
+    float alo = 255.0, ahi = 0.0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            const vec4 t = round(imageLoad(source, ivec3(min(base + ivec2(x, y), last), int(id.z))) * 255.0);
+            px[y * 4 + x] = t;
+            opaque = opaque && t.a >= 255.0;
+            alo = min(alo, t.a), ahi = max(ahi, t.a);
+        }
+    const uint block = pc.out_offset + (id.z * pc.blocks_y + id.y) * pc.blocks_x + id.x;
+    if (pc.mode == 1u) {
+        const uvec2 b = bc1();
+        dst.words[block * 2u] = b.x;
+        dst.words[block * 2u + 1u] = b.y;
+        return;
+    }
+    uvec4 b6, b5;
+    const float e6 = mode6(opaque, b6);
+    uvec4 b = b6;
+    if (ahi > alo) {
+        const float e5 = mode5(b5);
+        if (e5 < e6) b = b5;
+    }
+    dst.words[block * 4u] = b.x;
+    dst.words[block * 4u + 1u] = b.y;
+    dst.words[block * 4u + 2u] = b.z;
+    dst.words[block * 4u + 3u] = b.w;
+}

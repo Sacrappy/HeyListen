@@ -1009,3 +1009,143 @@ It produced counts (800-1,900 reports a frame, ~80% of them 0) and fewer draws (
 Also seen, and not caused by this ticket: the teal/white over-bright ground and some missing objects in Castle Town while walking. They show up in headless shots at presents ~6000-7500 and in windowed framelog frames, including with the unmodified backup build (backup-tick027). The sun glare drawn through walls when the camera is inside geometry comes from the fixed "visible" answer.
 
 Not verified: Hyrule Field; other GPUs; the windowed picture beyond framelog thumbnails; whether the faster eviction makes rendered textures come back empty in other scenes (the rule only takes targets whose storage a later target covers).
+
+## TICK-031: VRAM, decoded ASTC as BC7 / BC1, spare images (2026-11-09)
+
+RTX 5070 12 GB, which cannot sample ASTC (`textureCompressionASTC_LDR = false`).
+
+**Setup**
+- Save: Castle Town Market, near the fountain.
+- Scenes: `castle-move` now uses 0.7 s legs with 1.9 s of camera turn in place (the old 1.5 s legs walked Link out through the gate into Hyrule Field). `kokiri-idle` runs on the same save.
+- Runs are windowed: 6 of 7 `HOS_HEADLESS=1` runs hung at boot on a guest mutex (`nn.npln.Worker mutex 0x100ac110c8 ... waiting 10 s`). The old texture path hangs the same way, so this is a separate issue.
+- A = the same binary with `RX_VK_ASTC_BC3=1 RX_VK_SPARE_FRAMES=0` (the previous behaviour). B = the new defaults.
+
+**Where the VRAM went (A, castle-move, breakdown line at the end of the run)**
+
+| Source | Size |
+|---|---|
+| Heaps (driver) | 7938-8630 MB of 10.7-11.2 GB (71-80%) |
+| Textures, total | 4.5-5.1 GB |
+| of which decoded ASTC | 3.0 GB |
+| of which rendered, live | 0.8-1.2 GB |
+| of which rendered, finalized | 0.1-0.3 GB |
+| of which uploaded | 0.54 GB |
+| Mirrors | 1.71-1.76 GB |
+| Free in VMA blocks | 0.45-1.6 GB |
+| Other (staging, pipelines, swapchain, ...) | 0.8 GB |
+
+A new per-kind line, `vk: ASTC kept: ...`, is logged every 600 presents. It splits decoded ASTC by block size, kept format and shape:
+
+| ASTC block | kept as (A) | textures | MB (A) | MB (B) | kept as (B) |
+|---|---|---:|---:|---:|---|
+| 5x5, 2D + mips | RGBA8 | 551 | 1750 | 522 | BC7 |
+| 8x8 cube array (2048, 8 cubes) + mips | BC3 | 1 | 262 | 262 | BC7 (has alpha) |
+| 8x6, 8x5, 6x6, 8x8, 2D + mips | RGBA8 | 454 | 597 | ~215, both rows | BC1 (no alpha) or BC7 |
+| 8x5, 8x6, 6x6, 2D + mips | BC3 (2 MB and up) | 147 | 167 | (in the row above) | BC1 or BC7 |
+| 4x4 2D; 10x8, 10x10, 12x12 + mips | RGBA8 | ~125 | ~130 | ~40 | BC7 or BC1 |
+| all ASTC | | | **3024** | **1120** | 472 made as BC1, 838 as BC7 |
+
+The line also gives two bounds: everything as BC7 would take 999 MB, and BC1 for every 6x6-and-larger block (alpha ignored) 723 MB. So a better target format saves about 2 GB of the 3 GB. This ticket does not touch rendered targets or the mirrors (1.76 GB: one VRAM mirror per guest pool).
+
+**Transcode** (vk_texture.cpp, `shaders/astc_bc_encode.comp`; the encoder is new code written for this engine, no third-party code).
+
+Which textures go through it: every 2D ASTC texture of 64 KB and up as RGBA8 (`RX_VK_ASTC_BC_MIN_KB`) that fits the 2048 scratch.
+
+How: the existing path is kept. Eden's GPU ASTC decoder writes into the 2048 x 2048 x 8 RGBA8 scratch, one layer and level at a time, in the upload command buffer. The new compute shader then encodes the scratch, in place of the BC3 encoder.
+
+Formats chosen:
+- **BC1** (4 bits a texel), when both hold:
+  - the blocks are 6x6 texels or larger (3.6 bits a texel or less);
+  - no ASTC block can carry alpha.
+  - The alpha check reads the blocks' colour endpoint modes on the CPU when the texture is made (`astc_block_alpha`). It covers void-extent alpha, CEM 4/5/10/12-15, and multi-partition CEMs (parsed using the weight-bit count). It costs 40-60 ms over a whole scene load.
+  - Encoder: principal axis, then 3 rounds of index choice and least-squares endpoints. Texels under half alpha use 3-colour mode with transparent black.
+- **BC7** (8 bits a texel, the same size as ASTC 4x4) in all other cases.
+  - Mode 6: one RGBA line, 7-bit endpoints plus a p-bit, 4-bit indices. For opaque blocks the p-bits stay 1, so alpha stays 255.
+  - For blocks whose alpha varies, mode 5 is also tried (RGB and alpha encoded apart). The lower-error result is kept.
+  - Same refinement rounds as BC1.
+- **sRGB**: the image is UNORM (MUTABLE). Views are BC1/BC7 sRGB where the NVN format is sRGB, as for BC3 before.
+- **Mips**: each level is encoded from its own decoded level (the game's mips, as before).
+- **BC4/BC5 not used**: in these ASTC textures no NVN format or swizzle tells normal maps or masks apart safely.
+
+Edge cases:
+- **Alpha arriving later.** If a texture kept as BC1 gets an upload with alpha blocks, it is retired at the next present once the GPU is done with it, and made again as BC7. The check reads the source of the staging copy. The `made again as BC7` count in the log line was 0 in these runs.
+- **Copies between formats.** A copy between two decoded-ASTC textures of different BC formats is decoded by a blit into the scratch and encoded again (vk_xfer.cpp, texture_copy_into_bc).
+- **BC3 is kept** for `RX_VK_ASTC_BC3=1` and for the AMD uneven-level path.
+
+Why no worker threads or disk cache:
+- The encode is a GPU dispatch in the same upload command buffer as the decode before it (where the BC3 encode was).
+- So there is no frame where the texture is missing or a fallback is shown.
+- There is nothing worth caching: the decode had to run anyway.
+- The cost is GPU time at upload, mostly during scene loads. While moving, uploads are 0-3 a frame.
+
+A bug fixed along the way:
+- The first version read the staging copy back for the alpha re-check.
+- The staging memory is write-combined (VRAM behind the BAR), so a 1024 x 1024 BC1 upload took 40 ms.
+- Result: 60 "slow upload" lines a run, and 1% lows of 13-17 fps while moving.
+- After switching to the source: 5 slow uploads a run, none of them ASTC, the same as A.
+
+**Spare images (render-target churn)**
+- Images that are let go (destroy_later, once the GPU is done with them) wait for a new texture with the same VkImageCreateInfo.
+- They wait up to 6 presents (`RX_VK_SPARE_FRAMES`; 0 turns this off), with at most 256 MB held (`RX_VK_SPARE_MB`).
+- A matching new texture takes a spare instead of calling vkCreateImage and binding memory. It then gets the same layout change and clear as a new image.
+- All spares are freed when the heaps pass 85% of what the driver allows.
+- castle-move: ~9000 kept, ~5300 taken (58%), the rest freed unused. Spares held at the 600-present log lines: 0-30 MB.
+- Its fps effect on its own is within the run-to-run spread (run D below).
+
+| run (castle-move) | standing 70-84 s fps / 1% low / >33 ms | moving 88-110 s | nvidia-smi peak MB | mean 80-110 s MB | heaps at end MB |
+|---|---|---|---:|---:|---:|
+| A3 (shots on) | 63.3 / 27.2 / 1.4% | 59.3 / 26.5 / 1.6% | 10084 | 9335 | 8630 (80%) |
+| A4 | 62.2 / 26.8 / 1.5% | 62.7 / 32.6 / 0.8% | 10265 | 9286 | 8278 (77%) |
+| A5 | 62.3 / 27.9 / 1.4% | 60.5 / 33.0 / 0.4% | 9872 | 8772 | 7938 (71%) |
+| D (BC3, spares on) | 62.5 / 37.9 / 0.5% | 57.9 / 28.3 / 1.1% | 10092 | 9300 | - |
+| B6 | 63.5 / 36.7 / 0.4% | 57.8 / 29.6 / 1.0% | 8583 | 7501 | - |
+| B7 | 64.3 / 39.0 / 0.1% | 58.9 / 29.4 / 1.0% | 8719 | 7578 | 6204 (56%) |
+| B8 (shots on) | 64.9 / 37.6 / 0.0% | 57.5 / 29.1 / 1.1% | 8578 | 7691 | - |
+
+kokiri-idle (same save, standing):
+
+| | fps / 1% low | nvidia-smi peak | decoded ASTC | heaps |
+|---|---|---:|---:|---:|
+| A | 62.9 / 30.1 | 8964 MB | 2479 MB | 62% |
+| B | 62.5-63.9 / 34-35 | 7602-7603 MB | 941 MB | 50% |
+
+HOS_SPEED_LOG ratio was 60.0 in every run.
+
+**Result (castle-move)**
+- Decoded ASTC: 3.0 GB -> 1.1 GB (-63%).
+- nvidia-smi peak: 10.07 -> 8.63 GB (-14%).
+- Steady VRAM: 9.13 -> 7.59 GB (-17%).
+- Heaps at the end: 71-80% -> 56-59%.
+- The ticket's -30% peak target is NOT met. What is left:
+  - the mirrors (1.76 GB);
+  - rendered targets (0.8-1.6 GB; with more room, the budget now keeps more of them);
+  - about 0.8 GB other.
+- Standing fps is the same or higher, and 1% lows are higher (36-39 vs 27-28).
+- Moving fps averages 58.1 against 60.8 for A. That is within the spread between runs here (A 59-63, D 58), but equality is not shown.
+
+**Quality**
+- Compared: shots at the same present (5400, the scene's first frame) from all-RGBA8 (`RX_VK_ASTC_RGBA8=1`), A and B.
+- Crops at 3x, side by side: a house front, a barrel and sack, Link's back (build/shots/cmp, not committed).
+- At the 1280 x 720 shot size: no visible difference, and no block artefacts, banding or alpha loss.
+- Not measured: PSNR, close-up surfaces.
+
+**The white/mint ground in Castle Town is not a VRAM shortage.**
+- It is there from the Market's first frame in all three variants. The mint share of the frame is 0.31-0.36 at presents 5400-6600 in A, B and all-RGBA8.
+- Meanwhile the heaps are at 56-80%, nvidia-smi reads 8.2-10.3 of 12 GB, no image was refused, and no texture was evicted before it appeared.
+- It is not the ASTC re-encode either: all-RGBA8 shows it too.
+- Its cause stays open, and this ticket does not fix it.
+
+**Safe degradation**
+- Unchanged and already in place: an image VRAM refuses goes to system memory (create_image) instead of being left unmade.
+- The texture budget evicts before the next refusal (TICK-023).
+- Spare images are dropped first under pressure.
+- No lower-mip fallback was added: no image was refused in any run.
+
+**Not verified**
+- The BC1 -> BC7 remake path (never triggered).
+- Copies between BC1 and BC7 textures (none seen).
+- Hyrule Field.
+- Other GPUs (AMD's uneven-level path keeps BC3).
+- Long sessions.
+- PSNR of the encoder.
+- Headless runs.

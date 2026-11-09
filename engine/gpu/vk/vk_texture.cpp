@@ -46,6 +46,7 @@
 
 #include "host_shaders/astc_decoder_comp_spv.h"
 #include "host_shaders/bc_encoder_comp_spv.h"
+#include "shaders/astc_bc_encode_comp_spv.h"
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "keep_rendered.h"
@@ -214,8 +215,57 @@ struct Dead {
     std::vector<VkDeviceMemory> memory;   // (a sparse image's)
     VkBuffer buffer = VK_NULL_HANDLE;     // (the BC3 scratch's output buffer: given back with its image)
     VmaAllocation buffer_alloc = nullptr;
+    uint64_t ci_key = 0;                  // (TICK-031: its create info's, when it may be used again: a texture's image)
 };
 std::deque<Dead> dead;
+
+// ---- (TICK-031) images let go, kept a few presents for a new texture of the same create info ----
+// OoT's transient render targets move through a pool: each frame ~12-25 new full-screen targets at new addresses
+// (TICK-027), each one a vkCreateImage + bind, while targets of the same parameters were let go a few frames before.
+// Images the GPU is done with wait here up to RX_VK_SPARE_FRAMES presents (6; 0: none kept) and RX_VK_SPARE_MB (256)
+// in all; a new texture whose create info matches takes one (contents undefined: made the same way as a new image,
+// layout and clear included). All are freed when the VRAM is past 85% of what the driver allows.
+struct Spare {
+    uint64_t key, frame, bytes;
+    VkImage image;
+    VmaAllocation allocation;
+};
+std::deque<Spare> spares;
+uint64_t spare_bytes = 0;
+struct SpareStats { uint64_t kept = 0, taken = 0, freed = 0; } spare_st;
+uint32_t spare_frames() {
+    static const uint32_t v = getenv("RX_VK_SPARE_FRAMES") ? (uint32_t)atoi(getenv("RX_VK_SPARE_FRAMES")) : 6;
+    return v;
+}
+uint64_t image_key(const VkImageCreateInfo& ci) {
+    uint64_t h = 0x5BA7E;
+    for (const uint64_t v : {(uint64_t)ci.flags, (uint64_t)ci.imageType, (uint64_t)ci.format, (uint64_t)ci.extent.width,
+                             (uint64_t)ci.extent.height, (uint64_t)ci.extent.depth, (uint64_t)ci.mipLevels,
+                             (uint64_t)ci.arrayLayers, (uint64_t)ci.samples, (uint64_t)ci.tiling, (uint64_t)ci.usage})
+        h = (h ^ v) * 0x100000001B3ull + (h >> 29);
+    return h | 1;   // (0: not kept)
+}
+bool take_spare(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation) {
+    if (spares.empty() || (ci.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) return false;
+    const uint64_t key = image_key(ci);
+    for (auto it = spares.rbegin(); it != spares.rend(); ++it)
+        if (it->key == key) {
+            image = it->image, allocation = it->allocation;
+            spare_bytes -= std::min(spare_bytes, it->bytes);
+            spares.erase(std::next(it).base());
+            spare_st.taken++;
+            return true;
+        }
+    return false;
+}
+void spares_free(uint64_t older_than_frame) {   // (the ones let go before that present; ~0: all)
+    while (!spares.empty() && (older_than_frame == ~0ull || spares.front().frame < older_than_frame)) {
+        destroy_image(spares.front().image, spares.front().allocation);
+        spare_bytes -= std::min(spare_bytes, spares.front().bytes);
+        spares.pop_front();
+        spare_st.freed++;
+    }
+}
 
 // ---- the recording's upload command buffer ----
 thread_local VkCommandBuffer up_cmd = VK_NULL_HANDLE;   // (each recording thread's: a parallel replay's segments
@@ -415,6 +465,9 @@ struct BcPush {
 VkDescriptorSetLayout bc_set = VK_NULL_HANDLE;
 VkPipelineLayout bc_layout = VK_NULL_HANDLE;
 VkPipeline bc_pipe = VK_NULL_HANDLE;
+// (TICK-031) and this engine's BC1 / BC7 encoder (shaders/astc_bc_encode.comp), same layout: what decoded ASTC is kept as
+VkPipeline bc17_pipe = VK_NULL_HANDLE;
+bool bc1_ok = false, bc7_ok = false;   // (the formats sample on this device and the encoder was made)
 constexpr uint32_t kBcDim = 2048, kBcLayers = 8;   // the scratch: the largest level a BC3 texture may have
 VkImage bc_scratch = VK_NULL_HANDLE;
 VmaAllocation bc_scratch_alloc = nullptr;
@@ -513,7 +566,29 @@ bool bc_ready() {
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (r != VK_SUCCESS) return false;
     state = 1;
-    logf("vk: big ASTC textures are kept as BC3 (re-encoded on the GPU; RX_VK_ASTC_RGBA8=1: as RGBA8)");
+    // (TICK-031) BC1 and BC7 (RX_VK_ASTC_BC3=1: BC3 as before, for big ones only)
+    if (!getenv("RX_VK_ASTC_BC3")) {
+        auto samples = [](VkFormat f) {
+            VkFormatProperties p{};
+            vkGetPhysicalDeviceFormatProperties(dev.physical, f, &p);
+            return (p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+        };
+        mi.codeSize = sizeof ASTC_BC_ENCODE_COMP_SPV;
+        mi.pCode = ASTC_BC_ENCODE_COMP_SPV;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) == VK_SUCCESS) {
+            ci.stage.module = m;
+            if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &bc17_pipe) != VK_SUCCESS)
+                bc17_pipe = VK_NULL_HANDLE;
+            vkDestroyShaderModule(dev.device, m, nullptr);
+        }
+        bc1_ok = bc17_pipe && samples(VK_FORMAT_BC1_RGBA_UNORM_BLOCK) && samples(VK_FORMAT_BC1_RGBA_SRGB_BLOCK);
+        bc7_ok = bc17_pipe && samples(VK_FORMAT_BC7_UNORM_BLOCK) && samples(VK_FORMAT_BC7_SRGB_BLOCK);
+    }
+    if (bc7_ok)
+        logf("vk: ASTC textures are kept as BC7, or BC1 where their blocks have no alpha (encoded on the GPU; "
+             "RX_VK_ASTC_BC3=1: big ones as BC3; RX_VK_ASTC_RGBA8=1: all as RGBA8)");
+    else
+        logf("vk: big ASTC textures are kept as BC3 (re-encoded on the GPU; RX_VK_ASTC_RGBA8=1: as RGBA8)");
     return true;
 }
 
@@ -547,11 +622,136 @@ bool bc_scratch2_make() {
 void bc_encode_resized(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t n, Texture& dst,
                        uint32_t level, uint32_t layer);
 
+// ---- (TICK-031) whether ASTC blocks carry alpha: their colour endpoint modes, read from the blocks (no decode) ----
+// A block may carry alpha when one of its partitions has an alpha mode (LA 4/5, RGB scale + alpha 10, RGBA 12/13, HDR
+// 11/14/15), or it is a void extent of LDR alpha under one, or an HDR one. Conservative: a mode with alpha counts whatever
+// alpha it encodes. All-zero and reserved blocks say nothing.
+uint32_t ise_bits(uint32_t n, uint32_t quant) {   // (an ISE sequence of n values in weight range `quant`, 0..11)
+    static const uint8_t bits[12] = {1, 0, 2, 0, 1, 3, 1, 2, 4, 2, 3, 5};
+    static const uint8_t kind[12] = {0, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0};   // (1 trits, 2 quints)
+    const uint32_t b = bits[quant] * n;
+    return kind[quant] == 1 ? b + (8 * n + 4) / 5 : kind[quant] == 2 ? b + (7 * n + 2) / 3 : b;
+}
+/// -1 reserved / error / empty, else 1 when the block may carry alpha, 0 when it cannot
+int astc_block_alpha(const uint8_t* blk) {
+    uint64_t lo, hi;
+    std::memcpy(&lo, blk, 8), std::memcpy(&hi, blk + 8, 8);
+    if (!lo && !hi) return -1;
+    const uint32_t mode = (uint32_t)(lo & 0x7FF);
+    if ((mode & 0x1FF) == 0x1FC) {   // void extent: one colour, RGBA16 in bits 64..127
+        if (mode & 0x200) return 1;  // (HDR)
+        return (hi >> 48) != 0xFFFF ? 1 : 0;
+    }
+    uint32_t xw = 0, yw = 0, qbase = (mode >> 4) & 1, H = (mode >> 9) & 1, D = (mode >> 10) & 1;
+    const uint32_t A = (mode >> 5) & 3;
+    if (mode & 3) {
+        qbase |= (mode & 3) << 1;
+        uint32_t B = (mode >> 7) & 3;
+        switch ((mode >> 2) & 3) {
+        case 0: xw = B + 4, yw = A + 2; break;
+        case 1: xw = B + 8, yw = A + 2; break;
+        case 2: xw = A + 2, yw = B + 8; break;
+        default:
+            B &= 1;
+            if (mode & 0x100) xw = B + 2, yw = A + 2;
+            else xw = A + 2, yw = B + 6;
+        }
+    } else {
+        qbase |= ((mode >> 2) & 3) << 1;
+        if (((mode >> 2) & 3) == 0) return -1;
+        const uint32_t B = (mode >> 9) & 3;
+        switch ((mode >> 7) & 3) {
+        case 0: xw = 12, yw = A + 2; break;
+        case 1: xw = A + 2, yw = 12; break;
+        case 2: xw = A + 6, yw = B + 6, D = 0, H = 0; break;
+        default:
+            if (((mode >> 5) & 3) == 0) xw = 6, yw = 10;
+            else if (((mode >> 5) & 3) == 1) xw = 10, yw = 6;
+            else return -1;
+        }
+    }
+    const uint32_t count = xw * yw * (D + 1);
+    if (qbase < 2) return -1;
+    const uint32_t quant = qbase - 2 + 6 * H;
+    if (quant > 11 || count > 64) return -1;
+    const uint32_t wbits = ise_bits(count, quant);
+    if (wbits < 24 || wbits > 96) return -1;
+    const uint32_t parts = (uint32_t)((lo >> 11) & 3) + 1;
+    if (parts == 4 && D) return -1;
+    auto alpha_cem = [](uint32_t c) { return c == 4 || c == 5 || c >= 10; };   // (10, 11 HDR, 12..15)
+    auto bits_at = [&](uint32_t pos, uint32_t n) -> uint32_t {   // (n <= 32 bits from bit pos)
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t b = pos + i;
+            v |= (uint32_t)((b < 64 ? lo >> b : hi >> (b - 64)) & 1) << i;
+        }
+        return v;
+    };
+    if (parts == 1) return alpha_cem((uint32_t)((lo >> 13) & 15)) ? 1 : 0;
+    const uint32_t cem = (uint32_t)((lo >> 23) & 63);
+    if ((cem & 3) == 0) return alpha_cem(cem >> 2) ? 1 : 0;
+    const uint32_t base = (cem & 3) - 1;
+    const uint32_t extra = 3 * parts - 4;
+    const uint32_t below = 128 - wbits;
+    if (below < extra + 29) return -1;
+    const uint32_t enc = (cem >> 2) | (bits_at(below - extra, extra) << 4);
+    for (uint32_t i = 0; i < parts; i++) {
+        const uint32_t c = (enc >> i) & 1, m = (enc >> (parts + 2 * i)) & 3;
+        if (alpha_cem(((base + c) << 2) | m)) return 1;
+    }
+    return 0;
+}
+/// Over n bytes of ASTC blocks: 1 alpha seen (stops there), 0 none; *valid += the blocks that said either
+int astc_bytes_alpha(const uint8_t* p, uint64_t n, uint64_t* valid) {
+    for (uint64_t at = 0; at + 16 <= n; at += 16) {
+        const int a = astc_block_alpha(p + at);
+        if (a >= 0) ++*valid;
+        if (a > 0) return 1;
+    }
+    return 0;
+}
+/// The texture's storage, read where it is: 1 alpha, 0 none, -1 not readable or no valid block
+int astc_storage_alpha(uint64_t gpu, uint64_t size) {
+    uint64_t valid = 0;
+    std::vector<uint8_t> tmp;
+    for (uint64_t at = 0; at < size;) {
+        uint64_t avail = 0;
+        const uint8_t* p = host->gpu_ptr(gpu + at, &avail);
+        uint64_t n = std::min<uint64_t>(size - at, 1ull << 20);
+        if (p && avail >= 16) {
+            n = std::min(n, avail) & ~15ull;
+        } else {
+            tmp.resize(n);
+            if (!host->gpu_read(gpu + at, tmp.data(), n)) return -1;
+            p = tmp.data();
+        }
+        if (!n) return -1;
+        if (astc_bytes_alpha(p, n, &valid)) return 1;
+        at += n;
+    }
+    return valid ? 0 : -1;
+}
+std::atomic<int> remake_pending{0};   // (BC1 textures an upload found alpha in: made again as BC7 by texture_frame)
+struct AstcBcStats { uint64_t bc1 = 0, bc7 = 0, bc3 = 0, scan_ns = 0, remade = 0; } astc_bc_st;
+
+/// (TICK-031) formats of 8 bytes a 4x4 block (half a byte a texel)
+bool half_byte_bc(VkFormat f) {
+    f = linear_twin(f);
+    return f == VK_FORMAT_BC1_RGB_UNORM_BLOCK || f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || f == VK_FORMAT_BC4_UNORM_BLOCK ||
+           f == VK_FORMAT_BC4_SNORM_BLOCK;
+}
+/// (TICK-031) which encoder a BC image of decoded ASTC takes: 1 BC1, 7 BC7, 3 BC3 (Eden's)
+uint32_t bc_mode(VkFormat f) {
+    f = linear_twin(f);
+    return f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? 1u : f == VK_FORMAT_BC7_UNORM_BLOCK ? 7u : 3u;
+}
+
 /// Encodes scratch layers [0, n) (a w x h region at its corner) and copies the blocks into dst's level and layers
 void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Texture& dst, uint32_t level,
                     uint32_t layer, int dx, int dy, VkImageView from = VK_NULL_HANDLE) {
     full_barrier(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_pipe);
+    const uint32_t mode = bc_mode(dst.format);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mode == 3 ? bc_pipe : bc17_pipe);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, from ? from : bc_scratch_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bi{bc_out, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet wr[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -561,7 +761,7 @@ void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Tex
     wr[1].pBufferInfo = &bi;
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_layout, 0, 2, wr);
     descriptors_disturbed();
-    const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, 1, 0};
+    const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, mode == 3 ? 1u : mode, 0};
     vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (pc.blocks_x + 7) / 8, (pc.blocks_y + 7) / 8, n);
     full_barrier(cmd);
@@ -763,14 +963,31 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     const Staging s = staging(tail * layers.size(), std::max<uint64_t>(256, dev.props.limits.minStorageBufferOffsetAlignment));
     if (!s.buffer) return false;
     std::vector<uint8_t> scratch;
+    // (TICK-031: a texture kept as BC1 whose new blocks have alpha is made again as BC7. Read from the source: the staging
+    // memory may be write-combined (VRAM behind the BAR), where reading 561 KB back took 40 ms)
+    const bool check_alpha = tex.bc && !tex.remake && half_byte_bc(tex.format);
+    bool alpha = false;
+    uint64_t valid = 0;
     for (size_t k = 0; k < layers.size(); k++) {
         const uint64_t at = (uint64_t)layers[k] * layer_size + tail0;
         if (at >= total) continue;
         const uint64_t n = std::min(tail, total - at);
-        std::memcpy(s.data + k * tail, guest_bytes(tex.gpu + at, n, scratch), n);
+        const uint8_t* src = guest_bytes(tex.gpu + at, n, scratch);
+        if (check_alpha && !alpha) alpha = astc_bytes_alpha(src, n, &valid) != 0;
+        std::memcpy(s.data + k * tail, src, n);
     }
     const uint64_t staged = tail * layers.size();
     st_bytes += (int64_t)staged;
+    if (check_alpha) {
+        if (alpha) {
+            tex.remake = true;
+            remake_pending++;
+            static int logged;
+            if (logged++ < 20)
+                logf("vk: ASTC texture %#llx %ux%u x%u kept as BC1: an upload brought alpha; made again as BC7",
+                     (unsigned long long)tex.gpu, tex.width, tex.height, tex.layers);
+        }
+    }
     VkCommandBuffer cmd = upload_cmd();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
@@ -1473,6 +1690,7 @@ void destroy_later(Texture& tex) {
     for (auto& kv : tex.views)
         if (kv.second) d.views.push_back(kv.second);
     d.memory = tex.sparse_chunks;
+    d.ci_key = tex.sparse ? 0 : tex.ci_key;
     dead.push_back(std::move(d));
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
 }
@@ -1576,7 +1794,11 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             if (small) logf("vk: %llu MB of VRAM allowed: all large ASTC textures kept as BC3", (unsigned long long)(allowed >> 20));
             return small;
         }();
-        const uint64_t min_bytes = (bw * bh >= 36 || all) ? low : 64ull << 20;
+        // (TICK-031: as BC7 / BC1 every one from 64 KB as RGBA8 (RX_VK_ASTC_BC_MIN_KB), whatever its blocks: no bigger than
+        // ASTC 4x4's 8 bits a texel. RX_VK_ASTC_BC3=1: as before)
+        static const uint64_t min_bc17 = (uint64_t)(getenv("RX_VK_ASTC_BC_MIN_KB") ? atoi(getenv("RX_VK_ASTC_BC_MIN_KB")) : 64) << 10;
+        const bool bc17 = astc && bc_ready() && bc7_ok;
+        const uint64_t min_bytes = bc17 ? min_bc17 : (bw * bh >= 36 || all) ? low : 64ull << 20;
         uint64_t px = 0;
         for (uint32_t l = 0; l < x.levels; l++)
             px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l);
@@ -1633,6 +1855,22 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         } else if (bc_candidate && bc_ready()) {
             x.bc = true;
             x.format = VK_FORMAT_BC3_UNORM_BLOCK;
+            if (bc17) {
+                // (TICK-031) BC1 (4 bits a texel) for blocks of 6x6 texels and more (3.6 bits a texel or less) none of whose
+                // blocks has alpha; else BC7 (8): ASTC 4x4's size, alpha kept. RX_VK_ASTC_NO_BC1=1: BC7 for all
+                x.format = VK_FORMAT_BC7_UNORM_BLOCK;
+                static const bool no_bc1 = getenv("RX_VK_ASTC_NO_BC1") != nullptr;
+                if (bc1_ok && !no_bc1 && bw * bh >= 36) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const int a = astc_storage_alpha(t->gpu, t->L.size);
+                    astc_bc_st.scan_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (a == 0) x.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+                }
+                (x.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? astc_bc_st.bc1 : astc_bc_st.bc7)++;
+            } else {
+                astc_bc_st.bc3++;
+            }
         }
     }
     const VkFormatProperties fp = format_props(x.format);
@@ -1650,7 +1888,8 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         // Raw storage views address one compressed block per texel (8 or 16 bytes).
         flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        const VkFormat raw = bpb == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
+        const int block_bytes = x.bc ? (half_byte_bc(x.format) ? 8 : 16) : bpb;   // (TICK-031: decoded ASTC as BC1: 8)
+        const VkFormat raw = block_bytes == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
         VkImageFormatProperties limits{};
         // (asked without STORAGE: AMD's driver checks that against the compressed format and says no, though it makes
         // the image and its raw views (RX 6600 XT, amdvlk); without them the game's BC encoders wrote nowhere and
@@ -1677,6 +1916,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = x.usage;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    x.ci_key = image_key(ci);   // (TICK-031: a spare image of the same create info may be taken; the retry below changes it)
     if (x.sparse) {
         ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
         bool ok = vkCreateImage(dev.device, &ci, nullptr, &x.image) == VK_SUCCESS;
@@ -1716,11 +1956,11 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                    uint64_t px = 0;
                    for (uint32_t l = 0; l < x.levels; l++)
                        px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
-                   return px * x.layers >= big_image_bytes();
+                   return (half_byte_bc(x.format) ? px / 2 : px) * x.layers >= big_image_bytes();
                }();
-               !create_image(ci, x.image, x.allocation, big) &&
+               !(take_spare(ci, x.image, x.allocation) || create_image(ci, x.image, x.allocation, big)) &&
                !((ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) && (is_bc(x.format) || is_astc(x.format)) &&
-                 (ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT, x.usage = ci.usage, create_image(ci, x.image, x.allocation, big)))) {
+                 (ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT, x.usage = ci.usage, x.ci_key = image_key(ci), create_image(ci, x.image, x.allocation, big)))) {
         static int logged;
         if (logged++ < 16)
             logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,
@@ -1733,6 +1973,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
     const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
+    if (half_byte_bc(x.format)) x.bytes /= 2;   // (TICK-031: BC1 and BC4, 8 bytes a block)
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
     // MB held, and a budget of 4035 MB took 4300. RX_VK_COUNT_BY_ESTIMATE=1: the texels)
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
@@ -2146,7 +2387,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
             if (partial) for (const auto& r : dirty) part += r.second - r.first;
             logf("vk: slow upload %.1f ms: #%u %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, %llu of %llu KB%s", ms, tex->id,
                  (unsigned long long)tex->gpu, tex->width, tex->height, tex->depth, tex->layers, tex->levels,
-                 tex->nvn_format, tex->astc ? " ASTC" : "", tex->bc ? " (BC3)" : "",
+                 tex->nvn_format, tex->astc ? " ASTC" : "", tex->bc ? (bc_mode(tex->format) == 1 ? " (BC1)" : bc_mode(tex->format) == 7 ? " (BC7)" : " (BC3)") : "",
                  (unsigned long long)((partial ? part : tex->guest_size) >> 10), (unsigned long long)(tex->guest_size >> 10),
                  tex->uploaded ? " again" : "");
         }
@@ -2215,7 +2456,8 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
     if (tex->astc) f = (nf >= 0x87 && nf <= 0x94) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (tex->bc) {
         if (use != ViewUse::Sample) return VK_NULL_HANDLE;
-        f = f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        const VkFormat u = linear_twin(tex->format);   // (TICK-031: BC1 / BC3 / BC7 UNORM; its sRGB twin is the next format)
+        f = f == VK_FORMAT_R8G8B8A8_SRGB ? (VkFormat)(u + 1) : u;
     }
     if (use == ViewUse::Storage) f = force_format != VK_FORMAT_UNDEFINED ? force_format : storage_view_format(f);
     if (use == ViewUse::Attachment && is_astc(f)) return VK_NULL_HANDLE;
@@ -2327,8 +2569,13 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
                           Texture* dst, uint32_t dst_level, uint32_t dst_layer, int dx, int dy, uint32_t w, uint32_t h,
                           uint32_t layers) {
-    if (!src || !dst || !dst->bc || !src->astc || src->bc || !bc_ready() || w > kBcDim || h > kBcDim || (dx & 3) || (dy & 3))
+    if (!src || !dst || !dst->bc || !src->astc || !bc_ready() || w > kBcDim || h > kBcDim || (dx & 3) || (dy & 3))
         return false;
+    if (src->bc) {   // (TICK-031: from another BC format: decompressed by a blit into the scratch, encoded again)
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, src->format, &fp);
+        if (src->bc_resized || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) return false;
+    }
     // (hookshot-amd) into a resized BC3 image only whole levels, resized as their upload is
     const uint32_t ow = std::max(1u, dst->width >> dst_level), oh = std::max(1u, dst->height >> dst_level);
     if (dst->bc_resized) {
@@ -2348,7 +2595,15 @@ bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level,
         full_barrier(cmd);
         const VkImageCopy cp{{VK_IMAGE_ASPECT_COLOR_BIT, src_level, src_layer + l0, n}, {sx, sy, 0},
                              {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n}, {0, 0, 0}, {w, h, 1}};
-        vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        if (src->bc) {
+            VkImageBlit bl{};
+            bl.srcSubresource = cp.srcSubresource, bl.dstSubresource = cp.dstSubresource;
+            bl.srcOffsets[0] = {sx, sy, 0}, bl.srcOffsets[1] = {sx + (int32_t)w, sy + (int32_t)h, 1};
+            bl.dstOffsets[1] = {(int32_t)w, (int32_t)h, 1};
+            vkCmdBlitImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+        } else {
+            vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        }
         if (dst->bc_resized)
             bc_encode_resized(cmd, w, h, ow, oh, n, *dst, dst_level, dst_layer + l0);
         else
@@ -3037,17 +3292,50 @@ void texture_frame(uint64_t completed) {
         }
     }
     bc_scratch_idle();
+    if (remake_pending.load(std::memory_order_relaxed)) {   // (TICK-031: BC1 textures an upload found alpha in, once the GPU is
+        // done with them: the next use makes them again, as BC7 (their storage has alpha now), and uploads them)
+        for (auto it = textures.begin(); it != textures.end();) {
+            Texture* tex = it->second.get();
+            if (!tex->remake || tex->last_value > completed) {
+                ++it;
+                continue;
+            }
+            remake_pending--;
+            astc_bc_st.remade++;
+            watch_tex(tex, "made again as BC7");
+            if (tex->uploaded && !remade_skip_old()) {
+                std::lock_guard lk(from_memory_mu);
+                evicted_from_memory[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = tex->guest_size;
+            }
+            if (remade_log_on()) {
+                std::lock_guard lk(evicted_mu);
+                remade.erase(tex);
+            }
+            destroy_later(*tex);
+            forget_gpu(tex);
+            it = textures.erase(it);
+        }
+    }
     for (auto it = dead.begin(); it != dead.end();) {
         if (it->value > completed) {
             ++it;
             continue;
         }
         for (VkImageView v : it->views) vkDestroyImageView(dev.device, v, nullptr);
-        destroy_image(it->image, it->allocation);
+        static const uint64_t spare_max = (uint64_t)(getenv("RX_VK_SPARE_MB") ? atoi(getenv("RX_VK_SPARE_MB")) : 256) << 20;
+        const uint64_t sz = it->ci_key && it->allocation ? allocation_size(it->allocation) : 0;
+        if (sz && spare_frames() && it->memory.empty() && !it->buffer && spare_bytes + sz <= spare_max) {
+            spares.push_back(Spare{it->ci_key, frame_no, sz, it->image, it->allocation});
+            spare_bytes += sz;
+            spare_st.kept++;
+        } else {
+            destroy_image(it->image, it->allocation);
+        }
         if (it->buffer) destroy_buffer(it->buffer, it->buffer_alloc);
         for (VkDeviceMemory m : it->memory) vkFreeMemory(dev.device, m, nullptr);
         it = dead.erase(it);
     }
+    if (frame_no > spare_frames()) spares_free(frame_no - spare_frames());   // (TICK-031: spare images kept that long)
     // A budget: RX_VK_VRAM_MB of textures (default 4096), and less when the driver says the process is near what it
     // may have (other programs use the GPU too). The least recently used go first, down to 7/8 of it; nothing the
     // last 8 presents used, nothing recorded work may still read.
@@ -3055,6 +3343,7 @@ void texture_frame(uint64_t completed) {
     if (frame_no % 10) return;
     uint64_t used = 0, allowed = 0, block_free = 0;
     const bool known = vram_usage(&used, &allowed, &block_free);
+    if (known && allowed && used > allowed / 20 * 17) spares_free(~0ull);   // (TICK-031: no spare images near the limit)
     if (!own)   // (RX_VK_VRAM_MB, else 70% of what the driver allows the process at the first look)
         own = getenv("RX_VK_VRAM_MB") ? (uint64_t)atoi(getenv("RX_VK_VRAM_MB")) << 20
               : known                ? std::min<uint64_t>(allowed / 10 * 7, 6144ull << 20)   // (hookshot: at most 6 GB. A 16 GB
@@ -3145,6 +3434,60 @@ void texture_frame(uint64_t completed) {
                  (unsigned long long)(k_astc >> 20), (unsigned long long)(k_rt >> 20), (unsigned long long)(k_fin >> 20),
                  (unsigned long long)(k_other >> 20), (unsigned long long)mirror_mb, (unsigned long long)(block_free >> 20),
                  (unsigned long long)(used_mb > accounted ? used_mb - accounted : 0), vram_alloc_failures.load());
+        }
+        {   // (TICK-031) decoded ASTC by block size, kept format and shape (2D / array / cube; mips), MB: and what all of it
+            // would take as BC7 (8 bits a texel) and as BC1 for 6x6 blocks and up (4 bits), the bound a better target saves
+            struct Agg { uint64_t n = 0, b = 0; };
+            std::map<std::tuple<int, int, int, int>, Agg> by;   // (block w, block h, kept format 0 RGBA8 1 BC1 3 BC3 7 BC7, shape)
+            uint64_t all = 0, as_bc7 = 0, as_bc17 = 0, rgba8_big = 0;
+            std::vector<const Texture*> rgba8;
+            for (auto& kv : textures) {
+                const Texture* t = kv.second.get();
+                if (!t->astc) continue;
+                const int kept = t->bc ? (int)bc_mode(t->format) : 0;
+                const int shape = (t->cube ? 2 : t->layers > 1 ? 1 : 0) | (t->levels > 1 ? 4 : 0);
+                Agg& g = by[{t->block_w, t->block_h, kept, shape}];
+                g.n++, g.b += t->bytes + t->pad;
+                uint64_t px = 0;
+                for (uint32_t l = 0; l < t->levels; l++)
+                    px += (uint64_t)std::max(1u, t->width >> l) * std::max(1u, t->height >> l) * std::max(1u, t->depth >> l);
+                px *= t->layers;
+                all += t->bytes + t->pad, as_bc7 += px;
+                as_bc17 += t->block_w * t->block_h >= 36 && kept != 7 ? px / 2 : px;
+                if (!t->bc && t->bytes >= (1ull << 20)) rgba8_big += t->bytes, rgba8.push_back(t);
+            }
+            std::sort(rgba8.begin(), rgba8.end(), [](const Texture* a, const Texture* b) { return a->bytes > b->bytes; });
+            std::string kept_rgba8;
+            for (size_t i = 0; i < rgba8.size() && i < 4; i++) {   // (why: the largest, their shape)
+                char r[128];
+                snprintf(r, sizeof r, " %ux%ux%u x%u levels %u skip %u type %d (%llu KB);", rgba8[i]->width, rgba8[i]->height,
+                         rgba8[i]->depth, rgba8[i]->layers, rgba8[i]->levels, rgba8[i]->skip, (int)rgba8[i]->type,
+                         (unsigned long long)(rgba8[i]->bytes >> 10));
+                kept_rgba8 += r;
+            }
+            std::vector<std::pair<uint64_t, std::string>> rows;
+            for (auto& [k, g] : by) {
+                const auto& [bw, bh, kept, shape] = k;
+                char r[96];
+                snprintf(r, sizeof r, " %dx%d %s %s%s: %llu (%llu MB);", bw, bh,
+                         kept == 0 ? "RGBA8" : kept == 1 ? "BC1" : kept == 7 ? "BC7" : "BC3",
+                         (shape & 3) == 2 ? "cube" : (shape & 3) == 1 ? "array" : "2D", shape & 4 ? "+mips" : "",
+                         (unsigned long long)g.n, (unsigned long long)(g.b >> 20));
+                rows.push_back({g.b, r});
+            }
+            std::sort(rows.rbegin(), rows.rend());
+            std::string line;
+            for (size_t i = 0; i < rows.size() && i < 14; i++) line += rows[i].second;
+            logf("vk: ASTC kept: %llu MB (as BC7 it would be %llu, BC1 for 6x6 blocks and up %llu; RGBA8 ones of 1 MB and up %llu "
+                 "MB); made as BC1 %llu, BC7 %llu, BC3 %llu, made again as BC7 %llu, alpha scans %.0f ms; by block, format, "
+                 "shape:%s", (unsigned long long)(all >> 20), (unsigned long long)(as_bc7 >> 20),
+                 (unsigned long long)(as_bc17 >> 20), (unsigned long long)(rgba8_big >> 20),
+                 (unsigned long long)astc_bc_st.bc1, (unsigned long long)astc_bc_st.bc7, (unsigned long long)astc_bc_st.bc3,
+                 (unsigned long long)astc_bc_st.remade, (double)astc_bc_st.scan_ns / 1e6, line.c_str());
+            if (!kept_rgba8.empty()) logf("vk: ASTC kept as RGBA8, the largest:%s", kept_rgba8.c_str());
+            logf("vk: spare images: %zu held (%llu MB); %llu kept, %llu taken by new textures, %llu freed unused so far",
+                 spares.size(), (unsigned long long)(spare_bytes >> 20), (unsigned long long)spare_st.kept,
+                 (unsigned long long)spare_st.taken, (unsigned long long)spare_st.freed);
         }
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
         uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;

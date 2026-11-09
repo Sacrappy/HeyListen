@@ -50,8 +50,10 @@ HOOKSHOT_SCENES = {
     # camera turns (right stick) from 76 s to ~105 s (TICK-027: the user's 60 -> 30 fps drop while moving).
     # (B at 72-75 s closes the talk the last A presses start when the market is already up: the dancing couple
     # stands beside the spawn point)
+    # (TICK-031: legs of 0.7 s, each followed by 1.9 s of camera turn in place: the 1.5 s legs took Link from the
+    # Market out through its gate into Hyrule Field)
     "castle-move": LOAD_SAVE + ",72:B,73:B,74:B,75:B," + ",".join(
-        f"{76 + 6 * i}:LUP+RLEFT/1500,{77.5 + 6 * i}:RLEFT/1400,{79 + 6 * i}:LDOWN+RRIGHT/1500,{80.5 + 6 * i}:RRIGHT/1400"
+        f"{76 + 6 * i}:LUP+RLEFT/700,{77 + 6 * i}:RLEFT/1900,{79 + 6 * i}:LDOWN+RRIGHT/700,{80 + 6 * i}:RRIGHT/1900"
         for i in range(5)),
 }
 
