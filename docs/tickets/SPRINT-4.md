@@ -11,4 +11,7 @@ Rules for every replacement:
 | Ticket | Model | Content |
 |---|---|---|
 | TICK-026 | Opus | Hot-function map by system + replacement framework (switches, differential check) + first replacement (Castle Town binary search with strcmp) |
-| TICK-027+ | Opus | Next replacements by rank |
+| TICK-027 | Opus | Real occlusion queries (from NX2navi MIT base design) |
+| TICK-028 | Sonnet | Subgroup reconvergence + dark-frame diagnostics |
+| TICK-029 | Sonnet | Memory pressure follow-ups |
+| TICK-030+ | Opus | Next native replacements by rank |
