@@ -1,0 +1,5 @@
+# TICK-038 — Cut resource use (RAM, VRAM, CPU, GPU) without losing quality or fps  · model: Opus · after TICK-033
+**Why**: user, 2026-11-10: the Switch 2 runs this game in ~9 GB of 12 GB shared LPDDR5X; we use far more (castle-move VRAM peak 8.6 GB after TICK-031, plus process RAM: guest memory, mirrors, shadows, captures, lifted code, caches). Lower use also helps 8 GB cards and laptops.
+**Goal**: measure per-category use at the Market and Hyrule (process private bytes / working set, VRAM by kind: textures, mirrors, shadows, render targets, staging, pipelines; CPU threads busy-waiting or spinning; GPU idle/bubble work), then remove waste: duplicate copies (guest + mirror + shadow), oversized pools/staging rings, idle spinning threads, redundant passes, caches never read. Each change behind a switch; picture and fps unchanged (shots + bench).
+**Acceptance**: before/after table per category; total RAM+VRAM reduced measurably; no fps/1% low loss beyond spread; picture identical.
+**Branch**: `feature/TICK-038-resources`
