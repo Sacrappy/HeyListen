@@ -408,7 +408,11 @@ def main():
         for k, v in agg_unknown.most_common(8):
             print("    %s %s" % (k, f(v)))
 
-    if a.samples:
+    if a.samples and not a.maps:
+        # (without the build's maps every frame is a bare module+offset: the split below would call it all "system";
+        # it also stopped the report here, before the concurrency section, with a TypeError)
+        print("\n## samples on the path: skipped (--samples needs --maps, the folder with that build's map files)")
+    elif a.samples:
         path_samples(a, names, segs, frames)
 
     # how many job threads work while the main thread waits for the group (a chain of dependent jobs, or not enough
