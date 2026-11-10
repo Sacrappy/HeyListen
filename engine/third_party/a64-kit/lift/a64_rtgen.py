@@ -15,6 +15,10 @@ import re
 import a64emit
 
 
+def lift_switch(name):   # (HeyListen TICK-045: on by default, <name>=0 turns it off; as a64_lift.lift_switch)
+    return os.environ.get(name, "1") != "0"
+
+
 def _cut(text, start_marker, end_marker):
     a = text.find(start_marker)
     b = text.find(end_marker, a)
@@ -37,8 +41,8 @@ def runtime_h():
         h = re.sub(r"^%s\(.*\n" % re.escape(proto), "", h, flags=re.M)
     # (every context parameter A64_NOESC, rt/a64.h: these functions keep no pointer to it)
     h = re.sub(r"([(,]\s*)GuestContext\s*\*\s*(?=(?:\w+\s*)?[,)])", r"\1GuestContext *A64_NOESC ", h)
-    if os.environ.get("A64_FPX_FMA3") == "1":
-        # (HeyListen TICK-044, opt-in at lift time: the scalar binary32 FMA fast path by FMA3's fmaf, one rounding as
+    if lift_switch("A64_FPX_FMA3"):
+        # (HeyListen TICK-044, at lift time, on by default since TICK-045 (A64_FPX_FMA3=0: off): the scalar binary32 FMA fast path by FMA3's fmaf, one rounding as
         # AArch64, instead of the binary64 route with its midpoint fallback (TICK-022's change). Same results where
         # either keeps one (tests/test_fpx_slowpath.py). It is inlined into the lifted functions, so their profile's
         # records for it no longer match: an A/B needs that in mind (TICK-041))
@@ -95,7 +99,7 @@ def runtime_c():
         a64emit.runtime_text(3),
     ]
     text = "\n".join(parts)
-    if os.environ.get("A64_FPX_SLOWPATH") == "1":
+    if lift_switch("A64_FPX_SLOWPATH"):
         if text.count(ESTIMATE_SIG) != 1:
             raise SystemExit("a64_rtgen: A64_FPX_SLOWPATH: recomp_fp_estimate's signature changed: update a64_rtgen.py")
         text = text.replace(ESTIMATE_SIG, ESTIMATE_SIG + ESTIMATE_FAST)

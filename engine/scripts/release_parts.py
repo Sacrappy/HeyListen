@@ -11,14 +11,15 @@ and the play profile (addresses and counts made on the development PC).
         llvm-mingw as scripts/make_setup_parts.py names it (its official release, SHA-256 checked) unpacked into <folder>;
         prints its folder. --name: only prints its name (a cache key)
     python -I scripts/release_parts.py package <out folder> --publish <dotnet publish folder> --setup <setup exe>
-                                       [--list <setup list>] [--python-packages <requirements>]
+                                       [--list <setup list>] [--python-packages <requirements>] [--profile <folder>]
         the package folder make_setup_parts.py splits: the published builder, the setup, LICENSE, the tracked gpu, host, nx2
         and scripts under tools/, tools/work (the profile) and tools/third_party: the tracked files and, from the list's
         third_party part, the prebuilt files the repository does not carry (a64emit.dll, lld-link.exe, SDL2.dll, SDL3.dll,
         zbic.dll; rebuilt on the player's PC when their sources' stamps differ). Python, emsdk, CPM and wgpu-native are not
         in it: make_setup_parts.py --reuse takes their parts from the list. --python-packages: when the list's Python part
         lacks one of those pinned packages, the part goes into tools/python with them installed (by this Python's pip, for
-        the part's version), and make_setup_parts.py makes a new Python part of it
+        the part's version), and make_setup_parts.py makes a new Python part of it. --profile: that folder's play profile
+        (hookshot_pieces.prof, hot_funcs.txt, hot_order.txt) replaces the list's in tools/work (HeyListen: profile/)
 
 GitHub's API is read with $GH_TOKEN when it is set. Downloads are retried (GitHub answers 5xx now and then). Progress goes to
 stderr: what a command prints on stdout is its answer.
@@ -185,6 +186,9 @@ def copy(src, dst):
     shutil.copyfile(src, dst)
 
 
+PROFILE_FILES = ("hookshot_pieces.prof", "hot_funcs.txt", "hot_order.txt")
+
+
 def package(a):
     out = os.path.abspath(a.out)
     if os.path.exists(out):
@@ -208,6 +212,17 @@ def package(a):
             return 1
     else:
         print("no setup list: the package has no play profile and no prebuilt third_party files")
+    if a.profile:
+        # (HeyListen TICK-045) the play profile recorded on this lifter's default lift, over the list's (upstream's or the previous
+        # release's): a lift ships with its own profile. Function names, hashes and counts; no game code
+        work = os.path.join(tools, "work")
+        os.makedirs(work, exist_ok=True)
+        names = [n for n in PROFILE_FILES if os.path.isfile(os.path.join(a.profile, n))]
+        if "hookshot_pieces.prof" not in names:
+            sys.exit("--profile %s: no hookshot_pieces.prof" % a.profile)
+        for n in names:
+            copy(os.path.join(a.profile, n), os.path.join(work, n))
+        print("play profile from %s: %s" % (a.profile, ", ".join(names)))
     print("package folder: %s" % out)
     return 0
 
@@ -260,6 +275,7 @@ def main():
     s.add_argument("--setup", required=True)
     s.add_argument("--list")
     s.add_argument("--python-packages")
+    s.add_argument("--profile", help="a folder whose hookshot_pieces.prof (and hot_funcs.txt, hot_order.txt) replace the list's")
     a = p.parse_args()
     return {"previous": previous, "profile": profile, "llvm-mingw": llvm_mingw, "package": package}[a.cmd](a)
 

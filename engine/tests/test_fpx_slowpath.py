@@ -81,17 +81,17 @@ def generate(cxx, tmp, flags):
     import a64emit
     used = set()
     old, new = os.path.join(tmp, "old"), os.path.join(tmp, "new")
-    os.environ.pop("A64_FPX_SLOWPATH", None)
-    os.environ.pop("A64_FPX_FMA3", None)
+    os.environ["A64_FPX_SLOWPATH"] = "0"
+    os.environ["A64_FPX_FMA3"] = "0"
     try:
         a64_rtgen.write(old)
         os.environ["A64_FPX_SLOWPATH"] = os.environ["A64_FPX_FMA3"] = "1"
         a64_rtgen.write(new)
-        del os.environ["A64_FPX_SLOWPATH"], os.environ["A64_FPX_FMA3"]
+        os.environ["A64_FPX_SLOWPATH"] = os.environ["A64_FPX_FMA3"] = "0"
         text = cases(a64emit, a64_lift, used)
     finally:
-        os.environ.pop("A64_FPX_SLOWPATH", None)
-        os.environ.pop("A64_FPX_FMA3", None)
+        os.environ["A64_FPX_SLOWPATH"] = "0"
+        os.environ["A64_FPX_FMA3"] = "0"
         if a64emit._lib is not None:
             import _ctypes
             (_ctypes.FreeLibrary if os.name == "nt" else _ctypes.dlclose)(a64emit._lib._handle)
@@ -102,7 +102,7 @@ def generate(cxx, tmp, flags):
     try:
         h_new = a64_lift.fpx_header(used)
     finally:
-        del os.environ["A64_FPX_SLOWPATH"]
+        os.environ["A64_FPX_SLOWPATH"] = "0"
     if "TICK-044" in h_old or "TICK-044" not in h_new:
         raise SystemExit("fpx slowpath: the switch does not select the header")
     hs_old = open(os.path.join(old, "a64_suyu.h"), encoding="utf-8").read()
@@ -127,6 +127,8 @@ def generate(cxx, tmp, flags):
 
 
 def main():
+    # (TICK-045: the lift switches default on; the ones this test does not cover stay off, as when it was written)
+    os.environ["A64_VFPX_ELEM"] = "0"
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cc")
     p.add_argument("--cxx")

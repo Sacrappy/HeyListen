@@ -31,6 +31,21 @@ $env:OOT_EXEFS = "$Work\exefs"
 $env:OOT_ROMFS = "$Game\romfs"
 $env:RX_RELEASE = "1"
 $env:A64_HOT_CHUNK = "1"
+# (HeyListen TICK-045) The play profile recorded on this lifter's default lift (the A64_VFPX_ELEM / A64_FPX_SLOWPATH / A64_FPX_FMA3
+# switches on), kept in the repository's profile/ folder: copied into the work folder when it differs, so a dev build never pairs
+# the lift with another profile (an installed builder copies its own tools\work profile there when it builds; a lift without its
+# profile loses ~4-5 fps, TICK-040/041)
+$profileDir = Join-Path (Split-Path $root -Parent) "profile"
+if (Test-Path "$profileDir\hookshot_pieces.prof") {
+    foreach ($n in "hot_funcs.txt", "hot_order.txt", "hookshot_pieces.prof") {
+        $src = Join-Path $profileDir $n
+        $dst = Join-Path $Work $n
+        if ((Test-Path $src) -and (-not (Test-Path $dst) -or (Get-FileHash $src).Hash -ne (Get-FileHash $dst).Hash)) {
+            Copy-Item $src $dst -Force
+            Write-Host "profile: $n from $profileDir"
+        }
+    }
+}
 if (Test-Path "$Work\hot_funcs.txt") { $env:A64_HOT_FUNCS = "$Work\hot_funcs.txt" }
 if (Test-Path "$Work\hookshot_pieces.prof") { $env:RX_PGO = "$Work\hookshot_pieces.prof" }
 $env:PYTHONIOENCODING = "utf-8"
