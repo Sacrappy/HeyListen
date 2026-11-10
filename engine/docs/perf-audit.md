@@ -2064,3 +2064,123 @@ Not verified:
 - the order patch's gain (only estimated from the start delays: the stage ends when its long job ends);
 - other CPUs, Kokiri Forest and Hyrule Field; the Market's two crowd states change which long jobs appear (80166100 /
   802ca820 long in some runs and not others).
+
+## TICK-043: the engine's submit on the main thread, and copying the capture ahead (2026-11-10)
+
+**Result: the main thread's submit path is 1.8 ms a frame standing and 2.4 ms walking (with the sampler on). Over half
+of it is the capture copy (~1.0 ms), then the mark scan (collect_in, 0.23 ms), take_capture (0.2-0.5 ms, of which 0.1-0.2
+ms is a GPU wait for "late" pages) and memory_collect_written (0.06-0.15 ms). The recording of the main thread's own
+submits is small (~0.1 ms). The overlay's "GPU frame prep" (6.9-8.9 ms) is the replay's time summed over every thread,
+~90% of it on the Presentation Thread, off the main thread's path. Copying the capture ahead on a thread of its own
+(`RX_VK_CAPTURE_PRECOPY=1`) took ~0.6 ms a frame off the main thread, but fps fell by 2-4: the extra copying (pages
+copied again as the game rewrites them, buffers grown) and the cache lines it takes from the job threads cost more than
+the main thread gains. Splitting the scan over the copy helpers (`RX_VK_CAPTURE_SCAN_SPLIT=1`) is inside the spread. No
+default changed.** Market save by the fountain, `--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070,
+windowed `run_bench.py`, 110 s runs, 66 s cut.
+
+### The submit path on the main thread (HOS_SAMPLE_ALL + HOS_SAMPLE_NS, 72-108 s, default build)
+
+`build/tick043/mainsub.py` (scratch, not committed) counts the main thread's samples that have a hookshot_vk frame,
+inclusive by renderer function. The sampler was on (71.8 fps standing, 66.2 walking). The submit is
+`n_nvnQueueSubmitCommands` -> `submit_q`, the synchronous path: `sync_order_mu`, `capture_make`, then `submit_job` ->
+`run_submit` -> `submit_memory_work` -> `memory_take_capture`, then the recording.
+
+| ms a frame | kokiri-idle | castle-move |
+|---|---:|---:|
+| renderer on the main thread in all | 1.81 (13.0% of its samples) | 2.36 (15.6%) |
+| capture copy: `stream_memcpy` (main's fifth) + waiting for the 4 helpers | 0.99 | 1.06 |
+| mark scan (`collect_in`, ~1,000-1,500 ranges, 2.5-3.4 GB of guest memory) | 0.23 | 0.23 |
+| pool-range refresh (`refresh_pool_ranges_locked`, hash map rebuilt) | 0.03 | 0.08 |
+| `take_capture` in all | 0.21 | 0.53 |
+| - of it the GPU wait for late pages (`vk_timeline_wait`) | 0.11 | 0.22 |
+| - texture shadows (hash map, 4 KB copies), stamps, allocations | ~0.1 | ~0.3 |
+| `memory_collect_written` (the other GPU ranges' marks) | 0.06 | 0.15 |
+| recording of the main thread's own submits, begin and queue submit | ~0.1 | ~0.12 |
+| other (invalidate, texture finalize and registration) | ~0.1 | ~0.1 |
+
+Log (`vk: capture: a submit`, which now also gives the copy's time): standing 0.28 ms a submit (scan 0.06, copy 0.20),
+1,669 pages (6.5 MB); walking 0.34 ms (scan 0.08, copy 0.25), 1,977 pages (7.7 MB). Six submits a frame, from the main
+thread and the Presentation Thread. "GPU busy per frame" (2.2-2.7 ms) is the recordings' own timestamps; TICK-037's pass
+timing (~8-10 ms with its timestamps) was not run again.
+
+What has to stay synchronous: the capture must hold each page as it is at the submit. That is why it exists ("submit-time
+capture": OoT rewrites double-buffered data right after a submit). Only a page the game does not write again before
+the submit can be copied earlier, and the marks tell which. The stamps (`take_capture`) must come before the recording
+that follows on the same thread, and the late pages' GPU wait before their recopy. The copy cannot move *after* the
+submit without a write fence on the pages. Page protection would mean hundreds of runs a submit, two VirtualProtect calls
+each, and TLB shootdowns across the game's threads. It was not tried.
+
+### Tried 1: the capture copied ahead (`RX_VK_CAPTURE_PRECOPY=1`, `RX_VK_PRECOPY_US`, off by default)
+
+A thread of its own wakes every 250 us (high-resolution waitable timer). It takes the pages written so far in the last
+capture's ranges (collect_in clears their marks) and copies them into the next capture's buffer. The submit takes those
+copies (`precopy_take`: the thread stops at its next page) and copies only what was written since.
+
+- A page written again is marked again and copied again into its slot.
+- A page a GPU write-back may have written since its copy (write-back value past what the GPU had done when the copy
+  began) is copied again too (`gpu/vk/capture_merge.h`).
+
+This gives the bytes of a copy at the submit. The lifted store's mark comes after the store, with release order, and the
+thread clears a mark with an acquire exchange before it reads the page: the same argument as for the existing scan racing
+the game's other threads. Host writes mark too (`nvn_gpu_write` -> HOS_WRITTEN), and the GPU's are in `wb_pages`. The
+late-page rule, `shadow_written` and the stamps take the full list, as before.
+
+Fallbacks: if a copied page is outside the ranges now, or the buffer has no room left, every page is copied at the
+submit, as without the thread. A full buffer is grown by the thread (copied over, off the main thread).
+
+Test: `tests/test_capture_merge.py`, a simulation of marks, write-backs and the thread's rounds against a copy at the
+submit. It catches the removal of either rule.
+
+What it did (log, walking):
+- ~1,500 of ~1,600 pages a submit copied ahead, ~120 new at the submit, ~100 copied again there;
+- the main thread's renderer share went from 15.6% to 11.6% of its samples (~0.6 ms a frame);
+- but the thread copied ~700 pages a submit more than once (the game rewrites them), grew ~180 buffers per 600 submits,
+  and the kept captures rose to ~500 MB (from ~280).
+
+### Tried 2: the mark scan split over the copy helpers (`RX_VK_CAPTURE_SCAN_SPLIT=1`, off by default)
+
+The ranges are split by size between the submitting thread and the 4 copy helpers. The parts' pages are joined in range
+order, which gives the same list.
+
+### A/B (one binary, env switches only, interleaved; fps / 1% low / p99 ms)
+
+| scene | default (6 runs) | PRECOPY 250 us (3) | PRECOPY 2000 us (3) | SCAN_SPLIT (3) |
+|---|---|---|---|---|
+| kokiri-idle | 77.0 72.4 74.4 73.4 77.5 77.9: **75.4 / 51.6 / 18.0** | 68.9 72.8 72.6: **71.4 / 51.7 / 18.2** | 73.0 72.4 74.5: **73.3 / 53.0 / 17.5** | 71.6 76.4 71.0: **73.0 / 47.6 / 18.0** |
+| castle-move | 68.6 68.2 67.6 68.5 69.2 70.6: **68.8 / 36.0 / 22.6** | 66.7 66.0, one run on the title: **66.3 / 29.8 / 23.3** | 65.4 65.9 70.2: **67.2 / 35.5 / 23.3** | 68.9 70.9 69.5: **69.8 / 35.4 / 21.9** |
+
+Copying ahead:
+- At 250 us: -4.0 standing, -2.5 walking. At 2 ms: -2.1 / -1.6. Every standing run is below the default's mean.
+- The main thread's 0.6 ms do not become frame time saved: the job threads lose more. They write the data while the
+  thread reads it (cache lines shared, then taken back), and the copies' DRAM traffic grows with the rewrites. TICK-037
+  already saw the copy's traffic slow the job threads.
+- With a 2 ms period fewer pages are copied ahead (~1,050 of ~1,350) and fewer are copied twice; the loss halves, but no
+  setting gained.
+- One 250 us walking run stayed on the title screen for the whole run (50 draws a frame, 360 fps): the input script
+  never reached the save. It was not seen in any other run of this ticket or earlier ones, and was not reproduced or
+  explained. One more reason the switch stays off.
+
+Splitting the scan: +1.0 walking, -2.4 standing, inside the spread. The scan is ~0.04 ms a submit, and waking the
+helpers costs about as much.
+
+### Behaviour
+
+The default path's `capture_make` was restructured: the same steps in the same order, plus the copy's time in its log
+line. Shots every 1200 presents and HOS_SPEED_LOG, the default build against the Sync 11 build, standing and walking:
+docs/benchmarks/2026-11-10-tick043-async-submit.md.
+
+### What is next (ranked)
+
+1. **Fewer bytes, not the same bytes elsewhere.** Copy only the pages a submission's bindings can read (only ~75% of the
+   capture is ever synced, TICK-037). Needs the read sets. ~0.25 ms a frame at best.
+2. **The late pages' GPU wait in `take_capture`** (0.1-0.2 ms a frame on the main thread). In the synchronous replay the
+   take comes right after the make, on the same thread. Their recopy could move into the recording: a GPU copy from the
+   pool after the write-back, ordered by the queue (TICK-017's DEFER, without its pacing wait).
+3. **`take_capture`'s texture shadows** (~0.1-0.3 ms walking): an `std::unordered_map` of 4 KB pages; a flat table, as
+   for the capture entries.
+4. **The scan**: a summary of the marks (a bit per 256 pages, set with the mark) would make it nearly free. But A64_MARK
+   is in the lifted code (PGO caveat, TICK-041), so only at the next profile refresh.
+5. The game's job chain (TICK-042's ranked list) stays the larger lever: the submit is ~2 ms of a ~13.5 ms frame.
+
+Not verified: other CPUs (fewer cores make a copy thread costlier, a bigger cache could change the balance); pre-copy
+periods other than 250 us and 2 ms; Kokiri Forest and Hyrule Field.
