@@ -2,6 +2,7 @@
 
 python -I -B tests/test_linux_update.py
 """
+import io
 import os
 import shutil
 import stat
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,125 @@ def appdir(path):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_install_rejects_a_staging_link_before_cleanup_or_placing_parts(self):
+        from unittest import mock
+        for exists in (False, True):
+            with self.subTest(target_exists=exists), tempfile.TemporaryDirectory(prefix="hookshot-stage-") as tmp:
+                root = Path(tmp).resolve()
+                home = root / "home"
+                versions = home / "hookshot" / "builder" / "versions"
+                versions.mkdir(parents=True)
+                target = root / "outside-stage"
+                sentinel = root / "sentinel"
+                sentinel.write_text("unchanged", encoding="utf-8")
+                if exists:
+                    target.mkdir()
+                    (target / "kept").write_text("unchanged", encoding="utf-8")
+                self.assertIn(root, target.resolve().parents)
+                partial = versions / "v2.part"
+                partial.symlink_to(target, target_is_directory=True)
+                current = versions.parent / "current"
+                current.write_text("v1\n", encoding="utf-8")
+                manifest = linux_update.Manifest("v2", [linux_update.Part("a" * 64, 1, "usr/python", "unused", None)])
+                get = mock.Mock(side_effect=AssertionError("download must not start"))
+                with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(home)}), \
+                        mock.patch.object(linux_update, "_place", side_effect=AssertionError("placement must not start")) as place, \
+                        mock.patch.object(linux_update.shutil, "rmtree", side_effect=AssertionError("cleanup must not start")) as cleanup:
+                    error = None
+                    try:
+                        linux_update.install(manifest, None, None, get=get)
+                    except Exception as caught:
+                        error = caught
+                    self.assertIsInstance(error, ValueError)
+                    self.assertIn(str(partial), str(error))
+                    self.assertIn("symbolic link", str(error))
+                    cleanup.assert_not_called()
+                    place.assert_not_called()
+                    get.assert_not_called()
+                self.assertTrue(partial.is_symlink())
+                self.assertEqual(os.readlink(partial), str(target))
+                self.assertEqual(target.exists(), exists)
+                if exists:
+                    self.assertEqual(sorted(p.name for p in target.iterdir()), ["kept"])
+                    self.assertEqual((target / "kept").read_text(encoding="utf-8"), "unchanged")
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+                self.assertEqual(current.read_text(encoding="utf-8"), "v1\n")
+
+    def test_install_keeps_real_staging_and_symlinked_parent_roots_working(self):
+        from unittest import mock
+        for linked_home, stale in ((False, False), (False, True), (True, False)):
+            with self.subTest(linked_home=linked_home, stale=stale), tempfile.TemporaryDirectory(prefix="hookshot-stage-") as tmp:
+                root = Path(tmp).resolve()
+                real_home = root / "real-home"
+                real_home.mkdir()
+                home = root / "linked-home" if linked_home else real_home
+                if linked_home:
+                    home.symlink_to(real_home, target_is_directory=True)
+                self.assertIn(root, home.resolve().parents)
+                versions = home / "hookshot" / "builder" / "versions"
+                old = versions / "v1"
+                old.mkdir(parents=True)
+                (old / "kept").write_text("old", encoding="utf-8")
+                partial = versions / "v2.part"
+                if stale:
+                    partial.mkdir()
+                    (partial / "stale").write_text("old", encoding="utf-8")
+                part = linux_update.Part("a" * 64, 1, "usr/share/hookshot", "unused", None)
+                manifest = linux_update.Manifest("v2", [part])
+
+                def place(part, source_root, source, dest_root, get, note):
+                    self.assertEqual(dest_root, str(partial))
+                    tools = Path(dest_root) / part.dest / "builder" / "linux"
+                    tools.mkdir(parents=True)
+                    (tools / "AppRun").write_text("authored placeholder, never executed\n", encoding="utf-8")
+
+                get = mock.Mock(side_effect=AssertionError("no download in this fixture"))
+                with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(home)}), \
+                        mock.patch.object(linux_update, "_place", side_effect=place) as placed:
+                    apprun = linux_update.install(manifest, None, None, get=get)
+                installed = versions / "v2"
+                self.assertEqual(apprun, str(installed / "AppRun"))
+                self.assertEqual((installed / "AppRun").read_text(encoding="utf-8"), "authored placeholder, never executed\n")
+                self.assertEqual((versions.parent / "current").read_text(encoding="utf-8"), "v2\n")
+                self.assertEqual(sorted(p.name for p in versions.iterdir()), ["v2"])
+                self.assertFalse((installed / "stale").exists())
+                self.assertTrue((installed / linux_update.LIST_NAME).is_file())
+                placed.assert_called_once()
+                get.assert_not_called()
+                if linked_home:
+                    self.assertTrue(home.is_symlink())
+
+    def test_a_list_whose_names_leave_the_versions_folder_is_refused(self):
+        sha = "a" * 64
+        good = "tag v2.1.0\npart %s 10 usr/share/hookshot https://example.invalid/p.zip\nfile nx2/marker.py\n" % sha
+        self.assertEqual(linux_update.parse_list(good).tag, "v2.1.0")
+        bad = [
+            good.replace("tag v2.1.0", "tag .."),
+            good.replace("tag v2.1.0", "tag /home/someone"),
+            good.replace("tag v2.1.0", "tag ../../x"),
+            good.replace("usr/share/hookshot", "../../outside"),
+            good.replace("usr/share/hookshot", "/abs"),
+            good.replace("file nx2/marker.py", "file ../../../x"),
+            good.replace(sha, "abc"),
+            good.replace("https://", "http://"),
+        ]
+        for text in bad:
+            with self.assertRaises(ValueError, msg=text):
+                linux_update.parse_list(text)
+        # a file link is for a list from this PC only, not one downloaded (it read /dev/zero, or tested a file's hash)
+        local = good.replace("https://example.invalid/p.zip", "file:///dev/zero")
+        self.assertEqual(linux_update.parse_list(local).tag, "v2.1.0")
+        with self.assertRaises(ValueError):
+            linux_update.parse_list(local, local=False)
+        with self.assertRaises(ValueError):
+            linux_update.fetch_manifest(get=lambda url: local.encode())
+
+    def test_a_download_reads_at_most_its_limit(self):
+        import io
+        self.assertEqual(linux_update._read_at_most(io.BytesIO(b"x" * 10), 10), b"x" * 10)
+        with self.assertRaises(RuntimeError):
+            linux_update._read_at_most(io.BytesIO(b"x" * 11), 10)
+
     def test_the_button_matches_the_windows_builder(self):
         self.assertEqual(linux_update.choose_mode("v1", "v2", "v2", False, True), "update-game")
         self.assertEqual(linux_update.choose_mode("v2", "v2", "v2", False, True), "up-to-date")
@@ -85,10 +206,10 @@ class UpdateTests(unittest.TestCase):
             (root / "hookshot-linux.txt").write_text(
                 "tag v1.1-rc.1\npart %s 10 usr/share/hookshot file://%s/rc.zip\nfile nx2/marker.py\n" % ("a" * 64, tmp),
                 encoding="utf-8")
-            stable = "tag v1.0\npart %s 10 usr/share/hookshot file://%s/old.zip\nfile nx2/marker.py\n" % ("b" * 64, tmp)
+            stable = "tag v1.0\npart %s 10 usr/share/hookshot https://example.invalid/old.zip\nfile nx2/marker.py\n" % ("b" * 64)
             got = linux_update.startup_manifest(str(root), get=lambda url: stable.encode())
             self.assertEqual((got.tag, got.parts[0].sha), ("v1.1-rc.1", "a" * 64))     # (its own: nothing reinstalled)
-            newer = "tag v1.2\npart %s 10 usr/share/hookshot file://%s/new.zip\nfile nx2/marker.py\n" % ("c" * 64, tmp)
+            newer = "tag v1.2\npart %s 10 usr/share/hookshot https://example.invalid/new.zip\nfile nx2/marker.py\n" % ("c" * 64)
             got = linux_update.startup_manifest(str(root), get=lambda url: newer.encode())
             self.assertEqual((got.tag, got.parts[0].sha), ("v1.2", "c" * 64))          # (a newer release still wins)
             # a HOOKSHOT_LINUX_LIST is taken even when the tags match (a patched part for a release, issue 990)
@@ -104,7 +225,7 @@ class UpdateTests(unittest.TestCase):
             (release / "hookshot-linux.txt").write_text(
                 "tag v1\npart %s 10 usr/share/hookshot file://%s/release.zip\nfile nx2/marker.py\n" % ("e" * 64, tmp),
                 encoding="utf-8")
-            same = "tag v1\npart %s 10 usr/share/hookshot file://%s/old.zip\nfile nx2/marker.py\n" % ("b" * 64, tmp)
+            same = "tag v1\npart %s 10 usr/share/hookshot https://example.invalid/old.zip\nfile nx2/marker.py\n" % ("b" * 64)
             got = linux_update.startup_manifest(str(release), get=lambda url: same.encode())
             self.assertEqual(got.parts[0].sha, "e" * 64)
             # and one older than the release still downloads it
@@ -291,6 +412,65 @@ class UpdateTests(unittest.TestCase):
             ran = subprocess.run([str(script)], env=env, check=False, text=True, capture_output=True)
             self.assertEqual(ran.returncode, 0, ran.stderr)
             self.assertEqual(ran.stdout.strip(), "game")
+
+    def test_a_part_cannot_write_through_a_zip_symlink(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-zip-") as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            marker = outside / "marker"
+            marker.write_bytes(b"original")
+            for link_target, member in ((outside, "link/marker"), (marker, "./link")):
+                with self.subTest(member=member):
+                    archive = io.BytesIO()
+                    with zipfile.ZipFile(archive, "w") as zipped:
+                        link = zipfile.ZipInfo("link")
+                        link.create_system = 3
+                        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+                        zipped.writestr(link, str(link_target))
+                        zipped.writestr(member, b"changed")
+                    dest = root / ("directory" if member == "link/marker" else "file")
+                    with self.assertRaises((ValueError, FileExistsError)):
+                        linux_update._unpack(archive.getvalue(), str(dest), None)
+                    self.assertEqual(marker.read_bytes(), b"original")
+
+    def test_a_part_cannot_extract_through_a_symlinked_destination(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-zip-") as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            dest = root / "stage"
+            dest.mkdir()
+            (dest / "link").symlink_to(outside, target_is_directory=True)
+            staging_link = root / "staging-link"
+            staging_link.symlink_to(outside / "missing", target_is_directory=True)
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr("marker", b"changed")
+            data = archive.getvalue()
+            for stage, folder in ((dest, "link/sub"), (staging_link, "usr")):
+                with self.subTest(folder=folder):
+                    part = linux_update.Part(linux_update._sha256(data), len(data), folder, "test", None)
+                    with self.assertRaises(ValueError):
+                        linux_update._place(part, None, None, str(stage), lambda _: data, lambda _: None)
+                    self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_part_keeps_toolchain_links(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-zip-") as tmp:
+            root = Path(tmp)
+            source = root / "sysroot"
+            source.mkdir()
+            (source / "lib").symlink_to("usr/lib")
+            (source / "libmvec.so").symlink_to("/lib/x86_64-linux-gnu/libmvec.so.1")
+            (source / "usr" / "lib").mkdir(parents=True)
+            (source / "usr" / "lib" / "marker").write_bytes(b"contents")
+            archive = root / "part.zip"
+            make_parts.write_zip(str(archive), str(root), "sysroot", None)
+            dest = root / "unpacked"
+            linux_update._unpack(archive.read_bytes(), str(dest), None)
+            self.assertEqual(os.readlink(dest / "libmvec.so"), "/lib/x86_64-linux-gnu/libmvec.so.1")
+            self.assertEqual(os.readlink(dest / "lib"), "usr/lib")
+            self.assertEqual((dest / "lib" / "marker").read_bytes(), b"contents")
 
 
 if __name__ == "__main__":

@@ -49,14 +49,14 @@ typedef struct { uint32_t magic, flags, origin, depth_mode; } nvn_dev;
 typedef struct { void *dev; uint32_t flags; uint64_t cmd_sz, comp_sz, ctl_sz, flush; uint64_t mem, mem_sz; } nvn_queue_builder;
 typedef struct { uint32_t magic; uint64_t submits; } nvn_queue;
 
-/* a memory pool: mem = host pointer of its storage (null: a virtual pool), gpu = its GPU address */
+/* a memory pool: mem = guest address of its storage (0: a virtual pool), gpu = its GPU address. (hookshot) The object
+   is guest memory, so it holds no host pointers: a virtual pool's page table is found by its GPU address. */
 typedef struct { void *dev; uint64_t mem; uint64_t size; uint32_t flags; } nvn_pool_builder;   /* mem: guest address */
-typedef struct nvn_vmap nvn_vmap;
 typedef struct {
     uint32_t magic, flags;
-    uint8_t *mem;                         /* host pointer of the storage (null for a virtual pool) */
+    uint64_t mem;                         /* guest address of the storage (0 for a virtual pool) */
     uint64_t size, gpu;                   /* GPU address: the guest address, or a virtual pool's range above 4 GB */
-    nvn_vmap *vmap;                       /* virtual pools: the page table */
+    uint64_t reserved;
 } nvn_pool;
 typedef struct { const nvn_pool *pool; int64_t off; int32_t n; } nvn_dpool;   /* texture / sampler descriptor pool */
 
@@ -100,21 +100,23 @@ typedef struct { uint32_t magic; uint64_t gpu; } nvn_event;   /* gpu: the 32-bit
 typedef struct { void *dev; uint64_t native; int32_t ntex, interval, active; uint64_t tex[4]; } nvn_win_builder;   /* tex: guest addresses */
 typedef struct {
     uint32_t magic; int32_t ntex, interval, next, active, crop[4];
-    nvn_tex *tex[4];
+    uint64_t tex[4];                      /* (hookshot) guest addresses, checked at each use */
     uint64_t presents;
 } nvn_win;
 
 /* a command buffer: records go to a growable host buffer (never into the game's command memory) */
+/* (hookshot) The object is guest memory: the recording buffer's pointers (seg, cur, end) are kept in a host table
+   (host/nvn_native.c cmd_rec), and the object holds only its slot there, which names the object it belongs to. */
 typedef struct {
     uint32_t magic, recording;
-    uint8_t *cur;
+    uint32_t slot, slot_pad;              /* the host table's slot (0: none yet) */
     uint64_t guest_flags;                 /* +0x10: NVN 55 inline code writes a dirty flag here */
-    uint8_t *end;
+    uint64_t reserved_18;
     /* NVN 55 headers inline fast paths that read the write pointer at +0x20 and its end at +0x28 (main+0x70644c) and
        emit raw GPU methods when 0x30 bytes fit: ~0 / 0 never fits, so every call takes the API (*Deferred) path */
     uint64_t inline_cur, inline_end;
     uint64_t cb, cb_data;                 /* the memory callback (guest), never called: records live in host memory */
-    uint8_t *seg;                         /* the recording buffer */
+    uint64_t reserved_40;
     uint64_t ctl, ctl_size;               /* control memory the game gave (guest): a handle lives as long as it */
     uint64_t game_size;                   /* command memory the game gave (accounting only) */
     uint64_t cmd_used, ctl_used, rec_start;

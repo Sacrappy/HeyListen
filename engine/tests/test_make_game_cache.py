@@ -3,9 +3,11 @@
 Run with: python -I tests/test_make_game_cache.py
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -73,7 +75,9 @@ class NupCacheTests(unittest.TestCase):
         return {path.relative_to(self.out).as_posix(): path.read_bytes()
                 for path in self.out.rglob("*") if path.is_file() and ".game" not in path.parts}
 
-    def run_to_lift(self, nup, failure=None, supported=True, include_romfs=True):
+    def run_to_lift(self, nup, failure=None, supported=True, include_romfs=True, update=False):
+        self.assert_owned_fixture()
+
         def run(cmd, env=None, on_line=None):
             if "nx2/nup.py" in cmd:
                 target = Path(cmd[cmd.index("--extract") + 1]).resolve()
@@ -92,7 +96,8 @@ class NupCacheTests(unittest.TestCase):
                 raise Prepared
             self.fail("Unexpected build subprocess: %r" % cmd)
 
-        argv = ["make_game.py", "--nup", str(nup), "--out", str(self.out), "--work", str(self.work)]
+        argv = ["make_game.py", "--work", str(self.work)]
+        argv += ["--update", str(self.out)] if update else ["--nup", str(nup), "--out", str(self.out)]
         # The only external operation exercised is authored extraction above; no compiler, SDK,
         # translation, power-state update or real game is involved.
         with contextlib.ExitStack() as stack:
@@ -118,6 +123,46 @@ class NupCacheTests(unittest.TestCase):
                 self.output = output.getvalue()
                 for launch in blocked:
                     launch.assert_not_called()
+
+    def test_failed_scratch_exefs_cleanup_stops_before_copy_or_extraction(self):
+        scratch = self.work / "exefs"
+        scratch.mkdir()
+        stale = scratch / "locked"
+        stale.write_bytes(b"authored stale module")
+        before = self.cache()
+        remove = shutil.rmtree
+
+        def remove_with_lock(path, *args, **kwargs):
+            if Path(path) == scratch:
+                if not kwargs.get("ignore_errors"):
+                    raise PermissionError(errno.EACCES, "authored locked file", str(stale))
+                return
+            return remove(path, *args, **kwargs)
+
+        for update in (True, False):
+            with self.subTest(update=update), mock.patch.object(shutil, "rmtree", side_effect=remove_with_lock):
+                with self.assertRaises(SystemExit) as result:
+                    self.run_to_lift(self.new_nup, update=update)
+                self.assertEqual(result.exception.code, 1)
+                self.assertIn("@@error Could not clear", self.output)
+                self.assertIn(str(scratch), self.output)
+                self.assertIn("authored locked file", self.output)
+                self.assertEqual(self.extractions, [])
+                self.assertEqual(self.cache(), before)
+                self.assertEqual(stale.read_bytes(), b"authored stale module")
+
+    def test_update_replaces_clearable_scratch_exefs(self):
+        scratch = self.work / "exefs"
+        scratch.mkdir()
+        stale = scratch / "stale"
+        stale.write_bytes(b"authored stale module")
+        before = self.cache()
+        with self.assertRaises(Prepared):
+            self.run_to_lift(None, update=True)
+        self.assertFalse(stale.exists())
+        self.assertEqual(self.extractions, [])
+        self.assertEqual(self.cache(), before)
+        self.assertEqual((scratch / "main").read_bytes(), (self.out / ".hookshot_exefs/main").read_bytes())
 
     def test_changed_source_replaces_romfs_and_exefs_together(self):
         with self.assertRaises(Prepared):

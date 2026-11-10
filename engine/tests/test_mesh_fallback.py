@@ -82,9 +82,18 @@ def main():
     mesh = MESH.read_text(encoding="utf-8")
     if "void MeshFallbackEpilogue(" not in mesh or "void EmitMeshFallbackVertexBody(" not in mesh:
         raise SystemExit("the fallback epilogue or vertex body is missing")
+    if "AddLocalVariable" in block(mesh, "void Strided("):
+        raise SystemExit("the strided copies declare a function variable mid-function (spirv-val rejects it)")
     task = block(mesh, "void TaskEpilogue(")
     if "ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count)" not in task:
         raise SystemExit("a task starts a mesh workgroup for every thread, not only the meshlets it kept")
+    if "PushU64(ctx, MESH_FALLBACK_" in mesh:
+        raise SystemExit("a push constant byte offset is used as the push block's member index")
+    if "ctx.OpSelect(ctx.U32[1], started, ctx.Const(1U), ctx.u32_zero_value)" not in task:
+        raise SystemExit("the task's started flag is stored as a bool into a u32 word")
+    if "spv::MemoryAccessMask::Aligned, 4U" not in block(mesh, "Id LoadWord(") or \
+            "spv::MemoryAccessMask::Aligned, 4U" not in block(mesh, "void StoreWord("):
+        raise SystemExit("the fallback's PhysicalStorageBuffer accesses do not say their alignment")
     epilogue = block(mesh, "void MeshFallbackEpilogue(")
     if "ctx.OpAtomicIAdd" in epilogue:
         raise SystemExit("the fallback still allocates record slots atomically")
@@ -92,6 +101,11 @@ def main():
         raise SystemExit("a mesh workgroup does not write its count at its slot")
     if "MESH_FALLBACK_CAPACITY" not in epilogue:
         raise SystemExit("the records' count array is not at the fallback capacity")
+    isbe = block(mesh, "Id EmitIsbeRead(")
+    if "mesh_fallback_task_threads" not in isbe or "ctx.OpUMod" not in isbe:
+        raise SystemExit("a fallback mesh workgroup takes its slot, not its meshlet within the task workgroup, as its index")
+    if "mrt.mesh_fallback_task_threads = task_t ? task_t->program.workgroup_size[0] : 0;" not in translate:
+        raise SystemExit("the mesh stage is not told its task program's threads")
     body = block(mesh, "void EmitMeshFallbackVertexBody(")
     if "ctx.OpUDiv" not in body or "ctx.OpUMod" not in body:
         raise SystemExit("the vertex stage does not take its slot, primitive and corner from VertexIndex")
@@ -120,6 +134,8 @@ def main():
         raise SystemExit("the fallback's buffer addresses are not pushed")
     if "VK_WHOLE_SIZE" not in draw:
         raise SystemExit("a payload a task did not write is not cleared before the mesh dispatch")
+    if "(!p.fallback || dw().prog == &p)" not in draw or "dw().prog = &p;" not in draw:
+        raise SystemExit("a fallback draw reusing its descriptors after a dispatch pushes the dispatch's at the compute bind point")
     if "VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT" not in VMA.read_text(encoding="utf-8"):
         raise SystemExit("the allocator does not make the fallback's buffers addressable")
     if "st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)" \

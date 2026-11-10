@@ -86,7 +86,7 @@ std::atomic<int64_t> st_cache_hits{0};
 #define PROF_EXACT()   // (vk_prof.h's exact-timing scope, since #989: nothing to time here)
 #include "cache_functions.inc"
 
-void save(uint64_t key, bool empty_second = false) {
+void save(uint64_t key, bool empty_second = false, int bad_answer = 0) {
     Program program;
     program.key = key;
     program.stages.emplace_back();
@@ -96,6 +96,11 @@ void save(uint64_t key, bool empty_second = false) {
     program.stages[1].nvn_stage = 1;
     program.stages[1].vk_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     program.stages[1].info.handle_programs = {{1, 2}};
+    program.stages[1].info.texture_descriptors = {0};
+    program.answers.push_back({1, 0, 1, false});   // (a fitting answer: stage 1's one texture)
+    // (the file is passed around: an answer naming a stage or slot the program does not have is refused)
+    if (bad_answer == 1) program.answers.push_back({7, 0, 1, false});
+    if (bad_answer == 2) program.answers.push_back({1, 3, 1, false});
     std::vector<std::vector<uint32_t>> code{{0x07230203}, {0x07230203}};
     if (empty_second) code[1].clear();
     program_cache_save(program, code);
@@ -114,7 +119,7 @@ int main(int argc, char** argv) {
     disk_in = disk_out = std::tmpfile();
     CHECK(disk_in);
     const std::string scenario = argv[1];
-    save(7, scenario == "empty");
+    save(7, scenario == "empty", scenario == "answer_stage" ? 1 : scenario == "answer_desc" ? 2 : 0);
     if (scenario == "first") fail_at = 1;
     if (scenario == "second" || scenario == "mixed") fail_at = 2;
     if (scenario == "truncated") --disk_records.at(7).back().size;
@@ -131,6 +136,7 @@ int main(int argc, char** argv) {
     if (scenario == "first") CHECK(created == 0 && releases == 0);
     if (scenario == "second" || scenario == "empty") CHECK(created == 1 && releases == 1);
     if (scenario == "truncated") CHECK(created == 0 && releases == 0);
+    if (scenario == "answer_stage" || scenario == "answer_desc") CHECK(created == 2 && releases == 2);
     if (scenario == "valid") CHECK(created == 2 && releases == 0);
     if (scenario == "mixed") {
         CHECK(created == 3 && releases == 1);

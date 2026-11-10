@@ -21,6 +21,7 @@ void *hos_sdl_window(const char *title, int width, int height);
 void hos_sdl_fullscreen(void *window, int on);   /* (the desktop's mode, borderless) */
 void hos_sdl_relative_mouse(void *window, int on);
 int hos_sdl_desktop_size(int *width, int *height);
+int hos_sdl_refresh_mhz(void *window);   /* the refresh rate of the window's display in mHz, 0 when not known (the main thread) */
 int hos_sdl_vulkan_surface(void *window, void *instance, void *surface_out);   /* (VkInstance, VkSurfaceKHR *): 1 if made */
 void hos_sdl_pixel_size(void *window, int *width, int *height);
 const uint8_t *hos_sdl_keys(int *count);   /* the keyboard by scancode (USB HID usage), 1 a key down */

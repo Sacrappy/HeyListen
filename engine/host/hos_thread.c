@@ -561,12 +561,73 @@ static const NameSpec *match_name_spec(const NameSpec *s, int n, const char *nam
 /* The last physical core (its logical processors' mask), kept for the Vulkan back end's replay thread (gpu/vk
    vk_replay.cpp pins it there): the game's threads run on the others. The replay is on the frame's critical path
    (MKW waits for the last frame's GPU work before it submits the next), and on a core shared with game threads
-   it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none. */
+   it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none.
+   (hookshot) On a CPU with cores of more than one kind, the last core of the fastest kind: the last core of all is an
+   efficiency core on Intel's hybrid CPUs (an i7-12700K's logical processors 16-19), the slowest place for the replay
+   (an i7-13700K's Kokiri Forest: 48.7 fps with it there, 60 on a performance core). EfficiencyClass is higher the faster
+   the core, and the same for every core of a CPU of one kind (the last core, as before). Only with 4+ cores of the
+   fastest kind (8+ logical processors always have them on a CPU of one kind): a laptop's 2 performance cores and 8
+   efficiency ones (i5-1235U) would keep one of the two from the game; then none is kept. The calling thread's
+   processor group's cores: the masks the affinity calls take are its group's. Windows only: Linux keeps the last core,
+   as before. */
+/* (the choice: the cores' logical processor masks and EfficiencyClass, n of them; 0 for none. tests/test_reserved_core.py) */
+static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *classes, int n) {
+    uint64_t last = 0;
+    int best = -1, fast = 0, logical = 0;
+    for (int i = 0; i < n; i++) {
+        if (!masks[i]) continue;
+        logical += __builtin_popcountll(masks[i]);
+        if ((int)classes[i] > best) {
+            best = classes[i], last = masks[i], fast = 1;
+        } else if ((int)classes[i] == best) {
+            fast++;
+            if (masks[i] > last) last = masks[i];
+        }
+    }
+    if (logical < 8 || fast < 4) return 0;
+    return last;
+}
+#if defined(_WIN32)
+/* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
+static uint64_t last_fastest_core(int *cores) {
+    static uint64_t masks[256];
+    static unsigned char classes[256];
+    DWORD len = 0;
+    int n = 0;
+    *cores = 0;
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    char *buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && n < 256;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group) {
+                masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
+                classes[n] = e->Processor.EfficiencyClass;
+                n++;
+            }
+            at += e->Size;
+        }
+    free(buf);
+    *cores = n;
+    return pick_reserved_core(masks, classes, n);
+}
+#endif
 uint64_t hos_reserved_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
     mask = 0;
     if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return mask;
+#if defined(_WIN32)
+    {
+        int cores = 0;
+        const uint64_t fast = last_fastest_core(&cores);
+        if (cores) return mask = fast;
+    }
+#endif
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
     DWORD len = sizeof info;
     if (!GetLogicalProcessorInformation(info, &len)) return mask;
@@ -581,33 +642,12 @@ uint64_t hos_reserved_cpus(void) {
     return mask;
 }
 
-/* (hookshot) The game's render thread on the reserved core itself: in the default synchronous mode (RX_VK_ASYNC unset) the
-   Vulkan back end replays a submission on the thread that submits it, and OoT's "Presentation Thread" submits most of each
-   frame's (4 of its 6 queues). The core kept for the replay thread had nothing on it then. On a Ryzen 9 3900X in Kokiri
-   Forest: the replay ~24 -> ~22 ms a frame, 34 -> 36 fps (2026-11-08). HOS_PIN_RENDER=0: kept off the core as before */
-static int render_thread_on_reserved(const char *name) {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("HOS_PIN_RENDER"), *async = getenv("RX_VK_ASYNC");
-        on = (!e || atoi(e) != 0) && !(async && atoi(async) != 0);
-    }
-    return on && name && strcmp(name, "Presentation Thread") == 0;
-}
-
 void hos_thread_pin(void *h, const char *name) {
     const uint64_t reserved = hos_reserved_cpus();
     if (reserved) {
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-        if (render_thread_on_reserved(name) && ((uint64_t)proc & reserved)) {
-            SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & reserved));
-            static volatile LONG told;
-            if (!InterlockedExchange(&told, 1))
-                hos_log("threads: %s on the reserved core (logical processors %#llx; HOS_PIN_RENDER=0: off)", name,
-                        (unsigned long long)((uint64_t)proc & reserved));
-        } else if ((uint64_t)proc & ~reserved) {
-            SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
-        }
+        if ((uint64_t)proc & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;
@@ -1317,6 +1357,10 @@ void hos_vcore_back(void) {
     HosThread *t = cur;
     if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
 }
+/* Lifted code calls this from its interrupt polls with the loop's guest registers still in host registers (a64_poll_cur,
+   mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
+   read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
+   stall dump of a thread spinning in a polled loop shows such older registers for the same reason. */
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
     if (t && t->vc_kick) vc_yield(t, t->vc_kick == 1);

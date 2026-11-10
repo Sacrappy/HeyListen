@@ -124,6 +124,7 @@ static void pages_mark_used_locked(uint64_t addr, uint64_t size) {
 }
 
 static void discard_pages(uint64_t addr, uint64_t size) {
+    if (!hos_guest_range(addr, size)) return;   /* (hookshot: guest pages only; Linux's discard zeroes what it is given) */
     const uint64_t lo = (addr + 0xFFF) & ~0xFFFULL, hi = (addr + size) & ~0xFFFULL;
     static int keep = -1;
     if (keep < 0) keep = getenv("HOS_KEEP_FREED_PAGES") != NULL;
@@ -179,11 +180,17 @@ void hos_mark_written(const void *p, size_t n) {
 }
 #endif
 
+/* (hookshot) a heap of size bytes ends below the address regions and the guest window's end (no wrap-around: the size
+   comes from the game). Also svc SetHeapSize's check (hos_svc.c) */
+int hos_heap_size_fits(uint64_t size) {
+    const uint64_t limit = region_floor < HOS_SPACE_END ? region_floor : HOS_SPACE_END;
+    return limit >= HOS_HEAP_BASE && size <= limit - HOS_HEAP_BASE;
+}
 /* nn::os::SetMemoryHeapSize(unsigned long) -> Result */
 HLE(_ZN2nn2os17SetMemoryHeapSizeEm) {
     uint64_t size = ARG(0);
     HOS_TRACE_CALL("SetMemoryHeapSize");
-    if (HOS_HEAP_BASE + size > (region_floor < HOS_SPACE_END ? region_floor : HOS_SPACE_END)) {
+    if (!hos_heap_size_fits(size)) {
         hos_log("SetMemoryHeapSize(%#llx): collides with address regions at %#llx", (unsigned long long)size,
                 (unsigned long long)region_floor);
         RET(0xCA01);   /* svc::ResultOutOfMemory */
@@ -242,6 +249,11 @@ HLE(_ZN2nn2os17FreeAddressRegionEm) {
 HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
     HOS_TRACE_CALL("AllocateMemoryPages");
     const uint64_t a = ARG(0), n = ARG(1), end = a + n;
+    if (!hos_guest_range(a, n)) {   /* (hookshot: a range that wrapped around was zeroed whole, past the guest window) */
+        hos_log("AllocateMemoryPages(%#llx, %#llx): outside the guest window", (unsigned long long)a, (unsigned long long)n);
+        RET(0xCA01);   /* svc::ResultOutOfMemory */
+        return;
+    }
     static int zero_all = -1;
     if (zero_all < 0) zero_all = getenv("HOS_ZERO_ALL_PAGES") != NULL;
     if (end > (1ULL << 32) && !zero_all) {
@@ -282,6 +294,11 @@ HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
 /* nn::os::FreeMemoryPages(unsigned long, unsigned long) -> Result */
 HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
     HOS_TRACE_CALL("FreeMemoryPages");
+    if (!hos_guest_range(ARG(0), ARG(1))) {   /* (hookshot: decommitted or discarded: guest pages only) */
+        hos_log("FreeMemoryPages(%#llx, %#llx): outside the guest window", (unsigned long long)ARG(0), (unsigned long long)ARG(1));
+        RET(0xCA01);
+        return;
+    }
     if (ARG(0) + ARG(1) > (1ULL << 32)) {   /* (mkw-recomp: the pair of AllocateMemoryPages' commit above) */
         const uint64_t lo = (ARG(0) + 0xFFF) & ~0xFFFULL, hi = (ARG(0) + ARG(1)) & ~0xFFFULL;
         /* (pages the Vulkan back end imported, as part of a pool's 16 MB chunk, stay committed and are zeroed: the GPU

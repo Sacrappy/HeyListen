@@ -50,9 +50,14 @@ HLE(_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE) {
 /* nn::vi::GetDisplayVsyncEvent(nn::os::SystemEventType*, nn::vi::Display*) -> Result */
 HLE(_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE) {
     hos_system_event_init(ARG(0), 1);
-    if (nvsync < (LONG)(sizeof vsync_events / sizeof vsync_events[0])) {
-        vsync_events[nvsync] = ARG(0);
-        InterlockedIncrement(&nvsync);
+    {   /* (hookshot) under a lock: two threads checked the count at once and wrote past the table */
+        static SRWLOCK vsync_lock = SRWLOCK_INIT;
+        AcquireSRWLockExclusive(&vsync_lock);
+        if (nvsync < (LONG)(sizeof vsync_events / sizeof vsync_events[0])) {
+            vsync_events[nvsync] = ARG(0);
+            InterlockedIncrement(&nvsync);
+        }
+        ReleaseSRWLockExclusive(&vsync_lock);
     }
     if (!vsync_thread) vsync_thread = CreateThread(NULL, 0, vsync_main, NULL, 0, NULL);
     RET(0);

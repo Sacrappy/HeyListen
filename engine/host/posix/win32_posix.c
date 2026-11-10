@@ -945,7 +945,10 @@ DWORD GetFileAttributesA(LPCSTR name) {
         fail_errno();
         return INVALID_FILE_ATTRIBUTES;
     }
-    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    DWORD at = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    struct stat link;   /* (hookshot: a symbolic link is marked as Windows marks one, a reparse point; find_next too) */
+    if (lstat(path, &link) == 0 && S_ISLNK(link.st_mode)) at |= FILE_ATTRIBUTE_REPARSE_POINT;
+    return at;
 }
 BOOL CreateDirectoryA(LPCSTR name, void *attr) {
     (void)attr;
@@ -1006,6 +1009,8 @@ static BOOL find_next(HFind *f, WIN32_FIND_DATAA *fd) {
         } else {
             fd->dwFileAttributes = e->d_type == DT_DIR ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         }
+        struct stat link;   /* (hookshot: a symbolic link is marked as Windows marks one, a reparse point) */
+        if (lstat(full, &link) == 0 && S_ISLNK(link.st_mode)) fd->dwFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
         return TRUE;
     }
     last_error = ERROR_NO_MORE_FILES;

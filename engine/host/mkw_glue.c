@@ -17,6 +17,10 @@
    guest or host access to a page nothing committed is committed on first touch, 64 KB at a time, by the handler. */
 void hos_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
+    if (!hos_guest_range(addr, size)) {   /* (hookshot: guest pages only; the posix layer's commit changes any page's protection) */
+        hos_log("mem: commit of %#llx bytes at %#llx: outside the guest window", (unsigned long long)size, (unsigned long long)addr);
+        return;
+    }
     const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
     if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
         const DWORD err = GetLastError();
@@ -659,10 +663,17 @@ void hos_gpu_queue_submit(int channel_fd, const uint64_t *entries, uint32_t n, i
 /* The loop-header interrupt polls (nx2/poll.py): the virtual cores (HOS_VCORES) ask a thread holding a core a
    waiter should have to give it up there, so guest code with no nn::os call or SVC in it (a long job) is preempted
    as Horizon would preempt it. */
-void a64_poll(Ctx *c) {
-    c->poll = 0;
+/* (nx2/rtgen.py) the loop-header poll: the lifted code has cleared c->poll and calls this with no argument, so that the
+   compiler keeps guest registers in host registers across the loop header (a call handed the context could change any
+   of it). The thread's context is the running one's (hos_ctx: a fiber's while it runs one), which is where the kick
+   (hos_thread.c) set the flag; nothing here reads it */
+void a64_poll_cur(void) {
     void hos_vcore_checkpoint(void);
     hos_vcore_checkpoint();
+}
+void a64_poll(Ctx *c) {   /* (the old form, A64_POLL_CTX builds) */
+    c->poll = 0;
+    a64_poll_cur();
 }
 
 /* CNTPCT_EL0 at the Switch 2's 31.25 MHz (rt/a64_rt.c's default counts the Switch 1's 19.2 MHz). The SDK checks

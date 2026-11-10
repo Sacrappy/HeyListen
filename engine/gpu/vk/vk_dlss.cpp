@@ -26,8 +26,10 @@
 // off). DLSS's runtime (Windows: nvngx_dlss.dll; Linux: libnvidia-ngx-dlss.so.*) is looked for in RX_VK_DLSS_DIR=<folder>
 // when set, the game folder's ngx folder, and %LOCALAPPDATA%\Hookshot\ngx (Linux: $XDG_DATA_HOME/hookshot/ngx): NGX takes
 // the newest one it finds in them. Windows' paths are wide all the way (GetModuleFileNameW, _wgetenv), so any folder name
-// works. The Insert menu's DLSS model row (opts.dlss_model, upscaler_rows.h) chooses DLSS's preset: K by default, M, L, or
-// NVIDIA's default (0). RX_VK_DLSS_PRESET=<letter> (or 0) over it.
+// works. On Linux NGX takes only ASCII paths: a folder named otherwise goes to it as /proc/self/fd/<n> (wide()), and the
+// runtime itself has to be in a folder whose real path is ASCII (the log and the menu say so when it is not). The Insert
+// menu's DLSS model row (opts.dlss_model, upscaler_rows.h) chooses DLSS's preset: K by default, M, L, or NVIDIA's default
+// (0). RX_VK_DLSS_PRESET=<letter> (or 0) over it.
 // RX_VK_DLSS_DEBUG=motion: the motion vectors shown instead of the picture (|x|, |y| over 16 px as red and green, the actors'
 // in it); =alternate: every other frame the game's own upscale (a test's reference beside DLSS's). RX_VK_DLSS_LOG=1: NGX's
 // own log in ours.
@@ -49,8 +51,12 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#ifndef _WIN32
+#include <fcntl.h>   // (wide: a folder's descriptor for NGX)
+#endif
 
 #include "dlss_actor.h"
+#include "dlss_checks.h"
 #include "dlss_math.h"
 #include "upscaler_rows.h"
 #include "vk_draw.h"
@@ -137,6 +143,9 @@ struct State {
     VkPipeline prep = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
     VkSampler point = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Camera cam;               // (this frame's, since the last upscale)
+    // (the gameplay upscale's output, as last seen: the scene sizes DLSS can take follow from it, dlss_scene_size. Read on
+    // the game's draws without the lock)
+    std::atomic<uint32_t> out_w{0}, out_h{0};
     std::atomic<uint64_t> last_frame{0};   // (the frame DLSS last drew: read on the game's thread too)
     float last_jitter[2]{};   // (its camera's jitter: the frame before's, for the next one)
     float last_vp[16]{};      // (its camera's view-projection: the frame before's)
@@ -191,6 +200,14 @@ struct State {
 State& st() {
     static State s;
     return s;
+}
+
+/// The gameplay upscale's output size, as it is seen: the scene sizes DLSS can take (dlss_scene_size). Until the first one,
+/// none: that frame keeps the game's upscale
+void note_output(const Texture* out, uint32_t level) {
+    State& s = st();
+    s.out_w.store(std::max(1u, out->width >> level), std::memory_order_relaxed);
+    s.out_h.store(std::max(1u, out->height >> level), std::memory_order_relaxed);
 }
 
 bool fail(const char* why) {   // (the network runs: why, when it changes and every 600th time)
@@ -304,9 +321,28 @@ fs::path env_path(const char* name) {
     return e && *e ? fs::path(e) : fs::path();
 }
 std::string shown(const fs::path& p) { return p.native(); }
+/// A path for NGX, which takes wide strings. NGX's Linux library turns them back into bytes in the "C" locale
+/// (WStrToUTF8Str: newlocale(LC_ALL, "C") and wcsrtombs), which fails on any character past ASCII, and the path comes out
+/// empty. Before, each byte was also widened alone ("CafÃ©"). So a folder whose path is not all ASCII goes to NGX as
+/// /proc/self/fd/<n>, the folder opened and kept open for the process's life: an ASCII name for the same folder, nothing
+/// made on the disk. NGX writes its own files (the data path) and finds the runtime through it; the driver's part then
+/// loads the runtime by its real path (realpath), which has to be ASCII too: ngx_init says so when that is all there is.
+/// When the folder cannot be opened (not there), its path decoded from UTF-8 (dlss_checks.h, not through the locale; bytes
+/// that are not UTF-8 become U+FFFD), for an NGX that takes it. Each such folder is said in the log
 std::wstring wide(const fs::path& p) {
     const std::string& s = p.native();
-    return std::wstring(s.begin(), s.end());
+    if (dlss_checks::ascii(s)) return std::wstring(s.begin(), s.end());
+    if (const int fd = open(s.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); fd >= 0) {
+        const std::string alias = "/proc/self/fd/" + std::to_string(fd);
+        logf("vk: NVIDIA DLSS: %s is not all ASCII, which NGX's Linux library does not take: given to it as %s", s.c_str(),
+             alias.c_str());
+        return std::wstring(alias.begin(), alias.end());
+    }
+    bool bad = false;
+    std::wstring w = dlss_checks::utf8_to_wide(s, &bad);
+    logf("vk: NVIDIA DLSS: %s is not all ASCII and could not be opened: given to NGX as it is%s", s.c_str(),
+         bad ? " (not UTF-8: U+FFFD for its bad bytes)" : "");
+    return w;
 }
 #endif
 
@@ -379,15 +415,29 @@ bool ngx_init() {
         // (for the menu: a runtime found in none of the folders is the likely reason; with one there, the GPU (a GTX))
         int init = 0;
         NVSDK_NGX_Parameter_GetI(s.caps, NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &init);
-        bool runtime = false;
+        // (Linux: NGX loads the runtime by its real path, ASCII only (wide()): one only in folders named otherwise is not
+        // loaded, FeatureInitResult 0xbad00004, though the GPU runs DLSS)
+        bool runtime = false, loadable = false;
         std::error_code ec;
         for (const auto& d : dirs)
             for (const auto& f : fs::directory_iterator(d, ec))
-                runtime |= f.path().filename().native().rfind(kRuntimeName, 0) == 0;
+                if (f.path().filename().native().rfind(kRuntimeName, 0) == 0) {
+                    runtime = true;
+#ifdef _WIN32
+                    loadable = true;
+#else
+                    std::error_code real;
+                    loadable |= dlss_checks::ascii(fs::canonical(f.path(), real).native()) && !real;
+#endif
+                }
         if (needs_driver) logf("vk: NVIDIA DLSS: needs NVIDIA's driver %u.%u or newer", major, minor);
         else if (!runtime) logf("vk: NVIDIA DLSS: not available: no %s in %s (scripts/ngx_sdk.py fetches it)", kRuntime, where.c_str());
+        else if (!loadable)
+            logf("vk: NVIDIA DLSS: not available: %s is only in folders whose path is not all ASCII (%s), and NVIDIA's NGX on "
+                 "Linux loads it only from one that is: put it in $XDG_DATA_HOME/hookshot/ngx, or RX_VK_DLSS_DIR=<an ASCII folder>",
+                 kRuntime, where.c_str());
         else logf("vk: NVIDIA DLSS: not available on this GPU (%#x): DLSS needs an NVIDIA RTX GPU", (unsigned)init);
-        g_why = needs_driver ? DLSS_NEEDS_DRIVER : !runtime ? DLSS_NO_RUNTIME : DLSS_NEEDS_RTX;
+        g_why = needs_driver ? DLSS_NEEDS_DRIVER : !runtime ? DLSS_NO_RUNTIME : !loadable ? DLSS_RUNTIME_NOT_ASCII : DLSS_NEEDS_RTX;
         return false;
     }
     if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&s.params)) || !s.params) return false;
@@ -796,7 +846,10 @@ void dlss_probe() {
 
 void dlss_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                           uint64_t camera_size) {
-    if (!color0 || !depth || !camera || camera_size < 0x230 || width < 640 || height < 360) return;
+    // (only a size the gameplay upscale's output can come from: 1 to 3 times smaller. A smaller target with a camera (the
+    // pause screen's model views, a reflection) is never the scene; one this size that is not either is left by the checks
+    // below: the format, the camera's own size and perspective, the largest in the frame, and the upscale's input)
+    if (!color0 || !depth || !camera || camera_size < 0x230 || !dlss_scene_size(width, height)) return;
     if (color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !dlss_wanted()) return;
     State& s = st();
     std::lock_guard lk(s.mu);
@@ -815,6 +868,12 @@ void dlss_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
     k.width = width, k.height = height, k.depth = depth, k.depth_gen = texture_destroy_generation(), k.frame = now;
     k.valid = true;
+}
+
+bool dlss_scene_size(uint32_t width, uint32_t height) {
+    const State& s = st();
+    return dlss_checks::scene_size_fits(width, height, s.out_w.load(std::memory_order_relaxed),
+                                        s.out_h.load(std::memory_order_relaxed));
 }
 
 uint32_t dlss_jitter_size(int axis) {
@@ -971,6 +1030,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         if (!in || !out || in->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
             (out->width >> out_level) <= in->width)
             return false;
+        note_output(out, out_level);
         // (one in the gameplay networks' formats whose input is not this frame's scene: counted for the status line)
         if (!c.valid || texture_frame_no() - c.frame > 1 || in->width != c.width || in->height != c.height)
             return s.status_passed++, false;
@@ -980,6 +1040,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
                                             out->height >> out_level);
     }
     free_dead(false);
+    if (known && out && out->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) note_output(out, out_level);
     const Camera cam = s.cam;
     s.cam.valid = false;   // (each frame's own camera)
     struct SkinsDone {     // (the skinned draws, each frame's own too: actor_motion takes them, or they go here)
@@ -998,7 +1059,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     if (cam.depth->width != rw || cam.depth->height != rh || !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
         cam.depth->samples != VK_SAMPLE_COUNT_1_BIT || !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
         return fail("unexpected scene depth");
-    if (out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || ow < rw || oh < rh || ow > rw * 3 || oh > rh * 3)
+    if (out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !dlss_checks::scene_size_fits(rw, rh, ow, oh))
         return fail("unexpected output");
     if (!ngx_init()) {
         s.failed = true;
@@ -1149,6 +1210,7 @@ void dlss_probe() {}
 void dlss_instance_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 void dlss_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 void dlss_note_scene_draw(const Texture*, uint32_t, uint32_t, Texture*, uint64_t, uint64_t) {}
+bool dlss_scene_size(uint32_t, uint32_t) { return false; }
 bool dlss_upscale(VkCommandBuffer, uint64_t, bool, Texture*, VkImageView, Texture*, VkImageView, uint32_t) { return false; }
 void dlss_idle() {}
 int dlss_status(char*, size_t) { return 0; }

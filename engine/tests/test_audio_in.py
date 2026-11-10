@@ -27,6 +27,7 @@ typedef struct { uint64_t x[32]; uint64_t vreg[32][2]; } Ctx;
 #define G64(a) (*(uint64_t *)GP(a))
 #define G32(a) (*(uint32_t *)GP(a))
 #define HOS_WRITTEN(p, n) ((void)0)
+static inline void *hos_guest_range(uint64_t a, uint64_t n) { (void)n; return a ? GP(a) : (void *)0; }   /* (the test's addresses are host ones) */
 void hos_log(const char *fmt, ...);
 int64_t hos_now_ns(void);
 '''
@@ -269,6 +270,21 @@ int main(void) {
     if (stream[0] || READ(stream, buf, 16) != 0) FAIL(39, "closed: the handle gone");
     if (OPEN(stream, names[0]) != 0) FAIL(40, "a closed stream's slot is used again");
     cases += 4;
+
+    /* a frame count from the game past 10 s is held to 10 s (its ring's byte offsets are ints: 0x20000001 stereo
+       frames overflowed them) */
+    CALL(imp__ZN2nn5audio16CloseInputStreamEPNS0_15InputStreamTypeE, U(stream));
+    CALL(imp__ZN2nn5audio16CloseInputStreamEPNS0_15InputStreamTypeE, U(other));
+    hos_mic_select(0, "", -1);
+    static uint64_t big[0x360 / 8];
+    static const uint32_t stereo[4] = {2, 2, 48000, 0};
+    if (CALL(imp__ZN2nn5audio15OpenInputStreamEPNS0_15InputStreamTypeEPvmRKNS0_15AudioDeviceNameERKNS0_12StreamFormatEi,
+             U(big), U(work), (uint64_t)sizeof work, U(names[0]), U(stereo), (uint64_t)0x20000001) != 0)
+        FAIL(41, "a stream of a huge frame count did not open");
+    START(big);
+    for (int k = 0; k < 12; k++) MS(1000), (void)FILLED(big);   /* (silence comes a second at most a poll) */
+    if (FILLED(big) != 480000) FAIL(42, "a huge frame count: %d frames held, not 10 s", FILLED(big));
+    cases += 2;
     printf("PASS: %d input stream cases (device list, open, start, silence, a shared microphone, capacity, a lost one and its"
            " retries, a quiet one, named ones, a stand-in, stop, close)\n", cases);
     return 0;

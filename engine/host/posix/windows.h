@@ -361,6 +361,7 @@ DWORD GetCurrentDirectoryA(DWORD cap, LPSTR out);
 #define FILE_ATTRIBUTE_HIDDEN 0x2
 #define FILE_ATTRIBUTE_DIRECTORY 0x10
 #define FILE_ATTRIBUTE_NORMAL 0x80
+#define FILE_ATTRIBUTE_REPARSE_POINT 0x400   /* (a symbolic link: find_next sets it) */
 #define FILE_FLAG_SEQUENTIAL_SCAN 0x08000000
 #define FILE_FLAG_RANDOM_ACCESS 0x10000000
 #define FILE_FLAG_OVERLAPPED 0x40000000
@@ -537,6 +538,7 @@ HWND GetForegroundWindow(void);
 #define WS_EX_NOACTIVATE 0x08000000
 static inline LONG_PTR GetWindowLongPtrA(HWND w, int i) { (void)w, (void)i; return 0; }
 /* (the Insert menu's Fullscreen row, gpu/vk/vk_menu.cpp: WM_APP + 7 to the window sets it, GWL_STYLE without WS_CAPTION reads it) */
+#define WM_CLOSE 0x0010
 #define WM_APP 0x8000
 #define WS_CAPTION 0x00C00000L
 BOOL PostMessageA(HWND w, UINT msg, WPARAM wp, LPARAM lp);

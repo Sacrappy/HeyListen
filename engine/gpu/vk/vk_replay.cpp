@@ -198,7 +198,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
-    if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+    if (res == VK_ERROR_DEVICE_LOST) device_lost();
     batch_flushed = batch_next;
     st_flushes++, st_batched_cbs += (int64_t)pend.cbs.size();
     st_reason[flush_reason]++;
@@ -404,7 +404,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     r.submitted = res == VK_SUCCESS;
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
-    if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+    if (res == VK_ERROR_DEVICE_LOST) device_lost();
 }
 
 // ---- NVN state (the draw path's, vk_state.h) ----
@@ -897,7 +897,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (in_stream && !worker) {
                 uint32_t words[64];
                 for (auto& w : words) w = c0.value;
-                host->gpu_write(c0.dst, words, c0.size);
+                host->gpu_write(c0.dst, words, std::min<uint64_t>(c0.size, sizeof words));   // (hookshot: not past words)
             }
             if (dry) break;
             ParLock lk;
@@ -1431,11 +1431,13 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
     ub_limit = SIZE_MAX;
 }
 
-/// The replay cannot go on: logged, written to stderr (the host's log is queued, and goes with the process) and the
-/// process ended, as the host's hos_fatal does (exit code 3). For a parallel replay's init command buffer that could not
-/// be ended: images already made and published lost their first layout change, and any later submission may use them
+/// The replay cannot go on: logged, the host's queued log written out (as hos_fatal does: a device lost's report is many
+/// lines, and the queue went with the process), written to stderr and the process ended (exit code 3). For a parallel
+/// replay's init command buffer that could not be ended: images already made and published lost their first layout
+/// change, and any later submission may use them
 [[noreturn]] void replay_fatal(const char* why) {
     logf("vk: FATAL: %s", why);
+    if (host && host->log_flush) host->log_flush();
     std::fprintf(stderr, "vk: FATAL: %s\n", why);
     std::fflush(stderr);
     std::_Exit(3);
@@ -1629,7 +1631,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
         j->r->submitted = res == VK_SUCCESS;
         if (res != VK_SUCCESS) logf("vk: segment submit %llu failed (%d)", (unsigned long long)j->r->value, (int)res);
-        if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+        if (res == VK_ERROR_DEVICE_LOST) device_lost();
     }
     {
         std::unique_lock lk(par_pool.mu);
@@ -1943,12 +1945,56 @@ void finish_recording(uint64_t value) {
     submit_recording(r, signal, at);
 }
 
+// ---- (hookshot) the synchronous replay on the core kept for the replay ----
+// With RX_VK_ASYNC off (the default) a submission is replayed on the thread that submits it, or on whichever thread goes on
+// with a queue stopped at an event wait, and the core the host keeps free of the game's threads for the replay thread
+// (host->reserved_cpus: hos_reserved_cpus, the last core of the fastest kind) had nothing on it. Now a thread runs there
+// while it replays and takes a submission's capture, and goes back to its own processors after: every thread that replays,
+// none by name; with RX_VK_ASYNC=1 the replay thread is there already. Ryzen 9 3900X, Kokiri Forest: see the PR.
+// RX_VK_REPLAY_PIN=0: off. (Only preferring the core, as the thread's ideal processor with every processor allowed, gained
+// nothing there: the pin is what helps)
+bool async_on();
+// (Windows only: on Linux a thread inherits the affinity of the one that makes it, and the back end's threads made on
+// first use inside a replay (the capture's copy helpers, the shader workers, the pool imports...) would all have stayed on
+// the reserved core. Windows gives a new thread the process's)
+uint64_t replay_pin_mask() {
+#if defined(_WIN32)
+    static const uint64_t m = [] {
+        const char* e = getenv("RX_VK_REPLAY_PIN");
+        const uint64_t r = !(e && atoi(e) == 0) && host->reserved_cpus ? host->reserved_cpus() : 0;
+        if (r) logf("vk: replays run on logical processors %#llx while they replay (RX_VK_REPLAY_PIN=0: off)", (unsigned long long)r);
+        return r;
+    }();
+    return m;
+#else
+    return 0;
+#endif
+}
+thread_local int replay_pin_depth = 0;
+thread_local DWORD_PTR replay_pin_prev = 0;
+struct ReplayPin {
+    bool counted = false;
+    ReplayPin() {
+        if (async_on()) return;
+        counted = true;
+        if (replay_pin_depth++) return;   // (the outermost one: a submit's replay inside its capture's)
+        if (const uint64_t m = replay_pin_mask()) replay_pin_prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+    }
+    ~ReplayPin() {
+        if (!counted || --replay_pin_depth) return;
+        if (replay_pin_prev) SetThreadAffinityMask(GetCurrentThread(), replay_pin_prev), replay_pin_prev = 0;
+    }
+    ReplayPin(const ReplayPin&) = delete;
+    ReplayPin& operator=(const ReplayPin&) = delete;
+};
+
 /// A submission's command buffers from command buffer cb (op p; null: its start) on, into recordings of its own,
 /// submitted: true when it finished; false when it stopped at a wait not met (may_stop), its place kept in qruns.
 /// memory_work: its memory work first (else done as it came)
 bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, bool memory_work, int cb = 0,
                 const uint8_t* p = nullptr, bool may_stop = false) {
     std::lock_guard lk(replay_mu);
+    ReplayPin pin;
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
     if (memory_work) {
@@ -2156,6 +2202,9 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         if (it == value_rec.end()) return false;
         seq = it->second;
     }
+    // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
+    // without a flush, and the job that waited held up the main thread, so nothing flushed it: the load hang on RADV)
+    queue_flush_for(FR_WAIT);
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &rec_timeline;
@@ -2264,7 +2313,7 @@ int wait_inner(uint64_t f, uint64_t timeout_ns) {
     if (res != VK_SUCCESS && timeout_ns > 1000000000ull && logged++ < 8)
         logf("vk: wait for fence %llu (done %llu, pushed %llu): %d", (unsigned long long)f,
              (unsigned long long)completed(), (unsigned long long)pushed.load(), (int)res);
-    if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+    if (res == VK_ERROR_DEVICE_LOST) device_lost();
     return res == VK_SUCCESS;
 }
 void wait_queue_empty();
@@ -2535,6 +2584,17 @@ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
     return c;
 }
 } // namespace
+
+/// A submission or a wait came back VK_ERROR_DEVICE_LOST. Nothing sent from here on runs, and the replay kept going: no
+/// submission completed again, so no capture or staging arena was let go, and system memory filled until the window was
+/// closed (issue 1275: captures kept 25 -> 6527, staging 256 -> 1408 MB). Now the report once (a thread that sees the loss
+/// too waits for it, instead of ending the process before it is written), then the process ends as replay_fatal does
+[[noreturn]] void device_lost() {
+    static std::once_flag once;
+    std::call_once(once, checkpoints_report);
+    replay_fatal("the GPU device was lost (VK_ERROR_DEVICE_LOST): the driver stopped or reset the GPU, and nothing sent "
+                 "to it runs any more (on Linux, dmesg or journalctl -k around this time names the reset)");
+}
 
 void write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     std::vector<uint8_t> raw;
@@ -3692,6 +3752,7 @@ std::mutex submit_order_mu;   // (captures and submits queued in the same order)
 void submit_q(const uint64_t* handles, int n, uint64_t queue) {
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
+        ReplayPin pin;   // (the capture and the replay on the replay's core)
         // (the replay here is on the submitting thread, but the game's other threads go on writing their next frames: a pool
         // synced from guest memory later in the frame read those. The capture is taken here too)
         // (EvilOOT) on by default: without it every mirror sync read guest memory as it was at the replay, the game's later
@@ -3736,6 +3797,7 @@ void submit(const uint64_t* handles, int n) {
 void present(const nvn_tex* t, const int crop[4]) {
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
+        ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
         if (sync_waits_on()) {
             drain(0);   // (the frame's work whole before it is shown)
             update_blocked();
@@ -3928,6 +3990,7 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;
     t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp; DLAA: full scale, vk_dlss.cpp)
+        if (id == 11) return opts.stick_dead_zone;
         if (id == HOS_OPT_CHEAT_HEARTS) return menu_heart_protection();
         if (id == HOS_OPT_CHEAT_FLIGHT) return menu_player_flight();
         if (id == HOS_OPT_CHEAT_ACTION) return menu_take_cheat_action();

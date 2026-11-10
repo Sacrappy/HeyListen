@@ -24,6 +24,7 @@ import datetime
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -272,10 +273,34 @@ def list_all(args):
         show("Folder", *locate(FOLDER, args.folder, "--from"))
 
 
+def refuse_links(path):
+    """A save from someone else is only files and folders: a link in it would copy what it points to (any file or folder
+    of this PC) into the save"""
+    def link(p):
+        # (any reparse point on Windows: a junction is not a symbolic link, and os.path.isjunction is only in 3.12 and
+        # newer; copytree walks into a junction as into a folder)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False
+        return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
+    if link(path):
+        raise Fail("%s is a link: a save holds only files and folders, so nothing was copied" % path)
+    for root, dirs, files in os.walk(path):
+        for n in dirs + files:
+            if link(os.path.join(root, n)):
+                raise Fail("%s is a link: a save holds only files and folders, so nothing was copied" % os.path.join(root, n))
+
+
 def copy_saves(src, dst, backup, keep_settings, dry_run):
     names = slots(src)
     if not names:
         raise Fail("%s has no slot_* folders: nothing to copy" % src)
+    for s in names:
+        refuse_links(os.path.join(src, s))
+    for f in ("account.sav", "option.sav"):
+        if os.path.lexists(os.path.join(src, f)):
+            refuse_links(os.path.join(src, f))
     files = [f for f in ("account.sav", "option.sav") if os.path.isfile(os.path.join(src, f))]
     if keep_settings and "option.sav" in files:
         files.remove("option.sav")
@@ -291,10 +316,10 @@ def copy_saves(src, dst, backup, keep_settings, dry_run):
     shutil.copytree(dst, backup)
     for s in slots(dst):
         shutil.rmtree(os.path.join(dst, s))
-    for s in names:
-        shutil.copytree(os.path.join(src, s), os.path.join(dst, s))
+    for s in names:   # (links were refused above; copied as links, never followed, all the same)
+        shutil.copytree(os.path.join(src, s), os.path.join(dst, s), symlinks=True)
     for f in files:
-        shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
+        shutil.copy2(os.path.join(src, f), os.path.join(dst, f), follow_symlinks=False)
     print("Done. Backup of the old %s in %s" % (dst, backup))
 
 

@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <set>
+#include <utility>
 #include <vector>
 #include <thread>
 #include <setjmp.h>
@@ -692,10 +694,13 @@ void pcache_init() {
     }
     // (data of another device or driver is dropped before Vulkan sees it)
     if (data.size() >= 32) {
-        uint32_t vendor, device;
+        uint32_t head_size, version, vendor, device;
+        std::memcpy(&head_size, data.data(), 4);
+        std::memcpy(&version, data.data() + 4, 4);
         std::memcpy(&vendor, data.data() + 8, 4);
         std::memcpy(&device, data.data() + 12, 4);
-        if (vendor != dev.props.vendorID || device != dev.props.deviceID ||
+        if (head_size < 32 || head_size > data.size() || version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||   // (hookshot)
+            vendor != dev.props.vendorID || device != dev.props.deviceID ||
             std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
             data.clear();
     }
@@ -948,6 +953,24 @@ NoteFile note_file_state(FILE* f, long* first) {
     }
     return NoteFile::Unusable;
 }
+/// (hookshot) Targets a pipeline can be made with: at most 8 colour targets, a sample count Vulkan has, a topology it has.
+/// The notes and the state list are files: what they say is checked before a pipeline is made from it
+bool targets_ok(uint32_t n, uint32_t samples, uint32_t topo) {
+    return n <= 8 && samples >= 1 && samples <= 64 && !(samples & (samples - 1)) && topo <= VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+}
+/// (hookshot) a note read from hookshot_pipelines.bin: its counts in range, its booleans 0 or 1, and no host pointers (the
+/// render targets' objects of the run that wrote it mean nothing here)
+bool note_sane(PipeNote& n) {
+    if (!targets_ok(n.n, n.samples, n.topo) || n.s.nvattr < 0 || n.s.nvattr > 16) return false;
+    n.s.rt = nvn_p_set_rt{};
+    for (bool* b : {&n.s.has_prog, &n.s.restart, &n.s.depth_clamp, &n.s.raster_discard, &n.s.render_enabled}) {
+        unsigned char v;
+        std::memcpy(&v, b, 1);
+        v = v != 0;
+        std::memcpy(b, &v, 1);
+    }
+    return n.s.prog.nstage <= 6;
+}
 /// The records of a notes file from where they start, each pipeline (by the key it was written with) once
 std::vector<std::unique_ptr<PipeNote>> note_records(FILE* f, long first) {
     std::vector<std::unique_ptr<PipeNote>> notes;
@@ -956,6 +979,7 @@ std::vector<std::unique_ptr<PipeNote>> note_records(FILE* f, long first) {
     for (;;) {
         auto rec = std::make_unique<PipeNote>();
         if (fread(rec.get(), sizeof(PipeNote), 1, f) != 1) break;
+        if (!note_sane(*rec)) continue;
         if (seen.insert(rec->key).second) notes.push_back(std::move(rec));
     }
     return notes;
@@ -1092,7 +1116,9 @@ std::vector<StateRec> state_list_read(const std::string& path) {
     if (fread(magic, 8, 1, f) == 1 && !memcmp(magic, kStateMagic, 8) && fread(&size, 4, 1, f) == 1 && size == sizeof(StateRec)) {
         StateRec r;
         while (fread(&r, sizeof r, 1, f) == 1) {
-            if (r.nanswers > std::size(r.answers) || r.nquestions > std::size(r.questions)) continue;
+            if (r.nanswers > std::size(r.answers) || r.nquestions > std::size(r.questions) || r.nvattr > 16 ||
+                !targets_ok(r.n, r.samples, r.topo))
+                continue;   // (hookshot: a pipeline is made from the rest: its counts must be ones it can have)
             out.push_back(r);
         }
     }
@@ -1291,6 +1317,7 @@ VkPipeline gpl_part(const Program& p, const NvnState& s, const Targets& at, VkPr
     return it->second;
 }
 VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+    if (at.n < 0 || at.n > 8) return VK_NULL_HANDLE;   // (hookshot: at most 8 colour targets)
     const uint64_t program = mix(p.key, p.variant);
     uint64_t input = (uint64_t)topology_class(topo) + 1;
     if (!p.mesh && !p.fallback) {
@@ -1359,6 +1386,7 @@ const Shader::Info* vertex_info(const Program& p) {
 /// (TICK-008) The identity of a graphics pipeline: what is baked into it (the rest is dynamic state). The precompile makes it again from a note's
 /// state and does not trust the key the note was written with
 uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+    if (at.n < 0 || at.n > 8) return 0;   // (hookshot: at most 8 colour targets)
     const int topo_c = topology_class(topo);
     uint64_t key = mix(mix(p.key, p.variant), (uint64_t)topo_c << 8 | (uint64_t)at.samples);
     const Shader::Info& vs = *vertex_info(p);
@@ -1478,6 +1506,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     // to see what the draws do while pipelines are in the building)
     static const int delay_ms = getenv("RX_VK_PIPE_DELAY_MS") ? atoi(getenv("RX_VK_PIPE_DELAY_MS")) : 0;
     if (delay_ms > 0 && part < 0 && !driver_cache_only) Sleep((DWORD)delay_ms);
+    if (at.n < 0 || at.n > 8) return VK_NULL_HANDLE;   // (hookshot: at most 8 colour targets)
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
@@ -2123,6 +2152,7 @@ struct DescWriter {
     std::vector<VkDescriptorBufferInfo> bufs;
     std::vector<VkDescriptorImageInfo> imgs;
     std::vector<VkBufferView> views;
+    const Program* prog = nullptr;   // (the program they were built for: a dispatch builds its own over a draw's)
     void reset() {
         writes.clear(), bufs.clear(), imgs.clear(), views.clear();
     }
@@ -2279,6 +2309,7 @@ TLS_OBJECT(prog_slots, std::unordered_map<const Program*, ProgSlots>)
 
 void build_descriptors(const NvnState& s, const Program& p) {
     dw().reset();
+    dw().prog = &p;
     draw_sampled().clear();
     dump_written().clear();
     dump_inputs().clear();
@@ -5231,19 +5262,29 @@ bool mesh_args_ready() {
         void* mapped = nullptr;
         if (!create_buffer((uint64_t)kMeshArgs * 16,
                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true,
-                           mesh_args_buffer, mesh_args_alloc, &mapped) || !mapped)
+                           mesh_args_buffer, mesh_args_alloc, &mapped))
             return false;
+        const auto discard = [] {
+            destroy_buffer(mesh_args_buffer, mesh_args_alloc);
+            mesh_args_buffer = VK_NULL_HANDLE;
+            mesh_args_alloc = nullptr;
+            mesh_args_words = nullptr;
+            mesh_args_address = 0;
+            return false;
+        };
+        if (!mapped) return discard();
         uint32_t* w = (uint32_t*)mapped;
         mesh_args_words = w;
         for (uint32_t i = 0; i < kMeshArgs; i++) w[i * 4] = 0, w[i * 4 + 1] = 1, w[i * 4 + 2] = 1, w[i * 4 + 3] = 0;
         VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         da.buffer = mesh_args_buffer;
         mesh_args_address = vkGetBufferDeviceAddress(dev.device, &da);
-        return mesh_args_address != 0;
+        if (!mesh_args_address) return discard();
+        return true;
     }();
     return ok;
 }
-uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0)
+uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0; n below kMeshArgs: % 0 otherwise)
     static std::atomic<uint32_t> next{1};
     const uint32_t at = next.fetch_add(n) % (kMeshArgs - n);
     return at + 1;
@@ -5311,8 +5352,14 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
 
 bool fallback_compute_pipelines(Program& p) {
     static std::mutex mu;
+    // (the programs whose compute pipeline the driver refused or faulted on, by key and variant: not tried again. Each try
+    // was one more driver fault, on every draw of the program: 12,160 faults for one program in a Kokiri Forest run on
+    // RADV, the frame down to 2-3 fps (#1001); on a GTX 1070 the replay stopped presenting after the first one. Left out,
+    // the program costs its draws, as the first failure already did)
+    static std::set<std::pair<uint64_t, uint64_t>> failed;
     std::lock_guard lk(mu);
     if (!p.fallback_compute.empty()) return true;
+    if (failed.count({p.key, p.variant})) return false;
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -5328,8 +5375,10 @@ bool fallback_compute_pipelines(Program& p) {
         ci.stage = si;
         ci.layout = p.layout;
         if (guarded_compute(pcache, &ci, &made[i]) != VK_SUCCESS) {
+            failed.insert({p.key, p.variant});
             static std::atomic<int> told{0};
-            if (told++ < 2) logf("vk: fallback: the compute pipeline of %016llx could not be made", (unsigned long long)p.key);
+            if (told++ < 8)
+                logf("vk: fallback: the compute pipeline of %016llx could not be made: its draws are left out", (unsigned long long)p.key);
             return false;
         }
         pcache_built_since_save++;
@@ -5344,6 +5393,11 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (d.count_addr) {   // (more than one draw in the records: each its own dispatch, not one)
         static std::atomic<int> told{0};
         if (told++ < 2) logf("vk: fallback: a mesh draw with a count buffer is left out (issue 640)");
+        return false;
+    }
+    if (dw().prog != &p) {   // (the descriptors built are another program's: draw() rebuilds them for a fallback draw)
+        static std::atomic<int> told{0};
+        if (told++ < 2) logf("vk: fallback: the descriptors built are not %016llx's: its draw is left out", (unsigned long long)p.key);
         return false;
     }
     FallbackBuffers* f = nullptr;
@@ -5437,10 +5491,10 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
 }
 
 /// (hookshot, a diagnostic for NVIDIA DLSS's motion: vk_dlss.cpp) RX_VK_DLSS_TRACE=<frames>: every that many frames, one frame's
-/// draws into targets at least 640 wide, logged: the program, its targets' formats, the geometry and the uniform buffers
+/// draws into targets of a size DLSS can take as the scene (dlss_scene_size), logged: the program, its targets' formats, the geometry and the uniform buffers
 static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     static const int every = getenv("RX_VK_DLSS_TRACE") ? atoi(getenv("RX_VK_DLSS_TRACE")) : 0;
-    if (every <= 0 || at.width < 640) return;
+    if (every <= 0 || !dlss_scene_size(at.width, at.height)) return;
     const uint64_t f = texture_frame_no();
     if (f % (uint64_t)every != (uint64_t)every / 2) return;
     char line[3072];
@@ -5476,8 +5530,8 @@ static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs&
 /// (and 5, RGBA8), the joints at 6 (and 7, RGBA16UI or RGBA8UI), the bone palette in the vertex stage's uniform buffer 6 (NVN's
 /// binding 3: 3 x 4 matrices, a whole number of them) and the object's origin in its buffer 4 (binding 1, at 0x40)
 static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
-    if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth || at.width < 640 ||
-        at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7 || !dlss_wanted())
+    if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth ||
+        !dlss_scene_size(at.width, at.height) || at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7 || !dlss_wanted())
         return;
     const auto attr = [&](int i) { return *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]); };
     const nvn_va_st pos = attr(0);
@@ -5701,8 +5755,16 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // when none changed since the last draw, the set it pushed or bound stands)
     const uint64_t reg_gen = registrations_generation(), ub_gen = ub_generation();
     static const bool no_reuse = getenv("RX_VK_NO_DESC_REUSE") != nullptr;   // (A/B: every draw builds its own)
+    // (hookshot, issue 640: a mesh fallback draw also pushes the writes at the compute bind point, for its task and mesh
+    // dispatches, so they must be its own. A dispatch since its last draw built the compute program's over them: pushed
+    // with the fallback's layout, its task and mesh stages read another program's buffers, and descriptors the push left
+    // as they were: stale addresses, like the one RADV faulted on in Hyrule Field (#792))
     const bool same_desc = !no_reuse && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
-                           last_desc_reg == reg_gen && last_desc_ub == ub_gen;
+                           last_desc_reg == reg_gen && last_desc_ub == ub_gen && (!p.fallback || dw().prog == &p);
+    if (p.fallback && !same_desc && dw().prog != &p && last_desc_valid && last_desc_prog == &p) {
+        static std::atomic<int> told{0};
+        if (told++ < 3) logf("vk: fallback: %016llx's descriptors built again after a dispatch", (unsigned long long)p.key);
+    }
     if (!same_desc) {
         PROF_HOT(PROF_DESC);
         FINE_N(FC_BUILDS, 1);
@@ -5741,7 +5803,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // draw has no stride of its own: its entry is NVN's 16 bytes, taken as 8 the first was never copied)
     static const bool mesh_rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
     if (mesh_rewrite && d.mesh && d.indirect) {   // (out of the pass: a copy cannot be made in one)
-        const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)kMeshArgs), stride = d.stride ? (uint32_t)d.stride : 16u;
+        const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)kMeshArgs - 1), stride = d.stride ? (uint32_t)d.stride : 16u;
         BufferRef src = gpu_buffer_bind(d.indirect, (uint64_t)n * stride, false);
         if (!src) SKIP_HERE();
         if (mesh_args_ready()) {
@@ -5969,15 +6031,18 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (d.indirect) {
             BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
             if (mesh_conv_buf) {   // (EvilOOT: the records as {count, 1, 1}, mesh_indirect_convert)
+                // (hookshot: as many records as mesh_indirect_convert wrote, not the game's maximum)
+                const uint32_t conv_n = (uint32_t)std::clamp(d.max, 1, 4096);
                 if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
-                    vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_conv_buf, mesh_conv_off, cnt.buffer, cnt.offset, d.max, 12);
+                    vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_conv_buf, mesh_conv_off, cnt.buffer, cnt.offset, conv_n, 12);
                 else
-                    vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, std::max(d.max, 1), 12);
+                    vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, conv_n, 12);
                 mesh_conv_buf = VK_NULL_HANDLE;
                 st_mesh++;
                 st_draws++, pass().draws++;
                 return;
             }
+            if (d.max < 0 || d.stride < 0) SKIP_HERE();   // (hookshot: the game's ints; a negative count was ~4e9 draws)
             if (!mesh_args.buffer) {
                 mesh_args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * std::max(d.stride, 12), false);
                 if (!mesh_args) SKIP_HERE();
@@ -6070,6 +6135,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (d.indexed && d.itype == 0 && !dev.index_uint8) SKIP_HERE();
     if (d.prim == NVN_DRAW_PRIMITIVE_QUADS) {   // (quads as two triangles each: indices made in the stream)
         if (d.indirect || d.count < 4) SKIP_HERE();
+        if (d.count > (1 << 24)) SKIP_HERE();   // (hookshot: 4M quads at most; the game's count sized host vectors of up to 16 GB)
         const uint32_t quads = (uint32_t)d.count / 4, unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         std::vector<uint32_t> src(d.indexed ? (size_t)quads * 4 : 0);
         if (d.indexed) {
@@ -6098,18 +6164,22 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         return;
     }
     if (d.indirect) {
-        BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * std::max(d.stride, 16), false);
+        // (hookshot) the records the draw reads, at the stride it reads them with (20 for indexed draws), all bound; a
+        // negative count or stride from the game is no draw
+        if (d.max < 0 || d.stride < 0) SKIP_HERE();
+        const int ind_stride = std::max(d.stride, d.indexed ? 20 : 16);
+        BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * (uint64_t)ind_stride, false);
         BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
         if (!args) SKIP_HERE();
         if (d.indexed) {
             BufferRef ib = gpu_buffer_bind(d.ibuf, 4, false);
             if (!ib) SKIP_HERE();
             bind_index(cmd, ib.buffer, ib.offset, itype);
-            if (cnt) vkCmdDrawIndexedIndirectCount(cmd, args.buffer, args.offset, cnt.buffer, cnt.offset, d.max, std::max(d.stride, 20));
-            else vkCmdDrawIndexedIndirect(cmd, args.buffer, args.offset, std::max(d.max, 1), std::max(d.stride, 20));
+            if (cnt) vkCmdDrawIndexedIndirectCount(cmd, args.buffer, args.offset, cnt.buffer, cnt.offset, std::max(d.max, 1), ind_stride);
+            else vkCmdDrawIndexedIndirect(cmd, args.buffer, args.offset, std::max(d.max, 1), ind_stride);
         } else {
-            if (cnt) vkCmdDrawIndirectCount(cmd, args.buffer, args.offset, cnt.buffer, cnt.offset, d.max, std::max(d.stride, 16));
-            else vkCmdDrawIndirect(cmd, args.buffer, args.offset, std::max(d.max, 1), std::max(d.stride, 16));
+            if (cnt) vkCmdDrawIndirectCount(cmd, args.buffer, args.offset, cnt.buffer, cnt.offset, std::max(d.max, 1), ind_stride);
+            else vkCmdDrawIndirect(cmd, args.buffer, args.offset, std::max(d.max, 1), ind_stride);
         }
     } else if (d.indexed) {
         const uint32_t unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
@@ -6474,6 +6544,10 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     // (bounded when the history is last frame's or so: a pause of the TAAU, a menu, starts again unbounded)
     const uint64_t now_frame = texture_frame_no();
     size[2] = temporal && !no_clamp && hist_frame && now_frame - hist_frame <= 3 ? 1u : 0u;
+    // (the gameplay stand-in's edges: FXAA in the shader. RX_VK_TAAU_FXAA=0: the plain linear upscale as before; 2: the
+    // pixels it changed drawn red)
+    static const int fxaa = getenv("RX_VK_TAAU_FXAA") ? atoi(getenv("RX_VK_TAAU_FXAA")) : 1;
+    if (temporal && fxaa) size[2] |= fxaa == 2 ? 6u : 2u;
     hist_frame = now_frame;
     const VkDescriptorImageInfo in_info{linear, input_view, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorImageInfo out_info{VK_NULL_HANDLE, output_view, VK_IMAGE_LAYOUT_GENERAL};

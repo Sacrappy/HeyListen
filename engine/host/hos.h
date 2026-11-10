@@ -67,6 +67,12 @@ extern uint64_t hos_space_end;   /* web: the guest window ends where the host's 
 #else
 #define HOS_SPACE_END 0x8000000000ULL
 #endif
+/* (hookshot) host pointer of the n guest bytes at a, NULL unless all of them lie in the guest window. For addresses
+   and sizes host code takes from guest memory or arguments before it reads or writes there: GP alone wraps around
+   to any host address. */
+static inline void *hos_guest_range(uint64_t a, uint64_t n) {
+    return a < (uint64_t)HOS_SPACE_END && n <= (uint64_t)HOS_SPACE_END - a ? GP(a) : (void *)0;
+}
 #define HOS_TICK_HZ 31250000ULL   /* (mkw-recomp: the Switch 2 counter; the SDK checks it at init) */
 
 /* ---- logging: HOS_TRACE=1 logs every HLE call that uses HOS_TRACE_CALL */

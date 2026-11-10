@@ -465,7 +465,10 @@ static uint32_t ioctl_gpu(int fd, uint32_t group, uint32_t nr, uint64_t p, uint6
         return NV_OK;
     case 0x18: case 0x1A: {   /* ALLOC_GPFIFO_EX(2) {u32 entries, jobs, flags; NvFence out; reserved} */
         LOCK();
-        if (!fds[fd].syncpt) fds[fd].syncpt = next_syncpt++;
+        if (!fds[fd].syncpt) {   /* (hookshot: ids are used again after the last one; they index syncpt[] and syncpt_max[]) */
+            fds[fd].syncpt = next_syncpt++;
+            if (next_syncpt >= SYNCPTS) next_syncpt = 24;
+        }
         UNLOCK();
         G32(p + 12) = (uint32_t)fds[fd].syncpt;
         if ((int32_t)(syncpt_max[fds[fd].syncpt] - syncpt[fds[fd].syncpt]) < 0)
@@ -478,6 +481,7 @@ static uint32_t ioctl_gpu(int fd, uint32_t group, uint32_t nr, uint64_t p, uint6
         uint32_t n = G32(p + 8), flags = G32(p + 12);
         uint64_t entries = in2 && in2size >= (uint64_t)n * 8 ? in2 : p + 24;   /* Ioctl2: inline; else after it */
         (void)size;
+        if (!hos_guest_range(entries, (uint64_t)n * 8)) return NV_BAD_PARAMETER;   /* (hookshot) */
         int sp = fds[fd].syncpt;
         /* add_increment (bit 1): the kernel appends two sync point increments after the work (suyu's
            BuildIncrementCommandList): the fence is the value they reach */
@@ -598,6 +602,8 @@ static uint32_t ioctl(Ctx *c, int fd, uint32_t cmd, uint64_t buf, uint64_t x2, u
     uint32_t nr = cmd & 0xFF, group = (cmd >> 8) & 0xFF;
     uint64_t size = (cmd >> 16) & 0x3FFF;
     uint32_t r;
+    /* (hookshot) the argument buffers lie in guest memory (the handlers read fixed fields up to 0x100 past the start) */
+    if (!hos_guest_range(buf, size + 0x100) || (x2 && !hos_guest_range(x2, x2size))) return NV_BAD_PARAMETER;
     switch (fds[fd].type) {
     case DEV_NVMAP: r = ioctl_nvmap(nr, buf); break;
     case DEV_AS_GPU: r = ioctl_as_gpu(nr, buf, size); break;

@@ -130,8 +130,10 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
        the total allocation size is unchanged, so padding becomes black texels. */
     if (d->pkg_block_h) {                                             // packaged byte 0: low nibble block height, high nibble block depth
         const unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xFF;
-        if (dpl >= 2) tileH = pl & 0xF;
-        if (dpl == 3) tileD = pl >> 4;
+        /* (hookshot) at most 32 GOBs high and deep, the hardware's largest blocks: the game's nibble went up to 15, and
+           the renderer's scratch for one level grew with 512 << (tileH + tileD) */
+        if (dpl >= 2) tileH = (pl & 0xF) > 5 ? 5 : pl & 0xF;
+        if (dpl == 3) tileD = (pl >> 4) > 5 ? 5 : pl >> 4;
     } else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);

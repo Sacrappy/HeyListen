@@ -9,8 +9,10 @@ REPO=${GITHUB_REPOSITORY:?}
 TOKEN=${GH_TOKEN:?}
 API="https://api.github.com/repos/$REPO"
 AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "User-Agent: Hookshot")
+J=$(mktemp)   # (the release's JSON: a private file, not a fixed name in /tmp)
+trap 'rm -f "$J"' EXIT
 
-code=$(curl -s -o /tmp/linux-parts.json -w '%{http_code}' "${AUTH[@]}" "$API/releases/tags/linux-parts")
+code=$(curl -s -o "$J" -w '%{http_code}' "${AUTH[@]}" "$API/releases/tags/linux-parts")
 if [ "$code" = "404" ]; then
     curl -fsSL "${AUTH[@]}" -X POST "$API/releases" -d "$(python3 - <<'PY'
 import json, os
@@ -23,14 +25,14 @@ print(json.dumps({
     "make_latest": "false",
 }))
 PY
-)" > /tmp/linux-parts.json
+)" > "$J"
 fi
-python3 - <<'PY'
-import json
-json.load(open("/tmp/linux-parts.json"))["upload_url"]
+python3 - "$J" <<'PY'
+import json, sys
+json.load(open(sys.argv[1]))["upload_url"]
 PY
-upload=$(python3 -c 'import json; print(json.load(open("/tmp/linux-parts.json"))["upload_url"].split("{")[0])')
-have=$(python3 -c 'import json; print("\n".join(a["name"] for a in json.load(open("/tmp/linux-parts.json")).get("assets", [])))')
+upload=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["upload_url"].split("{")[0])' "$J")
+have=$(python3 -c 'import json, sys; print("\n".join(a["name"] for a in json.load(open(sys.argv[1])).get("assets", [])))' "$J")
 for zip in "$PARTS"/HookshotLinux-*.zip; do
     [ -f "$zip" ] || continue
     name=$(basename "$zip")

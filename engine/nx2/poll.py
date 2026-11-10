@@ -1,4 +1,6 @@
-"""Interrupt polls in lifted code: `A64_POLL(c);` at every loop header (the target of a backward branch).
+"""(HeyListen, Sync 10: upstream moved the polls to the loop back-edges, a64_poll_cur(); measured here that is -3 fps standing and
+-2 walking at the Market, so the loop-header polls stay. See docs/tickets/SPRINT-4.md.)
+Interrupt polls in lifted code: `A64_POLL(c);` at every loop header (the target of a backward branch).
 
 a64-kit's own runtime gives every guest thread a host thread, so the host OS preempts a guest spin loop. Inside
 Eglantine guest threads are fibers multiplexed on the emulated cores: a lifted loop that never makes an SVC would

@@ -37,6 +37,13 @@ VMA=v3.3.0
 APPIMAGETOOL=1.9.1
 APPIMAGE_RUNTIME=20251108
 APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+# (the SHA-256 of each release download: a part whose download differs stops the script. Change them with the versions.
+# GitHub's and GitLab's tag archives (dav1d, the headers) are made on demand and not pinned here)
+LLVM_SHA256=f72edb0b36580ece7f52e23858f00c18fad4e87395ea7ad05d7e55c39f8fc78a
+PY_SHA256=ce4f6d0a6cfdb3bed6e44c2f9affd85943c76a42e25ad3a259002f31d6fb8a20
+FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+SDL_SHA256=5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165
+APPIMAGETOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
 
 CURL=(curl -fL --retry 5 --retry-delay 10 --proto '=https')
 # A GitHub release link (github.com/O/R/releases/download/TAG/NAME) can answer 504 for a long while: the same file is
@@ -51,10 +58,15 @@ fetch_github_api() {   # url out
     echo "release link failed: fetching $name through the GitHub API"
     "${CURL[@]}" "${auth[@]}" -H "Accept: application/octet-stream" -o "$2" "https://api.github.com/repos/$repo/releases/assets/$id"
 }
-fetch() {   # url file
+fetch() {   # url file [sha256: checked on every run, the download removed when it differs]
     if [ ! -f "$DL/$2" ]; then
         "${CURL[@]}" -o "$DL/$2.part" "$1" || fetch_github_api "$1" "$DL/$2.part"
         mv -f "$DL/$2.part" "$DL/$2"
+    fi
+    if [ -n "${3:-}" ] && ! echo "$3  $DL/$2" | sha256sum -c --quiet -; then
+        rm -f "$DL/$2"
+        echo "$2: not the expected download (SHA-256 differs)"
+        exit 1
     fi
 }
 done_for() { [ -f "$DEPS/.$1" ] && [ "$(cat "$DEPS/.$1")" = "$2" ]; }
@@ -62,7 +74,7 @@ mark() { echo "$2" > "$DEPS/.$1"; }
 
 # ---- LLVM: clang, lld and clang's own headers, nothing else ----
 if ! done_for llvm "$LLVM_VER"; then
-    fetch "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VER/LLVM-$LLVM_VER-Linux-X64.tar.xz" llvm.tar.xz
+    fetch "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VER/LLVM-$LLVM_VER-Linux-X64.tar.xz" llvm.tar.xz "$LLVM_SHA256"
     rm -rf "$DEPS/emsdk" "$DEPS/llvm-x"
     mkdir -p "$DEPS/llvm-x"
     tar -xJf "$DL/llvm.tar.xz" -C "$DEPS/llvm-x" --strip-components=1 --wildcards \
@@ -82,7 +94,7 @@ fi
 
 # ---- Python and the tools' modules ----
 if ! done_for python "$PY_VER-$PY_TAG"; then
-    fetch "https://github.com/astral-sh/python-build-standalone/releases/download/$PY_TAG/cpython-$PY_VER+$PY_TAG-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" python.tar.gz
+    fetch "https://github.com/astral-sh/python-build-standalone/releases/download/$PY_TAG/cpython-$PY_VER+$PY_TAG-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz" python.tar.gz "$PY_SHA256"
     rm -rf "$DEPS/python"
     tar -xzf "$DL/python.tar.gz" -C "$DEPS"
     "$DEPS/python/bin/python3" -m pip install --no-cache-dir --only-binary :all: --disable-pip-version-check -q \
@@ -122,7 +134,7 @@ if ! done_for ffmpeg "$FFMPEG_VER-$DAV1D_VER"; then
     mkdir -p "$DEPS/src-dav1d" && tar -xzf "$DL/dav1d.tar.gz" -C "$DEPS/src-dav1d" --strip-components=1
     (cd "$DEPS/src-dav1d" && meson setup build --prefix="$P" --libdir=lib --buildtype=release --default-library=static \
         -Db_staticpic=true -Denable_tools=false -Denable_tests=false -Denable_examples=false && ninja -C build install)
-    fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz" ffmpeg.tar.xz
+    fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz" ffmpeg.tar.xz "$FFMPEG_SHA256"
     mkdir -p "$DEPS/src-ffmpeg" && tar -xJf "$DL/ffmpeg.tar.xz" -C "$DEPS/src-ffmpeg" --strip-components=1
     (cd "$DEPS/src-ffmpeg" && PKG_CONFIG_PATH="$P/lib/pkgconfig" ./configure --prefix="$P" --pkg-config-flags=--static \
         --enable-static --disable-shared --enable-pic --disable-programs --disable-doc --disable-network --disable-autodetect \
@@ -136,7 +148,7 @@ fi
 
 # ---- SDL2 (its X11, Wayland and sound back ends load their libraries at run time) ----
 if ! done_for sdl2 "$SDL_VER"; then
-    fetch "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VER/SDL2-$SDL_VER.tar.gz" sdl2.tar.gz
+    fetch "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VER/SDL2-$SDL_VER.tar.gz" sdl2.tar.gz "$SDL_SHA256"
     rm -rf "$DEPS/src-sdl2" "$DEPS/sdl2"
     mkdir -p "$DEPS/src-sdl2" && tar -xzf "$DL/sdl2.tar.gz" -C "$DEPS/src-sdl2" --strip-components=1
     cmake -S "$DEPS/src-sdl2" -B "$DEPS/src-sdl2/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
@@ -181,7 +193,7 @@ fi
 
 # ---- appimagetool ----
 if ! done_for appimagetool "$APPIMAGETOOL"; then
-    fetch "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL/appimagetool-x86_64.AppImage" appimagetool
+    fetch "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL/appimagetool-x86_64.AppImage" appimagetool "$APPIMAGETOOL_SHA256"
     cp "$DL/appimagetool" "$DEPS/appimagetool" && chmod +x "$DEPS/appimagetool"
     mark appimagetool "$APPIMAGETOOL"
 fi

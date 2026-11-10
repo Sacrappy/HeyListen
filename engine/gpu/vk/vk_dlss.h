@@ -13,7 +13,8 @@ struct Texture;
 /// Whether this build has DLSS in it (HOOKSHOT_NGX)
 bool dlss_built();
 /// Why DLSS cannot be chosen here (the Insert menu's Upscaler row says it), DLSS_OK when it can or is not known yet
-enum DlssWhy { DLSS_OK, DLSS_NOT_BUILT, DLSS_ENV_OFF, DLSS_NEEDS_RTX, DLSS_NEEDS_DRIVER, DLSS_NO_RUNTIME, DLSS_WHY_COUNT };
+enum DlssWhy { DLSS_OK, DLSS_NOT_BUILT, DLSS_ENV_OFF, DLSS_NEEDS_RTX, DLSS_NEEDS_DRIVER, DLSS_NO_RUNTIME,
+               DLSS_RUNTIME_NOT_ASCII, DLSS_WHY_COUNT };
 DlssWhy dlss_why();
 /// Asks NGX once whether DLSS runs on this device, so dlss_why knows before the first upscale (the menu, when it opens).
 /// Nothing off an NVIDIA device with NGX's extensions, or in a build without DLSS
@@ -32,6 +33,9 @@ void dlss_device_extensions(std::vector<const char*>& want, const std::vector<Vk
 /// `camera` (its size): the camera of the frame, when that buffer holds one
 void dlss_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                           uint64_t camera_size);
+/// Whether a target of width x height can be the scene DLSS draws from: the gameplay upscale's output (as last seen) is 1 to 3
+/// times its size (DLAA to Ultra Performance; dlss_checks.h). False before the first upscale, and in a build without DLSS
+bool dlss_scene_size(uint32_t width, uint32_t height);
 /// A skinned draw into a scene-sized target (vk_draw.cpp finds them by their vertex layout): what DLSS's motion needs to draw
 /// it again with this frame's bones and the frame before's (actor motion: Link, the others, what moves by itself)
 struct DlssSkin {

@@ -39,11 +39,11 @@ def main():
 ''' + fn + r'''
 int main() {
     CHECK(!framegen_wanted(0, 1));   /* menu Off: no copy, no luma */
-    CHECK(!framegen_wanted(1, 1));   /* the blank step between Off and 2x */
+    CHECK(framegen_wanted(1, 1));    /* Auto: as many as fill the display (tests/test_framegen_auto.py) */
     CHECK(framegen_wanted(2, 1));
     CHECK(framegen_wanted(8, 1));
     CHECK(!framegen_wanted(2, 0));   /* RX_VK_FRAMEGEN=0 */
-    std::printf("PASS: interpolation runs only from 2x up\n");
+    std::printf("PASS: interpolation runs only when the menu asks for it (Auto, 2x up)\n");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="framegen-gate-") as tmp:

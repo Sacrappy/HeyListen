@@ -22,8 +22,8 @@ jobs:
     if: github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts'
     runs-on: ubuntu-latest
     container: ubuntu:22.04
-    # (about 4 minutes with the dependencies cached; building them all takes longer)
-    timeout-minutes: 45
+    # (about 4 minutes with the dependencies cached; building them all, as a release does, takes longer)
+    timeout-minutes: 60
     steps:
       - name: System packages
         env:
@@ -48,10 +48,18 @@ jobs:
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # (a release builds what the AppImage carries from its checked downloads: no built deps from a cache, which other
+      # runs write. Other runs take the built deps)
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build-linux/deps
           key: linux-deps-${{ hashFiles('scripts/linux/deps.sh') }}
+      - if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-linux/deps/downloads
+          key: linux-deps-downloads-${{ hashFiles('scripts/linux/deps.sh') }}
 
       - name: Dependencies (LLVM, Python, FFmpeg with dav1d, SDL2, Vulkan headers)
         env:

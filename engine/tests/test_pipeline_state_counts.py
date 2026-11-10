@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--cxx',default='clang++')
     args=parser.parse_args()
     text=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
+    targets=block(text,'bool targets_ok(')
     actual='\n'.join((block(text,'constexpr char kStateMagic[8]')+';',block(text,'struct StateRec {')+';',
                        block(text,'std::vector<StateRec> state_list_read(')))
     fixture=r'''
@@ -37,7 +38,8 @@ def main():
 #include <stdexcept>
 #include <string>
 #include <vector>
-'''+actual+r'''
+constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_PATCH_LIST = 10;   // (vulkan_core.h)
+'''+targets+'\n'+actual+r'''
 static void write(const std::filesystem::path& path,const std::vector<StateRec>& records,size_t tail=0) {
  std::ofstream out(path,std::ios::binary);
  const uint32_t size=sizeof(StateRec);
@@ -50,10 +52,13 @@ int main(int argc,char** argv) {
  if(argc!=2)return 2;
  static_assert(sizeof(StateRec)==528);
  StateRec maximum{},zero{},bad_answers{},bad_questions{},huge{};
- maximum.code[0]=11;maximum.nanswers=24;maximum.nquestions=32;
+ maximum.code[0]=11;maximum.nanswers=24;maximum.nquestions=32;maximum.samples=1;maximum.n=8;maximum.nvattr=16;
  for(uint32_t i=0;i<24;i++)maximum.answers[i]=100+i;
  for(uint32_t i=0;i<32;i++)maximum.questions[i]=uint8_t(i);
- zero.code[0]=22;
+ zero.code[0]=22;zero.samples=1;
+ // (hookshot) the targets a pipeline is made with: at most 8, a sample count and topology Vulkan has, 16 attributes
+ StateRec bad_n=maximum,neg_n=maximum,bad_samples=maximum,no_samples=maximum,bad_topo=maximum,bad_vattr=maximum;
+ bad_n.n=9;neg_n.n=0xFFFFFFFFu;bad_samples.samples=3;no_samples.samples=0;bad_topo.topo=99;bad_vattr.nvattr=17;
  bad_answers=maximum;bad_answers.nanswers=25;
  bad_questions=maximum;bad_questions.nquestions=33;
  huge=maximum;huge.nanswers=huge.nquestions=std::numeric_limits<uint32_t>::max();
@@ -71,6 +76,8 @@ int main(int argc,char** argv) {
   write(path,{bad_answers});check(path,{},"answer count above array");
   write(path,{bad_questions});check(path,{},"question count above array");
   write(path,{huge});check(path,{},"maximum integer counts");
+  write(path,{bad_n,neg_n,bad_samples,no_samples,bad_topo,bad_vattr});check(path,{},"targets a pipeline cannot have");
+  write(path,{bad_n,maximum,bad_topo});check(path,{maximum},"retain a valid record between bad targets");
   write(path,{maximum,bad_answers,zero,bad_questions,maximum,huge,zero});
   check(path,{maximum,zero,maximum,zero},"retain valid records around rejected records");
   write(path,{maximum},sizeof(StateRec)-1);check(path,{maximum},"ignore truncated trailing record");

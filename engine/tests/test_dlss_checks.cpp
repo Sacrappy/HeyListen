@@ -1,0 +1,85 @@
+#include "../gpu/vk/dlss_checks.h"
+
+#include <clocale>
+#include <cstdio>
+#include <string>
+
+#define CHECK(name, condition) do { if (!(condition)) { std::fprintf(stderr, "FAIL %s at line %d\n", name, __LINE__); return 1; } } while (0)
+
+namespace dc = mkwvk::dlss_checks;
+
+/// The menu's size for a share of the output in twelfths (gpu/vk/vk_menu.cpp game_size): what the game draws the 3D at
+static void game_size(unsigned ow, unsigned oh, int k, unsigned& w, unsigned& h) { w = (ow * k + 11) / 12, h = oh * k / 12; }
+
+static std::wstring decode(const std::string& s, bool& bad) {
+    bad = false;
+    return dc::utf8_to_wide(s, &bad);
+}
+
+int main() {
+    // ---- the scene sizes DLSS takes for an output ----
+    // (the validation report's case: the handheld profile's 1536x864 at Ultra Performance draws its scene at 512x288,
+    // which the old 640x360 floor turned away)
+    CHECK("handheld Ultra Performance", dc::scene_size_fits(512, 288, 1536, 864));
+    CHECK("docked Ultra Performance", dc::scene_size_fits(683, 384, 2048, 1152));
+    CHECK("handheld at the game's 3/4", dc::scene_size_fits(1152, 648, 1536, 864));
+    CHECK("DLAA, the scene at full size", dc::scene_size_fits(1536, 864, 1536, 864));
+    CHECK("1080p Ultra Performance", dc::scene_size_fits(640, 360, 1920, 1080));
+    // every output the menu has, with every DLSS share (8, 7, 6, 4 twelfths) and DLAA's (12)
+    const unsigned outputs[][2] = {{1536, 864}, {1920, 1080}, {2048, 1152}, {2560, 1440}, {3840, 2160}};
+    for (const auto& o : outputs)
+        for (int k : {12, 8, 7, 6, 4}) {
+            unsigned w, h;
+            game_size(o[0], o[1], k, w, h);
+            CHECK("each mode at each output", dc::scene_size_fits(w, h, o[0], o[1]));
+        }
+    // what is still turned away
+    CHECK("output not known yet", !dc::scene_size_fits(512, 288, 0, 0));
+    CHECK("output not known yet (1080p scene)", !dc::scene_size_fits(1536, 864, 0, 0));
+    CHECK("no size", !dc::scene_size_fits(0, 0, 1536, 864));
+    CHECK("under a third wide", !dc::scene_size_fits(511, 288, 1536, 864));
+    CHECK("under a third high", !dc::scene_size_fits(512, 287, 1536, 864));
+    CHECK("a square shadow-map-like target", !dc::scene_size_fits(384, 384, 1536, 864));
+    CHECK("a half-size pass of the handheld scene", !dc::scene_size_fits(256, 144, 1536, 864));
+    CHECK("the old floor is under a third of 2048x1152", !dc::scene_size_fits(640, 360, 2048, 1152));
+    CHECK("larger than the output", !dc::scene_size_fits(2048, 1152, 1536, 864));
+    CHECK("wider than the output", !dc::scene_size_fits(1537, 864, 1536, 864));
+    CHECK("no 32-bit overflow in the third", dc::scene_size_fits(0x60000000u, 1, 0xFFFFFFFFu, 3));
+
+    // ---- UTF-8 paths as NGX's wide strings, in the C locale (the decoding must not depend on it) ----
+    std::setlocale(LC_ALL, "C");
+    // (which paths NGX's Linux library takes as they are: ASCII only. The others go to it as /proc/self/fd/<n>)
+    CHECK("ASCII path", dc::ascii("/home/u/Games/Hookshot/ngx") && dc::ascii(""));
+    CHECK("accented path", !dc::ascii("/home/u/Games/Hookshot-Caf\xC3\xA9/ngx"));
+    CHECK("CJK path", !dc::ascii("/g/\xE3\x82\xBC"));
+    CHECK("a byte that is not UTF-8", !dc::ascii("/g/\xFF"));
+    bool bad = false;
+    CHECK("ASCII", decode("/home/u/Games/Hookshot/ngx", bad) == L"/home/u/Games/Hookshot/ngx" && !bad);
+    CHECK("accented", decode("/home/u/Games/Hookshot-Caf\xC3\xA9/ngx", bad) == L"/home/u/Games/Hookshot-Café/ngx" && !bad);
+    CHECK("CJK", decode("/g/\xE3\x82\xBC\xE3\x83\xAB\xE3\x83\x80/ngx", bad) == L"/g/ゼルダ/ngx" && !bad);
+    // (U+1F3AE: one wchar_t where it has 32 bits, a surrogate pair where it has 16, as on Windows)
+    const std::wstring gamepad = sizeof(wchar_t) == 2 ? std::wstring{(wchar_t)0xD83C, (wchar_t)0xDFAE}
+                                                      : std::wstring(1, (wchar_t)0x1F3AE);
+    CHECK("four bytes", decode("/g/\xF0\x9F\x8E\xAE", bad) == L"/g/" + gamepad && !bad);
+    CHECK("all together",
+          decode("/home/u/Games/Hookshot-dlss-utf8-Caf\xC3\xA9-\xE3\x82\xBC\xE3\x83\xAB\xE3\x83\x80/ngx", bad) ==
+              L"/home/u/Games/Hookshot-dlss-utf8-Café-ゼルダ/ngx" && !bad);
+    // (the bug this replaces: each byte widened alone)
+    const std::string cafe = "Caf\xC3\xA9";
+    CHECK("the old widening was wrong", std::wstring(cafe.begin(), cafe.end()) != decode(cafe, bad));
+    // bytes that are not UTF-8: U+FFFD, one for each maximal ill-formed part, and *bad set
+    CHECK("a Latin-1 byte", decode("a\xE9" "b", bad) == L"a�b" && bad);
+    CHECK("a lone continuation", decode("\x80x", bad) == L"�x" && bad);
+    CHECK("cut at the end", decode("x\xC3", bad) == L"x�" && bad);
+    CHECK("cut in the middle", decode("\xE3\x82x", bad) == L"�x" && bad);
+    CHECK("overlong", decode("\xC0\xAF", bad) == L"��" && bad);
+    CHECK("overlong three", decode("\xE0\x80\xAF", bad) == L"���" && bad);
+    CHECK("surrogate", decode("\xED\xA0\x80", bad) == L"���" && bad);
+    CHECK("past U+10FFFF", decode("\xF4\x90\x80\x80", bad) == L"����" && bad);
+    CHECK("F5 and up", decode("\xF5\xFF", bad) == L"��" && bad);
+    CHECK("good after bad", decode("\xFF\xC3\xA9", bad) == L"�é" && bad);
+    CHECK("no flag asked", dc::utf8_to_wide("\xFF") == L"�");
+    CHECK("empty", decode("", bad).empty() && !bad);
+    std::puts("dlss checks: ok");
+    return 0;
+}

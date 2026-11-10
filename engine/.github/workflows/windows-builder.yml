@@ -51,7 +51,9 @@ jobs:
       - name: llvm-mingw version
         id: llvm
         run: echo "name=$(python -I scripts/release_parts.py llvm-mingw --name)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # (a release unpacks llvm-mingw from its checked download, not from a cache other runs write)
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/llvm
           key: ${{ steps.llvm.outputs.name }}
@@ -91,12 +93,15 @@ jobs:
         if: env.PREVIOUS != ''
         run: python -I scripts/release_parts.py profile "$PREVIOUS" work
 
+      # (--dependent-load-flag 0x800, LOAD_LIBRARY_SEARCH_SYSTEM32: the libraries it imports come from System32, not from
+      # the folder it was downloaded to)
       - name: HookshotBuilder-Setup.exe
         working-directory: builder/setup
         run: |
           "$LLVM_MINGW/bin/x86_64-w64-mingw32-windres" setup.rc -O coff -o "$RUNNER_TEMP/setup_rc.o"
           "$LLVM_MINGW/bin/x86_64-w64-mingw32-clang" -O2 -mwindows -municode setup.c "$RUNNER_TEMP/setup_rc.o" \
-            -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lole32 -o "$RUNNER_TEMP/HookshotBuilder-Setup.exe"
+            -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lole32 -Wl,--dependent-load-flag=0x800 \
+            -o "$RUNNER_TEMP/HookshotBuilder-Setup.exe"
           ls -l "$RUNNER_TEMP/HookshotBuilder-Setup.exe"
 
       - name: Hookshot Builder
@@ -163,7 +168,9 @@ jobs:
       - name: llvm-mingw version
         id: llvm
         run: echo "name=$(python -I scripts/release_parts.py llvm-mingw --name)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # (a release unpacks llvm-mingw from its checked download, not from a cache other runs write)
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/llvm
           key: ${{ steps.llvm.outputs.name }}

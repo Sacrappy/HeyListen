@@ -45,6 +45,12 @@ class ProgramCacheIndexTests(unittest.TestCase):
         self.assertLess(init.index("good = at;"), init.index("while (good + 20 <= whole)"))
         self.assertIn("idx_write(idx_path, stamp, order)", init)   # (written again unless it was whole)
 
+    def test_scan_size_unsigned(self):
+        # (a record size past 2^63 was negative as int64_t and passed the old check: the scan went backwards)
+        init = block(self.source, "void disk_init(")
+        self.assertIn("if (rec[1] > (uint64_t)(whole - good - 16)) break;", init)
+        self.assertNotIn("good + 16 + (int64_t)rec[1] > whole", init)
+
     def test_head_checked_on_load(self):
         read = block(self.source, "void program_cache_read(")
         self.assertIn("_fseeki64(in, d.at - 16, SEEK_SET)", read)

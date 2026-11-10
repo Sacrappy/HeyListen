@@ -40,15 +40,16 @@ def main():
 typedef struct { uint64_t x[32]; } Ctx;
 typedef struct {
     uint32_t magic, flags;
-    uint8_t *mem;
+    uint64_t mem;
     uint64_t size, gpu;
-    void *vmap;
+    uint64_t reserved;
 } nvn_pool;
 typedef struct { uint32_t magic; nvn_pool *pool; int64_t off; uint64_t size; } nvn_buffer;
 #define GP(a) ((void *)(uintptr_t)(a))
 #define P(i) ((void *)(c->x[i] ? GP(c->x[i]) : NULL))
 #define RET(v) (c->x[0] = (uint64_t)(v))
 #define RETP(p) RET((uint64_t)(uintptr_t)(p))
+#define POOL(p) ((const nvn_pool *)(p))
 #define NV(name) static void n_##name(Ctx *c, void *u_)
 
 /* Single-threaded fixture: the host lock and allocator are stand-ins, not tested implementations. */
@@ -108,12 +109,12 @@ int main(int argc, char **argv) {
         unsigned before = allocation_count;
         uint8_t memory[32] = {0};
         nvn_pool pool = {0};
-        pool.mem = memory;
+        pool.mem = (uint64_t)(uintptr_t)memory;
         buffer.pool = &pool;
         buffer.off = 7;
         buffer.size = 8;
         require(map(&buffer) == memory + 7, "a pooled map changed its pointer or offset");
-        pool.mem = NULL;
+        pool.mem = 0;
         require(map(&buffer) == NULL, "a pool without CPU memory must remain unmapped");
         require(map(NULL) == NULL, "a null buffer object must remain unmapped");
         require(allocation_count == before, "pooled or null inputs allocated scratch");

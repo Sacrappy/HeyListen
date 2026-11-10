@@ -15,7 +15,7 @@ static struct {
     /* window */
     void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
-        *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface;
+        *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode;
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
     /* controllers */
@@ -33,7 +33,11 @@ static HMODULE load_one(const char *dll) {   /* beside the executable, else the 
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
     snprintf(path + n, sizeof path - n, "%s", dll);
     HMODULE m = LoadLibraryA(path);
+#ifdef _WIN32   /* (hookshot: else the system's, not the current folder's or PATH's) */
+    return m ? m : LoadLibraryExA(dll, NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+#else
     return m ? m : LoadLibraryA(dll);
+#endif
 }
 static int get_all(HMODULE m, int three) {
 #define GET(field, name) if (!(*(FARPROC *)&f.field = GetProcAddress(m, name))) { hos_log("sdl: SDL%d has no %s", three ? 3 : 2, name); return 0; }
@@ -79,7 +83,11 @@ static int get_all(HMODULE m, int three) {
         *(FARPROC *)&f.LoadPNG = GetProcAddress(m, "SDL_LoadPNG");   /* (3.4 on: the icon, when there) */
         *(FARPROC *)&f.SetWindowIcon = GetProcAddress(m, "SDL_SetWindowIcon");
         *(FARPROC *)&f.DestroySurface = GetProcAddress(m, "SDL_DestroySurface");
+        *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetDisplayForWindow");   /* (the refresh: hos_sdl_refresh_mhz) */
+        *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
     } else {
+        *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetWindowDisplayIndex");   /* (the refresh: hos_sdl_refresh_mhz) */
+        *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
         GET(OpenAudioDevice, "SDL_OpenAudioDevice");
         GET(PauseAudioDevice, "SDL_PauseAudioDevice");
         GET(NumJoysticks, "SDL_NumJoysticks");
@@ -170,6 +178,20 @@ int hos_sdl_desktop_size(int *width, int *height) {
     if (CALL(int (*)(int, void *), GetDesktopDisplayMode)(0, &m)) return 0;
     *width = m.w, *height = m.h;
     return 1;
+}
+int hos_sdl_refresh_mhz(void *window) {
+    if (!window || !f.GetWindowDisplay || !f.GetCurrentDisplayMode) return 0;
+    float hz = 0;
+    if (version == 3) {   /* (SDL_DisplayMode: refresh_rate, a float, at 20) */
+        const uint32_t id = CALL(uint32_t (*)(void *), GetWindowDisplay)(window);
+        const uint8_t *m = id ? CALL(const uint8_t *(*)(uint32_t), GetCurrentDisplayMode)(id) : NULL;
+        if (m) memcpy(&hz, m + 20, 4);
+    } else {
+        const int index = CALL(int (*)(void *), GetWindowDisplay)(window);
+        struct { uint32_t format; int w, h, refresh_rate; void *driverdata; } m;
+        if (index >= 0 && CALL(int (*)(int, void *), GetCurrentDisplayMode)(index, &m) == 0) hz = (float)m.refresh_rate;
+    }
+    return hz > 1 && hz < 1000 ? (int)(hz * 1000 + 0.5f) : 0;
 }
 int hos_sdl_vulkan_surface(void *window, void *instance, void *surface_out) {
     return version == 3 ? CALL(_Bool (*)(void *, void *, const void *, void *), Vulkan_CreateSurface)(window, instance, NULL, surface_out)

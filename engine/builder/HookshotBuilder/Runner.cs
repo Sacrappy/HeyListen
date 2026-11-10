@@ -18,8 +18,11 @@ sealed record Tools(string Root, string Python, string[]? PythonArgs = null)
             var py = Path.Combine(bundled, "python", "python.exe");
             return new Tools(bundled, File.Exists(py) ? py : "python");
         }
+        // (the source tree the app was built in: its builder\ folder holds the app. Not any parent folder with an nx2\
+        // folder, such as one another user of the PC made at the drive's root)
         for (var d = new DirectoryInfo(at); d != null; d = d.Parent)
-            if (File.Exists(Path.Combine(d.FullName, "nx2", "make_game.py")))
+            if (File.Exists(Path.Combine(d.FullName, "nx2", "make_game.py")) &&
+                at.StartsWith(Path.Combine(d.FullName, "builder") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             {
                 var (exe, args) = PythonOnPath();
                 return new Tools(d.FullName, exe, args);

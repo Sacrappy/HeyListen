@@ -96,14 +96,15 @@ bool resolve(const nvn_tex* t, const nvn_view* v, bool has_v, const NVNcopyRegio
     s.x = r.xoffset, s.y = r.yoffset;
     s.w = r.width > 0 ? (uint32_t)r.width : (s.x >= 0 && (uint32_t)s.x < lw ? lw - (uint32_t)s.x : 0);
     s.h = r.height > 0 ? (uint32_t)r.height : (s.y >= 0 && (uint32_t)s.y < lh ? lh - (uint32_t)s.y : 0);
-    const uint32_t first = view_layer(view) + (uint32_t)std::max(0, r.zoffset);
+    // (hookshot: 64-bit, so a layer range near 2^32 does not wrap around past the clamp below)
+    const uint64_t first = (uint64_t)view_layer(view) + (uint64_t)std::max(0, r.zoffset);
     const uint32_t count = (uint32_t)std::max(1, r.depth);
     if (s.tex->type == VK_IMAGE_TYPE_3D) {
         s.z = (int32_t)std::max(0, r.zoffset), s.d = std::min(count, ld - std::min<uint32_t>(ld, (uint32_t)s.z));
         s.layer = 0, s.layers = 1;
     } else {
-        s.layer = first, s.layers = count;
-        if (s.layer + s.layers > s.tex->layers) s.layers = s.tex->layers > s.layer ? s.tex->layers - s.layer : 0;
+        s.layer = first < s.tex->layers ? (uint32_t)first : 0;
+        s.layers = first < s.tex->layers ? (uint32_t)std::min<uint64_t>(count, s.tex->layers - first) : 0;
     }
     s.w = std::min<uint32_t>(s.w, lw > (uint32_t)std::max(0, s.x) ? lw - (uint32_t)std::max(0, s.x) : 0);
     s.h = std::min<uint32_t>(s.h, lh > (uint32_t)std::max(0, s.y) ? lh - (uint32_t)std::max(0, s.y) : 0);
@@ -132,11 +133,18 @@ bool buffer_side(const NvnState& st, const Sub& s, uint64_t addr, uint64_t& size
     const uint32_t wb = (s.w + (uint32_t)s.bw - 1) / (uint32_t)s.bw;
     const uint32_t hb = (s.h + (uint32_t)s.bh - 1) / (uint32_t)s.bh;
     const uint64_t row = st.copy_stride > 0 ? (uint64_t)st.copy_stride : (uint64_t)wb * s.bpb;
-    if (row % s.bpb || row < (uint64_t)wb * s.bpb) {
+    if (row % s.bpb || row < (uint64_t)wb * s.bpb || row / s.bpb * (uint64_t)s.bw > UINT32_MAX) {
         warn(3, "copy row stride does not fit the level's blocks: skipped");
         return false;
     }
-    size = row * hb * s.layers * s.d;
+    // The last row ends at its last block: its trailing stride padding is not accessed by Vulkan.
+    // (hookshot: overflow-checked; the stride is the game's 64-bit value, and a wrapped size checked one row of many)
+    uint64_t rows = 0, body = 0;
+    if (__builtin_mul_overflow((uint64_t)hb * s.layers, (uint64_t)s.d, &rows) || __builtin_mul_overflow(row, rows - 1, &body) ||
+        __builtin_add_overflow(body, (uint64_t)wb * s.bpb, &size)) {
+        warn(3, "copy buffer size overflows: skipped");
+        return false;
+    }
     span = gpu_buffer_bind(addr, size, written);
     if (!addr || !span) {
         warn(3, "copy buffer is not one mapped pool span: skipped");
@@ -187,6 +195,10 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
     if (to_image && p.tex && (!b2t_gpu || astc)) {
         uint64_t avail = 0;
         const uint8_t* src = host->gpu_ptr(p.buf, &avail);
+        if (src && !texels_fit(p.tex, &p.r, st.copy_stride > 0 ? (uint64_t)st.copy_stride : 0, avail)) {
+            warn(3, "copy buffer runs past its mapping: skipped");
+            return;
+        }
         if (src) {
             const nvn_view* v = p.has_view ? &p.view : nullptr;
             texture_read_texels(p.tex, view_level(v), view_layer(v), &p.r, const_cast<uint8_t*>(src),

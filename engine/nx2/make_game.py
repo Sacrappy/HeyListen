@@ -264,6 +264,23 @@ def check_supported_build(exefs):
         fail("This is build %s. HeyListen supports build %s." % (bid[:8], BUILD_ID))
 
 
+def stand_in_damaged_files(romfs):
+    """An incomplete dump's damaged textures replaced by whole ones of the same kind, and said: without them the game
+    leaves out the walls and floors that use them (the Water Temple, #1002)"""
+    import nup
+    done = nup.stand_in_damaged(romfs)
+    if not done:
+        return
+    print("Your game dump is incomplete: %d game file%s in it %s damaged (a complete dump is about 23.8 GB, an incomplete "
+          "one 23.3 GB). Each is replaced by a similar file so that the places using it are still drawn, with a different "
+          "texture there. Dump the game again for the original look:" % (len(done), "" if len(done) == 1 else "s",
+                                                                          "is" if len(done) == 1 else "are"), flush=True)
+    for path, other in done:
+        print("  %s: %s" % (os.path.relpath(path, romfs),
+                            "in its place " + os.path.basename(other) if other else "nothing similar found, left as it is"),
+              flush=True)
+
+
 def check_cache_paths(out, paths):
     """Resolve generated paths and reject symbolic links/reparse points before replacement."""
     root = os.path.realpath(out)
@@ -789,6 +806,15 @@ def profile_readable(prof):
     return r.returncode == 0
 
 
+def copy_writable(src, dst):
+    """src's bytes at dst, writable whatever src's mode: copy2 took the mode along, and from a read-only install (a Nix
+    store, a packaged tools folder) the copies in the work folder were read-only, so lift.py could not write chunks.txt
+    again (PermissionError) and every later build failed on the same file"""
+    if os.path.exists(dst):
+        os.chmod(dst, stat.S_IREAD | stat.S_IWRITE)
+    shutil.copyfile(src, dst)
+
+
 def link_or_copy(src, dst):
     """the romfs by hard links where the disk allows: 26 GB not written twice"""
     files = [os.path.join(d, f) for d, _, fs in os.walk(src) for f in fs]
@@ -981,7 +1007,12 @@ def main(a=None):
     romfs = os.path.join(out, "romfs")
 
     say("stage", "read", "Reading your game files")
-    shutil.rmtree(exefs, ignore_errors=True)
+    try:
+        shutil.rmtree(exefs)
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError) or os.path.lexists(exefs):
+            fail("Could not clear the builder's working copy of exefs at %s (%s). "
+                 "Close any other builds or programs using this folder, then try again." % (exefs, e))
     kept = os.path.join(out, ".hookshot_exefs")   # (the game's code as read, kept in the folder: what an update builds from again)
     if a.update:
         if not os.path.isdir(kept) or not os.path.isdir(romfs):
@@ -997,7 +1028,11 @@ def main(a=None):
         good = os.path.join(out, ".hookshot_romfs")
         check_cache_paths(out, (game, good, kept, romfs))
         # (an update of the builder over the same .nup: nothing to read again, only what the build needs. Issues 21 and 28)
-        st = os.stat(a.nup)
+        try:
+            st = os.stat(a.nup)
+        except OSError as e:
+            fail("Could not access your .nup file %s: %s. Check that the file is still there, reconnect its drive if needed, "
+                 "or choose the file again in Hookshot Builder." % (a.nup, e))
         stamp = "unpacked by this builder: %s %d" % (os.path.basename(a.nup), st.st_size)
         same = False
         if os.path.exists(good) and os.path.isdir(romfs) and os.path.isdir(kept):
@@ -1025,6 +1060,8 @@ def main(a=None):
             with open(good, "w") as f:
                 f.write(stamp + chr(10))
         check_modules(exefs)
+        # (also when the .nup was read before: a folder built from a 23.3 GB dump by an earlier builder gets them too)
+        stand_in_damaged_files(romfs)
     else:
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)
         run(PY + ["nx2/unpack.py", exefs])
@@ -1040,11 +1077,11 @@ def main(a=None):
         dst = os.path.join(work, name)
         # (copied only when it differs: a compiler still ending from a cancelled build keeps the profile mapped, WinError 1224)
         if os.path.exists(src) and not (os.path.exists(dst) and filecmp.cmp(src, dst, shallow=False)):
-            shutil.copy2(src, dst)
+            copy_writable(src, dst)
     os.makedirs(os.path.join(work, "image"), exist_ok=True)
     src = os.path.join(ROOT, "work", "image", "chunks.txt")   # (where the lifted code's files begin: addresses)
     if os.path.exists(src):
-        shutil.copy2(src, os.path.join(work, "image", "chunks.txt"))
+        copy_writable(src, os.path.join(work, "image", "chunks.txt"))
     env = {"OOT_WORK": work, "OOT_EXEFS": exefs, "OOT_ROMFS": romfs, "OOT_DUMP": out, "RX_RELEASE": "1", "A64_HOT_CHUNK": "1"}
     if os.path.exists(os.path.join(work, "hot_funcs.txt")):
         env["A64_HOT_FUNCS"] = os.path.join(work, "hot_funcs.txt")
@@ -1214,7 +1251,7 @@ def main(a=None):
         print("the shader list was not made: the game will compile its shaders as it plays", flush=True)
     icon = os.path.join(ROOT, "assets", "hookshot.png")
     if LINUX and os.path.exists(icon):   # (the window's icon: host/posix/display_sdl.c)
-        shutil.copy2(icon, os.path.join(out, "hookshot.png"))
+        copy_writable(icon, os.path.join(out, "hookshot.png"))   # (a second build overwrites the first's)
     seed_pipelines(out)
     ship_state_list(out)
     language = os.path.join(out, "language.txt")   # (the same text as host/nn_applet.c writes)

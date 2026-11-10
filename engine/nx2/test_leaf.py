@@ -226,9 +226,12 @@ uint32_t recomp_stxr(GuestContext *c, uint64_t a, uint32_t s, uint64_t v) { if (
 void recomp_ldxp(GuestContext *c, uint64_t a, uint32_t s, uint64_t *lo, uint64_t *hi) { *lo = *hi = 0; memcpy(lo, A64_PTR(a), s); memcpy(hi, A64_PTR(a + s), s); c->excl_addr = a; c->excl_valid = 1; }
 uint32_t recomp_stxp(GuestContext *c, uint64_t a, uint32_t s, uint64_t lo, uint64_t hi) { if (!c->excl_valid || c->excl_addr != a) return 1; c->excl_valid = 0; memcpy(A64_PTR(a), &lo, s); memcpy(A64_PTR(a + s), &hi, s); return 0; }
 void recomp_clrex(GuestContext *c) { c->excl_valid = 0; }
-/* loop-header polls (nx2/poll.py) fire on two of every three loop iterations: they must change nothing */
+/* loop-header polls (nx2/poll.py) fire on two of every three loop iterations: they must change nothing. The poll is
+   called with no argument (rtgen.py): the context under test is the one run() was given */
 static uint64_t polls;
-void a64_poll(Ctx *c) { polls++; c->poll = (polls %% 3) != 0; }
+static Ctx *poll_ctx;
+void a64_poll_cur(void) { polls++; poll_ctx->poll = (polls %% 3) != 0; }
+void a64_poll(Ctx *c) { c->poll = 0; a64_poll_cur(); }
 
 #define IMG_BASE %(img_base)dULL
 #define IMG_SIZE %(img_size)dULL
@@ -251,6 +254,7 @@ static void make_scratch(uint64_t seed, uint64_t *out) {
     }
 }
 static int run(int idx, Ctx *c) {
+    poll_ctx = c;
     __try { T[idx](c); } __except (EXCEPTION_EXECUTE_HANDLER) { return (int)GetExceptionCode(); }
     return 0;
 }

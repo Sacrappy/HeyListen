@@ -1,16 +1,15 @@
 """Which pass made a flash: reads a probe_<frame>.txt (vk_draw.cpp RX_VK_PROBE) and aligns the frames before, at and
 after it by (kind, program, target, nth use), then prints the entries of the flash frame in order whose colour is far
-from both neighbours', decoded by format. The first of them is the pass that went wrong.
+from both neighbours', decoded by format. The comparison skips decoded NaNs.
+The first reported entry is the pass that went wrong.
 
     python -I scripts/probe.py work/runs/<run>/probe_<frame>.txt [ratio 4] [lines 25]
 """
-import collections, struct, sys
+import collections, math, struct, sys
 
 
 def half(h):
-    e, m, s = (h >> 10) & 31, h & 1023, h >> 15
-    v = (m / 1024.0) * 2.0 ** -14 if e == 0 else float("inf") if e == 31 else (1 + m / 1024.0) * 2.0 ** (e - 15)
-    return -v if s else v
+    return struct.unpack("<e", struct.pack("<H", h))[0]
 
 
 def uf(v, mbits):
@@ -61,6 +60,8 @@ def val(r):
 
 def far(x, y):
     for p, q in zip(x, y):
+        if math.isnan(p) or math.isnan(q):
+            continue
         hi, lo = max(abs(p), abs(q)), min(abs(p), abs(q))
         if hi > 1e-3 and hi > lo * ratio:
             return True

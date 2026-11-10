@@ -72,6 +72,7 @@ class MarkGroupsTests(unittest.TestCase):
 
     def test_every_run_end_marks_before_it(self):
         for end in ("L_80000010:;", "L_80000010:; A64_POLL(c);", "if (!c->z) { goto L_80000010; }", "    recomp_barrier();",
+                    "if (!c->z) { { A64_POLL(c); goto L_80000010; } }",   # (a backward goto with its interrupt poll: nx2/poll.py)
                     "    a64_svc(c, 0x60);", "    A64_ICALL(c, c->x[16]);", "    A64_IJUMP(c, c->x[16]); return;",
                     "    __atomic_fetch_add((uint32_t *)A64_PTR(c->x[2]), 1, __ATOMIC_SEQ_CST);",
                     "    c->x[30] = 0x80000020ULL; f_80001000(c);", "    return;",
