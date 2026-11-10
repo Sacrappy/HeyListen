@@ -7,6 +7,7 @@ join below are fixture scaffolding, not the production scheduler/handover.
 import argparse
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -28,6 +29,7 @@ HEAD = r'''
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,9 +45,10 @@ struct VkComputePipelineCreateInfo {
 };
 struct {uintptr_t device=0x1234;}dev;
 VkPipelineCache pcache=0x5678;
-struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;};
-struct Pre {std::mutex mu;bool abandoned=false;};
-int mode=0,calls=0,destroys=0; bool completed=false;
+struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;std::atomic<int>compute_state{1};};
+struct Pre {std::vector<Program*>computes;};
+int mode=0,calls=0,destroys=0,released=0; bool completed=false;
+void cs_module_release(Program&){++released;}
 #define CHECK(c) do {if(!(c)){std::fprintf(stderr,"CHECK failed line %d: %s\n",__LINE__,#c);std::exit(7);}}while(0)
 const VkComputePipelineCreateInfo* expected_ci=nullptr; VkPipeline* expected_out=nullptr;
 void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&stage,unsigned x){CHECK(x==32);CHECK(stage.stage==12);}
@@ -75,11 +78,12 @@ def main():
     source=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
     wrapper=block(source,'__declspec(noinline) VkResult guarded_compute(')
     precompile=block(source,'void precompile_run(')
-    arm=block(precompile,'if (i < computes.size()) {')
+    # (TICK-008: the arm is the background worker's, over pre->computes; a finished build is kept, nothing waits on it)
+    arm=block(precompile,'if (i < pre->computes.size()) {')
     # ci/made identities are checked at the boundary as well as inside the API spy.
     armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
     assert armed != arm
-    cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){std::vector<Program*>computes{&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
+    cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){pre->computes={&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
 int main(int argc,char**argv){
  SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX);
  CHECK(argc==2);int which=std::atoi(argv[1]);Program program;Pre pre;
@@ -88,21 +92,26 @@ int main(int argc,char**argv){
   expected_ci=&ci;expected_out=&out;
   CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
  }
- mode=which==1?1:which==2?2:0;pre.abandoned=which==3;
+ mode=which==1?1:which==2?2:0;
  std::thread worker([&]{actual_arm(program,&pre);});worker.join();
  CHECK(completed&&calls==1);
- if(which==0)CHECK(program.compute_pipeline==0xcafe&&destroys==0);
- if(which==1||which==2)CHECK(program.compute_pipeline==0&&destroys==0);
- if(which==3)CHECK(program.compute_pipeline==0xbeef&&destroys==1);
+ // (a build that works is kept and its module released; one that fails or faults leaves the program's own, and a dispatch makes it)
+ if(which==0)CHECK(program.compute_pipeline==0xcafe&&program.compute_state.load()==2&&released==1&&destroys==0);
+ if(which==1||which==2)CHECK(program.compute_pipeline==0xbeef&&program.compute_state.load()==0&&released==0&&destroys==0);
  return 0;
 }
 '''
     with tempfile.TemporaryDirectory(prefix='precompile-seh-') as tmp:
         path=Path(tmp); unit=path/'fixture.cpp';exe=path/'fixture.exe';unit.write_text(cpp,encoding='utf-8')
-        cmd=[args.cxx,'--target=x86_64-pc-windows-msvc','-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
+        # (an llvm-mingw clang, as the tests are run here without Visual Studio or the Windows SDK: its GNU ABI target, with
+        # -fms-extensions for __try/__except and __declspec, as tools/toolchain.py's native_target; else the MSVC target)
+        compiler=shutil.which(args.cxx) or args.cxx
+        mingw=os.path.isfile(os.path.join(os.path.dirname(compiler),'x86_64-w64-mingw32-clang++.exe'))
+        target=['--target=x86_64-w64-mingw32','-fms-extensions'] if mingw else ['--target=x86_64-pc-windows-msvc']
+        cmd=[args.cxx]+target+['-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
         if args.linker:cmd+=['-B'+str(args.linker.parent)]
         subprocess.run(cmd,check=True,timeout=60)
-        for case in [0,1,2,3,4]:
+        for case in [0,1,2,4]:
             result=subprocess.run([str(exe),str(case)],timeout=10)
             code=result.returncode & 0xffffffff
             expected=0xc0000005 if args.expect_fault and case==1 else 0

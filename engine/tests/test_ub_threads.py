@@ -60,8 +60,8 @@ def main():
     for at in pools:
         lambda_at = draw.rindex("const auto worker = [", 0, at)
         body = block(draw, "const auto worker = [", lambda_at)
-        first = body[body.index("{") + 1:].lstrip()
-        if not first.startswith("ub_thread_off();"):
+        # (the thread may set its priority first; it leaves the update list before its first job)
+        if "ub_thread_off();" not in body or body.index("ub_thread_off();") > body.index("for (;;)"):
             raise SystemExit("a precompile worker translates before leaving the update list")
     print("PASS: background threads stay out of the replay's uniform update list")
 
