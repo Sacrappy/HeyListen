@@ -16,6 +16,16 @@ repository (the engine under `engine/`).
 - `heylisten-setup.txt`: the list of parts the setup reads (you do not need to download it).
 - `SHA256SUMS.txt`: checksums of the files above.
 
+## New in v0.2.0
+
+- **Castle Town Market ground fixed** while walking (no more flat mint/white or teal ground): ASTC textures are kept as
+  BC1/BC7 (decoded textures 3.0 -> 1.1 GB, VRAM peak -14%) and a pool-mirror ordering bug is fixed.
+- **Faster**: Market about 71 -> 75 fps standing, 64 -> 68 walking, with much better 1% lows (about 40 -> 50 fps
+  standing) on the test PC (Ryzen 7 7800X3D, RTX 5070), from faster capture copies and Hookshot's latest engine work.
+- **Less RAM**: about 2 GB less (compute pipelines built on first use, their modules dropped); faster shader start-up.
+- **Hookshot v2.0.12/v2.0.13**: the new Dear ImGui menu (Insert), keyboard shortcut choice, capture and screenshot fixes,
+  builder hardening. HeyListen's frame limit row and FPS counter (F10) are kept.
+
 ## What HeyListen adds to Hookshot
 
 - **Frame rate**: game speed correct at 60-360 fps (was +12% too fast at 120); engine copies cut (write-backs 67.5 -> 13.9 MB
@@ -34,8 +44,7 @@ repository (the engine under `engine/`).
 
 - **Occlusion is off** (a fixed value, as in Hookshot): real occlusion queries break the picture; some scenes draw more than
   they need.
-- **Missing ground textures while walking in Castle Town Market** (flat mint/white or teal ground; buildings and people are fine): VRAM runs short there. A fix (smaller texture formats for the game's ASTC textures) is planned. Standing still renders correctly.
-- **12 GB of VRAM recommended.** 8 GB cards may show the issue above more often.
+- **12 GB of VRAM recommended.** 8 GB cards are untested.
 - **Tested on NVIDIA RTX only.** AMD and Intel cards are untested in HeyListen (see Hookshot's notes for them).
 - **Frame generation is off by default** (turn it on in the Insert menu if you want to try it).
 - The first build takes a long time (tens of minutes, then shader preparation); later updates rebuild only what changed.
