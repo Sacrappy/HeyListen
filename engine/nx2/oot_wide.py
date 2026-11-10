@@ -1,9 +1,10 @@
 """Widescreen and ultrawide for Ocarina of Time 1.1.1: C added after a few instructions of the game (a64_lift.py Lifter.after).
 
 The game draws a 2560x1440 picture whatever the screen and renders its scene at 1920x1080; its cameras use a 16:9 ratio.
-With these patches the picture takes the window's shape (the height stays the game's, the width grows: Hor+), the 16:9
-cameras take the picture's ratio, the HUD and menus keep their 16:9 shape in the middle of the picture, pre-rendered
-movies play in that middle 16:9, and the picture a save keeps shows that middle 16:9. Every patch reads host globals
+With these patches the picture takes the window's shape (the height stays the game's, the width grows on an ultrawide
+screen and shrinks on a 16:10 or 4:3 one), the 16:9 cameras take the picture's ratio, the HUD and menus keep their 16:9
+shape in the middle of a wider picture (a narrower one: its whole width), pre-rendered movies play in that middle 16:9,
+and the picture a save keeps shows that middle 16:9 (a narrower picture: its middle band, at the texture's shape). Every patch reads host globals
 (host/hos_wide.c) that stay 0 for a 16:9 window, so the game runs as shipped then.
 
 The sites and what each does come from NX2navi's recomp/patches-v111.txt, where they are credited to Ivan0xFF (MIT,
@@ -52,9 +53,15 @@ MOVIE = ("{ extern volatile float hos_wide_margin; const float _m = hos_wide_mar
 # game's viewport-and-scissor helper (f_802a46e0: SetScissor, then SetViewport(x, y, w, h) in w1-w4 from [x8], called by blr x8).
 # Wider than 16:9, the whole picture was squeezed into it. That one viewport is made wider than the texture by the picture's
 # ratio over 16:9, centred: the middle 16:9 fills the texture (the scissor keeps the texture's), as a 16:9 window would show.
-THUMB = ("{ extern volatile float hos_wide_squeeze; const float _q = hos_wide_squeeze; if (_q > 0.0f && (uint32_t)c->x[1] == 0 "
-         "&& (uint32_t)c->x[2] == 0 && (uint32_t)c->x[3] == 543 && (uint32_t)c->x[4] == 306) { const int _w = (int)(543.0f / _q + 0.5f); "
-         "c->x[1] = (uint32_t)((543 - _w) / 2); c->x[3] = (uint32_t)_w; } }   /* (nx2/oot_wide.py: the save's picture, the middle 16:9) */")
+# Narrower than 16:9 (4:3, 16:10) it is made taller instead, by 16:9 over the picture's ratio: the picture's middle band fills
+# the texture at its own shape, neither squeezed nor with bars.
+THUMB = ("{ extern volatile float hos_wide_ratio; const float _r = hos_wide_ratio; if (_r > 0.0f && (uint32_t)c->x[1] == 0 "
+         "&& (uint32_t)c->x[2] == 0 && (uint32_t)c->x[3] == 543 && (uint32_t)c->x[4] == 306) { "
+         "if (_r > 16.0f / 9.0f) { const int _w = (int)(543.0f * _r / (16.0f / 9.0f) + 0.5f); "
+         "c->x[1] = (uint32_t)((543 - _w) / 2); c->x[3] = (uint32_t)_w; } "
+         "else { const int _h = (int)(306.0f * (16.0f / 9.0f) / _r + 0.5f); "
+         "c->x[2] = (uint32_t)((306 - _h) / 2); c->x[4] = (uint32_t)_h; } } }"
+         "   /* (nx2/oot_wide.py: the save's picture, the middle 16:9) */")
 
 # (main offset, the original instruction word there, the C after it)
 SITES = (

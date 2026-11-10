@@ -8,6 +8,7 @@
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -18,30 +19,81 @@ const char *hos_romfs_dir, *hos_user_dir;
 #define R_NOT_MOUNTED 0xCA02            /* fs::ResultInvalidMountName-ish: no such mount */
 #define R_TARGET_NOT_FOUND 0x7D402      /* fs::ResultTargetNotFound (save data) */
 
+#define FS_PATH_MAX 0x302                /* (nn::fs paths: 0x300 bytes and the NUL; DirectoryEntry's name is 0x301) */
+
 typedef struct { char name[32]; char root[MAX_PATH]; int writable; } Mount;
 static Mount mounts[16];
 static int nmounts;
 static SRWLOCK mount_lock = SRWLOCK_INIT;
 
-static void mount(const char *name, const char *root, int writable) {
+static int mount(const char *name, const char *root, int writable) {   /* 0: the table is full (16 mounts) */
     AcquireSRWLockExclusive(&mount_lock);
     int i;
     for (i = 0; i < nmounts && strcmp(mounts[i].name, name); i++) {}
-    if (i == nmounts && nmounts < 16) nmounts++;
+    if (i == nmounts) {   /* (hookshot: a 17th name was written past the table) */
+        if (nmounts == 16) {
+            ReleaseSRWLockExclusive(&mount_lock);
+            hos_log("fs: %s: not mounted (16 mounts already)", name);
+            return 0;
+        }
+        nmounts++;
+    }
     snprintf(mounts[i].name, sizeof mounts[i].name, "%s", name);
     snprintf(mounts[i].root, sizeof mounts[i].root, "%s", root);
     mounts[i].writable = writable;
     ReleaseSRWLockExclusive(&mount_lock);
     if (writable) CreateDirectoryA(root, NULL);
     hos_log("fs: mounted %s: -> %s", name, root);
+    return 1;
 }
 
 int hos_mods_romfs(const char *rel, char *out, size_t cap);   /* mods.c */
 int hos_mods_dir_extras(const char *rel, const char *base_dir, void (*fn)(void *, const char *, int, uint64_t), void *arg);
 
+/* (hookshot) a guest path below its mount stays below it on the host: no "." or ".." part, no \\ or : (a drive or a
+   Windows stream), no control characters; on Windows also no part ending in a dot or a space (Windows drops them) and
+   no device name (CON, NUL, COM1, COM\u00b9, "NUL .txt"...) */
+static int guest_path_ok(const char *rest) {
+#ifdef _WIN32
+    static const char *const devices[] = {"CON", "PRN", "AUX", "NUL", "COM", "LPT", "CONIN$", "CONOUT$", "CLOCK$"};
+#endif
+    for (const char *p = rest; *p;) {
+        const char *e = strchr(p, '/');
+        const size_t n = e ? (size_t)(e - p) : strlen(p);
+        if ((n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.')) return 0;
+        for (size_t i = 0; i < n; i++)
+            if ((unsigned char)p[i] < 32 || p[i] == '\\' || p[i] == ':') return 0;
+#ifdef _WIN32
+        if (n && (p[n - 1] == '.' || p[n - 1] == ' ')) return 0;
+        for (size_t d = 0; d < sizeof devices / sizeof *devices; d++) {
+            const size_t k = strlen(devices[d]);
+            if (n < k || _strnicmp(p, devices[d], k)) continue;
+            const char *after = p + k;
+            if (k == 3 && (!strcmp(devices[d], "COM") || !strcmp(devices[d], "LPT"))) {
+                /* (a digit, or a superscript 1, 2 or 3 in UTF-8, the game's code page: Windows takes those too) */
+                if (after < p + n && *after >= '0' && *after <= '9') after++;
+                else if (after + 1 < p + n && (unsigned char)after[0] == 0xC2 &&
+                         ((unsigned char)after[1] == 0xB9 || (unsigned char)after[1] == 0xB2 || (unsigned char)after[1] == 0xB3))
+                    after += 2;
+                else continue;
+            }
+            while (after < p + n && *after == ' ') after++;   /* ("NUL .txt" is NUL too) */
+            if (after == p + n || *after == '.') return 0;
+        }
+#endif
+        p += n;
+        while (*p == '/') p++;
+    }
+    return 1;
+}
+
 /* "mount:/a/b" -> host path (a mod's file instead of the RomFS one, when a mod has it: mods.c). Returns 0 if the mount
-   is unknown. */
-static int host_path(const char *guest, char *out, size_t cap, int *writable) {
+   is unknown, or the path leaves it (guest_path_ok). */
+static int host_path(const char *guest_mem, char *out, size_t cap, int *writable) {
+    /* (hookshot) one copy of the path, read once: another guest thread may change guest memory between the check and
+       the use */
+    char guest[FS_PATH_MAX];
+    if ((size_t)snprintf(guest, sizeof guest, "%s", guest_mem) >= sizeof guest) return 0;
     const char *colon = strchr(guest, ':');
     if (!colon) return 0;
     size_t n = (size_t)(colon - guest);
@@ -51,7 +103,9 @@ static int host_path(const char *guest, char *out, size_t cap, int *writable) {
         if (strlen(mounts[i].name) == n && !strncmp(mounts[i].name, guest, n)) {
             const char *rest = colon + 1;
             while (*rest == '/') rest++;
-            if (mounts[i].writable || !hos_mods_romfs(rest, out, cap)) snprintf(out, cap, "%s/%s", mounts[i].root, rest);
+            if (!guest_path_ok(rest)) break;
+            if (mounts[i].writable || !hos_mods_romfs(rest, out, cap))
+                if ((size_t)snprintf(out, cap, "%s/%s", mounts[i].root, rest) >= cap) break;   /* (cut short: not this path) */
             if (writable) *writable = mounts[i].writable;
             ok = 1;
             break;
@@ -65,7 +119,14 @@ static int host_path(const char *guest, char *out, size_t cap, int *writable) {
 /* For other OS layer parts that open game files themselves (videos): "mount:/a/b" -> host path, 0 if unknown. */
 int hos_fs_host_path(const char *guest, char *out, size_t cap) { return host_path(guest, out, cap, NULL); }
 
-static const char *gstr(uint64_t a) { return a ? (const char *)GP(a) : ""; }
+/* (hookshot) a guest string: "" unless it lies in guest memory and ends within FS_PATH_MAX bytes */
+static const char *gstr(uint64_t a) {
+    if (!a || a >= (uint64_t)HOS_SPACE_END) return "";
+    const uint64_t room = (uint64_t)HOS_SPACE_END - a;
+    const char *s = (const char *)GP(a);
+    const size_t max = room < FS_PATH_MAX ? (size_t)room : FS_PATH_MAX;
+    return strnlen(s, max) < max ? s : "";
+}
 
 static void make_dirs(const char *path) {   /* every parent of path */
     char tmp[MAX_PATH];
@@ -106,23 +167,21 @@ static void free_handle(uint64_t id) {
 HLE(_ZN2nn2fs22QueryMountRomCacheSizeEPm) { G64(ARG(0)) = 0x10000; RET(0); }
 HLE(_ZN2nn2fs8MountRomEPKcPvm) {
     if (!hos_romfs_dir) hos_fatal(c, "fs: MountRom but no RomFS folder given (--romfs)");
-    mount(gstr(ARG(0)), hos_romfs_dir, 0);
-    RET(0);
+    RET(mount(gstr(ARG(0)), hos_romfs_dir, 0) ? 0 : R_NOT_MOUNTED);
 }
 /* (hookshot) MountRom(char const* name): the cacheless overload OoT uses (SDK 22). Left to the SDK it opens the
    file-system proxy over IPC and aborts on the empty reply. */
 HLE(_ZN2nn2fs8MountRomEPKc) {
     if (!hos_romfs_dir) hos_fatal(c, "fs: MountRom but no RomFS folder given (--romfs)");
-    mount(gstr(ARG(0)), hos_romfs_dir, 0);
-    RET(0);
+    RET(mount(gstr(ARG(0)), hos_romfs_dir, 0) ? 0 : R_NOT_MOUNTED);
 }
 
-static void user_mount(const char *name, const char *sub) {
+static int user_mount(const char *name, const char *sub) {
     char root[MAX_PATH];
     snprintf(root, sizeof root, "%s\\%s", hos_user_dir, sub);
     make_dirs(root);
     CreateDirectoryA(root, NULL);
-    mount(name, root, 1);
+    return mount(name, root, 1);
 }
 
 /* nn::fs::IsSaveDataExisting(ApplicationId, account::Uid const&) -> bool */
@@ -136,23 +195,20 @@ HLE(_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE) {
 HLE(_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE) {
     char sub[64];
     snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(1) + 8), (unsigned long long)G64(ARG(1)));
-    user_mount(gstr(ARG(0)), sub);
-    RET(0);
+    RET(user_mount(gstr(ARG(0)), sub) ? 0 : R_NOT_MOUNTED);
 }
 /* MountSaveDataReadOnly(char const*, ApplicationId, account::Uid const&) */
 HLE(_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE) {
     char sub[64];
     snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(2) + 8), (unsigned long long)G64(ARG(2)));
-    user_mount(gstr(ARG(0)), sub);
-    RET(0);
+    RET(user_mount(gstr(ARG(0)), sub) ? 0 : R_NOT_MOUNTED);
 }
-HLE(_ZN2nn2fs21MountTemporaryStorageEPKc) { user_mount(gstr(ARG(0)), "temp"); RET(0); }
+HLE(_ZN2nn2fs21MountTemporaryStorageEPKc) { RET(user_mount(gstr(ARG(0)), "temp") ? 0 : R_NOT_MOUNTED); }
 /* MountCacheStorage(char const*, int index) */
 HLE(_ZN2nn2fs17MountCacheStorageEPKci) {
     char sub[32];
     snprintf(sub, sizeof sub, "cache\\%d", (int)ARG(1));
-    user_mount(gstr(ARG(0)), sub);
-    RET(0);
+    RET(user_mount(gstr(ARG(0)), sub) ? 0 : R_NOT_MOUNTED);
 }
 /* CreateCacheStorage(int index, long size, long journal) */
 HLE(_ZN2nn2fs18CreateCacheStorageEill) {
@@ -374,7 +430,9 @@ static void delete_tree(const char *dir) {
             if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
             char sub[MAX_PATH];
             snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(sub);
+            /* (hookshot) a link (a symbolic link, a junction) goes itself: never what it points to */
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { if (!DeleteFileA(sub)) RemoveDirectoryA(sub); }
+            else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(sub);
             else DeleteFileA(sub);
         } while (FindNextFileA(f, &fd));
         FindClose(f);
@@ -385,6 +443,13 @@ HLE(_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc) {
     char path[MAX_PATH];
     int writable = 0;
     if (!host_path(gstr(ARG(0)), path, sizeof path, &writable) || !writable) { RET(R_PATH_NOT_FOUND); return; }
+    /* (hookshot) the folder named itself a link: the link goes, never what it points to (as for the links inside) */
+    const DWORD at = GetFileAttributesA(path);
+    if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        if (!DeleteFileA(path)) RemoveDirectoryA(path);
+        RET(0);
+        return;
+    }
     delete_tree(path);
     RET(0);
 }

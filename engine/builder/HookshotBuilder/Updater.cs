@@ -166,6 +166,10 @@ static class Updater
                 return;
             }
             var name = string.Concat(newTag.Where(c => char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.'));
+            // (hookshot) the name is a folder under builders\ that the update replaces: "..", "." or a name with a leading dot
+            // would be the HookshotBuilder folder itself or not a version (the same rule as the setup's and Linux's lists)
+            if (name.Length == 0 || name.Length > 128 || name[0] == '.')
+                throw new InvalidOperationException("The latest release's tag is not a version name.");
             var cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HeyListenBuilder", "update");
             Directory.CreateDirectory(cache);
             // (a release with the setup and its list: the setup downloads only the parts that changed since the version installed (a few MB

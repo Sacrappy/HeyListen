@@ -42,7 +42,7 @@ class CacheModuleCleanupTests(unittest.TestCase):
         structs = '\n'.join(block(header, marker) + ';' for marker in ('struct Stage {', 'struct Program {'))
         structs += '\n' + block(source, 'struct DiskRecord {') + ';'
         functions = '\n'.join(block(source, marker) for marker in (
-            'VkShaderModule make_module(', 'uint64_t answers_hash(', 'void idx_put('))
+            'VkShaderModule make_module(', 'uint64_t answers_hash(', 'bool answers_fit(', 'void idx_put('))
         serialization = source[source.index('void put_bytes('):source.index('void program_cache_save(')]
         functions += '\n' + serialization + block(source, 'void program_cache_save(')
         functions += '\n' + block(source, 'void program_cache_read(')
@@ -86,6 +86,12 @@ class CacheModuleCleanupTests(unittest.TestCase):
 
     def test_independent_records_continue(self):
         self.run_case('mixed')
+
+    def test_answer_past_the_stages_refused(self):
+        self.run_case('answer_stage')
+
+    def test_answer_past_the_slots_refused(self):
+        self.run_case('answer_desc')
 
 
 if __name__ == '__main__':

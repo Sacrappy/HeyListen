@@ -36,7 +36,11 @@ VKX_DEVICE3(VKX_DEFINE)
 static PFN_vkGetInstanceProcAddr get_instance_proc;
 
 bool load_global() {
+#ifdef _WIN32   // (hookshot: the loader from System32 only, not from the current folder or PATH)
+    HMODULE m = LoadLibraryExA("vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
     HMODULE m = LoadLibraryA("vulkan-1.dll");   // (linux: libvulkan.so.1, host/posix/win32_posix.c)
+#endif
     if (!m) return false;
     get_instance_proc = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(m, "vkGetInstanceProcAddr");
     if (!get_instance_proc) return false;
@@ -825,7 +829,7 @@ int start(void* hwnd) {
 #else
     const MkwVkWindow* w = (const MkwVkWindow*)hwnd;
     prep_window = w;
-    if (w->version != MKWVK_WINDOW_VERSION) {
+    if (w->version < 1 || w->version > MKWVK_WINDOW_VERSION) {   // (1: no refresh_mhz)
         logf("vk: unsupported SDL window bridge version %u (expected %u)", w->version, MKWVK_WINDOW_VERSION);
         return 0;
     }
@@ -937,4 +941,34 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 
 namespace mkwvk {
 HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
+
+/// (hookshot) The refresh rate of the display the window is on, in mHz; 0 when not known (frame generation's Auto). Asked
+/// again once a second at most: the window may move to another display, and Windows' answer costs a few system calls
+int display_refresh_mhz() {
+    static std::atomic<int> cached{0};
+    static std::atomic<int64_t> asked_at{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t last = asked_at.load(std::memory_order_relaxed);
+    if (last && now - last < 1000) return cached.load(std::memory_order_relaxed);
+    asked_at.store(now, std::memory_order_relaxed);
+    int mhz = 0;
+#ifdef _WIN32
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof dm;
+    if (main_window && GetMonitorInfoW(MonitorFromWindow(main_window, MONITOR_DEFAULTTONEAREST), &mi) &&
+        EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)   // (0 and 1: the default)
+        // (whole Hz: a 59.94 Hz mode often says 59, and Auto would then make a frame too few a second. One under a
+        // multiple of 6 (24, 30, 60, 120, 144, 240 Hz) is taken as that rate's /1.001)
+        mhz = (dm.dmDisplayFrequency + 1) % 6 == 0 ? (int)((dm.dmDisplayFrequency + 1) * 1000000ull / 1001)
+                                                    : (int)dm.dmDisplayFrequency * 1000;
+#else
+    const MkwVkWindow* w = (const MkwVkWindow*)main_window;
+    if (w && w->version >= 2 && w->refresh_mhz) mhz = w->refresh_mhz(w->window);
+#endif
+    cached.store(mhz, std::memory_order_relaxed);
+    return mhz;
+}
 } // namespace mkwvk

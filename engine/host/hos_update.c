@@ -3,6 +3,21 @@
    that made the folder (hookshot_version.txt, written by nx2/make_game.py) with --update: it downloads the new release and builds the
    folder again from the game files the folder keeps, and the game closes. A folder with no hookshot_version.txt (built from the
    repository, or before updates came in) is never asked about. HOOKSHOT_NO_UPDATE_CHECK=1 (hookshot_env.txt) turns it off; in this fork it is off unless HOOKSHOT_UPDATE_CHECK=1 */
+#if defined(_WIN32) || defined(__linux__)
+#include <ctype.h>
+#include <string.h>
+
+/* a release tag as it may be shown and passed on to the Builder: letters, digits and . _ + - (from the network, or a
+   file of the game folder) */
+static int safe_tag(const char *s) {
+    size_t n = strlen(s);
+    if (!n || n > 80) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && !strchr("._+-", s[i])) return 0;
+    return 1;
+}
+#endif
+
 #ifdef _WIN32
 #include "hos_paths.h"
 #include <windows.h>
@@ -65,7 +80,7 @@ static int latest_tag(char *tag, size_t cap) {
                     if (e && e > k && (size_t)(e - k) < cap) {
                         memcpy(tag, k, (size_t)(e - k));
                         tag[e - k] = 0;
-                        ok = 1;
+                        ok = safe_tag(tag);   /* (hookshot: it goes on the Builder's command line) */
                     }
                 }
                 free(body);
@@ -91,7 +106,7 @@ void hos_update_check(void) {
     dir[n - 1] = 0;
     char have[128], builder[MAX_PATH * 3], skipped[128] = "", tag[128];
     _snwprintf(file, MAX_PATH + 64, L"%ls\\hookshot_version.txt", dir);
-    if (!read_value(file, "version", have, sizeof have)) return;
+    if (!read_value(file, "version", have, sizeof have) || !safe_tag(have)) return;
     _snwprintf(file, MAX_PATH + 64, L"%ls\\user\\hookshot_update_skip.txt", dir);
     read_value(file, "skip", skipped, sizeof skipped);
     if (!latest_tag(tag, sizeof tag)) {
@@ -181,13 +196,6 @@ static int read_value(const char *path, const char *name, char *out, size_t cap)
     return found;
 }
 
-static int safe_tag(const char *s) {
-    size_t n = strlen(s);
-    if (!n || n > 80) return 0;
-    for (size_t i = 0; i < n; i++)
-        if (!isalnum((unsigned char)s[i]) && !strchr("._+-", s[i])) return 0;
-    return 1;
-}
 
 static int pipe_tag(const char *cmd, char *tag, size_t cap) {
     FILE *p = popen(cmd, "r");

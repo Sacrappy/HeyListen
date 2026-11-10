@@ -7,22 +7,82 @@
 // Against one-frame flashes: the picture before (`hist`, this pass's own last output) bounds each pixel, which may
 // rise to 1.5x and fall to 0.6x of it in a frame (a light change or a camera cut settles over a few frames). Some
 // frames' scene colour blows up to white across the picture (or a light term drops out for a frame); those frames
-// came out as full-screen flashes. A NaN or infinite pixel takes the one before. pc.valid = 0 (the first frame, a
+// came out as full-screen flashes. A NaN or infinite pixel takes the one before. pc.valid bit 0 = 0 (the first frame, a
 // new size): no bound.
+//
+// Edges (pc.valid bit 1, the gameplay stand-in): FXAA (3.11, quality) on the input, in its perceptual encoding. The
+// network smoothed them; a plain linear upscale left every edge stair-stepped, and hair, foliage and thin edges shimmer
+// as they move. The network reads the scene colour alone (no motion, no depth), so a filter of one frame stands in for
+// it: temporal accumulation without motion vectors smears everything that moves (see the clamp above).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
 layout(binding = 2, r11f_g11f_b10f) uniform image2D hist;
 layout(push_constant) uniform P { ivec2 size; int valid; } pc;
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+// (FXAA 3.11's quality variant: the edge's orientation from the 3x3 neighbourhood, a search along it for its
+// ends (12 steps at most), the pixel moved across the edge by its place on that span; and the sub-pixel blend, which
+// softens the features thinner than a pixel (hair, twigs) that no span describes. On the input, at its texel size)
+float L(vec2 uv) { return luma(textureLod(src, uv, 0.0).rgb); }
+vec3 fxaa(vec2 uv, vec3 rgbM, out int moved) {
+    moved = 0;
+    const vec2 px = 1.0 / vec2(textureSize(src, 0));
+    const float m = luma(rgbM);
+    float n = L(uv + vec2(0.0, -px.y)), s = L(uv + vec2(0.0, px.y));
+    const float e = L(uv + vec2(px.x, 0.0)), w = L(uv + vec2(-px.x, 0.0));
+    const float hi = max(max(max(n, s), max(e, w)), m), lo = min(min(min(n, s), min(e, w)), m);
+    const float range = hi - lo;
+    // (FXAA's high-quality thresholds: with 0.125 / 0.0312 it also took the moss, cloth and leaf textures for edges and
+    // softened them)
+    if (range < max(0.0833, hi * 0.166)) return rgbM;   // (no edge: flat areas and fine textures keep their plain sample)
+    const float nw = L(uv - px), se = L(uv + px), ne = L(uv + vec2(px.x, -px.y)), sw = L(uv + vec2(-px.x, px.y));
+    const float ns = n + s, we = w + e, nesw = ne + sw + nw + se;
+    const float edge_h = abs(-2.0 * w + nw + sw) + abs(-2.0 * m + ns) * 2.0 + abs(-2.0 * e + ne + se);
+    const float edge_v = abs(-2.0 * s + sw + se) + abs(-2.0 * m + we) * 2.0 + abs(-2.0 * n + nw + ne);
+    const bool horz = edge_h >= edge_v;
+    if (!horz) n = w, s = e;
+    float step = horz ? px.y : px.x;
+    const float grad_n = n - m, grad_s = s - m;
+    const bool pair_n = abs(grad_n) >= abs(grad_s);
+    const float grad = max(abs(grad_n), abs(grad_s)) * 0.25;
+    if (pair_n) step = -step;
+    const float edge_luma = (pair_n ? n + m : s + m) * 0.5;
+    vec2 pos = uv;
+    if (horz) pos.y += step * 0.5; else pos.x += step * 0.5;
+    const vec2 along = horz ? vec2(px.x, 0.0) : vec2(0.0, px.y);
+    vec2 pn = pos - along, pp = pos + along;
+    float end_n = L(pn) - edge_luma, end_p = L(pp) - edge_luma;
+    bool done_n = abs(end_n) >= grad, done_p = abs(end_p) >= grad;
+    const float q[11] = float[](1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0);
+    for (int i = 0; i < 11 && !(done_n && done_p); i++) {
+        if (!done_n) { pn -= along * q[i]; end_n = L(pn) - edge_luma; done_n = abs(end_n) >= grad; }
+        if (!done_p) { pp += along * q[i]; end_p = L(pp) - edge_luma; done_p = abs(end_p) >= grad; }
+    }
+    const float dn = horz ? uv.x - pn.x : uv.y - pn.y, dp = horz ? pp.x - uv.x : pp.y - uv.y;
+    const bool below = m - edge_luma < 0.0;
+    const bool good = dn < dp ? (end_n < 0.0) != below : (end_p < 0.0) != below;
+    const float span_off = good ? 0.5 - min(dn, dp) / (dn + dp) : 0.0;
+    const float sub = clamp(abs((ns * 2.0 + we * 2.0 + nesw) / 12.0 - m) / range, 0.0, 1.0);
+    const float sub_f = (-2.0 * sub + 3.0) * sub * sub;
+    const float sub_off = sub_f * sub_f * 0.5;   // (half the blend of FXAA's default 0.75: textures stay sharper)
+    const float off = max(span_off, sub_off);
+    if (horz) uv.y += off * step; else uv.x += off * step;
+    moved = span_off >= 0.1 && span_off >= sub_off ? 1 : sub_off >= 0.1 ? 2 : 0;   // (1: along an edge, 2: sub-pixel)
+    return textureLod(src, uv, 0.0).rgb;
+}
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
     const vec2 uv = (vec2(g) + 0.5) / vec2(pc.size);
     // (the input is the square root of the scene colour, the network's perceptual encoding, which its output undoes:
     // 6637ac1d's means 0.58 0.50 0.27 -> 0.77 0.69 0.49)
-    const vec3 s = textureLod(src, uv, 0.0).rgb;
+    vec3 s = textureLod(src, uv, 0.0).rgb;
+    int moved = 0;
+    if ((pc.valid & 2) != 0) s = fxaa(uv, s, moved);
+    // (RX_VK_TAAU_FXAA=2: the pixels it moved by a tenth of a texel or more: red along an edge, blue the sub-pixel blend)
+    if ((pc.valid & 4) != 0 && moved != 0) s = moved == 1 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.3, 1.0);
     vec3 c = s * s;
-    if (pc.valid != 0) {
+    if ((pc.valid & 1) != 0) {
         const vec3 p = imageLoad(hist, g).rgb;
         c = mix(c, p, bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b)));
         c = clamp(c, p * 0.6, p * 1.5 + 0.01);

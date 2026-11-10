@@ -16,6 +16,8 @@
 #include <mutex>
 #include <thread>
 
+#include <cmath>
+
 #include "vk_framegen.h"
 #include "vk_menu.h"
 #include "vk_texture.h"
@@ -33,6 +35,7 @@
 #endif
 
 namespace mkwvk {
+int display_refresh_mhz();   // (vk_main.cpp: the window's display, mHz; outside the unnamed namespace, where it is defined)
 extern std::atomic<uint32_t> present_kind;   // (vk_replay.cpp: the frame log's)
 namespace {
 
@@ -47,6 +50,11 @@ struct OutSet {
     Img frame[kMaxMult];
     int made = 0;   // (frame[0..made) are made frames; frame[made] is the game's)
     bool busy = false;
+    // (Auto: frame[0..shown) each at its own time, due[k] (steady clock), game[k] the game's own frame; shown < 0: the
+    // fixed multipliers' frames, made + 1 of them, shown evenly)
+    int shown = -1;
+    int64_t due[kMaxMult] = {};
+    bool game[kMaxMult] = {};
 };
 struct Job {
     OutSet* set;
@@ -76,6 +84,8 @@ struct State {
     OutSet* recorded = nullptr;   // (the set the last framegen_record filled, for framegen_queue)
     int64_t recorded_at = 0;
     int mult = 0;   // (the multiplier the sets' frames were made for)
+    int64_t game_ns = 0;     // (Auto: the game's frame time, smoothed: the delay its frames are shown at)
+    int64_t slot_next = 0;   // (Auto: the display's next refresh to be given a frame, on the game's timeline)
 } fg;
 
 // Used only by present_image, whose lock serializes direct and interpolated presents.
@@ -91,7 +101,43 @@ int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-int multiplier() { return std::clamp(opts.framegen, 1, kMaxMult); }   // (the Insert menu; 1: the game's frames alone)
+// (hookshot) Frame generation's Auto (the menu's 1): a frame for each refresh of the display, no more. Each game frame
+// is given the display's refreshes that fall between it and the game's frame before (on the game's own timeline, a
+// refresh period apart), and each of them a frame made at its place between the two: 45 fps on a 60 Hz display makes one
+// frame for every three of the game's (3 of 4 shown are made, at 3/4, 1/2, 1/4), on 120 Hz two or three a frame; at
+// 60 fps on 60 Hz none (a refresh near a game frame shows it), and faster than the display a game frame may be given no refresh and is not shown. Shown one
+// game frame time later, each at its refresh's time. The sets' frames are made once for the most a game frame may be
+// given (the refresh over 30 fps, 2 to 4). An unknown refresh counts as 60 Hz.
+int auto_cap() {
+    const int hz = (display_refresh_mhz() + 500) / 1000;
+    return std::clamp(hz > 0 ? (hz + 29) / 30 : 2, 2, 4);
+}
+int multiplier() {   // (the Insert menu; 1 Auto (its most); the game's frames alone at 0)
+    return opts.framegen == 1 ? auto_cap() : std::clamp(opts.framegen, 1, kMaxMult);
+}
+/// Auto: the display's refreshes in the game frame's interval (last, now], next the first not given a frame yet (moved
+/// past them). Each one's place between the two game frames in t (1: this one) and its time in at; most of them at the
+/// most, those past it skipped. A timeline outside the interval (the first frame, a hitch) starts again at now.
+int auto_slots(int64_t last, int64_t now, int64_t period, int64_t& next, float* t, int64_t* at, int most) {
+    if (now <= last || period <= 0) return 0;
+    if (next <= last || next > now + period) next = now;
+    int n = 0;
+    for (; next <= now; next += period)
+        if (n < most) t[n] = (float)(next - last) / (float)(now - last), at[n++] = next;
+    // A refresh within a quarter period of the game's frame shows that frame itself: at the game's rate the frames come
+    // a little early or late (jitter), and without this nearly every refresh got a made frame at t near 1 and some game
+    // frames none (their neighbour two). The timeline is pulled an eighth of the way to the frame, so that a game at the
+    // display's rate (or a whole fraction of it) stays on it while the two clocks drift apart, and other rates hardly
+    // change how many frames the display is given
+    const int64_t snap = period / 4;   // (not "near": windows.h defines it empty)
+    if (next - now < snap) {
+        n = std::min(n + 1, most);
+        t[n - 1] = 1.0f, at[n - 1] = now, next += period + (now - next) / 8;
+    } else if (n > 0 && now - (next - period) < snap) {
+        t[n - 1] = 1.0f, at[n - 1] = now, next += (now - (next - period)) / 8;
+    }
+    return n;
+}
 
 /// A compute pipeline over bindings of these types (push descriptors), push constants of push bytes
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<VkDescriptorType> types, uint32_t push,
@@ -149,7 +195,11 @@ bool init() {
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     vkCreateSampler(dev.device, &si, nullptr, &fg.linear);
     fg.failed = false;
-    logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)", multiplier());
+    if (opts.framegen == 1)
+        logf("vk: frame interpolation ready: Auto, a frame for each of the display's refreshes (%d Hz; up to %d a game frame)",
+             (display_refresh_mhz() + 500) / 1000, multiplier());
+    else
+        logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)", multiplier());
     return true;
 }
 
@@ -324,19 +374,22 @@ void display_main() {
         // apart, a frame early waiting for it: never more than one game frame behind what the game handed over, and a line
         // that has fallen behind what came starts again from now. RX_VK_PACE=0: as they come.
         const bool pace = opts.pace != 0;
-        const int shown = j.set->made + 1;
-        const int64_t step = interval / shown;
-        for (int k = 0; k <= j.set->made; k++) {
-            int64_t due = pace ? next_show : 0;
+        const bool timed = j.set->shown >= 0;   // (Auto: each frame at its own refresh's time)
+        const int shown = timed ? j.set->shown : j.set->made + 1;
+        const int64_t step = interval / std::max(shown, 1);
+        if (timed) menu_note_frame(true, 0);   // (the overlay's game rate: Auto counts each game frame, given a refresh or not)
+        for (int k = 0; k < shown; k++) {
+            int64_t due = timed ? j.set->due[k] : pace ? next_show : 0;
             const int64_t now = now_ns();
             if (due < now) due = now;
-            if (due > j.at + interval + step) due = j.at + interval + step;
+            if (!timed && due > j.at + interval + step) due = j.at + interval + step;
+            if (timed && due > now + 100000000) due = now;   // (a game frame time gone wrong: not held back)
             if (due - now > 1000000) wait_until_near(due - now - 1000000);
             while (now_ns() < due) SwitchToThread();
             const int64_t t = now_ns();
-            present_kind.store(k < j.set->made ? 1 : 0);
+            present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);
             present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
-            menu_note_frame(k == j.set->made);
+            menu_note_frame(!timed && k == j.set->made);
             if (shown_at) {
                 const int64_t d = t - shown_at;
                 hist[d < 7000000 ? 0 : d < 9000000 ? 1 : d < 12000000 ? 2 : d < 17000000 ? 3 : d < 25000000 ? 4 : 5]++;
@@ -355,9 +408,9 @@ void display_main() {
 
 // The Insert menu's Frame generation is off at 0. While it was ignored, every present still copied the frame and
 // reduced it to luma (framegen_record), then a second thread showed it. Open areas paid for that on a full GPU and
-// gained no made frames. 2x and up is the interpolation; RX_VK_FRAMEGEN=0 keeps it off entirely.
+// gained no made frames. Auto (1) and 2x and up are the interpolation; RX_VK_FRAMEGEN=0 keeps it off entirely.
 bool framegen_wanted(int menu_value, int allow) {
-    return allow && menu_value >= 2;
+    return allow && menu_value >= 1;   // (1: Auto)
 }
 
 bool framegen_on() {
@@ -441,8 +494,10 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         fg.thread_started = true;
         std::thread(display_main).detach();
     }
-    const int64_t now = now_ns();
+    const int64_t now = now_ns(), before = fg.last_at;
     const bool gap = fg.last_at && now - fg.last_at > 100000000;   // (a loading hitch: nothing to blend)
+    if (fg.last_at && !gap)
+        fg.game_ns = fg.game_ns ? (fg.game_ns * 7 + (now - fg.last_at)) / 8 : now - fg.last_at;
     fg.last_at = now;
     OutSet* set;
     {
@@ -461,6 +516,48 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     set->made = 0;
+    set->shown = -1;
+    if (opts.framegen == 1) {   // (Auto: a frame for each of the display's refreshes, at its own time)
+        const int mhz = display_refresh_mhz();
+        const int64_t period = (int64_t)(1e12 / (mhz > 0 ? mhz : 60000));
+        float t[kMaxMult];
+        int64_t at[kMaxMult];
+        int n;
+        if (blend) {
+            n = auto_slots(before, now, period, fg.slot_next, t, at, std::min(fg.mult, kMaxMult));
+        } else {   // (nothing to blend from: the game's frame, and the timeline starts at it)
+            n = 1, t[0] = 1.0f, at[0] = now, fg.slot_next = now + period;
+        }
+        bool flow = false;
+        for (int k = 0; k < n; k++) {
+            set->game[k] = t[k] > 0.999f;
+            set->due[k] = at[k] + fg.game_ns;
+            if (set->game[k]) {
+                const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                    {0, 0, 0}, {uw, uh, 1}};
+                vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[k].image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+                continue;
+            }
+            if (!flow) {
+                flow = true;
+                pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
+                                    {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
+                pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+            }
+            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                 {fg.flows[1].view, fg.nearest}, {set->frame[k].view, VK_NULL_HANDLE}},
+                 uw, uh, &t[k], 4);
+        }
+        set->shown = n;
+        set->made = n > 0 && !set->game[n - 1] ? n : std::max(0, n - 1);   // (for framegen_made_image: any made)
+        full_barrier(cmd);
+        fg.have_prev = true;
+        fg.cur = prev;
+        fg.recorded = set;
+        fg.recorded_at = now;
+        return true;
+    }
     if (blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);

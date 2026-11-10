@@ -28,14 +28,22 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cc", default="gcc")
     a = p.parse_args()
-    fn = block((ROOT / "host" / "hos_main.c").read_text(encoding="utf-8"), "static void load_hookshot_env(void) {")
+    main_c = (ROOT / "host" / "hos_main.c").read_text(encoding="utf-8")
+    fn = block(main_c, "static int env_line_allowed(") + "\n" + block(main_c, "static void load_hookshot_env(void) {")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         game = tmp / "game"
         game.mkdir()
-        (game / "hookshot_env.txt").write_text("FROM_BESIDE=1\nSHARED=beside\n", encoding="utf-8")
-        (tmp / "test_env.txt").write_text("# a test run's own switches\nFROM_OTHER=1\nSHARED=other\n", encoding="utf-8")
+        # (the player's file sets the game's switches only: not the system's variables, HOS_ENV_FILE or paths)
+        (game / "hookshot_env.txt").write_text(
+            "HOS_T_BESIDE=1\nHOS_T_SHARED=beside\nVK_ADD_LAYER_PATH=/x\nLD_PRELOAD=/x.so\nPATH=C:\\x\nSDL_DYNAMIC_API=/x.so\n"
+            "HOS_ENV_FILE=other.txt\nHOS_SAMPLE_FILE=/home/x/.bashrc\nRX_VK_DUMP_DIR=C:\\Users\\x\nRX_VK_SKIP_CODE=2c56,ab\n"
+            "RX_VK_DLSS_DIR=/opt/ngx\nHOS_T_HOME=~\nSDL_VULKAN_LIBRARY=x.dll\nSDL_VIDEO_EGL_DRIVER=x.so\n"
+            "SDL_AUDIODRIVER=pulseaudio\nHOS_T_UP=..\nHOS_SAMPLE_FILE=hookshot_vk.dll\nRX_VK_FRAME_LOG=x.txt\n"
+            "RX_VK_DUMP_DIR=dumps\nHOS_PRESENT_TRACE=t.txt\nRX_VK_DLSS_DIR=\\\\server\\share\n", encoding="utf-8")
+        (tmp / "test_env.txt").write_text("# a test run's own switches\nHOS_T_OTHER=1\nHOS_T_SHARED=other\n"
+                                          "VK_T_LAYER=/y\n", encoding="utf-8")
         exe = str(game / "hookshot").replace("\\", "\\\\")
         fixture = r'''#include <stdio.h>
 #include <stdlib.h>
@@ -61,28 +69,36 @@ static int is(const char *name, const char *want) {
     const char *v = getenv(name);
     return want ? v && !strcmp(v, want) : !v;
 }
-static void clear(void) { unsetenv("FROM_BESIDE"); unsetenv("FROM_OTHER"); unsetenv("SHARED"); }
+static void clear(void) { unsetenv("HOS_T_BESIDE"); unsetenv("HOS_T_OTHER"); unsetenv("HOS_T_SHARED"); unsetenv("VK_T_LAYER"); }
 int main(int argc, char **argv) {
     (void)argc;
     unsetenv("HOS_ENV_FILE");                      /* out of the box: the file beside the game */
     load_hookshot_env();
-    CHECK(is("FROM_BESIDE", "1") && is("SHARED", "beside") && is("FROM_OTHER", NULL));
+    CHECK(is("HOS_T_BESIDE", "1") && is("HOS_T_SHARED", "beside") && is("HOS_T_OTHER", NULL));
+    CHECK(is("VK_ADD_LAYER_PATH", NULL) && is("SDL_DYNAMIC_API", NULL) && is("HOS_ENV_FILE", NULL));
+    CHECK(is("HOS_SAMPLE_FILE", NULL) && is("RX_VK_DUMP_DIR", NULL) && is("HOS_T_HOME", NULL));
+    CHECK(is("RX_VK_SKIP_CODE", "2c56,ab") && is("RX_VK_DLSS_DIR", "/opt/ngx"));
+    CHECK(is("SDL_VULKAN_LIBRARY", NULL) && is("SDL_VIDEO_EGL_DRIVER", NULL) && is("HOS_T_UP", NULL));
+    CHECK(is("SDL_AUDIODRIVER", "pulseaudio") && is("HOS_SAMPLE_FILE", NULL) && is("RX_VK_FRAME_LOG", NULL));
+    CHECK(is("RX_VK_DUMP_DIR", NULL) && is("HOS_PRESENT_TRACE", NULL));
+    CHECK(getenv("LD_PRELOAD") == NULL || strcmp(getenv("LD_PRELOAD"), "/x.so"));
+    CHECK(getenv("PATH") == NULL || strcmp(getenv("PATH"), "C:\\x"));
 
     clear();
     setenv("HOS_ENV_FILE", "", 1);                 /* empty: as if unset */
     load_hookshot_env();
-    CHECK(is("FROM_BESIDE", "1") && is("FROM_OTHER", NULL));
+    CHECK(is("HOS_T_BESIDE", "1") && is("HOS_T_OTHER", NULL));
 
     clear();
     setenv("HOS_ENV_FILE", argv[1], 1);            /* a test run's own file, and only that one */
     load_hookshot_env();
-    CHECK(is("FROM_OTHER", "1") && is("SHARED", "other") && is("FROM_BESIDE", NULL));
+    CHECK(is("HOS_T_OTHER", "1") && is("HOS_T_SHARED", "other") && is("HOS_T_BESIDE", NULL) && is("VK_T_LAYER", "/y"));
 
     clear();
     setenv("HOS_ENV_FILE", argv[2], 1);            /* a file that is not there: nothing, not the player's switches */
     load_hookshot_env();
-    CHECK(is("FROM_BESIDE", NULL) && is("FROM_OTHER", NULL) && is("SHARED", NULL));
-    printf("PASS: HOS_ENV_FILE replaces hookshot_env.txt; unset or empty reads it as before\n");
+    CHECK(is("HOS_T_BESIDE", NULL) && is("HOS_T_OTHER", NULL) && is("HOS_T_SHARED", NULL));
+    printf("PASS: HOS_ENV_FILE replaces hookshot_env.txt; unset or empty reads it as before; the player's file sets only the game's switches\n");
     return 0;
 }
 '''

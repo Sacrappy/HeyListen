@@ -246,7 +246,7 @@ HLE(_ZN2nn3nsd24GetEnvironmentIdentifierEPNS0_21EnvironmentIdentifierE) {
 
 static void calendar(uint64_t out, uint64_t info, int64_t posix, int local) {
     time_t t = (time_t)posix;
-    struct tm tmv;
+    struct tm tmv = {0};   /* (hookshot: a time the C library cannot convert left it as the stack had it) */
     if (local) localtime_s(&tmv, &t); else gmtime_s(&tmv, &t);
     /* CalendarTime { s16 year; s8 month, day, hour, minute, second; pad } */
     uint8_t ct[8] = {0};

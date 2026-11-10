@@ -889,6 +889,7 @@ static void queue_init(uint64_t key, int capacity) {
     Obj *q = fresh(key, K_QUEUE);
     q->qcap = capacity > 0 ? capacity : 1;
     q->q = (uint64_t *)calloc(q->qcap, 8);
+    if (!q->q) hos_fatal(NULL, "os: message queue of %d entries", q->qcap);   /* (hookshot: was written through NULL) */
 }
 /* (mkw-recomp) HOS_QUEUE_TRACE=1: the first 400 puts (thread, queue, value) */
 static void queue_trace(Obj *q, uint64_t v, const char *what) {

@@ -21,6 +21,7 @@ A file that is itself zstd in the game (the romfs .zs files) is not one of those
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import stat
 import struct
@@ -452,6 +453,59 @@ def heal(nup, t, out, names):
         else:
             if have:
                 print("  %s is not a game module in any title: it starts %s" % (m, have.hex()))
+
+
+def damaged_game_files(romfs):
+    """The romfs .zs files that do not start as zstd: in the 23.3 GB dumps three of them begin with zeros (the complete
+    dump is about 23.8 GB), and the game then leaves out every model that uses one: the Water Temple's walls and floors,
+    the Great Fairy Fountain's floor (#1002, #718, #1259)"""
+    found = []
+    for folder, dirs, files in os.walk(romfs):
+        dirs.sort()
+        for name in sorted(files):
+            if name.endswith(".zs"):
+                path = os.path.join(folder, name)
+                with open(path, "rb") as f:
+                    if f.read(4) != ZSTD:
+                        found.append(path)
+    return found
+
+
+def stand_in_for(path, damaged=()):
+    """A whole file of the same kind beside a damaged one, to load in its place: the same last part of the name
+    (_Nrm.bntx.zs: a normal map for a normal map), the longest common start of the name, then the nearest size. Never
+    one of the damaged files, even one already given a stand-in"""
+    folder, name = os.path.split(path)
+    suffix = re.search(r"(_[A-Za-z]+\d*)?(\.[^_]*)$", name).group(0)
+    size = os.path.getsize(path)
+    best = None
+    for other in os.listdir(folder):
+        if other == name or not other.endswith(suffix):
+            continue
+        candidate = os.path.join(folder, other)
+        if candidate in damaged:
+            continue
+        with open(candidate, "rb") as f:
+            if f.read(4) != ZSTD:
+                continue
+        score = (len(os.path.commonprefix((name, other))), -abs(os.path.getsize(candidate) - size))
+        if best is None or score > best[0]:
+            best = (score, candidate)
+    return best and best[1]
+
+
+def stand_in_damaged(romfs):
+    """Each damaged .zs file in an unpacked romfs replaced by a copy of its stand-in: (damaged, stand-in or None) each.
+    Only for a romfs this tool unpacked: the player's own folder is never written to"""
+    done = []
+    damaged = damaged_game_files(romfs)
+    for path in damaged:
+        other = stand_in_for(path, set(damaged))
+        if other:
+            shutil.copyfile(other, path + ".part")
+            os.replace(path + ".part", path)
+        done.append((path, other))
+    return done
 
 
 def main():

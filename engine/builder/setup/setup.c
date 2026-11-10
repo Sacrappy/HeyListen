@@ -40,6 +40,22 @@ typedef struct {
     unsigned long long size;
     char dest[260], from[260], to[260], url[1024];
 } Part;
+/* a name from the setup list (a tag, or with path set a relative path with / or \ between its parts): letters, digits
+   and . _ + - only, no ".." part, no drive, no root */
+static int list_name_ok(const char *s, int path) {
+    if (!*s || *s == '/' || *s == '\\') return 0;
+    for (const char *q = s; *q; q++)
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || strchr("._+-", *q) ||
+              (path && (*q == '/' || *q == '\\'))))
+            return 0;
+    for (const char *q = s; *q;) {   /* (each part: not "." or "..") */
+        const size_t n = path ? strcspn(q, "/\\") : strlen(q);
+        if ((n == 1 && q[0] == '.') || (n == 2 && q[0] == '.' && q[1] == '.') || !n) return 0;
+        q += n;
+        if (*q) q++;
+    }
+    return 1;
+}
 
 static void status(const wchar_t *fmt, ...) {
     va_list ap;
@@ -508,6 +524,16 @@ static DWORD WINAPI work(LPVOID unused) {
         }
     }
     if (!tag[0] || !run[0] || !nparts) fail(L"The release's setup list could not be read. Try again later.");
+    {   /* (the list's names become paths under the install folder, a folder this removes and remakes: they stay inside it) */
+        int bad = !list_name_ok(tag, 0) || !list_name_ok(run, 1);
+        for (int i = 0; i < nparts && !bad; i++) {
+            const Part *p = &parts[i];
+            bad = strlen(p->sha) != 64 || strspn(p->sha, "0123456789abcdef") != 64 || _strnicmp(p->url, "https://", 8) ||
+                  (strcmp(p->dest, ".") && !list_name_ok(p->dest, 1)) || (strcmp(p->from, "-") && !list_name_ok(p->from, 0)) ||
+                  (strcmp(p->to, "-") && !list_name_ok(p->to, 0));
+        }
+        if (bad) fail(L"The release's setup list has a name this setup does not accept. Try again later.");
+    }
     {
         char want[128];
         wanted_tag(want, sizeof want);
@@ -678,6 +704,8 @@ static int launch_installed(const wchar_t *args) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev;
+    /* (libraries loaded from here on come from System32 only, never from the folder the setup was downloaded to) */
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     wcsncpy(g_cmdline, cmdline ? cmdline : L"", 2047);
     {
         wchar_t self[MAX_PATH];

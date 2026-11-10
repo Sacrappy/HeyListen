@@ -49,8 +49,9 @@ def data_root():
     return os.path.join(base, "hookshot", "builder")
 
 
-def parse_list(text):
-    """The setup list. A part owns the following tree line, or the file lines, until the next part."""
+def parse_list(text, local=True):
+    """The setup list. A part owns the following tree line, or the file lines, until the next part. local: a list from
+    this PC (the tools' own, HOOKSHOT_LINUX_LIST), whose parts may be file:// links; a downloaded one's are https"""
     tag, parts, cur = "", [], None
     for raw in text.splitlines():
         line = raw.strip()
@@ -76,6 +77,17 @@ def parse_list(text):
             raise ValueError("unknown list line")
     if not tag or not parts:
         raise ValueError("the setup list has no release")
+    # (the tag names a folder under versions/ that an update removes and remakes, and a part's names are paths in it:
+    # they stay inside it)
+    if not re.fullmatch(r"[0-9A-Za-z._+-]{1,128}", tag) or tag in (".", ".."):
+        raise ValueError("the setup list's tag is not a version name")
+    for part in parts:
+        if not re.fullmatch(r"[0-9a-f]{64}", part.sha) or not part.url.startswith(("https://", "file://") if local else "https://"):
+            raise ValueError("a part line has a bad checksum or link")
+        if part.dest != ".":
+            _safe_name(part.dest)
+        for name in part.files or ():
+            _safe_name(name)
     return Manifest(tag, parts)
 
 
@@ -185,10 +197,20 @@ def game_exe(folder):
     return None
 
 
-def _request(url, timeout):
+MAX_DOWNLOAD = 4 << 30   # (no part or list is this big: a download that is stops there)
+
+
+def _read_at_most(response, limit):
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError("the download is larger than expected")
+    return data
+
+
+def _request(url, timeout, limit=MAX_DOWNLOAD):
     req = urllib.request.Request(url, headers={"User-Agent": "HeyListen", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        return response.read()
+        return _read_at_most(response, limit)
 
 
 def _api_download(url):
@@ -208,7 +230,7 @@ def _api_download(url):
             req = urllib.request.Request(asset["url"], headers={
                 "User-Agent": "HeyListen", "Accept": "application/octet-stream"})
             with urllib.request.urlopen(req, timeout=120) as response:
-                return response.read()
+                return _read_at_most(response, MAX_DOWNLOAD)
     return None
 
 
@@ -251,7 +273,7 @@ def latest_tag(get=None):
         pass
     try:
         text = get(LATEST_LIST).decode("utf-8")
-        return parse_list(text).tag
+        return parse_list(text, local=False).tag
     except Exception:
         return None
 
@@ -291,9 +313,14 @@ def _clone_tree(src, dst):
 
 
 def _safe_name(name):
-    if name.startswith("/") or ".." in name.split("/"):
+    if not name or name.startswith("/") or ".." in name.split("/"):
         raise ValueError("the zip has a path outside its folder")
     return name
+
+
+def _check_part_directory(path):
+    if os.path.realpath(path) != os.path.abspath(path):
+        raise ValueError("the update would write through a symbolic link: %s" % path)
 
 
 def _unpack(data, dest, files):
@@ -306,19 +333,25 @@ def _unpack(data, dest, files):
             if files is not None and name not in files:
                 raise ValueError("the zip has %s, which this part does not list" % name)
             target = os.path.join(dest, name)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
+            parent = os.path.dirname(target)
+            _check_part_directory(parent)
+            os.makedirs(parent, exist_ok=True)
             mode = info.external_attr >> 16
             if stat.S_ISLNK(mode):
                 os.symlink(zipped.read(info).decode("utf-8"), target)
             else:
-                with open(target, "wb") as out:
+                # A part can ship symlinks, but cannot overwrite one (or any earlier entry).
+                with open(target, "xb") as out:
                     out.write(zipped.read(info))
                 if mode & 0o777:
                     os.chmod(target, mode & 0o777)
 
 
 def _place(part, source_root, source, dest_root, get, note):
-    dest = os.path.join(dest_root, part.dest)
+    # Resolve installation parent links without following the staging directory itself.
+    parent, staging = os.path.split(os.path.abspath(dest_root))
+    dest = os.path.join(os.path.realpath(parent), staging, _safe_name(part.dest))
+    _check_part_directory(dest)
     old = source.by_sha(part.sha) if source else None
     src = os.path.join(source_root, part.dest) if old and old.same(part) and source_root else ""
     ready = src and os.path.isdir(src) and (part.files is None or all(
@@ -363,6 +396,8 @@ def install(manifest, source_root, source, note=None, get=None):
     versions = os.path.join(root, "versions")
     dest = os.path.join(versions, manifest.tag)
     partial = dest + ".part"
+    if os.path.islink(partial):
+        raise ValueError("the update staging folder is a symbolic link: %s" % partial)
     if os.path.isdir(partial):
         shutil.rmtree(partial)
     os.makedirs(versions, exist_ok=True)
@@ -409,7 +444,7 @@ def fetch_manifest(get=None):
     if override:
         with open(override, encoding="utf-8") as handle:
             return parse_list(handle.read())
-    return parse_list(get(LATEST_LIST).decode("utf-8"))
+    return parse_list(get(LATEST_LIST).decode("utf-8"), local=False)
 
 
 def startup_manifest(root, get=None):

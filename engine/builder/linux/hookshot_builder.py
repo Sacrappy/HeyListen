@@ -93,6 +93,8 @@ APP_ID = "io.github.NotRexed.HeyListen"   # (the game's window names itself so: 
 
 def add_to_menu(folder):
     """an entry in the applications menu that starts the game"""
+    if any(ch in folder for ch in "\r\n\0"):   # (a line break would start another key of the entry)
+        raise ValueError("the game folder's name has a line break")
     icon = os.path.join(folder, "hookshot.png")
     src = os.path.join(ROOT, "assets", "hookshot.png")
     if os.path.exists(src):
@@ -612,7 +614,7 @@ class Builder(tk.Tk):
             self.bar.configure(value=1.0)
             try:
                 add_to_menu(folder)
-            except OSError:
+            except (OSError, ValueError):   # (no menu entry; the game is built)
                 pass
             ttk.Button(self.buttons, text="Play", command=lambda: self.play_and_close(folder)).pack(side="right", padx=self.px(4))
             ttk.Button(self.buttons, text="Open folder", command=lambda: subprocess.Popen(["xdg-open", folder])).pack(side="right", padx=self.px(4))

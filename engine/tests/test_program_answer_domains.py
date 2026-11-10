@@ -115,10 +115,12 @@ def main():
     # The baseline has no canonical helper: execute its real functions and fail behavioral checks.
     if 'uint8_t canonical_answer(' in source:
         markers.append('uint8_t canonical_answer(')
+    if 'bool answers_fit(' in source:   # (the answers from files checked against the stages and their slots)
+        markers.append('bool answers_fit(')
     markers += ['uint64_t answers_hash(', 'void record_answers(', 'bool still_valid(',
                 'void answer_handles(', 'uint32_t answer_stage_mask(']
     functions = '\n\n'.join(block(source, marker) for marker in markers)
-    if 'if (answers_in)' in functions:
+    if 'if (answers_in' in functions:
         start = source.rfind('\n', 0, source.index(' answers_in =')) + 1
         functions = source[start:source.index(';', start) + 1] + '\n\n' + functions
     fixture = FIXTURE.replace('#include MATCHER_FUNCTIONS', functions)

@@ -496,6 +496,15 @@ void hos_bind(int set, int button, int slot, int code) {
 static volatile LONG pad_raw_now;   /* the gamepads' inputs at the last read, 1 << HOS_PAD_* */
 uint32_t hos_pad_raw(void) { return (uint32_t)pad_raw_now; }
 
+/* A stick axis cut at the dead zone, as XInput's and SDL's pads both are (pad_sdl.c): zone is the Insert menu's "Stick
+   dead zone" (option 11), 0 XInput's own 7849 (~24%, the only one before issue 752), 1 to 5 5%, 10%, 15%,
+   20%, 30%. Per axis, as before: the game's own dead zone still follows */
+int32_t hos_stick_axis(int16_t v, int zone) {
+    static const int32_t cut[6] = {7849, 1638, 3277, 4915, 6553, 9830};
+    const int32_t a = v < -32767 ? -32767 : v, t = cut[(unsigned)zone < 6 ? zone : 0];
+    return (a > t || a < -t) ? a : 0;
+}
+
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     static int64_t next_read, retry[XUSER_MAX_COUNT];
     static int was_connected[XUSER_MAX_COUNT];
@@ -524,8 +533,13 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
         static int64_t load_retry;
         if (now >= load_retry) {
             load_retry = now + 5000000000LL;
+#ifdef _WIN32   /* (hookshot: System32's, not one beside the game, in the current folder or on PATH) */
+            HMODULE x = LoadLibraryExA("xinput1_4.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!x) x = LoadLibraryExA("xinput9_1_0.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
             HMODULE x = LoadLibraryA("xinput1_4.dll");
             if (!x) x = LoadLibraryA("xinput9_1_0.dll");
+#endif
             if (x) xinput_get = (XInputGetStateFn)GetProcAddress(x, "XInputGetState");
         }
     }
@@ -555,11 +569,9 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
         if (xs.Gamepad.bRightTrigger > 64) raw |= 1ULL << HOS_PAD_RTRIGGER;
         const int16_t thumb[4] = {xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY, xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY};
         int32_t v[4];
-        for (int i = 0; i < 4; i++) {
-            const int a = thumb[i] < -32767 ? -32767 : thumb[i];
-            v[i] = (a > 7849 || a < -7849) ? a : 0;
-        }
         int rx_option(int id, int otherwise);
+        const int zone = rx_option(11, 0);   /* (the menu's Stick dead zone) */
+        for (int i = 0; i < 4; i++) v[i] = hos_stick_axis(thumb[i], zone);
         if (rx_option(16, 0)) v[2] = -v[2];
         if (rx_option(17, 0)) v[3] = -v[3];
         stick_max(s, v);
@@ -702,7 +714,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         if (bound_down(i, 0)) *buttons |= 1ULL << i;
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
-       stick; also the stick while no camera has been found (mouse_native.c gives the motion back) */
+       stick; also the stick while the player camera does not run (the pause menu, other cameras: mouse_native.c) */
     static const char *native_env;
     static int native_looked;
     if (!native_looked) native_looked = 1, native_env = getenv("HOS_MOUSE_NATIVE");

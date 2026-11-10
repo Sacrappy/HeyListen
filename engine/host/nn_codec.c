@@ -106,12 +106,16 @@ HLE(_ZN2nn5codec17GetOpusPacketSizeEPKhm) {
 HLE(_ZN2nn5codec33DecodeOpusInterleavedWithHardwareEPNS0_23HardwareOpusDecoderTypeEPmPiPsmPKvm) {
     Dec *d = dec_of(ARG(0));
     const uint64_t out_size = ARG(4), in_size = ARG(6);
-    const uint8_t *in = (const uint8_t *)GP(ARG(5));
-    if (!d || in_size < 8) { RET(0x1F0); return; }
+    /* (hookshot) both buffers in guest memory, and the frame count an int (a 64-bit size was cut to any int) */
+    const uint8_t *in = (const uint8_t *)hos_guest_range(ARG(5), in_size);
+    if (!d || in_size < 8 || !in) { RET(0x1F0); return; }
     const uint32_t len = be32(in);
     if (len > in_size - 8) { RET(0x1F0); return; }
-    const int frames = (int)(out_size / (2 * (uint64_t)d->channels));
-    const int n = opus_decode(d->dec, in + 8, (opus_int32)len, (opus_int16 *)GP(ARG(3)), frames, 0);
+    const uint64_t room = out_size / (2 * (uint64_t)d->channels);
+    const int frames = room < 5760 ? (int)room : 5760;   /* (Opus' longest packet: 120 ms at 48 kHz) */
+    opus_int16 *out = (opus_int16 *)hos_guest_range(ARG(3), (uint64_t)frames * 2 * (uint64_t)d->channels);
+    if (!out) { RET(0x1F0); return; }
+    const int n = opus_decode(d->dec, in + 8, (opus_int32)len, out, frames, 0);
     static int logged;
     if (logged++ < 6)
         hos_log("codec: decode %u bytes (of %llu) -> %d samples (room for %d)", len, (unsigned long long)in_size, n, frames);

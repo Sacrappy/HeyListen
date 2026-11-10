@@ -43,13 +43,16 @@ PREBUILT_EXT = (".dll", ".lib", ".exe", ".sha1")
 
 def get(url, api=False, tries=5):
     headers = {"User-Agent": "heylisten-release"}
+    token = None
     if api:
         headers["Accept"] = "application/vnd.github+json"
-        if os.environ.get("GH_TOKEN"):
-            headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
+        token = os.environ.get("GH_TOKEN")
     for i in range(tries):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+            req = urllib.request.Request(url, headers=headers)
+            if token:   # (not sent again on a redirect, which may lead to another host: urllib copies plain headers)
+                req.add_unredirected_header("Authorization", "Bearer " + token)
+            with urllib.request.urlopen(req, timeout=120) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             if e.code < 500 or i == tries - 1:
@@ -127,6 +130,10 @@ def extract(zip_path, prefix, dest, keep=lambda rel: True):
             if ".." in rel.split("/") or not keep(rel):
                 continue
             out = os.path.join(dest, *rel.split("/"))
+            # (a name with a drive or a root, such as "C:/x" on Windows, would leave dest: such members are skipped)
+            root = os.path.realpath(dest)
+            if os.path.commonpath([os.path.realpath(out), root]) != root:
+                continue
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with z.open(m) as src, open(out, "wb") as f:
                 shutil.copyfileobj(src, f)

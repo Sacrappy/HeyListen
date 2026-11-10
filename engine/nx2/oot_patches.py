@@ -50,7 +50,9 @@ MOVE_MATRIX = "L_82c41778:;\n"
 WARP_HEAD = "void f_806d2530(Ctx *__restrict A64_NOESC c) {\n"
 WARP_ANCHOR = "{ uint64_t _t = c->x[8]; c->x[30] = 0x806d25c8ULL; A64_ICALL(c, _t); }\n"
 VIEW_HEAD = "void f_804e48c0(Ctx *__restrict A64_NOESC c) {\n"
-VIEW_ANCHOR = "L_804e5068:; A64_POLL(c);\n"
+# (the head of the view's loop: a bare label, since nx2/poll.py puts the interrupt poll before each backward goto; with the
+# poll after the label in C lifted before that)
+VIEW_ANCHORS = ("L_804e5068:;\n", "L_804e5068:; A64_POLL(c);\n")
 LIFE_CAS = ("{ uint64_t _a = c->x[13]; uint32_t _e = (uint32_t)c->x[11]; "
             "__atomic_compare_exchange_n((uint32_t *)A64_PTR(_a), &_e, (uint32_t)c->x[12], "
             "0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); A64_MARK(_a, 4); c->x[11] = (uint64_t)_e; }")
@@ -111,19 +113,43 @@ def patch_view(source):
         return None
     end = source.find("\n}", start)
     body = source[start:end]
-    if end < 0 or body.count(VIEW_ANCHOR) != 1:
+    if end < 0:
         return None
-    body = body.replace(VIEW_ANCHOR, VIEW_ANCHOR + "    hos_oot_free_view(c, c->x[20]);\n")
+    for anchor in VIEW_ANCHORS:
+        if body.count(anchor) == 1:
+            break
+    else:
+        return None
+    body = body.replace(anchor, anchor + "    hos_oot_free_view(c, c->x[20]);\n")
     return (source[:start] + body + source[end:]).replace(
         '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_free_view(Ctx *c, uint64_t view);\n', 1)
+
+# Native mouse look (host/mouse_native.c): the player camera's update, f_80644c80 (a virtual method, the camera in x0), hands
+# its camera to the host before anything else, on the game's thread, once a frame; with the menu's Mouse camera on the mouse's
+# motion turns the camera's yaw (+0x1a4) and pitch (+0x18c) there, before the camera reads its input.
+CAM_HEAD = "void f_80644c80(Ctx *__restrict A64_NOESC c) {\n"
+
+
+def patch_mouse_camera(source):
+    start = source.find(CAM_HEAD)
+    if start < 0:
+        return None
+    if "hos_mouse_camera(c->x[0]);" in source:   # (made before: a lift patched again)
+        return source
+    at = start + len(CAM_HEAD)
+    source = source[:at] + "    hos_mouse_camera(c->x[0]);   /* (nx2/oot_patches.py: native mouse look) */\n" + source[at:]
+    return source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_mouse_camera(uint64_t camera);\n', 1)
 
 TEXT_HEAD = "void f_80b1e140(Ctx *__restrict A64_NOESC c) {"
 # (the letters' block: past the early returns, the auto-advance timer and the hidden / no-text checks; reached once a call)
 TEXT_OLD = ("L_80b1e1b4:;\n"
             "    c->x[9]=recomp_load16(c,c->x[19] + 110);\n"
             "if ((uint32_t)c->x[9] == 0) { goto L_80b1e18c; }\n")
-TEXT_NEW = TEXT_OLD + ("    if (hos_text_scale != 1.0f) { float _t; uint32_t _u; memcpy(&_t,c->vreg[0],4); _t *= hos_text_scale; "
-                       "memcpy(&_u,&_t,4); a64_vset64(c->vreg[0],_u); }   /* (nx2/oot_patches.py: text speed) */\n")
+# (the same block in a build with interrupt polls: nx2/poll.py puts the poll before each backward goto, as a block)
+TEXT_OLD_POLLED = TEXT_OLD.replace("{ goto L_80b1e18c; }", "{ { A64_POLL(c); goto L_80b1e18c; } }")
+TEXT_ADD = ("    if (hos_text_scale != 1.0f) { float _t; uint32_t _u; memcpy(&_t,c->vreg[0],4); _t *= hos_text_scale; "
+            "memcpy(&_u,&_t,4); a64_vset64(c->vreg[0],_u); }   /* (nx2/oot_patches.py: text speed) */\n")
+TEXT_NEW = TEXT_OLD + TEXT_ADD
 
 
 def patch_dynres(s):
@@ -144,12 +170,17 @@ def patch_text_speed(s):
         return None
     end = s.find("\nvoid f_", head + len(TEXT_HEAD))
     body = s[head:end if end >= 0 else len(s)]
-    if TEXT_NEW in body:   # (applied already: a second run)
+    for old in (TEXT_OLD_POLLED, TEXT_OLD):   # (with the interrupt poll before the block's backward goto, or without: --no-polls)
+        if old + TEXT_ADD in body:   # (applied already: a second run)
+            return s
+        if body.count(old) == 1:
+            break
+    else:
         return s
-    if body.count(TEXT_OLD) != 1 or body.count("goto L_80b1e1b4;") != 1:
+    if body.count("goto L_80b1e1b4;") != 1:
         return s
-    at = head + body.index(TEXT_OLD)
-    s = s[:at] + TEXT_NEW + s[at + len(TEXT_OLD):]
+    at = head + body.index(old)
+    s = s[:at] + old + TEXT_ADD + s[at + len(old):]
     return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEXT_DECL, 1)
 
 
@@ -166,6 +197,7 @@ def apply(gen, *, protect_hearts=False, required=False):
         done["player flight"] = 0
         done["player flight rotation"] = 0
         done["free camera"] = 0
+        done["mouse camera"] = 0
     for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -199,6 +231,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = rotation
             done["player flight rotation"] += 1
             print("oot_patches: player flight rotation in", os.path.basename(path))
+        mouse = patch_mouse_camera(out) if protect_hearts else None
+        if mouse is not None:
+            out = mouse
+            done["mouse camera"] += 1
+            print("oot_patches: native mouse camera in", os.path.basename(path))
         view = patch_view(out) if protect_hearts else None
         if view is not None:
             out = view

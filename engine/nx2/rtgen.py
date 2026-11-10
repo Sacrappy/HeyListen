@@ -16,10 +16,21 @@ import os
 import kit
 
 POLL_DECL = r"""
-/* (nx2/poll.py) loop-header interrupt polls: A64_POLLING builds call a64_poll, the backend's, when c->poll is set */
+/* (nx2/poll.py) loop back-edge interrupt polls: A64_POLLING builds clear c->poll and call a64_poll_cur, the backend's,
+   when it is set. The call is handed nothing on purpose: the context parameter is noescape (A64_NOESC) and never
+   captured, so a call with no pointer argument cannot touch *c, and the compiler keeps guest registers in host registers
+   across the loop. (a64_poll(c), the old form, made every loop body reload and store them: a call that takes c may change
+   any of it.) The poll sits before the backward goto, after the body's stores: at the loop header, a call C cannot mark
+   as returning (LLVM's willreturn) left the stores after it not guaranteed to execute, and nothing was promoted.
+   a64_poll_cur finds the thread's context itself (host/mkw_glue.c, hos_ctx). A64_POLL_CTX keeps the old form for the
+   emulator-hosted DLL (nx2/rt/eden_shim.c), whose host's poll takes the context. */
 void a64_poll(Ctx *A64_NOESC c);
-#if defined(A64_POLLING)
+void a64_poll_cur(void);
+#if defined(A64_POLLING) && defined(A64_POLL_CTX)
 #define A64_POLL(c) do { if (__builtin_expect(__atomic_load_n(&(c)->poll, __ATOMIC_RELAXED) != 0, 0)) a64_poll(c); } while (0)
+#elif defined(A64_POLLING)
+#define A64_POLL(c) do { if (__builtin_expect(__atomic_load_n(&(c)->poll, __ATOMIC_RELAXED) != 0, 0)) { \
+    __atomic_store_n(&(c)->poll, 0, __ATOMIC_RELAXED); a64_poll_cur(); } } while (0)
 #else
 #define A64_POLL(c) ((void)0)
 #endif"""
@@ -56,7 +67,7 @@ MARK_NATIVE_64 = r"""extern uint8_t a64_dirty[A64_DIRTY_PAGES];
 SUBST = {
     "a64.h": [
         (THREAD, THREAD.replace("\n} GuestContext;", "\n    uint32_t poll;              "
-                                "/* (nx2/rtgen.py) interrupt request: A64_POLL calls a64_poll when set */\n} GuestContext;")),
+                                "/* (nx2/rtgen.py) interrupt request: A64_POLL clears it and calls a64_poll_cur when set */\n} GuestContext;")),
         (RET_MISMATCH, RET_MISMATCH + POLL_DECL),
         ("#define A64_PTR(a) (A64_MEM + (uint32_t)(a))", ADDR64),
         (MARK_NATIVE, MARK_NATIVE_64),
