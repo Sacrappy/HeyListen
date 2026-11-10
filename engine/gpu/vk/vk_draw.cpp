@@ -740,7 +740,8 @@ int skip_slot(int line) {
     return 47;
 }
 }  // namespace
-#define SKIP_HERE() do { static const int slot_ = skip_slot(__LINE__); skip_sites[slot_].n.fetch_add(1, std::memory_order_relaxed); st_skipped++; return; } while (0)
+thread_local bool occ_skipped_here = false;   // (TICK-033: a draw left out after its occlusion query began)
+#define SKIP_HERE() do { static const int slot_ = skip_slot(__LINE__); skip_sites[slot_].n.fetch_add(1, std::memory_order_relaxed); st_skipped++; occ_skipped_here = true; return; } while (0)
 void skip_report_impl(double frames) {
     char line[600];
     int n = snprintf(line, sizeof line, "vk: skips a frame by vk_draw.cpp line:");
@@ -4835,6 +4836,317 @@ void StatsQuery::copy_args(VkCommandBuffer cmd, const DrawArgs& d, uint32_t inde
 }
 } // namespace
 
+// ---- (HeyListen, TICK-033) real occlusion counts: RX_VK_OCC_REAL=<mode> ----
+// The samples-passed reports are written on the CPU in stream order with RX_VK_OCC_FIXED (4096, "everything visible"). Here
+// every draw the replay records also runs inside a Vulkan occlusion query, one slot a draw (or dispatch) of the stream (its
+// serial number in the stream, the same on the dry pass and on the parallel segments' threads), in a host-reset ring of 64K
+// slots. A report's count is the sum of the slots between the reset before it and it, read once its submission is done.
+//   0 (default): off, no queries.  1: measured and logged only (the fixed value is still written: the picture is unchanged).
+//   2: the fixed value, or 0 when the same report address read 0 the last time it was measured (one frame late).
+//   3: the last measured count itself (fixed until the address has one).
+//   4: same frame: a render condition on a report not read yet ends the recording there (a parallel replay's dry pass stops
+//      there, and its segments up to it are recorded), submits it and waits for the GPU; every report's count is then written
+//      over the fixed value in guest memory before the condition reads it. OoT: one wait a frame (its ~900 test draws come
+//      first, the first condition 550+ draws after the last of them).
+//   5: one frame late, by the report's place in the frame: OoT's report addresses differ from frame to frame (none repeats
+//      within 4 frames; modes 2 and 3 read some old frame's count of another object: the washed-out picture), but the k-th
+//      report of a frame tests the same object as the k-th of the frame before (99% of zero / non-zero agree, standing).
+//      Key: the program bound at the report, its window's draws, and its place among the frame's reports with those two.
+//      The count measured for that key at most 3 frames before is written; the fixed value until there is one.
+// RX_VK_OCC_LOG=<dir>: RX_VK_OCC_LOG_FRAMES frames (default 2) every RX_VK_OCC_LOG_EVERY presents (default 600) written to <dir>/occ_<present>.txt: every
+// report (window, draws, real count), every render condition, every draw in a window with its pipeline statistics.
+thread_local int64_t occ_draw_slot = -1;   // (the replay: the serial of the draw it hands to draw(); -1: none)
+int occ_mode() {
+    static const int m = getenv("RX_VK_OCC_REAL") ? atoi(getenv("RX_VK_OCC_REAL")) : 0;
+    return m;
+}
+namespace {
+constexpr uint32_t kOccRing = 1u << 16, kOccChunk = 1u << 12;
+enum : uint8_t { OCC_BEGUN = 1, OCC_MESH = 2, OCC_INDIRECT = 4, OCC_SKIPPED = 8, OCC_STATS = 16, OCC_INDEXED = 32 };
+struct OccMeta { uint64_t prog; uint8_t flags; };
+OccMeta occ_meta[kOccRing];
+VkQueryPool occ_pool = VK_NULL_HANDLE, occ_stats_pool = VK_NULL_HANDLE;
+bool occ_precise = false, occ_stats_mesh = false, occ_failed = false;
+std::once_flag occ_once;
+uint64_t occ_chunk_value[kOccRing / kOccChunk];   // (the last submission value whose draws used each chunk: the replay thread's)
+std::atomic<uint64_t> occ_log_lo{UINT64_MAX}, occ_log_hi{UINT64_MAX};   // (serials of the frames being logged)
+const char* occ_log_dir() {
+    static const char* d = getenv("RX_VK_OCC_LOG");
+    return d && *d ? d : nullptr;
+}
+void occ_init() {
+    VkPhysicalDeviceFeatures2 f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    occ_precise = f.features.occlusionQueryPrecise != VK_FALSE;
+    VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+    qi.queryCount = kOccRing;
+    if (vkCreateQueryPool(dev.device, &qi, nullptr, &occ_pool) != VK_SUCCESS) {
+        occ_failed = true;
+        logf("vk: occlusion: no query pool; the fixed value stays");
+        return;
+    }
+    vkResetQueryPool(dev.device, occ_pool, 0, kOccRing);
+    if (occ_log_dir() && f.features.pipelineStatisticsQuery) {
+        VkQueryPoolCreateInfo si{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        si.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        si.queryCount = kOccRing;
+        const VkQueryPipelineStatisticFlags base =
+            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        si.pipelineStatistics = base;
+        if (dev.mesh_shader) {
+            si.pipelineStatistics = base | VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT |
+                                    VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT;
+            occ_stats_mesh = vkCreateQueryPool(dev.device, &si, nullptr, &occ_stats_pool) == VK_SUCCESS;
+        }
+        if (!occ_stats_mesh) {
+            si.pipelineStatistics = base;
+            vkCreateQueryPool(dev.device, &si, nullptr, &occ_stats_pool);
+        }
+        if (occ_stats_pool) vkResetQueryPool(dev.device, occ_stats_pool, 0, kOccRing);
+    }
+    logf("vk: occlusion: real counts, mode %d (1 log only, 2 zero-or-fixed, 3 counts), %u query ring%s%s", occ_mode(), kOccRing,
+         occ_precise ? ", precise" : "", occ_stats_pool ? ", pipeline statistics in logged frames" : "");
+}
+}  // namespace
+/// One draw's occlusion query (and in logged frames its pipeline statistics), ended on every way out of draw()
+struct OccQuery {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint32_t slot = 0;
+    bool stats = false;
+    OccQuery(VkCommandBuffer c, uint64_t prog, const DrawArgs& d, bool stats_busy) {
+        if (occ_draw_slot < 0 || !occ_pool) return;
+        const uint64_t serial = (uint64_t)occ_draw_slot;
+        slot = (uint32_t)(serial % kOccRing);
+        uint8_t fl = OCC_BEGUN | (d.mesh ? OCC_MESH : 0) | (d.indirect ? OCC_INDIRECT : 0) | (d.indexed ? OCC_INDEXED : 0);
+        stats = occ_stats_pool && !stats_busy && serial >= occ_log_lo.load(std::memory_order_relaxed) &&
+                serial < occ_log_hi.load(std::memory_order_relaxed);
+        if (stats) fl |= OCC_STATS;
+        occ_meta[slot] = {prog, fl};
+        occ_skipped_here = false;
+        vkCmdBeginQuery(c, occ_pool, slot, occ_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        if (stats) vkCmdBeginQuery(c, occ_stats_pool, slot, 0);
+        cmd = c;
+    }
+    ~OccQuery() {
+        if (!cmd) return;
+        if (stats) vkCmdEndQuery(cmd, occ_stats_pool, slot);
+        vkCmdEndQuery(cmd, occ_pool, slot);
+        if (occ_skipped_here) occ_meta[slot].flags |= OCC_SKIPPED;
+    }
+};
+namespace {
+struct OccPending {
+    uint64_t addr, lo, hi, value, key;
+    int64_t present;
+    uint64_t seq;
+    bool logged;
+};
+std::deque<OccPending> occ_pending;   // (the replay thread's, in stream order)
+std::unordered_map<uint64_t, int> occ_pending_at;     // (report address -> reports pending there)
+std::unordered_map<uint64_t, uint64_t> occ_latest;    // (report address -> the seq of its latest report)
+struct OccKeyed { uint64_t count; int64_t present; };
+std::unordered_map<uint64_t, OccKeyed> occ_keyed;     // (mode 5: key -> its last measured count)
+std::unordered_map<uint64_t, uint32_t> occ_key_ord;   // (mode 5: this frame's reports so far by program and window)
+std::unordered_map<uint64_t, uint64_t> occ_last;   // (report address -> its last measured count)
+FILE* occ_log = nullptr;
+uint64_t occ_seq = 0;
+int64_t occ_presents = 0;
+// (every 600 presents: reports a frame, of them 0, and the 0s by what their windows held)
+struct OccTally {
+    int64_t reports = 0, zero = 0, empty = 0, unrecorded = 0, skipped = 0, mesh = 0, indirect = 0, plain = 0, draws = 0;
+    int64_t unknown_write = 0, zero_write = 0;
+} occ_t;
+void occ_resolve(size_t n) {   // (the first n pending: their submissions are done)
+    if (!n) return;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (size_t i = 0; i < n; i++) lo = std::min(lo, occ_pending[i].lo), hi = std::max(hi, occ_pending[i].hi);
+    std::vector<uint64_t> res;   // (per slot: count, available)
+    std::vector<uint64_t> st;    // (logged slots: clip, fs, [task, mesh], available)
+    const uint32_t sw = occ_stats_mesh ? 5 : 3;
+    const bool span_ok = hi > lo && hi - lo <= kOccRing / 2;
+    if (span_ok) {
+        res.assign((size_t)(hi - lo) * 2, 0);
+        for (uint64_t at = lo; at < hi;) {
+            const uint32_t first = (uint32_t)(at % kOccRing), cnt = (uint32_t)std::min<uint64_t>(hi - at, kOccRing - first);
+            vkGetQueryPoolResults(dev.device, occ_pool, first, cnt, (size_t)cnt * 16, &res[(size_t)(at - lo) * 2], 16,
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            at += cnt;
+        }
+        if (occ_log && occ_stats_pool) {
+            st.assign((size_t)(hi - lo) * sw, 0);
+            for (uint64_t at = lo; at < hi;) {
+                const uint32_t first = (uint32_t)(at % kOccRing), cnt = (uint32_t)std::min<uint64_t>(hi - at, kOccRing - first);
+                vkGetQueryPoolResults(dev.device, occ_stats_pool, first, cnt, (size_t)cnt * sw * 8, &st[(size_t)(at - lo) * sw],
+                                      (VkDeviceSize)sw * 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                at += cnt;
+            }
+        }
+    }
+    static uint64_t logged_upto = 0;   // (draw lines written once)
+    for (size_t i = 0; i < n; i++) {
+        const OccPending& r = occ_pending[i];
+        uint64_t sum = 0;
+        int draws = 0, unrec = 0, skipped = 0, mesh = 0, indirect = 0;
+        if (span_ok)
+            for (uint64_t k = r.lo; k < r.hi; k++) {
+                const uint64_t* v = &res[(size_t)(k - lo) * 2];
+                const OccMeta& m = occ_meta[k % kOccRing];
+                draws++;
+                if (!v[1] || !(m.flags & OCC_BEGUN)) { unrec++; continue; }
+                sum += v[0];
+                if (m.flags & OCC_SKIPPED) skipped++;
+                if (m.flags & OCC_MESH) mesh++;
+                if (m.flags & OCC_INDIRECT) indirect++;
+            }
+        occ_last[r.addr] = sum;
+        if (r.key) occ_keyed[r.key] = {sum, r.present};
+        if (auto pa = occ_pending_at.find(r.addr); pa != occ_pending_at.end() && --pa->second <= 0) occ_pending_at.erase(pa);
+        if (occ_mode() >= 4 && span_ok && occ_latest[r.addr] == r.seq) host->gpu_write(r.addr, &sum, 8);   // (over the fixed value)
+        occ_t.reports++;
+        occ_t.draws += draws;
+        if (!sum) {
+            occ_t.zero++;
+            if (!draws) occ_t.empty++;
+            else if (unrec == draws) occ_t.unrecorded++;
+            else if (skipped) occ_t.skipped++;
+            else if (mesh) occ_t.mesh++;
+            else if (indirect) occ_t.indirect++;
+            else occ_t.plain++;
+        }
+        if (occ_log && r.logged) {
+            fprintf(occ_log, "R %llu p%lld addr %#llx win %llu %llu draws %d unrec %d skipped %d mesh %d indirect %d count %llu\n",
+                    (unsigned long long)r.seq, (long long)r.present, (unsigned long long)r.addr, (unsigned long long)r.lo,
+                    (unsigned long long)r.hi, draws, unrec, skipped, mesh, indirect, (unsigned long long)sum);
+            if (span_ok)
+                for (uint64_t k = std::max(r.lo, logged_upto); k < r.hi; k++) {
+                    const uint64_t* v = &res[(size_t)(k - lo) * 2];
+                    const OccMeta& m = occ_meta[k % kOccRing];
+                    const uint64_t* q = st.empty() ? nullptr : &st[(size_t)(k - lo) * sw];
+                    const bool qa = q && q[sw - 1] && (m.flags & OCC_STATS);
+                    fprintf(occ_log, "D %llu prog %016llx flags %#x avail %d samples %llu clip %lld fs %lld task %lld mesh %lld\n",
+                            (unsigned long long)k, (unsigned long long)m.prog, (unsigned)m.flags, (int)v[1], (unsigned long long)v[0],
+                            qa ? (long long)q[0] : -1, qa ? (long long)q[1] : -1, qa && occ_stats_mesh ? (long long)q[2] : -1,
+                            qa && occ_stats_mesh ? (long long)q[3] : -1);
+                }
+            logged_upto = std::max(logged_upto, r.hi);
+        }
+    }
+    occ_pending.erase(occ_pending.begin(), occ_pending.begin() + (ptrdiff_t)n);
+    if (occ_log) fflush(occ_log);
+}
+void occ_poll(uint64_t done) {
+    size_t n = 0;
+    while (n < occ_pending.size() && occ_pending[n].value <= done) n++;
+    occ_resolve(n);
+}
+}  // namespace
+/// (the replay thread, at every draw and dispatch of the stream) the ring's next chunk reset from the host before its first use
+void occ_advance(uint64_t serial, uint64_t value) {
+    if (!occ_mode()) return;
+    std::call_once(occ_once, occ_init);
+    if (!occ_pool) return;
+    const uint32_t chunk = (uint32_t)((serial % kOccRing) / kOccChunk);
+    occ_chunk_value[chunk] = std::max(occ_chunk_value[chunk], value);
+    if (serial % kOccChunk) return;
+    // (entering a chunk: its last lap's draws done and its reports read, then reset)
+    const uint64_t last = occ_chunk_value[chunk];
+    if (last && last != value) vk_timeline_wait(last);
+    size_t n = 0;
+    while (n < occ_pending.size() && occ_pending[n].lo + kOccRing < serial + kOccChunk) n++;
+    if (n) {
+        if (occ_pending[n - 1].value > vk_timeline_completed()) vk_timeline_wait(occ_pending[n - 1].value);
+        occ_resolve(n);
+    }
+    vkResetQueryPool(dev.device, occ_pool, chunk * kOccChunk, kOccChunk);
+    if (occ_stats_pool) vkResetQueryPool(dev.device, occ_stats_pool, chunk * kOccChunk, kOccChunk);
+    for (uint32_t i = 0; i < kOccChunk; i++) occ_meta[chunk * kOccChunk + i].flags = 0;
+    occ_chunk_value[chunk] = value;
+}
+/// (the replay thread, a samples-passed report in stream order) the value to write: fixed, or from the last measured count
+uint64_t occ_report(uint64_t addr, uint64_t lo, uint64_t hi, uint64_t value, uint64_t fixed, uint64_t prog) {
+    const int mode = occ_mode();
+    if (!mode || !occ_pool) return fixed;
+    const bool logged = occ_log && lo >= occ_log_lo.load(std::memory_order_relaxed) && hi <= occ_log_hi.load(std::memory_order_relaxed);
+    uint64_t key = 0;
+    if (mode == 5) {
+        const uint64_t pk = prog * 0x9E3779B97F4A7C15ull ^ (hi - lo) * 0xC2B2AE3D27D4EB4Full;
+        const uint32_t ord = occ_key_ord[pk]++;
+        key = (pk ^ ((uint64_t)ord * 0x165667B19E3779F9ull)) | 1;
+    }
+    occ_pending.push_back({addr, lo, hi, value, key, occ_presents, occ_seq, logged});
+    occ_latest[addr] = occ_seq++;
+    occ_pending_at[addr]++;
+    if (mode == 4) return fixed;   // (the count written once read, before a condition reads it)
+    if (mode == 1) return fixed;
+    if (mode == 5) {
+        const auto k = occ_keyed.find(key);
+        if (k == occ_keyed.end() || occ_presents - k->second.present > 3) {
+            occ_t.unknown_write++;
+            return fixed;
+        }
+        if (!k->second.count) occ_t.zero_write++;
+        return k->second.count;
+    }
+    const auto it = occ_last.find(addr);
+    if (it == occ_last.end()) {
+        occ_t.unknown_write++;
+        return fixed;
+    }
+    if (!it->second) occ_t.zero_write++;
+    if (mode == 2) return it->second ? fixed : 0;
+    return it->second;
+}
+/// (mode 4) a render condition at addr reads a report not read yet
+bool occ_cond_pending(uint64_t addr) {
+    return occ_mode() == 4 && (occ_pending_at.count(addr) || occ_pending_at.count(addr + 16));
+}
+/// (mode 4, after the GPU finished everything recorded so far) every pending report read and written
+void occ_resolve_all() {
+    occ_resolve(occ_pending.size());
+}
+/// (mode 4: no submit was possible there) the conditions read what is written (the fixed value); the counts come later
+void occ_give_up() {
+    static int told;
+    if (told++ < 8) logf("vk: occlusion: a condition on a report not read yet could not wait for it (the fixed value read)");
+    occ_pending_at.clear();
+}
+/// (the replay thread, logged frames) a render condition as it was decided
+void occ_cond(uint64_t addr, int mode, uint64_t x, uint64_t y, bool on, uint64_t serial) {
+    if (!occ_log || serial < occ_log_lo.load(std::memory_order_relaxed) || serial >= occ_log_hi.load(std::memory_order_relaxed)) return;
+    fprintf(occ_log, "C %llu p%lld at %llu addr %#llx mode %d x %llu y %llu %s\n", (unsigned long long)occ_seq++, (long long)occ_presents,
+            (unsigned long long)serial, (unsigned long long)addr, mode, (unsigned long long)x, (unsigned long long)y, on ? "on" : "off");
+}
+/// (the replay thread, at each present) reports whose submissions are done read; the logged frames opened and closed
+void occ_present(int64_t presents, uint64_t serial, uint64_t done) {
+    if (!occ_mode() || !occ_pool) return;
+    occ_presents = presents;
+    occ_key_ord.clear();
+    occ_poll(done);
+    if (presents % 600 == 0 && occ_keyed.size() > 200000) occ_keyed.clear();
+    if (const char* dir = occ_log_dir()) {
+        static const int64_t every = getenv("RX_VK_OCC_LOG_EVERY") ? std::max(4, atoi(getenv("RX_VK_OCC_LOG_EVERY"))) : 600;
+        static const int64_t frames = getenv("RX_VK_OCC_LOG_FRAMES") ? std::clamp(atoi(getenv("RX_VK_OCC_LOG_FRAMES")), 1, 16) : 2;
+        if (presents % every == 0) {
+            if (occ_log) fclose(occ_log);
+            char path[600];
+            snprintf(path, sizeof path, "%s/occ_%lld.txt", dir, (long long)presents);
+            occ_log = fopen(path, "w");
+            occ_log_hi.store(UINT64_MAX), occ_log_lo.store(serial);
+        } else if (presents % every == frames && occ_log) {
+            occ_log_hi.store(serial);
+        }
+    }
+    if (presents % 600 == 0 && occ_t.reports) {
+        const double f = 600.0;
+        logf("vk: occlusion: %.0f reports a frame, %.0f read 0 (%.0f with no draws, %.0f none recorded, %.0f a draw skipped, %.0f with mesh "
+             "draws, %.0f indirect, %.0f plain draws); %.1f draws a report; written: %.0f zero, %.0f not yet measured",
+             occ_t.reports / f, occ_t.zero / f, occ_t.empty / f, occ_t.unrecorded / f, occ_t.skipped / f, occ_t.mesh / f, occ_t.indirect / f,
+             occ_t.plain / f, occ_t.reports ? (double)occ_t.draws / occ_t.reports : 0.0, occ_t.zero_write / f, occ_t.unknown_write / f);
+        occ_t = {};
+    }
+}
+
 // ---- (EvilOOT) NVN2's indirect mesh draws in Vulkan's layout ----
 // NVN2 keeps an indirect mesh draw as {task count, first task} (as its direct DrawMeshTasks(first, count) and NVIDIA's
 // mesh shading always did); vkCmdDrawMeshTasksIndirectEXT reads {x, y, z} workgroups. Read as they were, "7 tasks from 0"
@@ -5583,6 +5895,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     StatsQuery stats_query(cmd, p.key, d);   // (EvilOOT, RX_VK_DRAW_STATS)
+    OccQuery occ_query(cmd, p.key, d, stats_query.cmd != VK_NULL_HANDLE);   // (TICK-033, RX_VK_OCC_REAL)
     if (stats_frame_now() && stats_prog_wanted(p.key)) {   // (and the wanted programs' buffers: a mesh draw's stages, fragment)
         for (const int stage : {6, 7, 1}) stats_dump_stage(p.key, s, stage);
         // (and as the GPU holds them, after it: RX_VK_GPU_DUMP=1 only; its bindings can sync a pool's mirror mid-frame, and
