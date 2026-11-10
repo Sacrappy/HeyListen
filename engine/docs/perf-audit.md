@@ -1367,3 +1367,92 @@ draws are still recorded), so it is not worth it now.
 
 Not verified: other scenes than the Market (no Hyrule Field save; Kokiri not reached), other GPUs (precise queries,
 NVIDIA's counts), long sessions with mode 4, the sun's behaviour under mode 4 at sunset/night.
+
+## TICK-038: resource use (RAM, VRAM, CPU, GPU) at the Market (2026-11-10)
+
+**Result: the process's working set 14.2 -> 11.9 GB standing and 15.5 -> 13.6 GB walking (-1.9 to -2.3 GB), private bytes -2.0 to
+-2.5 GB, start-up shaders 8.5 -> 2.8 s; fps and 1% lows not worse (standing +1.7 fps). Both changes are in what the precompile kept
+in the NVIDIA driver's memory: 7808 compute pipelines and their shader modules made at every start, of which the Market binds ~110.
+VRAM: the driver's untracked part -120 to -190 MB; the total is within run-to-run noise (render targets vary by up to 1 GB between
+runs).** Ryzen 7 7800X3D, 32 GB, RTX 5070 12 GB, windowed `run_bench.py`, `--fps-limit 360`, frame generation off, 66 s cut, Market save.
+
+### Instruments
+
+- `RX_VK_RES_LOG=1` (vk_vma.cpp, vk_memory.cpp, vk_draw.cpp; off by default: a mutex per allocation and per pipeline bind). Every
+  600 presents, beside the VRAM breakdown: `vk: process memory:` (private, working set, the C heaps' use (HeapSummary), the
+  captures' kept and spare buffers, the texture-storage shadow, the capture table), `vk: pipelines:` (graphics made, pipelines
+  ever bound, compute modules let go), `vk: compute pipelines built in play:`, and `vk: allocations by kind` (every VMA allocation
+  tagged at its call site: textures, render targets (images with attachment usage), mirrors, write-back shadows, captures,
+  streams, staging, readback, scratch, other; by memory class: VRAM, VRAM the CPU maps (BAR), system cached, system uncached).
+- `tools/bench/ressample.py <dir>` beside run_bench: private / working set / threads / CPU each second, CPU by thread name,
+  nvidia-smi, and a scan of the address space with residency (QueryWorkingSetEx) at 12, 30, 45 and 95 s.
+
+### Where it went (before; kokiri-idle at 95 s, castle-move in brackets)
+
+| category | committed | resident | what |
+|---|---:|---:|---|
+| guest window (the game's memory) | 11.2 GB (12.3) | 7.75 GB (9.2) | committed as the runtime hands it out; ~3.5 GB never touched |
+| HeyListen.exe image (lifted code) | 1.03 GB | 0.27 GB | |
+| **5 private regions of ~1 GB** | **5.18 GB** | **5.0 GB** | the NVIDIA driver's arenas (the C heaps hold only ~0.4 GB); 4.8 GB by the end of the precompile (12 s) |
+| 165-210 private regions of 32-63 MB | 5.5 GB (6.9) | 0.4 GB (0.6) | come with the scene's VRAM (the driver's commit beside video memory); not resident |
+| captures (host-cached Vulkan memory) | 0.47 GB (0.61) | | 25 kept 270-330 MB + 12 spares 195-385 MB |
+| C heaps | 0.45 GB | | the engine's own objects |
+| process: private / working set | 23.7 GB (25.7) | 14.2 GB (15.5) | |
+
+Experiments on the arenas: without the precompile (`RX_VK_PRECOMPILE=0`, title only) they hold 1.8 GB (one ~1 GB region is likely
+the 1.07 GB pipeline cache read at start); with it 5.1 GB. Letting the compute programs' modules go: -0.7 GB; not building the
+compute pipelines at start: a further -0.65 GB (and -0.2 GB of VRAM, the "other" part of the breakdown). In play the Market binds
+1,108-1,119 pipelines (106-117 of them compute) of the 10,635 made.
+
+VRAM by kind (kokiri-idle; castle-move): textures 1.27 GB (1.6-1.7), render targets 1.0-1.1 GB (0.96-2.2: the dynamic resolution's
+sets, kept up to 3600 presents while there is room), mirrors 1.52-1.54 GB (1.7), write-back shadows 224 MB, BC scratch 160 MB,
+staging 76-140 MB and streams 96 MB in BAR VRAM, free inside VMA blocks 0.4-1.9 GB (varies), the driver's other ~1.03 GB. None of
+these was changed: the BC scratch give-back (`RX_VK_BC_IDLE_S`) brought upstream issue 993's garbled textures; the render-target and
+finalized-texture rules each fix a past picture bug (rainbow sky, black pause blur, issues 107/386/993); the mirrors and the
+write-back shadows are the design (the shadows are a ~20% fps feature on some GPUs).
+
+CPU (72-102 s, both builds ~5.9 cores busy): replay workers 4 x ~20% (real recording; they block on a condition variable, no spin),
+capture helpers 4 x ~7% (the bandwidth-bound copies of TICK-037), the game's job threads 25-42% each, nn.npln.* (the online library)
+~19% of a core in all. Spinning: the guest's 20 us SleepThread polls (lr 0x8009a478, ~17,000 a second, `HOS_SLEEP_LOG=1`) are
+yielded away (`sleep_ns`: SwitchToThread under 1 ms), ~0.35 of a core; they are the job chain's waits on the critical path
+(TICK-037), where a timer would add latency: left as they are. GPU: 55-67% busy (nvidia-smi) in both builds; redundant passes were
+not looked for in this ticket.
+
+### Changes
+
+1. **Compute programs stay on disk until dispatched** (`RX_VK_LAZY_COMPUTE`, vk_draw.cpp precompile_run): when the pipeline cache
+   began with this device's and driver's data, the precompile no longer loads every kept compute program (7808 texture variants)
+   and builds its pipeline. A dispatch reads its program from the program cache (`program_cache_load`, as graphics draws already
+   did) and builds the pipeline on a worker, the dispatch waiting up to 50 ms as before. From the warm caches: ~2.5 ms each,
+   106-117 at the Market's load; 0 dispatches left out and 0 slow compiles in all runs. A start whose cache data is refused (a new
+   driver) precompiles all of them as before. 0: always precompiled; 2: lazy even without the cache's data. A build under 30 ms
+   (NVIDIA leaves the creation feedback's cache-hit bit clear) does not count toward the 32 that write the 1 GB cache file again in
+   play; the exit save writes it whatever the count.
+2. **Compute shader modules let go once their pipeline is made** (`RX_VK_CS_MODULE_DROP`, default on): nothing reads a compute
+   program's module after `compute_pipeline` is set (the dispatch builds only while it is null); the driver kept each module's SPIR-V.
+3. Tried, off by default: `RX_VK_CAP_SPARE_AGE=<n>` frees capture spares not taken for n captures. With 600 the spares still held
+   89-411 MB (they are taken again, not left over from the load) and 1.5-2x as many capture buffers were made on the game's thread.
+
+No shader-stamp input changed (vk_shader.cpp, vk_api.h, vk_state.h, vk_draw.h untouched): no `--prepare-shaders`.
+
+### A/B (one binary; off = `RX_VK_LAZY_COMPUTE=0 RX_VK_CS_MODULE_DROP=0`), means of the runs
+
+| scene (runs off/on) | fps off -> on | 1% low | p99 ms | working set GB | private GB | VRAM "other" MB | start-up shaders s |
+|---|---|---|---|---|---|---|---|
+| kokiri-idle (3/3) | 69.7 -> 71.4 | 30.7 -> 35.2 | 23.1 -> 21.2 | 14.20 -> 11.90 | 23.68 -> 21.23 | 1033 -> 840 | 8.5 -> 2.8 |
+| castle-move (5/5) | 66.6 -> 66.2 | 26.3 -> 26.7 | 28.0 -> 29.2 | 15.51 -> 13.59 | 25.70 -> 23.74 | 1041 -> 918 | 7.7 -> 4.3 |
+| hyrule-walk (2/2) | 65.2 -> 66.1 | 17.9 -> 27.2 | 36.5 -> 29.9 | 14.85 -> 12.98 | 25.11 -> 23.19 | 1048 -> 918 | 8.2 -> 5.2 |
+
+Runs: kokiri-idle off 68.8 / 69.7 / 70.6, on 71.1 / 70.8 / 72.2; castle-move off 65.8 / 66.9 / 68.9 / 65.5 / 65.7, on 68.1 / 65.6 /
+65.5 / 63.8 / 67.9; hyrule-walk off 65.8 / 64.6, on 65.4 / 66.7. The driver's arenas at 95 s: 5.02 -> 2.83 GB resident standing,
+5.02 -> 2.85 GB walking. Peak working set 14.2 -> 11.9 GB standing, 16.0 -> 13.8 GB walking. nvidia-smi peak and the process's
+dedicated GPU memory: within noise (7.6-8.7 GB both ways). CPU 5.9 cores both. Shots every 1200 presents, on and off, all three
+scenes (`build/tick038/ab/r1-*/shots` in the worktree, not committed): the same picture (ground, fountain, trees, people, shadows,
+HUD), not pixel-equal (frames at other moments). Saves identical after every run.
+
+Not verified: other areas (a compute program first dispatched elsewhere builds then, from the warm caches), a driver update's
+first start (falls back to the full precompile by design), AMD/Intel, long sessions.
+
+Next: the pipeline cache object (~1 GB of the driver's arenas); the ~1,700 precompiled graphics pipelines the Market never binds
+(needs a rebuild path without pop-in); render targets of old dynamic-resolution sets kept 3600 presents while VRAM has room
+(needs the write-back path proven first); VMA free space inside blocks (0.4-1.9 GB, the 128 MB image blocks' fragmentation).
