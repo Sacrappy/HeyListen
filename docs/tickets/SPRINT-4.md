@@ -76,3 +76,9 @@ Branch `feature/sync-hookshot-10` (from main 167182c), 10 upstream commits since
   - no PGO profile on either side: +4.4 standing, +4.0 walking;
   - each with a profile recorded on its own lift (6 runs each): +2.1 / +1.7, inside the 2-4 fps spread.
 - Decision: not adopted; the switch stays off, so the default lift is byte for byte as on main. Take it at the next profile refresh, together with a profile recorded on that lift (as for the back-edge polls). Game folder: the Sync 10 build restored.
+
+## TICK-042 (2026-11-10): the game's job graph at the Market
+- Mapped with a job-marked diagnostic lift (`tools/bench/jobmarks.py`, `hos_jt_job` records in HOS_JOBTRACE) and `tools/bench/jobgraph.py`. A frame: the main thread alone 2.1 ms standing / 3.0 walking (mostly the engine's submit), six BaseProc calc stages each ending in one long per-actor job (Link's calc 1.5-1.7 ms, alone ~0.85 ms; 80166100 and 802ca820 1.1-1.7 ms, all in the same model subsystem f_80168320 > f_81b47080), module-worker work (80083580, which the next frame waits for), and a last stage that only four of six executors join.
+- Scheduling losses found: Link's and 802ca820's jobs start late in their stage (#13-17 and #119-124: 0.17-0.45 ms a frame); the last stage misses two executors because their partner threads post them late (f_83acfb90) and the six virtual cores are full.
+- Tried (env only): a 16x larger per-thread nn::os object cache for 80083580's ~8,000 mutexes a frame: 68.6 -> 67.7 standing, 66.4 -> 65.2 walking, inside the spread; removed.
+- Decision: no default changed; the game folder keeps the Sync 10 build. Next: the submit off the main thread's chain, a job-order patch of the game's scheduler, the model subsystem's FP slow paths, more executors (game patch).
