@@ -1562,3 +1562,149 @@ Build check (kokiri-idle, interleaved, trace off): the TICK-038 build 74.0 / 71.
 shots and no HOS_SPEED_LOG run were made for this build.
 
 Not verified: other CPUs (fewer cores make the virtual cores and the spin matter more), Kokiri / Hyrule Field, long sessions.
+
+## TICK-040: the hot set and the PGO profile on the Market job chain (2026-11-10)
+
+**Result: before this ticket, 72-78% of the Market job path already ran in `code_hot_*` (-O2 + upstream's profile), not in the
+-O1 chunks. Two variants stay inside the 2-4 fps spread. The first is a hot set extended with our scenes' functions (849 -> 2949
+functions, 93-96% of the path hot) with a profile recorded at the Market. The second is that set with upstream's back-edge polls
+and their own profile. -O3 is no faster. No default changed; the game folder keeps the Sync 10 build.** Market save by the
+fountain, `--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`, 110 s runs, 66 s cut.
+
+### What dev builds use
+
+`scripts/dev-build.ps1` sets `A64_HOT_FUNCS=%LOCALAPPDATA%\HookshotBuilder\hot_funcs.txt` and
+`RX_PGO=%LOCALAPPDATA%\HookshotBuilder\hookshot_pieces.prof` when they exist. build.py links with that folder's `hot_order.txt`.
+All three are the builder's play profile (`versions\v0.1.0-rc1\HookshotBuilder\tools\work`, from upstream's builder parts
+through `scripts/release_parts.py profile`, byte-identical):
+- 849 hot functions (83 MB of lifted C in 8 pieces);
+- a 6.6 MB profile of 1587 records;
+- 3682 functions in the link order.
+
+A test compile of one piece against the current lift: 17 of 260 functions have a mismatched profile (ignored), the rest use it.
+
+### Hot and cold on the path (HOS_JOBTRACE + HOS_SAMPLE_NS, `tools/bench/jobtrace.py`, now with a hot/cold split)
+
+Each sample on the job group's critical path is charged to its innermost guest function, by the object that function was linked
+from: `code_hot_*.o` (hot) or a -O1 `code_NNN*.o` (cold), read from the map's last column.
+
+| | kokiri-idle before | after (h2) | castle-move before | after (h2) |
+|---|---:|---:|---:|---:|
+| path samples under hot code | 77.9% | 95.8% | 71.5% | 93.0% |
+| guest-code leaves that are hot | 78% | 96% | 72% | 94% |
+| path work, ms a frame (one 4 s trace each) | 7.09 | 6.63 | 8.08 | 8.09 |
+
+All game threads (36 s of samples, 72-108 s): the main thread and the job threads were 80-82% hot before. The cold remainder
+was a long tail of more than 1,700 cold functions, none above 0.7% of the samples:
+- walking, in one trace: f_81738440 3.4% and f_817327a0 3.2% of the path;
+- f_801102e0 4.6%, on a streaming thread off the path;
+- 80% of the cold weight takes ~775 functions.
+
+Moving ~20% of the path from -O1 into the hot pieces took 0.46 ms off the standing path and nothing off the walking one. So
+compiling this code at -O2 with a profile instead of -O1 is worth a few percent at most. The lifted code's cost is its memory
+traffic (guest registers in the context, the runtime calls), and neither level changes it.
+
+### Variants (all from the same sources; `build/tick040/bin/<variant>` in the worktree, not committed)
+
+- **base**: the game-folder build (Sync 10): upstream's hot list and profile, loop-header polls.
+- **h2**: 2949 functions, 123 MB of hot C:
+  - upstream's 849;
+  - 917 cold functions from our three scenes' samples (kokiri-idle, castle-move, hyrule-walk, equal weight): the ones covering
+    80% of the cold weight, each at most 250 KB of C;
+  - 1183 one-level callees of at most 1.5 KB, so they inline.
+
+  Link order: our sampled functions by weight, then upstream's. Profile:
+  1. an `RX_PGO=gen` build of that lift;
+  2. one run of each scene with `HOS_PGO` (counters reset at 72 s, written at 106 s);
+  3. `llvm-profdata merge`;
+  4. merged with upstream's profile at weight 6:1 (ours 1.6e11 counts, theirs 4.5e11).
+
+  A test compile of two pieces: no mismatched or unprofiled function.
+- **h2o3**: h2 with `RX_HOT_OPT=O3`.
+- **p2**: h2's list with upstream's back-edge polls (from upstream 0d6ed03: `nx2/poll.py`, `rtgen.py`, build.py's
+  `-DA64_POLL_CTX` for the DLL) and a profile recorded on that code the same way (683,147 polls in 113,685 functions).
+- **h1**, dropped: the same 80% of the cold weight with no size cap, 3418 functions. Its giant new functions joined upstream's
+  three 2 MB ones in one piece:
+
+  | that piece | time | peak RAM |
+  |---|---:|---:|
+  | instrumented | 1281 s | |
+  | -O2, compiled alone | 337 s | 1.9 GB |
+  | upstream's heaviest piece, for comparison | 133 s | 1.4 GB |
+
+### A/B, interleaved (fps / 1% low / p99 ms; two sessions of 3 rounds, base and h2 in both)
+
+| scene | base (6 runs) | h2 (6) | h2o3 (3, session 1) | p2 (3, session 2) |
+|---|---|---|---|---|
+| kokiri-idle | 70.8 / 38.3 / 21.3 | 71.8 / 37.2 / 21.7 | 70.9 / 35.4 / 22.2 | 72.4 / 36.1 / 21.7 |
+| castle-move | 65.7 / 30.4 / 27.3 | 64.9 / 28.7 / 30.1 | 63.8 / 28.0 / 30.8 | 67.2 / 30.5 / 27.5 |
+| base in the same session, kokiri-idle | | | 70.3 / 36.0 / 22.3 | 71.2 / 40.6 / 20.3 |
+| base in the same session, castle-move | | | 65.4 / 30.1 / 28.0 | 65.9 / 30.6 / 26.7 |
+
+The runs (fps):
+
+| | kokiri-idle | castle-move |
+|---|---|---|
+| base | 71.2 71.1 68.6 69.7 73.2 70.8 | 63.1 65.5 67.6 65.2 66.3 66.2 |
+| h2 | 75.7 68.6 71.1 71.0 72.8 71.5 | 65.6 65.4 65.2 64.4 64.3 64.4 |
+| p2 | 73.0 71.7 72.6 | 66.0 65.6 70.1 |
+
+- h2 is +1.0 fps standing and -0.8 walking. Its walking p99 was above base's in every run (29.1-31.2 against 26.1-28.6 ms).
+- p2 is +1.2 / +1.3 fps against base in its session.
+
+None is beyond the spread, so none became the default.
+
+The back-edge polls: Sync 10 measured them at -3 fps standing and -2 walking with upstream's profile. With a profile recorded on
+their own code they are at least even (+1.2 / +1.3, inside the spread). So the Sync 10 loss was the profile no longer matching
+the functions whose loops changed. With these polls:
+- `native_replace` reports `strcmp_805afc70 ... NOT applied`: the region hashes change. The replacement is off by default, and
+  its recorded text would need updating.
+- The text-speed block still applies (`oot_patches.py` matches both forms).
+
+Adopting them needs the profile shipped with them: a lift without it costs ~3 fps.
+
+### Behaviour
+
+- Game speed: `HOS_SPEED_LOG=1`, castle-move, the last 40 one-second lines. Ratio: base 59.98 (58.61-61.12), h2 60.02
+  (58.93-60.86), p2 60.01 (59.36-60.86).
+- Picture: shots every 1200 presents (`RX_VK_SHOTS`), walking, in `build/tick040/shots/{base,h2,p2}-move` in the worktree.
+  The Market, people, shadows, the HUD and text boxes are drawn alike (the frames are at other moments).
+
+No variant is the default, so no test run was needed for them. The only code committed is in the tools and a script.
+
+### Build cost (8 jobs, this PC; clang's working set summed over all its processes)
+
+| | time | peak RAM |
+|---|---|---|
+| lift (-Lift) | 169-179 s | |
+| hot pieces, upstream's list, -O2 + profile | heaviest piece 133 s alone | 1.4 GB (that piece) |
+| hot pieces, h2, -O2 + profile | 98-212 s a piece, the build 217 s | 7.3 GB for all eight compiles |
+| hot pieces, h2, -O3 + profile | 101-280 s a piece, the build 285 s | 7.4 GB |
+| `RX_PGO=gen` build (developer only) | 731-736 s with the lift's chunks | 21.9 GB (the instrumented giant functions) |
+
+The `RX_PGO=gen` build also plays at ~10 fps.
+
+A changed hot list also moves the chunk boundaries: a chunk-ending function that is now hot ends no chunk. So on an update every
+cold chunk compiles again once, as for any lifter change.
+
+### Fixed on the way
+
+`scripts/dev-build.ps1 -Lift` kept the earlier lift's `code_*.c`. After a lift with fewer chunks (a longer hot list ends fewer
+of them), the earlier lift's last chunks stayed beside the new ones. The link then failed on duplicate symbols (f_85392450 in
+code_047 and code_051). The script now deletes them first, as `make_game.py` does. The objects stay cached by content.
+
+### What is next (ranked)
+
+1. A lifter that keeps guest registers in host registers across calls (the large project TICK-039 ranked third). The compile
+   level is not the lever (above): the guest code's cost is its traffic through the context. Upstream's back-edge polls were a
+   step in that direction, and they are even here once profiled.
+2. The job graph: the serial tail (TICK-039) and more executors.
+3. If the back-edge polls are taken later:
+   - ship a profile recorded on them with the same lift (the builder's `tools/work`);
+   - update `native_replace`'s recorded text;
+   - measure again over more runs.
+
+Not verified:
+- other CPUs and memory systems (the profile's branch weights are the game's, the code layout is the PC's);
+- Kokiri Forest and Hyrule Field (no saves);
+- more than 6 runs a variant.

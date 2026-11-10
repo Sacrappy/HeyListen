@@ -51,3 +51,17 @@ Branch `feature/sync-hookshot-10` (from main 167182c), 10 upstream commits since
 - **Upstream's lifter change costs fps here and is not taken.** Upstream moved the interrupt polls from the loop headers to the back-edges (`nx2/poll.py`, `rtgen.py`: `a64_poll_cur()`, `-DA64_POLL_CTX` for the DLL). Run to run, same session, run_bench, 110 s, 66 s cut (fps / 1% low / p99 ms): main (old build) kokiri-idle 69.3, 73.0 (mean 71.2) / 34.2, 41.4 / 22.5, 19.4, castle-move 64.4, 67.8 (66.1) / 25.7, 28.2 / 30.7, 27.1. The merge with upstream's poll: kokiri-idle 63.5, 68.3, 66.3, 66.6 (mean 66.2) / 20.1-40.1 / 20.4-29.5, castle-move 60.5, 65.8 (63.2) / 26.9, 29.7 / 33.1, 26.7. The merge with the loop-header polls kept (our `nx2/poll.py`, `rtgen.py`, `build.py` as on main): kokiri-idle 69.4, 69.4 / 36.2, 36.5 / 22.6, 22.0, castle-move 65.8, 64.9 (65.4) / 22.7, 27.4 / 29.3, 28.0. So the security checks cost 0-2 fps (inside the 2-4 fps spread) and the new poll placement about 3 fps standing and 2 walking, most likely the PGO profile (`hookshot_pieces.prof`) no longer matching the functions whose loops changed (not measured separately). Decision: the loop-header polls stay (a note on top of `nx2/poll.py`); take the upstream poll when the profile is recorded again on its code.
 - Also: `native_replace: strcmp_805afc70 NOT applied` appears with upstream's poll text (hashes of the regions changed: the polls sit before each backward goto). The replacement is off by default (HOS_NR_STRCMP_805AFC70) and the loop-header lift, kept, applies it as before.
 - In game (Market save, windowed, run_bench, limit 360, frame generation off): ground, fountain, trees and the HUD drawn (shots in E:\OOT\HeyListen\build\shots\sync10-move and sync10-final-move). Saves identical to the backup after the runs.
+
+## TICK-040 (2026-11-10): hot set and PGO profile at the Market
+- Measured with the job trace and the samples, split by object (`jobtrace.py`):
+  - Upstream's hot set already holds 72-78% of the Market job path.
+  - Extending it with our scenes' functions and their small callees (2949 functions, our profile merged 6:1 with upstream's) raises that to 93-96%, but the path work barely moves (7.09 -> 6.63 ms standing, 8.08 -> 8.09 walking).
+- fps against base, interleaved:
+  - extended set: +1.0 standing, -0.8 walking (walking p99 +2.8 ms);
+  - -O3: no gain;
+  - upstream's back-edge polls with a profile recorded on them: +1.2 / +1.3, inside the spread.
+- So the Sync 10 loss of those polls was the stale profile.
+- Decision: no default changed; the builder keeps upstream's hot list and profile; the game folder keeps the Sync 10 build.
+  - Take the back-edge polls only together with a profile made on that lift.
+  - Next lever: the lifted code's context traffic (a lifter project) or the job graph, not compile levels.
+- Also: `dev-build.ps1 -Lift` now deletes the earlier lift's chunks first (duplicate symbols after a lift with fewer chunks).

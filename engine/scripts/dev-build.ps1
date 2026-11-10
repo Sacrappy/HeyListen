@@ -37,6 +37,10 @@ $env:PYTHONIOENCODING = "utf-8"
 Push-Location $root
 try {
     if ($Lift) {
+        # (TICK-040, as make_game.py: an earlier lift's C goes first. A lift that writes fewer chunks (a longer hot list ends
+        # fewer of them) left the earlier lift's last chunks beside the new ones, and the link failed on duplicate symbols.
+        # The objects stay cached by their contents)
+        Get-ChildItem "$Work\sa\gen" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "code_*.c" -or $_.Name -like "code_*.c.whole" } | Remove-Item -Force
         & "$Tools\python\python.exe" -I nx2/lift.py --standalone --write --exefs $env:OOT_EXEFS --work $Work
         if ($LASTEXITCODE) { throw "lift failed" }
         if (Test-Path "$Work\sa\gen\code_hot.c") { & "$Tools\python\python.exe" -I nx2/split_hot.py "$Work\sa\gen" }
