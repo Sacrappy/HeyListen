@@ -119,6 +119,19 @@ def blocked(w):
     return w.wake_t is not None and w.wake_t > w.b
 
 
+def map_objects(path):
+    """(TICK-040) f_<addr> -> the object file it was linked from (the map's last column); {} without a map"""
+    objs = {}
+    if not os.path.exists(path):
+        return objs
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 4 and p[1].startswith("f_") and p[-1].endswith(".o"):
+                objs[p[1]] = p[-1]
+    return objs
+
+
 def path_samples(a, names, segs, frames):
     """the HOS_SAMPLE_ALL samples (same run) of the threads on the path while they are on it: guest code, the runtime
     under it, the system (a leaf outside the exe and the dll), by leaf and by innermost guest function"""
@@ -149,6 +162,9 @@ def path_samples(a, names, segs, frames):
     cat = collections.Counter()
     leaf = collections.Counter()
     fn = collections.Counter()
+    hc = collections.Counter()
+    coldfn = collections.Counter()
+    objs = map_objects(os.path.join(a.maps, "HeyListen.map"))
     n = 0
     for line in open(a.samples, encoding="utf-8", errors="replace"):
         head, _, stack = line.rstrip("\n").partition("|")
@@ -179,7 +195,13 @@ def path_samples(a, names, segs, frames):
             c = "system"
         cat[c] += 1
         leaf[(c, lf if c != "system" else lf + " <- " + next((x for x in named if x.startswith("HeyListen:")), "?"))] += 1
-        fn[next((x for x in named if x.startswith("HeyListen:f_")), "?")] += 1
+        inner = next((x for x in named if x.startswith("HeyListen:f_")), "?")
+        fn[inner] += 1
+        if objs:   # (TICK-040) where the innermost guest function was compiled: code_hot_*.o (RX_HOT_OPT + profile) or a chunk (-O1)
+            where = "hot" if objs.get(inner[10:], "").startswith("code_hot") else "cold" if inner != "?" else "none"
+            hc[(c, where)] += 1
+            if where == "cold":
+                coldfn[inner] += 1
     print("\n## samples on the path's work (%d samples)" % n)
     for k, v in cat.most_common():
         print("  %-12s %5.1f%%" % (k, 100 * v / max(n, 1)))
@@ -189,6 +211,19 @@ def path_samples(a, names, segs, frames):
     print("  innermost guest function:")
     for k, v in fn.most_common(a.top * 2):
         print("    %5.1f%%  %s" % (100 * v / max(n, 1), k))
+    if objs:
+        print("  hot / cold (TICK-040: where the innermost guest function was compiled, code_hot_*.o or an -O1 chunk):")
+        for c in ("guest code", "runtime", "system"):
+            h, k = hc[(c, "hot")], hc[(c, "cold")]
+            if h + k:
+                print("    %-10s hot %5.1f%%  cold %5.1f%%  of the path's samples (%.0f%% of these hot)" % (
+                    c, 100 * h / n, 100 * k / n, 100 * h / (h + k)))
+        h = sum(v for (c, w), v in hc.items() if w == "hot")
+        k = sum(v for (c, w), v in hc.items() if w == "cold")
+        print("    all        hot %5.1f%%  cold %5.1f%%" % (100 * h / max(n, 1), 100 * k / max(n, 1)))
+        print("  cold functions on the path:")
+        for k, v in coldfn.most_common(a.top * 2):
+            print("    %5.1f%%  %s" % (100 * v / max(n, 1), k))
 
 
 def main():
