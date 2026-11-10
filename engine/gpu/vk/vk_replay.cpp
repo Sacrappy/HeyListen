@@ -49,6 +49,25 @@
 namespace mkwvk {
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
 int64_t presents_now;   // (the presents so far, for SlowWatch)
+// (TICK-033, vk_draw.cpp: real occlusion counts, RX_VK_OCC_REAL) each draw and dispatch of the stream numbered in stream order: on
+// the replay thread (serial and dry passes) and on a segment's thread from the dry pass's number at its start
+extern thread_local int64_t occ_draw_slot;
+int occ_mode();
+void occ_advance(uint64_t serial, uint64_t value);
+uint64_t occ_report(uint64_t addr, uint64_t lo, uint64_t hi, uint64_t value, uint64_t fixed, uint64_t prog);
+void occ_cond(uint64_t addr, int mode, uint64_t x, uint64_t y, bool on, uint64_t serial);
+void occ_present(int64_t presents, uint64_t serial, uint64_t done);
+bool occ_cond_pending(uint64_t addr);
+void occ_resolve_all();
+void occ_give_up();
+const uint8_t* occ_stop_at = nullptr;   // (RX_VK_OCC_REAL=4: where a dry pass stopped for a condition on a report not read yet)
+uint64_t occ_serial = 0;              // (the replay thread's)
+thread_local uint64_t occ_wserial = 0;   // (a segment's thread)
+uint64_t occ_win_lo = 0;              // (the serial at the last samples-passed reset)
+struct OccSlot {   // (the draw's serial for draw()'s query)
+    explicit OccSlot(uint64_t serial) { if (occ_mode()) occ_draw_slot = (int64_t)serial; }
+    ~OccSlot() { occ_draw_slot = -1; }
+};
 void hang_watch_start();   // (EvilOOT, vk_hangdump.cpp: RX_VK_HANG_DUMP)
 struct CondNote { int64_t present; uint64_t addr, x, y; int mode; bool on; };   // (the last render conditions, for a dark frame)
 CondNote cond_ring[1 << 15];
@@ -707,6 +726,7 @@ void log_stage_bind(uint32_t op, int stage) {
 }
 
 void maybe_split(VkCommandBuffer& cmd);
+bool occ_sync(VkCommandBuffer& cmd);
 
 /// The handles already stored, so a rebind of the same ones does not rebuild descriptors
 bool handles_unchanged(const uint64_t* have, const uint64_t* next, int n) {
@@ -803,7 +823,10 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             // ground and the haze brightened over the whole picture (one-frame flicker, most of it at load-in; 30-52 per 2,700
             // frames in Kokiri, 4-6 with this, RX 7900 GRE). RX_VK_OCC_FIXED=<n>: that value; -1: the per-draw count as before
             static const int64_t occ_fixed = getenv("RX_VK_OCC_FIXED") ? atoll(getenv("RX_VK_OCC_FIXED")) : 4096;
-            const uint64_t rec[2] = {samples ? (occ_fixed >= 0 ? (uint64_t)occ_fixed : s.samples_passed) : 0, ns * 12 / 625};
+            uint64_t count = samples ? (occ_fixed >= 0 ? (uint64_t)occ_fixed : s.samples_passed) : 0;
+            // (TICK-033, RX_VK_OCC_REAL: measured beside it, and with modes 2 and 3 the last measured count of this address)
+            if (samples && !flag_written && occ_mode()) count = occ_report(c.addr, occ_win_lo, occ_serial, rec_value_now, count, s.has_prog ? s.prog.serial : 0);
+            const uint64_t rec[2] = {count, ns * 12 / 625};
             if (dump_on())
                 logf("vk: dump-op %03d REPORT_COUNTER type %d at %#llx: %llu", dump_seq(), (int)c.type,
                      (unsigned long long)c.addr, (unsigned long long)rec[0]);
@@ -819,7 +842,10 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_RESET_COUNTER: {
             const auto c = payload<nvn_p_counter>(a, avail);
-            if (c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) s.samples_passed = 0;
+            if (c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                s.samples_passed = 0;
+                if (!worker) occ_win_lo = occ_serial;
+            }
             break;
         }
         case NOP_COPY_B2B: {
@@ -1114,6 +1140,15 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 break;
             }
             const auto r = payload<nvn_p_render_cond>(a, avail);
+            // (TICK-033, RX_VK_OCC_REAL=4: a report of this stream not read yet: what is recorded goes to the GPU and is waited for)
+            if (occ_cond_pending(r.addr)) {
+                if (dry) {   // (a dry pass ends here: replay_handle records and submits its segments, waits, and goes on from here)
+                    occ_stop_at = p;
+                    return;
+                }
+                if (occ_sync(cmd)) occ_resolve_all();
+                else occ_give_up();
+            }
             uint64_t x = r.x, y = r.y;
             if (!r.snapped) {
                 host->gpu_read(r.addr, &x, 8);
@@ -1127,6 +1162,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 if (always) s.render_enabled = true;
             }
             if (dry) par_conds.push_back(s.render_enabled ? 1 : 0);
+            if (occ_mode()) occ_cond(r.addr, (int)r.mode, x, y, s.render_enabled, occ_serial);
             if (dump_on())
                 logf("vk: dump-op %03d RENDER_COND mode %d at %#llx: %llu vs %llu: %s", dump_seq(), r.mode,
                      (unsigned long long)r.addr, (unsigned long long)x, (unsigned long long)y,
@@ -1179,6 +1215,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 DrawArgs da;
                 da.prim = d.prim, da.first = d.first, da.count = d.count;
                 da.base_instance = d.base_instance, da.instances = d.instances;
+                OccSlot os(worker ? occ_wserial : occ_serial);
                 draw(cmd, s, da);
             }
             s.samples_passed += 16;
@@ -1191,6 +1228,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.prim = d.prim, da.indexed = true, da.itype = d.itype, da.count = d.count;
                 da.base_vertex = d.base_vertex, da.base_instance = d.base_instance, da.instances = d.instances;
                 da.ibuf = d.ibuf;
+                OccSlot os(worker ? occ_wserial : occ_serial);
                 draw(cmd, s, da);
             }
             s.samples_passed += 16;
@@ -1203,6 +1241,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.prim = d.prim, da.indexed = d.indexed != 0, da.itype = d.itype;
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
                 da.ibuf = d.ibuf;
+                OccSlot os(worker ? occ_wserial : occ_serial);
                 draw(cmd, s, da);
             }
             s.samples_passed += 16;
@@ -1222,6 +1261,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.groups[0] = d.y, da.groups[1] = 1, da.groups[2] = 1;
                 if (d.kind == 0) da.first_task = d.x;   // (hookshot: the task programs add it, vk_draw.cpp's mesh_args)
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
+                OccSlot os(worker ? occ_wserial : occ_serial);
                 draw(cmd, s, da);
             }
             s.samples_passed += 16;
@@ -1241,6 +1281,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         if (h.op == NOP_DRAW || h.op == NOP_DRAW_IDX || h.op == NOP_DRAW_INDIRECT || h.op == NOP_DRAW_MESH ||
             h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT) {
+            if (worker) occ_wserial++;
+            else if (occ_mode()) occ_advance(++occ_serial, rec_value_now);
+            else ++occ_serial;
             if (dry) {
                 const bool compute = h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT;
                 if (s.render_enabled && (compute || !s.raster_discard)) dry_mark_written(s, compute, dry_work == 0);
@@ -1283,6 +1326,27 @@ void maybe_split(VkCommandBuffer& cmd) {
     cmd = r.cmd;
     part_work = 0;
     rec_parts++;
+}
+
+/// (TICK-033, RX_VK_OCC_REAL=4) what is recorded so far submitted and waited for; recording goes on in a new part
+bool occ_sync(VkCommandBuffer& cmd) {
+    if (!rec_cur || rec_parts + 1 >= kMaxParts || dump_on()) return false;
+    end_pass(cmd);
+    flush_ub_updates(cmd);
+    memory_end_submission(cmd);
+    full_barrier(cmd, "barrier (recording end)");
+    Recording* old = rec_cur;
+    submit_recording(*rec_cur, false);
+    ub_first_of_recording = ub_updates.size();
+    Recording& r = begin_recording(rec_cur_value);
+    memory_begin_submission();
+    full_barrier(r.cmd, "barrier (recording start)");
+    rec_cur = &r;
+    cmd = r.cmd;
+    part_work = 0;
+    rec_parts++;
+    recording_wait(*old);
+    return true;
 }
 
 // ---- parallel replay: the threads and a command buffer's segments ----
@@ -1350,12 +1414,14 @@ struct Segment {
     const uint8_t *p, *end;
     const NvnState* s;
     size_t ub, cond;
+    uint64_t serial = 0;   // (TICK-033: the stream number of its first draw or dispatch)
 };
 /// One segment recorded into cmd from the state at its start (any thread: the replay thread's own included)
 void record_segment(VkCommandBuffer& cmd, const Segment& g) {
     rmode = Mode::Worker;
     NvnState s = *g.s;
     ub_limit = g.ub, cond_at = g.cond;
+    occ_wserial = g.serial;
     ub_gen++;
     full_barrier(cmd);   // (after what the command buffers before it did)
     replay(cmd, s, g.p, g.end);
@@ -1379,7 +1445,8 @@ std::recursive_mutex par_mu;
 /// A command buffer of the submission from h (its start, or where it stopped at a wait): on the replay thread alone
 /// (RX_VK_PARALLEL off, a small one, dumps and profiles), or its dry pass there and its segments on the threads.
 /// may_stop: up to a wait not met, which it returns (null: the command buffer done)
-const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop = false) {
+const uint8_t* occ_go_on(VkCommandBuffer& cmd, const uint8_t* at, bool may_stop, Recording* last);
+const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop) {
     const int threads = par_threads();
     NvnState& state = *cur_state;
     suspend_at = nullptr;
@@ -1390,17 +1457,20 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         return suspend_at;
     }
     // the dry pass: the state at every 64 draws and dispatches, the render conditions, the uniform updates
+    occ_stop_at = nullptr;
     const auto t_dry0 = std::chrono::steady_clock::now();
     const NvnState start = state;
     const size_t ub0 = ub_updates.size();
     par_points.clear(), par_conds.clear(), dry_work = 0;
+    const uint64_t serial0 = occ_serial;   // (TICK-033: the segments' draws numbered from here)
     rmode = Mode::Dry;
     VkCommandBuffer none = cmd;
     suspend_ok = may_stop;
     replay(none, state, h);
     suspend_ok = false;
     rmode = Mode::Serial;
-    const uint8_t* const stop = suspend_at;   // (the segments end there)
+    const uint8_t* const occ_stop = suspend_at ? nullptr : occ_stop_at;   // (TICK-033: stopped for a report's count)
+    const uint8_t* const stop = suspend_at ? suspend_at : occ_stop;     // (the segments end there)
     const int64_t total = dry_work;
     static double dry_ms, seg_ms, segs_n;
     static int64_t timed;
@@ -1410,7 +1480,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     static const int64_t per = getenv("RX_VK_PARALLEL_SEG") ? std::max(32, atoi(getenv("RX_VK_PARALLEL_SEG"))) : 160;
     const int nseg = (int)std::clamp<int64_t>(total / per, 1, kMaxBatch);
     std::vector<Segment> seg;
-    seg.push_back({h, nullptr, &start, ub0, 0});
+    seg.push_back({h, nullptr, &start, ub0, 0, serial0});
     // (RX_VK_PARALLEL_BOUNDARY=<k>, diagnosis: only the k-th boundary of each command buffer splits it, and its program's code keys are logged,
     // to find which boundary a wrong picture comes from)
     static const int only_boundary = getenv("RX_VK_PARALLEL_BOUNDARY") ? atoi(getenv("RX_VK_PARALLEL_BOUNDARY")) : 0;
@@ -1430,12 +1500,12 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
             if (seen.insert(keys).second && seen.size() < 40) logf("vk: parallel boundary %d at work %lld of %lld: program%s", k, (long long)at->work, (long long)total, keys.c_str());
         }
         seg.back().end = at->p;
-        seg.push_back({at->p, nullptr, &at->s, at->ub, at->cond});
+        seg.push_back({at->p, nullptr, &at->s, at->ub, at->cond, serial0 + (uint64_t)at->work});
     }
     seg.back().end = stop;
     if (seg.size() == 1) {   // (one segment: here, as the dry pass left the reports and conditions)
         record_segment(cmd, seg[0]);
-        return stop;
+        return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, nullptr) : stop;
     }
     if (!par_pool.started) {
         par_pool.started = true;
@@ -1502,7 +1572,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         Segment whole = seg[0];
         whole.end = stop;
         record_segment(cmd, whole);
-        return stop;
+        return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, nullptr) : stop;
     }
     texture_segments_begin(inits.data(), inits.size());
     const auto t_seg0 = std::chrono::steady_clock::now();
@@ -1586,7 +1656,17 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     rec_cur = &nr;
     cmd = nr.cmd;
     rec_parts += (int)seg.size() + 1;
-    return stop;
+    return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, jobs.back()->r) : stop;
+}
+
+/// (TICK-033, RX_VK_OCC_REAL=4) a dry pass stopped at a condition on a report not read yet: what it covered is recorded (and
+/// submitted when last is its last segment's recording, else submitted here); the GPU waited for, the reports read, and the
+/// command buffer replayed on from the condition
+const uint8_t* occ_go_on(VkCommandBuffer& cmd, const uint8_t* at, bool may_stop, Recording* last) {
+    if (last) recording_wait(*last);
+    if (last || occ_sync(cmd)) occ_resolve_all();
+    else occ_give_up();
+    return replay_handle(cmd, at, may_stop);
 }
 
 // ---- the rx_* functions ----
@@ -2746,6 +2826,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         full_barrier(r.cmd);
         presents++;
         presents_now = presents;
+        occ_present(presents, occ_serial, completed());
         if (presents == 1) hang_watch_start();
         {   // (EvilBoyce, diagnostics) RX_VK_WATCH_CPU=<present>:<gpu address>[,...] (hex addresses): from that present on, the
             // CPU's writes to those 4 KB pages logged with the writer's stack (host page watch: 12 reports)
