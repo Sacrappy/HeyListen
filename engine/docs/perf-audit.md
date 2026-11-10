@@ -1456,3 +1456,109 @@ first start (falls back to the full precompile by design), AMD/Intel, long sessi
 Next: the pipeline cache object (~1 GB of the driver's arenas); the ~1,700 precompiled graphics pipelines the Market never binds
 (needs a rebuild path without pop-in); render targets of old dynamic-resolution sets kept 3600 presents while VRAM has room
 (needs the write-back path proven first); VMA free space inside blocks (0.4-1.9 GB, the 128 MB image blocks' fragmentation).
+
+## TICK-039: the job-group wait, reconstructed (2026-11-10)
+
+**Result: the main thread's wait for its job group (f_8007fe60 -> WaitLightEvent, lr 0x80080188; 7.0 ms a frame standing,
+7.8-8.1 walking) is ~97% job execution on the dependency chain. Waking (signal -> the woken thread running again) is ~3%
+(0.18-0.30 ms a frame), virtual-core waits and SleepThread polls on the path ~0.1% each. Of the chain's work, ~80-85% is
+guest code itself, ~8-10% the runtime under it (obj_lookup, the soft-FP helpers, mutex_lock) and ~7-10% the system (mostly
+the wake syscall inside the signaller's SignalLightEvent). The host's sync primitives, thread placement and spin are not
+what the frame waits for; no host switch moved fps beyond the spread, and every one tried was slower. No default changed.**
+Market save by the fountain, `--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`.
+
+### Instruments (kept, off by default)
+
+- `HOS_JOBTRACE=<file>` (host/hos_jobtrace.c): for a window (`HOS_JOBTRACE_AT`, default 90 s; `HOS_JOBTRACE_SECS`, 3) every
+  guest thread's blocking waits with object and guest caller (events / light events, condition variables, contended mutexes,
+  message queues, semaphores, multi-waits, the kernel's ArbitrateLock / WaitProcessWideKey / WaitForAddress), how each ended
+  (ready, after the 20 us spin, after sleeping), every signal (and, for the kernel, whom it woke), SleepThread polls and waits
+  for a virtual core. Outside the window a record point is one load and a branch. ~1 M records a second (4 M cap: ~4 s).
+  NavMeshCAStepDepWorker1 alone signals ~750 k condition variables a second that nobody waits on (lr 0x80044344..0x800457f0).
+- `HOS_SAMPLE_NS=1`: each HOS_SAMPLE_ALL sample also carries its own instant (`;@<ns>`), so samples can be matched to the
+  trace's 50-250 us segments (the line's ms is 1 ms coarse: matching on it put half the "work" samples in waits).
+- `tools/bench/jobtrace.py <trace> --present <present_trace.csv> [--samples <file> --maps <dir>]`: per-thread work / waits /
+  spin / polls / vcore waits; the main thread's waits by caller; the critical path of every blocked job-group wait, walked
+  back from the main thread's wake-up (the signaller, what it did since its own blocked wait ended, who woke that, ...) as
+  work / wake / poll / vcore segments; the job threads' concurrency during the group's waits; wake latency by thread; the
+  samples that fall on the path's work, by leaf and guest function. Work is what a thread does between blocking waits; a wait
+  that did not block counts as work; the spin before a block counts as waiting; a memcpy or a driver call counts as work.
+
+### The frame (main thread, ms a frame; trace windows of 3-5 s at 86-91 s)
+
+| | kokiri-idle (standing, 71-74 fps in the run) | castle-move (walking, 63-64 fps) |
+|---|---:|---:|
+| job group wait (lr 0x80080188) | 7.0 | 7.8-8.1 |
+| f_83acfb90's event (lr 0x83acfcf4) | 1.1 | 0.7-0.9 |
+| SleepThread polls (lr 0x8009a478, 20 us each, ~3 k a second) | 0.9 | 1.0-1.2 |
+| other waits | < 0.1 | 0.4 |
+| main thread working (its guest code and the engine's submit) | ~4.5 | ~5.9 |
+
+### The job group's critical path
+
+| | kokiri-idle | castle-move |
+|---|---:|---:|
+| work on the path | 6.78 ms (96.8%) | 7.49-7.82 ms (95.8-96.7%) |
+| wake (signal -> running) | 0.21 ms (3.0%) | 0.24-0.30 ms (2.9-3.8%) |
+| virtual-core waits on the path | 0.01 ms | 0.02 ms |
+| SleepThread polls on the path | 0.01 ms | 0.01 ms |
+| path work by thread | BaseProcExecutor0-5 0.78-1.17 ms each, ModuleSystemWorker1 0.37, MSW2-5 0.05-0.17 | the same shape |
+
+Wake latency of every blocked wait (not only on the path): 5.7-6.5 us mean after a sleep (p90 8-9 us, p99 10-24 us) for the
+executors, module workers and the main thread; waits ended in the spin: < 1 us. Virtual-core waits: < 2 ms a second per job
+thread (NavMeshDepWorker2 ~20 ms a second, off the path).
+
+What the path's work runs (HOS_SAMPLE_ALL with HOS_SAMPLE_NS in the same run; 579 samples standing, 428 walking): guest code
+84.8% / 80.1%; runtime 8.1% / 10.3% (obj_lookup + obj 1.9-2.4%, the soft-FP helpers a64_fpx_mul32_fma32, a64_fpx_fma32_fma32,
+recomp_fp_estimate ~1-3.5%, mutex_lock 0.7%); system 6.9% / 9.6% (ntdll under event_signal and under f_8004ab40's signals:
+the wake syscall of a SignalLightEvent whose waiter sleeps, 3-5%; a copy in n_nvnTextureInitialize). The largest guest
+functions on it: f_801d99a0 3.7-4.0%, f_800a8400 2.2-3.3%, f_80ba6d80 1.2-2.9%, f_81c86720, f_81b8c000, f_81501180,
+f_8004ab40 (the dispatcher) ~1.5-2% each: the same flat profile as docs/hotmap.md.
+
+The job threads during the group's waits (share of that time): all six executors working 41-44%; one or none 36-39%; 2-5
+the rest; 3.45 executors on average. The group is two phases: a parallel one where the six executors are all busy, and a
+serial tail where one job (on one executor or a module worker) is the chain. Neither is a wake or scheduling problem.
+
+Attribution asked by the ticket: (a) job code execution ~97% of the wait (of which ~80-85% guest code); (b) wake latency of
+the guest sync primitives ~3%; (c) host overhead inside the lifted code ~8-10% of the path's work (~0.6-0.8 ms a frame),
+spread over obj_lookup, soft-FP helpers, mutex_lock, plus ~3-5% wake syscalls; (d) host scheduling (virtual cores, polls,
+priorities, core count) < 0.5%.
+
+### Tried (env only, castle-move, 110 s runs, 66 s cut; fps / 1% low / p99)
+
+| config | runs | mean fps |
+|---|---|---:|
+| default (spin 20 us) | 65.4 / 28.4 / 28.9 ms, 67.8 / 30.2 / 27.3, 66.0 / 26.6 / 29.3 | **66.4** |
+| `HOS_SPIN_US=0` | 63.8 / 26.1 / 29.6, 64.9 / 27.3 / 27.9 | 64.4 |
+| `HOS_SPIN_US=5` | 62.4 / 24.2 / 31.8, 62.7 / 27.5 / 30.5 | 62.6 |
+| `HOS_SPIN_US=100 HOS_SPIN_ALWAYS=1` | 61.9 / 25.1 / 31.5 | 61.9 |
+| `HOS_PIN_BY_CORE=1` (game threads on logical CPU 2 x core) | 36.4 / 7.8 / 115.8 | 36.4 |
+| `HOS_CORES=8` (kokiri-idle, with the trace) | 70.2 / 36.8 / 20.4 (default with the trace: 71.3) | the game still makes 6 executors and 5 module workers |
+
+The 20 us spin is the best of these: shorter spins put the wake syscall and the ~6 us wake on more hand-offs, longer ones
+hold the spinning thread's virtual core (and its SMT sibling) away from the work. Fixed affinity is far worse than letting
+Windows place threads. More virtual cores change nothing: the executor pool is the game's (f_80b5e9e0 builds it, with
+per-core slots for six cores), so more executors would need a game patch of the job system's per-core tables.
+
+Not changed, and why: a faster wake (WaitOnAddress, spin-then-block): the path's wake is 0.2-0.3 ms a frame and the spin
+already covers the short hand-offs; thread priorities (TICK-011: within the spread); obj_lookup (~0.15 ms a frame on the
+path; a cache in the guest MutexType needs proof the game never reads it); native replacements: no guest function carries
+more than ~4% of the path, the self-contained FP kernels 1-3% each (at a 2x native speed-up ~0.1 ms a frame each).
+
+### What is next (ranked)
+
+1. The serial tail of the group (36-39% of its time with one job thread working): which job it is per frame (the trace
+   names the thread, the samples the guest function) and whether it can start earlier or be split. This is the game's job graph.
+2. More executors: the parallel phase (41-44% of the group's wait, all six executors busy while ~10 logical CPUs idle) would
+   shrink with 8-12 executors, ~1 ms a frame at best. Needs the job system's per-core slots (f_80b5e9e0 and its users)
+   widened and the virtual cores raised with them: a game patch, high risk.
+3. Lifter-level speed of the guest code (80-85% of the path): what TICK-011/022 measured (A64_POLL, memory marks, atomics,
+   FMA) did not move it; a new approach (e.g. keeping hot guest registers in host registers across calls) is a large project.
+4. The runtime on the path (~0.6-0.8 ms a frame): the soft-FP helpers' remaining fallbacks and obj_lookup's misses, each
+   ~0.1-0.25 ms.
+
+Build check (kokiri-idle, interleaved, trace off): the TICK-038 build 74.0 / 71.1 fps (mean 72.6 / 36.9 / 21.2 ms), this build
+70.2 / 74.8 (72.5 / 39.6 / 20.7 ms): the same. Picture and game speed: no default path changed (record points only), so no
+shots and no HOS_SPEED_LOG run were made for this build.
+
+Not verified: other CPUs (fewer cores make the virtual cores and the spin matter more), Kokiri / Hyrule Field, long sessions.

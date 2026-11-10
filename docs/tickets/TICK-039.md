@@ -3,3 +3,9 @@
 **Goal**: reconstruct the job graph's critical path per frame (job start/end per thread, who signals whom, wait->wake latency), attribute it, and cut it: faster wake paths for guest sync primitives (spin-then-block, futex/WaitOnAddress, thread priorities/affinity), lower per-call overhead in the lifted code, or native replacements (TICK-026 framework) of the hottest jobs on the path. Each behind a switch, picture and game speed unchanged.
 **Acceptance**: breakdown of the job-group wait; measurable fps gain in kokiri-idle/castle-move beyond the 2-4 fps spread, or proof and a ranked plan.
 **Branch**: `feature/TICK-039-job-chain`
+
+## Result (2026-11-10)
+- The job-group wait (f_8007fe60, lr 0x80080188; 7.0 ms a frame standing, 7.8-8.1 walking) is ~97% job execution on the chain, ~3% wake latency (0.2-0.3 ms a frame), < 0.5% virtual cores / polls / scheduling. The chain's work: ~80-85% guest code, ~8-10% runtime (obj_lookup, soft-FP helpers, mutex_lock), ~7-10% system (wake syscalls). During the wait all six executors are busy 41-44% of the time, one or none 36-39%.
+- Instruments kept (off by default): `HOS_JOBTRACE` (host/hos_jobtrace.c), `HOS_SAMPLE_NS`, `tools/bench/jobtrace.py`.
+- Tried, env only (castle-move, default 66.4 fps): spin 0 / 5 / 100 us 64.4 / 62.6 / 61.9, HOS_PIN_BY_CORE 36.4, HOS_CORES=8 no change (the game keeps six executors). No default changed: no fps gain is available from the host's sync, wake or placement.
+- Acceptance met by proof and a ranked plan (engine/docs/perf-audit.md, "TICK-039"): the serial tail's job, more executors (game patch of the per-core job tables), lifter-level guest speed, the runtime on the path.
