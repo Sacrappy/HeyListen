@@ -16,6 +16,12 @@ repository (the engine under `engine/`).
 - `heylisten-setup.txt`: the list of parts the setup reads (you do not need to download it).
 - `SHA256SUMS.txt`: checksums of the files above.
 
+## New in v0.2.1
+
+- **Faster floating-point code**: the game's vector math runs as real SIMD instead of lane by lane, its slow paths (quiet
+  NaN lanes, estimates) are cut, and the builder ships an optimization profile recorded on that code. Market about
+  75 -> 78 fps standing, 68 -> 73 walking, street to the gate 71 -> 74 on the test PC. Results are bit-identical to before.
+
 ## New in v0.2.0
 
 - **Castle Town Market ground fixed** while walking (no more flat mint/white or teal ground): ASTC textures are kept as
