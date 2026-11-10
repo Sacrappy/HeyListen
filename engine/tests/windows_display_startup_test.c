@@ -67,6 +67,7 @@ static void reset(void) {
     event_result = (HANDLE)1; thread_result = (HANDLE)2; window_result = (HANDLE)3;
     hwnd = NULL; error_result = 0; exit_code = 0;
     thread_proc = NULL; thread_arg = NULL; closed_handle = NULL; log_line[0] = 0;
+    (void)thread_arg;   /* (hookshot fork: clang -Werror says set but not used) */
 }
 static void failed(const char *operation, DWORD error) {
     CHECK("process exits nonzero", exit_calls == 1 && exit_code != 0);
