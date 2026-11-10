@@ -224,6 +224,22 @@ VkFormatInfo vk_format(int nvn_format);
 bool is_depth_format(VkFormat f);
 bool has_stencil(VkFormat f);
 
+// (TICK-038) what each allocation is for, by kind and where it landed (RX_VK_RES_LOG=1: counted, and logged every 600 presents).
+// A call site sets the kind for the allocations it makes with MemKindScope; images are told apart by their usage
+enum class MemKind : uint8_t { Other, Texture, Target, Mirror, WbShadow, Capture, Stream, Staging, Readback, Scratch, Count };
+extern thread_local MemKind mem_kind_tag;
+struct MemKindScope {
+    MemKind prev;
+    explicit MemKindScope(MemKind k) : prev(mem_kind_tag) { mem_kind_tag = k; }
+    ~MemKindScope() { mem_kind_tag = prev; }
+};
+bool res_log_on();
+/// one line: bytes by kind and memory class (VRAM, VRAM the CPU maps, system cached, system uncached)
+void mem_kinds_log();
+void memory_res_log();   // (vk_memory.cpp: the process line, then mem_kinds_log)
+void res_note_pipeline_use(VkPipeline pl);   // (vk_draw.cpp, RX_VK_RES_LOG: a pipeline bound)
+/// (vk_draw.cpp) graphics pipelines made, pipelines ever bound, compute shader modules let go (RX_VK_CS_MODULE_DROP)
+void res_pipeline_counts(size_t* graphics, size_t* used, int64_t* modules_dropped);
 // device memory (vk_vma.cpp, Vulkan Memory Allocator)
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false);

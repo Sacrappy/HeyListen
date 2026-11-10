@@ -428,6 +428,7 @@ bool stream_next(uint64_t need) {
         RecordingRes::Stream s{};
         s.size = std::max<uint64_t>((need + (1u << 20) - 1) & ~((1ull << 20) - 1), std::min<uint64_t>(r.size * 2, 32ull << 20));
         void* mapped = nullptr;
+        MemKindScope mem_kind_(MemKind::Stream);   // (TICK-038: RX_VK_RES_LOG)
         if (!create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true) || !mapped) return false;
         s.mapped = (uint8_t*)mapped;
         stream_extra += s.size, stream_grown++;
@@ -668,6 +669,7 @@ void ensure_layout(Program& p) {
 
 // ---- the pipeline cache, on disk ----
 VkPipelineCache pcache = VK_NULL_HANDLE;
+bool pcache_loaded = false;   // (TICK-038: it began with this device's and driver's data from the file)
 std::string pcache_path;
 std::atomic<int64_t> pcache_built_since_save{0};
 void pcache_init() {
@@ -704,6 +706,7 @@ void pcache_init() {
         ci.initialDataSize = 0, ci.pInitialData = nullptr;
         vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache);
     }
+    pcache_loaded = pcache && ci.initialDataSize >= 32;
     logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size() >> 10);
 }
 
@@ -3768,6 +3771,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
         void* mapped = nullptr;
         RecordingRes::Stream s{};
         s.size = kStream;
+        MemKindScope mem_kind_(MemKind::Stream);   // (TICK-038: RX_VK_RES_LOG)
         create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true);
         s.mapped = (uint8_t*)mapped;
         static int logged;   // (TICK-019: the uniform data, inline data and indices the GPU reads from these)
@@ -5816,6 +5820,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (pl != last_pipeline) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
+        if (res_log_on()) res_note_pipeline_use(pl);   // (TICK-038)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), last_pipeline = pl;
     }
     if (!same_desc) {
@@ -6537,6 +6542,41 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     return typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true);
 }
 
+// ---- (TICK-038) resources: the pipelines the game binds (RX_VK_RES_LOG=1), and compute programs' shader modules let go ----
+namespace {
+std::mutex res_use_mu;
+std::unordered_set<VkPipeline> res_used;
+}
+void res_note_pipeline_use(VkPipeline pl) {
+    std::lock_guard lk(res_use_mu);
+    res_used.insert(pl);
+}
+size_t res_pipelines_used() {
+    std::lock_guard lk(res_use_mu);
+    return res_used.size();
+}
+/// RX_VK_CS_MODULE_DROP: a compute program's shader module is let go once its pipeline is made (nothing reads it after: the
+/// dispatch builds from it only while compute_pipeline is null). The driver keeps each module's SPIR-V; 0: kept, as before
+bool cs_module_drop() {
+    static const bool v = !getenv("RX_VK_CS_MODULE_DROP") || atoi(getenv("RX_VK_CS_MODULE_DROP")) != 0;
+    return v;
+}
+std::atomic<int64_t> cs_modules_dropped{0};
+std::atomic<int64_t> cs_cache_hits{0}, cs_cache_misses{0};   // (compute pipelines built in play: in the pipeline cache or not)
+void res_pipeline_counts(size_t* graphics, size_t* used, int64_t* modules_dropped) {
+    *graphics = pipelines.size();   // (the replay's map, read for a count only)
+    *used = res_pipelines_used();
+    *modules_dropped = cs_modules_dropped.load();
+    logf("vk: compute pipelines built in play: %lld from the pipeline cache (or under 30 ms), %lld compiled", (long long)cs_cache_hits.load(),
+         (long long)cs_cache_misses.load());
+}
+void cs_module_release(Program& p) {
+    if (!cs_module_drop() || !p.compute || !p.compute_pipeline || p.stages.empty() || !p.stages[0].module) return;
+    vkDestroyShaderModule(dev.device, p.stages[0].module, nullptr);
+    p.stages[0].module = VK_NULL_HANDLE;
+    cs_modules_dropped++;
+}
+
 bool precompile_wanted() {
 #if defined(HOOKSHOT_RELEASE)
     bool on = true;
@@ -6799,10 +6839,19 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
     Pre* pre = new Pre;
     pre->t0 = t0, pre->marker = running, pre->background = !wait;
     const size_t notes_n = notes.size();
+    // (TICK-038) The kept compute programs stay on disk, their pipelines made at their first dispatch, when the pipeline cache began
+    // with this driver's data: the precompile made all 7808 of them (every texture variant of every compute program) and kept their
+    // modules and pipelines, ~2 GB of the driver's memory, of which the Market binds ~110. Read from the program cache and built from
+    // the pipeline cache when first dispatched (on a worker, the dispatch waiting up to 50 ms as for any compute pipeline), a few ms
+    // each, at the scene's load. A new driver's start (the cache's data refused) precompiles them all as before.
+    // RX_VK_LAZY_COMPUTE=0: precompiled always, as before; 2: lazy even without the cache's data
+    const int lazy_mode = getenv("RX_VK_LAZY_COMPUTE") ? atoi(getenv("RX_VK_LAZY_COMPUTE")) : 1;
+    const bool lazy_compute = lazy_mode == 2 || (lazy_mode == 1 && pcache_loaded);
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
         if (p.compute) pre->computes.push_back(&p);
-    });
+    }, !lazy_compute);
+    if (lazy_compute) logf("vk: precompile: the compute programs stay on disk until dispatched (RX_VK_LAZY_COMPUTE)");
     // The entries are made here, before the game draws: a draw that asks for one finds it (not ready) and does not make another
     {
         ParLock lk;
@@ -6855,6 +6904,7 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
                 if (guarded_compute(pcache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
                 if (made) {
                     p.compute_pipeline = made;
+                    cs_module_release(p);   // (TICK-038)
                     p.compute_state.store(2, std::memory_order_release);
                 } else {
                     p.compute_state.store(0, std::memory_order_release);   // (a dispatch makes its own, and says why it fails)
@@ -7088,18 +7138,31 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                 if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                 const auto t0 = std::chrono::steady_clock::now();
                 VkPipeline made = VK_NULL_HANDLE;
+                // (TICK-038) whether the pipeline cache had it: a hit is not a reason to write the 1 GB cache file again
+                VkPipelineCreationFeedback fb{};
+                VkPipelineCreationFeedbackCreateInfo fci{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+                fci.pipelineStageCreationFeedbackCount = 0;
+                fci.pPipelineCreationFeedback = &fb;
+                ci.pNext = &fci;
                 if (const VkResult r = guarded_compute(pcache, &ci, &made); r != VK_SUCCESS || !made) {
                     static std::atomic<int> told{0};
                     if (told++ < 20) logf("vk: compute pipeline of %016llx not made (%d)", (unsigned long long)q.key, (int)r);
                     q.failed = true;
                 } else {
                     q.compute_pipeline = made;
+                    cs_module_release(q);   // (TICK-038)
                 }
                 const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
                 if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms (on a worker)", (unsigned long long)q.key, (long long)ms);
                 st_pipeline_us += ms * 1000;
                 st_pipelines++;
-                pcache_built_since_save++;
+                // (NVIDIA leaves the hit bit clear even for what it had: a build under 30 ms is taken as one, the lazy compute
+                // programs' ~2.5 ms each at the Market. One not counted is still saved at exit, which saves whatever the count)
+                const bool hit = ((fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+                                  (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)) ||
+                                 (pcache_loaded && ms < 30);
+                (hit ? cs_cache_hits : cs_cache_misses)++;
+                if (!hit) pcache_built_since_save++;
                 q.compute_state.store(2, std::memory_order_release);
             };
             if (serial) jobs_push_serial(std::move(build));
@@ -7152,6 +7215,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         st_pipeline_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         st_pipelines++;
         pcache_built_since_save++;
+        if (p.compute_pipeline) cs_module_release(p);   // (TICK-038)
     }
     if (plk.on) par_mutex().unlock(), plk.on = false;
     dclock.t_pipe = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -7210,6 +7274,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");
+    if (res_log_on()) res_note_pipeline_use(p.compute_pipeline);   // (TICK-038)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.compute_pipeline);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) SKIP_HERE();
     push_constants(cmd, p, nullptr);

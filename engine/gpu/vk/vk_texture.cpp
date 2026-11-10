@@ -369,6 +369,7 @@ Staging staging(uint64_t n, uint64_t align = 256) {
     Arena a;
     a.size = std::max(kArena, uint64_t((n + 0xFFFFF) & ~0xFFFFFull));
     void* m = nullptr;
+    MemKindScope mem_kind_(MemKind::Staging);   // (TICK-038: RX_VK_RES_LOG)
     if (!create_buffer(a.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
                        a.allocation, &m) || !m)
         return {};
@@ -509,6 +510,7 @@ bool bc_scratch_make() {   // (bc_mu held)
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     static const bool pool = getenv("RX_VK_BC_POOL") != nullptr;
+    MemKindScope mem_kind_(MemKind::Scratch);   // (TICK-038: RX_VK_RES_LOG)
     if (!create_image(ii, bc_scratch, bc_scratch_alloc, !pool)) return false;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = bc_scratch;
@@ -603,6 +605,7 @@ bool bc_scratch2_make() {
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     static const bool pool = getenv("RX_VK_BC_POOL") != nullptr;
+    MemKindScope mem_kind_(MemKind::Scratch);   // (TICK-038: RX_VK_RES_LOG)
     if (!create_image(ii, bc_scratch2, bc_scratch2_alloc, !pool)) return false;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = bc_scratch2;
@@ -2724,6 +2727,7 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
     // (cached host memory, which the CPU reads: the sequential-write kind is write-combined, or VRAM behind the BAR, and every read
     // of it by the unswizzle below goes over PCIe uncached. RX_VK_FLUSH_UNCACHED=1: as before)
     static const bool uncached = getenv("RX_VK_FLUSH_UNCACHED") != nullptr;
+    MemKindScope mem_kind_(MemKind::Readback);   // (TICK-038: RX_VK_RES_LOG)
     if (!(uncached ? create_buffer(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, buf, alloc, &map)
                    : create_buffer_cached(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, buf, alloc, &map)) || !map)
         return false;
@@ -3497,6 +3501,7 @@ void texture_frame(uint64_t completed) {
             logf("vk: spare images: %zu held (%llu MB); %llu kept, %llu taken by new textures, %llu freed unused so far",
                  spares.size(), (unsigned long long)(spare_bytes >> 20), (unsigned long long)spare_st.kept,
                  (unsigned long long)spare_st.taken, (unsigned long long)spare_st.freed);
+            memory_res_log();   // (TICK-038: RX_VK_RES_LOG=1, the process and the allocations by kind)
         }
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
         uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;

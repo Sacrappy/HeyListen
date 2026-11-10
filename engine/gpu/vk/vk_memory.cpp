@@ -831,7 +831,7 @@ uint64_t cap_bytes = 0;
 constexpr size_t kKeep = 24;
 constexpr uint64_t kCapBytesMax = 768ull << 20;   // (and no more than this in them: loads capture hundreds of MB)
 // (retired buffers, for the next captures: making and freeing a 5 MB buffer every submit cost the replay too)
-struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; };
+struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; uint64_t at = 0; };
 std::vector<FreeBuf> cap_free;
 uint64_t cur_cap_value = 0;   // (the submission being recorded: what its syncs' copies wait for)
 uint32_t cur_cap_gen = 0;     // (its capture's generation)
@@ -851,14 +851,38 @@ uint64_t cap_spare_max() {
     }();
     return v;
 }
+// (TICK-038, off by default) RX_VK_CAP_SPARE_AGE=<n>: a spare no capture took for n captures is freed. The 12 spares held 195-385 MB of
+// host memory in the Market; with 600 they held 89-411 MB and the submits made 1.5-2x as many buffers (each on the game's thread):
+// the spares are taken again, not left over from the load. 0 (default): kept, as before
+uint64_t cap_gets = 0;   // (cap_free_mu: buffers asked for)
+uint64_t cap_spare_age() {
+    static const uint64_t v = getenv("RX_VK_CAP_SPARE_AGE") ? (uint64_t)atoll(getenv("RX_VK_CAP_SPARE_AGE")) : 0;
+    return v;
+}
+uint64_t cap_spares_aged = 0;   // (cap_free_mu)
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
-    std::lock_guard lk(cap_free_mu);
-    if (cap_free.size() < 12 && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
-        cap_free.push_back({buffer, alloc, map, size});
-        cap_free_bytes += size;
-    } else {
-        destroy_buffer(buffer, alloc);
+    FreeBuf old[12];
+    int n_old = 0;
+    {
+        std::lock_guard lk(cap_free_mu);
+        if (const uint64_t age = cap_spare_age())
+            for (size_t i = 0; i < cap_free.size();)
+                if (cap_gets - cap_free[i].at > age && n_old < 12) {
+                    old[n_old++] = cap_free[i];
+                    cap_free_bytes -= cap_free[i].size;
+                    cap_free.erase(cap_free.begin() + (ptrdiff_t)i);
+                    cap_spares_aged++;
+                } else {
+                    i++;
+                }
+        if (cap_free.size() < 12 && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
+            cap_free.push_back({buffer, alloc, map, size, cap_gets});
+            cap_free_bytes += size;
+            buffer = VK_NULL_HANDLE;
+        }
     }
+    if (buffer) destroy_buffer(buffer, alloc);
+    for (int i = 0; i < n_old; i++) destroy_buffer(old[i].buffer, old[i].alloc);
 }
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
     cap_bytes -= it->second.size;
@@ -874,8 +898,10 @@ uint64_t cap_buf_size(uint64_t need) {
     while (s < need && s < (16ull << 20)) s <<= 1;
     return s >= need ? s : (need + (1u << 20) - 1) & ~((1ull << 20) - 1);
 }
+uint64_t cap_bufs_made = 0;   // (TICK-038: capture buffers made, for the log: a spare that was missed)
 bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& map, uint64_t& size) {
     std::lock_guard lk(cap_free_mu);
+    cap_gets++;
     size_t best = cap_free.size();
     for (size_t i = 0; i < cap_free.size(); i++)
         if (cap_free[i].size >= need && (best == cap_free.size() || cap_free[i].size < cap_free[best].size)) best = i;
@@ -887,6 +913,8 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     }
     size = cap_buf_size(need);
     map = nullptr;
+    cap_bufs_made++;
+    MemKindScope mem_kind_(MemKind::Capture);   // (TICK-038: RX_VK_RES_LOG)
     const bool ok = create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, buffer, alloc, &map,
                                          size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
     static int logged;   // (TICK-019: the mirror syncs copy from these)
@@ -2366,6 +2394,7 @@ bool scatter_ready() {   // (scatter_mu held)
     }
     vkDestroyShaderModule(dev.device, module, nullptr);
     void* m = nullptr;
+    MemKindScope mem_kind_(MemKind::Staging);   // (TICK-038: RX_VK_RES_LOG)
     ok = ok && create_buffer(kScatterEntries * sizeof(ScatterEntry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                              true, scatter.ring, scatter.ring_alloc, &m, false) && m;
     if (ok) {
@@ -3228,6 +3257,7 @@ bool mirror_make(Pool& pool) {
                      (unsigned long long)(mirror_budget() >> 20));
             return false;
         }
+        MemKindScope mem_kind_(MemKind::Mirror);   // (TICK-038: RX_VK_RES_LOG)
         if (!create_device_buffer(n, kUsage, p->mirror, p->mirror_alloc)) {
             p->mstate = Pool::MIRROR_REFUSED;
             return false;
@@ -3437,6 +3467,7 @@ bool shadow_room(uint64_t n) {   // (the shadows' budget, and VRAM 85% full at m
 bool shadow_make(Pool& p) {
     const uint64_t n = p.hi - p.lo;
     if (!p.mirror || !shadow_room(n)) return false;
+    MemKindScope mem_kind_(MemKind::WbShadow);   // (TICK-038: RX_VK_RES_LOG)
     if (!create_device_buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, p.shadow, p.shadow_alloc))
         return false;
@@ -3588,6 +3619,7 @@ WbdTable* wbd_table_get(uint64_t bytes) {
         t = {};
         const uint64_t n = std::max<uint64_t>(128u << 10, (bytes + 65535) & ~65535ull);
         void* map = nullptr;
+        MemKindScope mem_kind_(MemKind::Staging);   // (TICK-038: RX_VK_RES_LOG)
         if (!create_buffer(n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, t.buf, t.alloc, &map) ||
             !map) {
             if (t.buf) destroy_buffer(t.buf, t.alloc);
@@ -3882,6 +3914,61 @@ void memory_end_submission(VkCommandBuffer cmd) {
     mirror_upload = false;
 }
 
+/// (TICK-038, RX_VK_RES_LOG=1) one line of the process's memory: commit, working set, the C heaps, and what this file keeps in
+/// system memory (the captures' buffers, the texture-storage shadow, the capture table)
+void memory_res_log() {
+    if (!res_log_on()) return;
+    struct Counters {
+        DWORD cb, PageFaultCount;
+        SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage,
+            QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
+    };
+    using MemInfo = BOOL(WINAPI*)(HANDLE, Counters*, DWORD);
+    struct Summary { DWORD cb; SIZE_T allocated, committed, reserved, max_reserve; };
+    using HeapSum = BOOL(WINAPI*)(HANDLE, DWORD, Summary*);
+    static const MemInfo mem_info = (MemInfo)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    static const HeapSum heap_sum = (HeapSum)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "HeapSummary");
+    Counters m{};
+    m.cb = sizeof m;
+    if (mem_info) mem_info(GetCurrentProcess(), &m, sizeof m);
+    uint64_t h_alloc = 0, h_commit = 0;
+    HANDLE heaps[64];
+    const DWORD nh = GetProcessHeaps(64, heaps);
+    for (DWORD i = 0; i < nh && i < 64 && heap_sum; i++) {
+        Summary su{};
+        su.cb = sizeof su;
+        if (heap_sum(heaps[i], 0, &su)) h_alloc += su.allocated, h_commit += su.committed;
+    }
+    size_t kept = 0, spares = 0;
+    {
+        std::lock_guard lk(cap_mu);
+        kept = captures.size(), spares = spare.size();
+    }
+    size_t chunks = 0;   // (the capture table's chunks made: the replay's, read racily, for the count only)
+    for (const auto& c : cap_table) chunks += c != nullptr;
+    uint64_t free_n = 0, free_b = 0, made = 0, aged = 0, gets = 0;
+    {
+        std::lock_guard lk(cap_free_mu);
+        free_n = cap_free.size(), free_b = cap_free_bytes, made = cap_bufs_made, aged = cap_spares_aged, gets = cap_gets;
+    }
+    logf("vk: process memory: private %llu MB, working set %llu MB (peak %llu); C heaps (%lu) %llu MB in use of %llu committed; "
+         "captures: %zu queued, %zu buffers kept %llu MB, %llu spare buffers %llu MB (%llu made, %llu spares aged out of %llu asked), "
+         "%zu spare records; texture shadow %zu pages "
+         "(%llu MB); capture table %zu chunks (%llu MB)",
+         (unsigned long long)(m.PrivateUsage >> 20), (unsigned long long)(m.WorkingSetSize >> 20),
+         (unsigned long long)(m.PeakWorkingSetSize >> 20), (unsigned long)nh, (unsigned long long)(h_alloc >> 20),
+         (unsigned long long)(h_commit >> 20), kept, cap_bufs.size(), (unsigned long long)(cap_bytes >> 20),
+         (unsigned long long)free_n, (unsigned long long)(free_b >> 20), (unsigned long long)made,
+         (unsigned long long)aged, (unsigned long long)gets, spares, shadow_n.load(),
+         (unsigned long long)((uint64_t)shadow_n.load() * 4096 >> 20), chunks,
+         (unsigned long long)((uint64_t)chunks * kCapChunkPages * sizeof(CapEntry) >> 20));
+    size_t g = 0, used = 0;
+    int64_t dropped = 0;
+    res_pipeline_counts(&g, &used, &dropped);
+    logf("vk: pipelines: %zu graphics made, %zu pipelines bound so far; %lld compute shader modules let go", g, used,
+         (long long)dropped);
+    mem_kinds_log();
+}
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;
     *wb_bytes = st_wb_bytes;
