@@ -171,8 +171,21 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP + 8:   /* (the Insert menu opened or closed: gpu/vk/vk_menu.cpp) */
         menu_mouse(w, (int)wp);
         return 0;
-    case WM_TIMER:
+    case WM_TIMER: {
+        /* (hookshot, #1532) a controller is not input to Windows: playing with one, the display went off at the power
+           plan's timeout. While the game's window is in front and not minimized, the display's idle timer is reset every
+           30 s (ES_DISPLAY_REQUIRED without ES_CONTINUOUS: nothing is held when the game is left or closed).
+           HOS_KEEP_DISPLAY=0: Windows' timeout as before */
+        static ULONGLONG last_awake;
+        static int keep = -1;
+        if (keep < 0) keep = !getenv("HOS_KEEP_DISPLAY") || atoi(getenv("HOS_KEEP_DISPLAY")) != 0;
+        const ULONGLONG now = GetTickCount64();
+        if (keep && renderer && now - last_awake >= 30000 && GetForegroundWindow() == w && !IsIconic(w)) {
+            last_awake = now;
+            SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        }
         return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_SCREENSAVE && !(wp & SCF_ISSECURE) &&
             renderer && GetForegroundWindow() == w && !IsIconic(w)) {
@@ -198,10 +211,18 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         extern void hos_vk_note_key_press(unsigned key);
         if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
-        if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+        if (wp == VK_F11 && !(lp & (1 << 30))) {
+            const int mod = (GetKeyState(VK_SHIFT) | GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU)) & 0x8000;
+            if (!mod) set_fullscreen(w, !fullscreen);
+        }
         return 0;
     }
     case WM_SYSKEYDOWN:   /* Alt+Enter, as on Linux (display_sdl.c); other Alt keys (Alt+F4) go on to Windows */
+        if (wp == VK_F10) {   /* (HeyListen: F10, the overlay's key, comes as a system key; noted for the menu, no window menu mode) */
+            extern void hos_vk_note_key_press(unsigned key);
+            if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
+            return 0;
+        }
         if (wp == VK_RETURN && (lp & (1 << 29))) {
             if (!(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
             return 0;

@@ -4,6 +4,8 @@
 // Taken from the oot-pc port's runtime/ui/menu.cpp (the performance overlay, MIT, Copyright (c) 2026 Jeff Aigner and the
 // totk-pc-recomp contributors, in the style of SavageWindRecomp's perf_overlay_draw, MIT, Copyright (c) 2026 Revivedx), with
 // the catalog's English texts in place and the numbers from vk_perf.cpp. ImGui runs on the presentation thread only.
+// (Sync 11: drawn inside the menu's Dear ImGui frame, upstream's vk_imgui.cpp, which records it into the window's image with the
+// menu, sRGB and HDR handled there; this file keeps only its own font, style and drawing)
 #include <atomic>
 #include <cfloat>
 #include <cmath>
@@ -16,7 +18,6 @@
 #include "vk_perf.h"
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "backends/imgui_impl_vulkan.h"
 
 namespace mkwvk {
 
@@ -24,11 +25,10 @@ HWND app_window();   // (vk_main.cpp)
 
 namespace {
 
-#include "imgui/roboto_ttf.inc"
+#include "overlay_font/roboto_ttf.inc"   // (Roboto Medium, Apache 2.0: overlay_font/LICENSE-Roboto.txt)
 
-bool ctx_ok = false, vk_ok = false;
-VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
-float font_scale = 0;
+ImFont* roboto = nullptr;
+bool style_ok = false;
 ImGuiStyle base_style;
 
 // The sizes are tuned for 1080 lines and follow the window's height. Under 720 lines at 100% display scale they stay at the
@@ -68,77 +68,14 @@ void style_init(ImGuiStyle& s) {
     c[ImGuiCol_Separator] = ImVec4(0.30f, 0.36f, 0.30f, 1);
 }
 
-void make_context() {
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.LogFilename = nullptr;
-    io.BackendPlatformName = "hookshot_overlay";
-    style_init(base_style);
-    ImGui::GetStyle() = base_style;
-    ctx_ok = true;
-}
-
-void vk_down() {
-    if (!vk_ok) return;
-    ImGui_ImplVulkan_Shutdown();
-    vk_ok = false;
-    font_scale = 0;
-}
-
-PFN_vkVoidFunction load_fn(const char* name, void*) { return instance_proc()(dev.instance, name); }
-
-bool vk_up(VkFormat fmt) {
-    if (vk_ok && vk_fmt == fmt) return true;
-    if (vk_ok) {   // the swapchain changed format: pipelines for the new one
-        std::lock_guard qk(dev.present_mu);
-        vkQueueWaitIdle(dev.queue);
-        vk_down();
-    }
-    static bool loaded = false;
-    if (!loaded) loaded = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, load_fn, nullptr);
-    if (!loaded) return false;
-    ImGui_ImplVulkan_InitInfo ii = {};
-    ii.ApiVersion = VK_API_VERSION_1_3;
-    ii.Instance = dev.instance;
-    ii.PhysicalDevice = dev.physical;
-    ii.Device = dev.device;
-    ii.QueueFamily = dev.queue_family;
-    ii.Queue = dev.queue;
-    ii.DescriptorPoolSize = 16;
-    ii.MinImageCount = 2;
-    ii.ImageCount = 4;   // vertex buffers rotate per recorded frame: more than the three frames in flight
-    ii.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-    ii.UseDynamicRendering = true;
-    vk_fmt = fmt;
-    ii.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    ii.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-    ii.PipelineRenderingCreateInfo.pColorAttachmentFormats = &vk_fmt;
-    if (!ImGui_ImplVulkan_Init(&ii)) return false;
-    vk_ok = true;
-    return true;
-}
-
-// Roboto Medium (Latin, Cyrillic, dashes and quotes) at 26 px per 1080 lines. Made again when the window height changes; the
-// old texture goes after the queue is idle (CreateFontsTexture).
-const ImWchar kRanges[] = {0x0020, 0x00FF, 0x0400, 0x052F, 0x2010, 0x2027, 0};
-
-bool fonts_up(float scale) {
-    ImFontAtlas* fa = ImGui::GetIO().Fonts;
-    fa->Clear();
+// Roboto Medium at 26 px per 1080 lines, in the menu's font atlas (Dear ImGui 1.92 bakes each size as it is asked for). Added
+// before a frame begins (overlay_prepare), once the menu's context is there
+void add_font() {
     ImFontConfig fc;
     fc.FontDataOwnedByAtlas = false;
-    fa->AddFontFromMemoryTTF((void*)roboto_ttf, (int)sizeof roboto_ttf, 26.0f * scale, &fc, kRanges);
-    bool ok;
-    {
-        std::lock_guard qk(dev.present_mu);   // (the upload submits on the queue and waits for it)
-        ok = ImGui_ImplVulkan_CreateFontsTexture();
-    }
-    fa->ClearInputData();   // the glyphs are in the texture: the font file and the pixels are not needed again
-    fa->ClearTexData();
-    logf("overlay: font atlas at %.1f px", 26.0f * scale);
-    font_scale = ok ? scale : 0;
-    return ok;
+    snprintf(fc.Name, sizeof fc.Name, "Roboto Medium (overlay)");
+    roboto = ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)roboto_ttf, (int)sizeof roboto_ttf, 26.0f, &fc);
+    if (!roboto) logf("overlay: the font could not be added");
 }
 
 // ---- what the picture lines show: set by the present path
@@ -363,104 +300,30 @@ void perf_fps_draw(uint32_t width, float scale, bool menu_open) {
     dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), fps_text);
 }
 
-// ---- one view of each swapchain image, made when first drawn on
-struct View { VkImage image; VkImageView view; };
-std::vector<View> views;
-
-VkImageView view_of(VkImage image, VkFormat fmt) {
-    for (const View& v : views)
-        if (v.image == image) return v.view;
-    // (views of images the swapchain no longer has go first; the swapchain's change waited for the device)
-    for (size_t i = 0; i < views.size();) {
-        bool live = false;
-        for (VkImage im : dev.swap_images) live |= im == views[i].image;
-        if (live) { i++; continue; }
-        vkDestroyImageView(dev.device, views[i].view, nullptr);
-        views.erase(views.begin() + (long)i);
-    }
-    VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    ci.image = image;
-    ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    ci.format = fmt;
-    ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkImageView v = VK_NULL_HANDLE;
-    if (vkCreateImageView(dev.device, &ci, nullptr, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
-    views.push_back({image, v});
-    return v;
-}
-
-void layout_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src_stage,
-                    VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
-    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    b.srcStageMask = src_stage, b.srcAccessMask = src_access, b.dstStageMask = dst_stage, b.dstAccessMask = dst_access;
-    b.oldLayout = from, b.newLayout = to;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
-    vkCmdPipelineBarrier2(cmd, &di);
-}
-
 } // namespace
 
 void overlay_note_image(int w, int h) { image_w = w, image_h = h; }
 
-void overlay_record(VkCommandBuffer cmd, VkImage dst, uint32_t w, uint32_t h, int mode, bool menu_open) {
-    if (mode < 1 || !w || !h) return;
-    if (!ctx_ok) make_context();
-    if (!vk_up(dev.swap_format)) return;
-    const float scale = overlay_scale(h);
-    if (std::fabs(scale - font_scale) > 1e-4f && !fonts_up(scale)) return;
-    // the style follows the window's size (the sizes above are for 1080 lines)
-    ImGui::GetStyle() = base_style;
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)w, (float)h);
-    static uint64_t last = 0;
-    const uint64_t now = (uint64_t)prof_now();
-    io.DeltaTime = last ? std::max(1e-4f, (float)((now - last) / 1e9)) : 1.0f / 60;
-    last = now;
-    if (mode == 1) fps_tick(now);
-    ImGui_ImplVulkan_NewFrame();
-    ImGui::NewFrame();
-    if (mode == 2) perf_full_draw(w, h, scale, menu_open);
-    else perf_fps_draw(w, scale, menu_open);
-    ImGui::Render();
-    ImDrawData* dd = ImGui::GetDrawData();
-    if (!dd || !dd->TotalVtxCount) return;
-    const VkImageView view = view_of(dst, dev.swap_format);
-    if (!view) return;
-    layout_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    att.imageView = view;
-    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, {w, h}};
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments = &att;
-    vkCmdBeginRendering(cmd, &ri);
-    ImGui_ImplVulkan_RenderDrawData(dd, cmd);
-    vkCmdEndRendering(cmd);
-    layout_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+void overlay_prepare() {
+    if (!roboto && ImGui::GetCurrentContext()) add_font();
 }
 
-void overlay_release() {
-    if (!ctx_ok) return;
-    vkDeviceWaitIdle(dev.device);
-    for (const View& v : views) vkDestroyImageView(dev.device, v.view, nullptr);
-    views.clear();
-    vk_down();
-    ImGui::DestroyContext();
-    ctx_ok = false;
+void overlay_draw(uint32_t w, uint32_t h, int mode, bool menu_open) {
+    if (mode < 1 || !w || !h || !roboto || !ImGui::GetCurrentContext()) return;
+    if (!style_ok) style_init(base_style), style_ok = true;
+    const float scale = overlay_scale(h);
+    // (the overlay's style and font for its own drawing; the menu's back after it)
+    ImGuiStyle& st = ImGui::GetStyle();
+    const ImGuiStyle saved = st;
+    st = base_style;
+    st.ScaleAllSizes(scale);
+    ImGui::PushFont(roboto, 26.0f * scale);
+    if (mode == 1) fps_tick((uint64_t)prof_now());
+    if (mode == 2) perf_full_draw(w, h, scale, menu_open);
+    else perf_fps_draw(w, scale, menu_open);
+    ImGui::PopFont();
+    st = saved;
 }
+
 
 } // namespace mkwvk

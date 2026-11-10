@@ -1,38 +1,49 @@
-/* (TICK-036) A pool's new mirror takes over a retired pool's mirror (vk_memory.cpp mirror_make): which parts of it. */
+// Which part of a retired pool's mirror a new pool's mirror takes over (vk_memory.cpp, mirror_make).
+//
+// A pool remade larger gets a new mirror: guest memory whole, then the retired pools' mirrors over their part, for what
+// the GPU wrote there and only there. A page the CPU wrote after the retired mirror's last sync holds the game's newer
+// data in guest memory, and the old mirror's copy of it is stale. Copied over the new mirror, it counted as synced and
+// was never fixed: OoT writes its light probes when an area comes in, so after a pool was remade the fog read the old
+// area's probes for good (white glow, black or coloured blocks over the fog, dark shadows; a save reload did not clear
+// it, a restart did). Only the pages not stamped since the retired mirror's last sync are taken from it.
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
-#include <utility>
-#include <vector>
 
-namespace mkwvk::mirror_inherit {
+namespace mirror_inherit {
 
-/// The runs [lo, hi) of the guest range [a, b) to copy from a retired pool's mirror into the new mirror: the pages the CPU
-/// has not written since that mirror's last sync. The others stay as the new mirror has them (guest memory and the
-/// captures, the CPU's newer writes): copied whole, the retired mirror put back what it held before the CPU wrote them
-/// (the vertices and indices a scene load writes after the mirror's last sync: zeros, or another object's).
-/// written(page): the CPU wrote the page since that sync. region_clean(region): no page of that region of region_pages
-/// pages was written since (a whole region at once; only asked for a region that lies inside [a, b))
-template <class Written, class RegionClean>
-void runs(uint64_t a, uint64_t b, unsigned page_shift, uint64_t region_pages, Written written, RegionClean region_clean,
-          std::vector<std::pair<uint64_t, uint64_t>>& out) {
-    if (b <= a) return;
-    const auto add = [&out](uint64_t lo, uint64_t hi) {
-        if (hi <= lo) return;
-        if (!out.empty() && out.back().second == lo) out.back().second = hi;
-        else out.push_back({lo, hi});
+/// The runs of [a, b) (guest addresses, inside both pools) to copy from the retired mirror: the pages whose copy there
+/// is current. region_clean(r): every page of 2 MB region r is (the stamp map's summary: none stamped since the last sync);
+/// page_current(p): page p is (not stamped since the sync, or a page mirror_sync also keeps the mirror's copy of).
+/// emit(src, dst, size) gets each run, merged where contiguous, with src an offset in the retired mirror (from r_lo) and
+/// dst one in the new mirror (from p_lo). Returns the bytes left to guest memory.
+template <class RegionClean, class PageCurrent, class Emit>
+uint64_t runs(uint64_t a, uint64_t b, uint64_t r_lo, uint64_t p_lo, uint64_t page_shift, uint64_t region_pages,
+              RegionClean region_clean, PageCurrent page_current, Emit emit) {
+    uint64_t skipped = 0, run_lo = 0, run_hi = 0;
+    const auto flush = [&] {
+        if (run_hi > run_lo) emit(run_lo - r_lo, run_lo - p_lo, run_hi - run_lo);
+        run_lo = run_hi = 0;
     };
-    const uint64_t last = (b - 1) >> page_shift;
-    for (uint64_t page = a >> page_shift; page <= last;) {
-        if (region_pages && page % region_pages == 0 && page + region_pages - 1 <= last && region_clean(page / region_pages)) {
-            add(std::max(page << page_shift, a), std::min((page + region_pages) << page_shift, b));
-            page += region_pages;
-            continue;
+    const uint64_t page_size = uint64_t{1} << page_shift;
+    for (uint64_t page = a >> page_shift; page < (b + page_size - 1) >> page_shift;) {
+        const bool whole_region = page % region_pages == 0 && region_clean(page / region_pages);
+        const uint64_t step = whole_region ? region_pages : 1;
+        const uint64_t lo = std::max(page << page_shift, a), hi = std::min((page + step) << page_shift, b);
+        if (hi > lo) {
+            if (whole_region || page_current(page)) {
+                if (run_hi != lo) flush(), run_lo = lo;
+                run_hi = hi;
+            } else {
+                flush();
+                skipped += hi - lo;
+            }
         }
-        if (!written(page)) add(std::max(page << page_shift, a), std::min((page + 1) << page_shift, b));
-        page++;
+        page += step;
     }
+    flush();
+    return skipped;
 }
 
-} // namespace mkwvk::mirror_inherit
+} // namespace mirror_inherit

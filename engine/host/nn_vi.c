@@ -2,6 +2,7 @@
    layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
+#include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*: the Insert menu's HDR, answered by the renderer) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -64,15 +65,20 @@ HLE(_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE) {
 }
 
 /* nn::vi::QueryDisplayHdrStatus(bool* on, HdrOutputFormat*, unsigned short* max nits, Display const*) -> Result */
+/* (hookshot) the Insert menu's HDR set to Native on an HDR10 swapchain: an HDR10 display (format 1, which makes the game present PQ
+   codes in 10 bits) of the menu's peak; otherwise SDR, as a desktop window is */
 HLE(_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE) {
-    *(uint8_t *)GP(ARG(0)) = 0;
-    if (ARG(1)) G32(ARG(1)) = 0;
-    if (ARG(2)) *(uint16_t *)GP(ARG(2)) = 0;
+    const int native = rx_option(HOS_OPT_HDR_NATIVE, 0);
+    *(uint8_t *)GP(ARG(0)) = (uint8_t)native;
+    if (ARG(1)) G32(ARG(1)) = native ? 1 : 0;
+    if (ARG(2)) *(uint16_t *)GP(ARG(2)) = native ? (uint16_t)rx_option(HOS_OPT_HDR_PEAK, 1000) : 0;
+    static int logged = -1;
+    if (logged != native) logged = native, hos_log("vi: QueryDisplayHdrStatus -> %s", native ? "HDR10 (the game's native HDR)" : "SDR");
     RET(0);
 }
 /* nn::vi::QueryDisplayHdrPaperWhite(unsigned short*, Display const*) -> Result */
 HLE(_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE) {
-    *(uint16_t *)GP(ARG(0)) = 203;
+    *(uint16_t *)GP(ARG(0)) = rx_option(HOS_OPT_HDR_NATIVE, 0) ? (uint16_t)rx_option(HOS_OPT_HDR_WHITE, 203) : 203;
     RET(0);
 }
 /* nn::vi::QueryDisplayVrrSupported(bool*, Display const*) -> Result */
@@ -102,10 +108,14 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
 static volatile int present_interval = 1;
 /* (hookshot) The frame rate limit: 60, or what the Insert menu's Frame rate limit (HOS_FPS_LIMIT=<30..360> over it) gives. Above 60 the game
    runs its frames at that rate with its time following the clock (Game speed Real time): the display queue, the step (realtime_step)
-   and the game's own limiter (+0xfc) are all at the limit */
+   and the game's own limiter (+0xfc) are all at the limit. (Sync 11: upstream's Frame rate cap, frame_rate_cap= / HOS_FPS_MAX read once at
+   the start, is the same feature; ours is kept, read live, and HOS_FPS_MAX is taken as HOS_FPS_LIMIT) */
 static int fps_limit(void) {
     static int env = -1;
-    if (env < 0) env = getenv("HOS_FPS_LIMIT") ? atoi(getenv("HOS_FPS_LIMIT")) : 0;
+    if (env < 0) {
+        const char *e = getenv("HOS_FPS_LIMIT") ? getenv("HOS_FPS_LIMIT") : getenv("HOS_FPS_MAX");
+        env = e ? atoi(e) : 0;
+    }
     int rx_option(int id, int otherwise);
     int v = env > 0 ? env : rx_option(10, 60);
     v = v < 30 ? 30 : v > 360 ? 360 : v;
@@ -267,7 +277,8 @@ static void realtime_step(int64_t now) {
         if (cap > 60 && target < cap) target = cap;   /* (the Insert menu's limit raises the game's own limiter too) */
         if (target && *limit > 0 && *limit < target) *limit = target;
     }
-    if (!rx_option(0, 1)) {   /* (the Insert menu: per frame) */
+    /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time; fps_limit() is 60 then) */
+    if (!rx_option(0, 1)) {
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
         hos_realtime_fps = 0;
