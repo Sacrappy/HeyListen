@@ -2414,3 +2414,93 @@ Shots and speed are as C's above.
 Not verified: other CPUs (TICK-041/044: without AVX2 the vector paths are SSE2 code, without FMA3 the FMA switch does
 nothing), Kokiri Forest and Hyrule Field (no saves), a builder release made with `--profile` (no release was
 made), more than 6 runs a variant.
+
+## TICK-047: the game's long jobs first in the BaseProc scheduler (2026-11-11)
+
+**Result: not adopted. The switch works on the chain (Link's calc starts #5 of its stage instead of #13-17 and runs
+alone 0.25-0.29 ms instead of 0.71-0.74), but the frame rate does not move beyond the spread: +1.1 fps standing, +0.2
+walking, -1.0 on the street (6 interleaved runs a variant).** The hooks are in the lifter behind a lift-time switch
+(`OOT_JOB_ORDER=1`, off: lifted code as before) and the runtime switch `HOS_JOB_ORDER=1` (`host/hos_joborder.c`). Market
+save by the fountain, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs, 66 s cut.
+
+### How the game orders a stage's jobs
+
+The BaseProc dispatcher f_8004ab40 runs on six executors over one scheduler object S. S has three levels of bounded
+lock-free MPMC rings (16-byte cells with a sequence word): level L at S + 0x40 + L * 0x50, each an A ring (+0x00 size,
++0x08 cells, +0x10 head, +0x18 tail) and a B ring (+0x28 ...). Measured sizes: A 128 / 128 / 64 cells, B 256 / 16384 /
+1024 (levels 0 / 1 / 2).
+
+- f_8004fa40(S, job) pushes a job into a B ring once it is ready (its last predecessor done, job +0x3c). The job's int16
+  at +0xc picks the level: -2 level 0, 0 level 2 (each when that ring exists), anything else level 1.
+- An executor takes the first job it finds in level 0 A, 0 B, 1 A, 1 B, 2 A, 2 B; FIFO inside a ring. The A rings hold
+  parallel jobs (job +0x38: runners left) put back after an executor took one share, so the next executors join them.
+- So inside a level, a stage's jobs start in the order they became ready: their driver's actor-list order. No priority
+  field. At the Market ~15 actor calcs are level-0 jobs pushed in one burst; Link's (800b3ce0) is about the 15th.
+
+### The patch
+
+A64-lift statements without control flow, so the two hot functions keep their PGO records (the profile hash counts
+branches, loops, labels and comparisons; the build gave no mismatched-profile warning):
+
+- f_8004ab40: `hos_jo_begin()` / `hos_jo_end()` around its two indirect job calls (0x8004b3f0, 0x8004b560) time each run
+  by the job record's first word (its object, stable from frame to frame).
+- f_8004fa40: `x0 -= hos_jo_shift(c, x0, job, level)` before the branch to each level's push (level 2 at 0x8004fa74,
+  level 0 at 0x8004fa84, level 1 after the label 0x8004fa88; never after the level-0 / level-2 retry labels 0x8004fd88 /
+  0x8004fc80, which reload x0). The push code addresses the B ring by x0 + offsets; x0 - 0x28 makes the same code push
+  into that level's A ring. Nothing reads x0 after the push.
+- `hos_jo_shift` moves a job only when its smoothed run time is over `HOS_JOB_ORDER_US` (300), it runs once (runners 1),
+  on any executor (job +0x10 = 0x21; a job tied to one executor is forwarded from the B path only), and its A ring is
+  under three quarters full (a push into a full ring returns without pushing, 0x8004fc18; the A rings are small).
+- The moved job is ready exactly as before; ready jobs are already independent (six executors take them in any order).
+  Only which ready job an idle executor takes first changes.
+
+Earlier tries (J..J4, their job-marked twins JM..JM5): moving long level-1 jobs only (Link's job is level 0: no
+change), and moving long jobs one level up (802ca820 moved from #121 to #22 of its stage, but Link's job stayed #13-15).
+The A-ring form (J5, JM6) is the one that moved Link's job.
+
+### The chain (HOS_JOBTRACE at 90 s for 4 s, job-marked builds, `tools/bench/jobgraph.py`)
+
+| | castle-move base | castle-move on | kokiri-idle base | kokiri-idle on |
+|---|---|---|---|---|
+| Link's calc 800b3ce0: starts | 238 us late, #13 of 40 | 11 us late, #5 of 40 | 371 us late, #17 of 49 | 11 us late, #5 of 49 |
+| its time alone after the stage | 738 us | 287 us | 711 us | 254 us |
+| 802ca820 (long, 0.3-0.6 a frame): starts | #121 of 126 | #22 of 127 | - | - |
+| its time alone | 624 us | 676 us (longer run, 974 us) | - | - |
+| main waiting with 1 executor in a job | 1.43 ms | 1.22 ms | 1.61 ms | 1.46 ms |
+| main waiting, total | 9.26 ms | 8.58 ms | 8.77 ms | 7.94 ms |
+| frame (job-marked build, one run) | 14.70 ms | 14.21 ms | 13.93 ms | 13.01 ms |
+
+The stage that ends with Link's calc is ~0.45 ms shorter, as TICK-042 predicted. The marked runs suggest 0.5-0.9 ms a
+frame, but each is one run of a marked build.
+
+### A/B (fps / 1% low / p99 ms; 6 interleaved runs, rounds 1-3 in the order A, J5, J5@on, rounds 4-6 reversed)
+
+| scene | A: TICK-045 build | J5: hooks, switch off | J5@on: `HOS_JOB_ORDER=1` |
+|---|---|---|---|
+| kokiri-idle | 76.3 / 40.0 / 18.3 | 76.7 / 49.9 / 17.7 | 77.4 / 52.7 / 17.5 |
+| castle-move | 71.6 / 33.4 / 23.3 | 71.5 / 33.8 / 23.3 | 71.8 / 34.5 / 23.1 |
+| hyrule-walk | 74.4 / 40.3 / 20.7 | 74.9 / 36.2 / 21.2 | 73.4 / 35.4 / 21.6 |
+
+Ranges: kokiri-idle A 73.1-80.0, on 75.1-80.8; castle-move A 69.6-73.9, on 70.3-73.6; hyrule-walk A 73.4-75.6, on
+72.6-75.1. All inside the 2-4 fps spread. The 0.45 ms the stage loses does not reach the frame: the main thread's own
+serial part and the other stages still hold it, and the executors that finish earlier wait for the next stage.
+
+### Behaviour (J6: J5 with the A-ring room check, the committed code)
+
+- HOS_SPEED_LOG, last 40 one-second lines: A 60.00 / 59.98, J6 on 60.00 / 59.99 (kokiri-idle / castle-move). In a first
+  pair one J6 castle-move second read 47.4 (one hitch, the lines around it 60.0-60.4; mean 59.69).
+- Shots every 1200 presents (`build/tick047/shots` in the worktree): the same sequence for both builds; the Market,
+  NPCs, Link's idle and walk, the fairy, text bubbles and the "Parler" prompt are drawn alike. NPC positions differ by
+  the moment of each shot, as between two runs of one build.
+- J6 smoke runs: 80.2 / 73.9 fps (A 77.6 / 69.4) in one pair, 73.9 / 70.7 (A 77.3 / 72.4) in another: spread.
+- Saves identical after every run; no game process left after any run.
+- New `tests/test_job_order_patch.py` (places, once, idempotent, no new branch).
+
+### What is next
+
+The job order is not the lever. The frame is the main thread's serial part (~5.4 ms running) plus stages whose length
+is set by their total work over six executors. Next: shorter jobs themselves (80166100's model subsystem, 800b73d0),
+or the main thread's serial part.
+
+Not verified: the J6 room check in a 6-run A/B (only the check differs from J5; how often it held a job back was not
+counted); other CPUs; more than 6 runs a variant; a job-marked trace of J6.

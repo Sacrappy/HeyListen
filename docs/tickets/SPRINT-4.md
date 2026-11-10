@@ -130,3 +130,10 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
   - The profile lives in the repository under `profile/`, with no game data. dev-build.ps1 installs it, and the release package takes it.
   - The game folder runs the new default build; Sync 11 is backed up in `build/backup-tick045`.
 - Next: the job start order; inline FRSQRTE / FRECPE and the quiet-NaN test, each with a profile refresh.
+
+## TICK-047 (2026-11-11): the game's long jobs first
+- Found: the BaseProc scheduler has no priority; a stage's jobs start in actor-list order (lock-free rings per level, FIFO). Link's calc starts ~15th of its stage and ends it alone for ~0.7 ms.
+- Built: hooks in f_8004ab40 / f_8004fa40 that put a long job (>300 us) in its level's A ring, taken before the waiting jobs. Behind `OOT_JOB_ORDER=1` (lift time) and `HOS_JOB_ORDER=1` (run time); the PGO records still match.
+- Chain: Link's calc #13-17 -> #5, alone 0.71-0.74 -> 0.25-0.29 ms.
+- A/B, 6 runs each: 76.3 -> 77.4 standing, 71.6 -> 71.8 walking, 74.4 -> 73.4 on the street: inside the spread.
+- Decision: not adopted; the default lift is as before; the game folder keeps the TICK-045 build. Next: shorter jobs (80166100, 800b73d0) or the main thread's serial part.
