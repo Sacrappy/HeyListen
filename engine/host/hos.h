@@ -165,7 +165,12 @@ enum {
     JT_VC_WAIT_B, JT_VC_WAIT_E,                                /* a wait for a virtual core */
     JT_Q_WAIT_B, JT_Q_WAIT_E, JT_Q_SIGNAL,                     /* message queue / semaphore (a object) */
     JT_K_WAIT_B, JT_K_WAIT_E, JT_K_WAKE,                       /* kernel wait (a address, b lr) / wake (a the HosThread woken) */
-    JT_MARK                                                     /* free use (a, b) */
+    JT_MARK,                                                    /* free use (a, b) */
+    JT_JOB_B, JT_JOB_E                                          /* (TICK-042) a job run by the dispatcher f_8004ab40 (a the job
+                                                                   object x0, b target | call site << 32), with a diagnostic lift */
 };
+/* (TICK-042) the job marks: called around f_8004ab40's indirect calls in a diagnostic build only (the patched lifted C); one
+   load and a branch outside the trace window */
+void hos_jt_job(uint64_t obj, uint64_t target, uint64_t site, int begin);
 #define HOS_JT(t, a, b) do { if (__builtin_expect(hos_jt_on, 0)) hos_jt_rec((t), (uint64_t)(a), (uint64_t)(b)); } while (0)
 #endif

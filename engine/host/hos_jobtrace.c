@@ -57,6 +57,9 @@ void hos_jt_rec(int type, uint64_t a, uint64_t b) {
     r->a = a;
     r->b = b;
 }
+void hos_jt_job(uint64_t obj, uint64_t target, uint64_t site, int begin) {
+    HOS_JT(begin ? JT_JOB_B : JT_JOB_E, obj, (target & 0xffffffffu) | site << 32);
+}
 uint64_t hos_jt_lr(void) {
     Ctx *c = hos_ctx();
     return c ? c->x[30] : 0;

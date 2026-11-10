@@ -1876,3 +1876,191 @@ Not verified:
 - other CPUs (without AVX2 the change falls back to the lanes);
 - Kokiri Forest and Hyrule Field;
 - a profile recorded on base with our scenes, to separate the profile's share of v1b-p's +2 fps.
+
+## TICK-042: the game's job graph at the Market (2026-11-10)
+
+**Result: the frame is a fixed chain of stages, and the chain's serial parts are the game's own work, not bad
+scheduling of short jobs. A Market frame (14.4 ms standing, 16.3 walking with the trace) runs: the main thread alone,
+~2.1 ms standing / ~3.0 walking (90% of it the engine's submit: the capture copy, collect_in, take_capture); the BaseProc
+calc stages on the six executors, driven by one module-worker job (83aff1f0); the module workers' work (80083580 and
+others); and a last executor stage (800b73d0) that only four of the six executors ever join. Each calc stage ends with
+one long per-actor job that runs alone: Link's calc (800b3ce0 on Link, 1.5-1.7 ms, alone for its last ~0.85 ms), a
+second model/physics job (80166100, 1.4-1.5 ms), and in some frames a third (802ca820, 1.1-1.3 ms, alone ~0.9 ms). All
+three spend most of their time in the same subsystem (f_80168320 > f_8016b620 > f_81b47080 > f_81b56de0, FP-heavy).
+Link's and 802ca820's jobs are also started late in their stage (#13-17 of ~40, and #124 of 128): 0.17-0.45 ms a frame
+lost to order. The executors are capped by the six virtual cores (a guest thread holds one while it runs), so the last
+stage gets four executors whenever two of the main / module threads are still busy (their executor is woken by them,
+f_83acfb90). No host-only change found moves fps beyond the spread; no default changed.** Market save by the fountain,
+`--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`, 110 s runs, 66 s cut.
+
+### Instruments (kept, off by default)
+
+- `JT_JOB_B` / `JT_JOB_E` in `HOS_JOBTRACE` (host/hos_jobtrace.c, `hos_jt_job()`): a job's start and end, with its object
+  (x0), its function (the call's target) and the call site. Only a job-marked lift calls it.
+- `tools/bench/jobmarks.py <gen> <backup dir>`: makes that lift by patching the lifted C in place (the original files
+  copied out first): every indirect call in the BaseProc dispatcher f_8004ab40, in the job-group runner f_8007fe60 (main
+  thread and module workers) and the thread loop f_80df25c0, the dispatcher's sub-runners f_80049280, f_8004fee0,
+  f_8004fa40 with their tail jumps, and the dispatcher's direct calls of them. The marks change lifted code (and that
+  function's profile no longer matches): never measure fps with such a build. Copy the files back afterwards.
+  Without f_80049280 / f_8004fee0 (first version) a third of the executors' work showed as "busy outside a job".
+- `tools/bench/jobgraph.py <trace> [--samples --maps] [--gantt N] [--job F[:obj]]`: the frame split by what runs, executor
+  jobs by function with how many executors ran each a frame, the long jobs (start delay in their stage, rank, time alone
+  after the rest), a text gantt of one frame, and one job's samples (self, inclusive, the chain below it), its waits and
+  who ended them.
+- `HOS_OBJ_STATS` / `HOS_OBJ_CACHE_BITS` (host/nn_os_sync.c) were used for the measurements below and removed again.
+
+Traces: a job-marked build of main's lift (`build/tick042/bin/jt3`), `HOS_JOBTRACE` for 3 s at 90 s with
+`HOS_SAMPLE_ALL` + `HOS_SAMPLE_NS` at 72-108 s, one run each of kokiri-idle and castle-move (`build/tick042/tr-jt3-*`,
+`jobgraph.txt` beside each). The marks cost ~0.5-1 ms a frame (16.3 ms walking against ~15.1).
+
+### The frame (ms a frame, with the marks)
+
+| what runs | kokiri-idle (14.4 ms) | castle-move (16.3 ms) |
+|---|---:|---:|
+| main thread alone (no job thread working) | 2.14 | 3.03 |
+| main thread with job threads working | 2.65 | 2.62 |
+| main waits, no executor in a job (module workers' work, the frame-start wait) | 2.34 | 2.96 |
+| main waits, 1 executor in a job | 1.68 | 1.54 |
+| main waits, 2-3 executors in a job | 0.98 | 1.36 |
+| main waits, 4-5 executors in a job | 1.71 | 1.58 |
+| main waits, all 6 executors in a job | 2.87 | 3.16 |
+
+The main thread alone is the engine's submit (samples: renderer 43%, its system calls 37%, the runtime's collect_in /
+cmp_range 12%, guest code 8%; `stream_memcpy` alone 28%): TICK-037's capture, now the largest single serial piece.
+
+### The chain, one walking frame (`jobgraph.py --gantt`, 0.2 ms rows; the job function's low 16 bits and busy %)
+
+```
+  ms    EX0     EX1     EX2     EX3     EX4     EX5     MS1     MS2-5 ...  MAIN
+  0.00                                                                    (MS4 3580 99: 80083580 of the last frame)
+  0.50 .. 2.30                                                             .. 99   main alone: game draw + engine submit
+  2.70  49b0 99   .. 99   .. 99 c2a0 99   .. 99   .. 99 f1f0  0          stage A (802ca820 ...); MS1 drives (83aff1f0)
+  3.30  fee0 99         a820 99                         f1f0  0          one 802ca820 job alone
+  3.90  3ce0 81 3ce0 71 3ce0 71 3ce0 70 3ce0 72 3ce0 62 f1f0 15          stage B: actor calc (800b3ce0)
+  5.30  f6c0 99 f6c0 99 f6c0 99 f6c0 99 f6c0 99 3ce0 99 f1f0  0          Link's job (EX5) forks 8007f6c0 and waits
+  5.90                          f6c0 45         3ce0 56 f1f0  0          Link's job alone
+  6.50  a4a0 99 6100 99 6100 99 49b0 99 6100 99 6100 99 f1f0  0          stage C (80166100 + 8004fee0 jobs)
+  7.90                  6100 65 fee0 99                 f1f0  0          one 80166100 job alone
+  8.50  59c0 99 59c0 99 59c0 99 59c0 99 59c0 99 59c0 99 f1f0  0          stages D-F (83af59c0, 83af7320, 83af6150)
+  9.30                                                  f1f0 99 5400 95  module workers' groups (main waits / joins)
+ 12.4 .. 14.2  73d0 x4 (two executors idle)          3580 on 1-2 of MS1-5 / main; the rest wait in f_83acfb90
+```
+
+Main waits at lr 0x80080188 (f_8007fe60) ~15 times a frame, most of them short: the module workers' small groups. The
+BaseProc stages are one long wait (~6.5 ms) while the driver job 83aff1f0 (on a module worker) waits for each stage.
+
+### Executor jobs (ms a frame; how many executors ran them in a frame)
+
+| job function @ call site | standing | walking | executors |
+|---|---:|---:|---|
+| 800b73d0 (last stage, per actor) | 5.73 | 4.71 | always 4 |
+| 800b3ce0 (actor calc, Link's among them) | 5.47 | 5.36 | 6 |
+| 8004fee0 @ 8004b694 (sub-runner: f_8191ee00, f_819b8e20, the f_817xxxxx code) | 4.99 | 5.50 | 6 |
+| 80166100 (model/physics) | 1.37 | 4.20 | 4-6 |
+| 83af59c0 | 2.22 | 1.70 | 6 |
+| 802ca820 | 1.55 | 1.68 | 5-6 |
+| 8007f6c0 (Link's parallel-for) | 1.56 | 1.60 | 5 |
+| 82c3d740, 82c46560, 82c3bbb0 (last stage) | 0.3-0.4 each | 0.26-0.29 each | 4 |
+
+### The long jobs (one object each, medians)
+
+| job (object) | length | starts after its stage's first job | rank | runs alone after the others of its kind |
+|---|---:|---:|---:|---:|
+| Link's calc, 800b3ce0, standing | 1514 us | 451 us | #17 of 48 | 829 us |
+| Link's calc, walking | 1727 us | 275 us | #13 of 41 | 864 us |
+| 80166100, walking (1.0 a frame) | 1462 us | 3 us | #5 of 15 | 85 us |
+| 80166100 (other run, standing) | 1718 us | 225 us | #16 of 21 | 1588 us |
+| 802ca820, walking (0.54 a frame) | 1136 us | 172 us | #124 of 128 | 876 us |
+| 802ca820 (other run, standing, 1.0 a frame) | 1287 us | 187 us | #119 of 128 | 924 us |
+| 8073a4a0 | 378-420 us | 0 | #1 of 1 | 356-418 us |
+| 803749b0 | 436-470 us | 23-68 us | #3 of 3 | 355-377 us |
+
+Which actors: Link's job runs f_82c3fab0 > f_82c415e0 (the movement code `oot_patches.py` patches), then f_8030b390
+(f_801d7ac0 > f_801d99a0, f_8030c240 > f_803120f0) and f_80186a00 > f_80168320 (the model subsystem). It also waits
+0.35-0.42 ms a frame (event, lr 0x80169ee0) for its own parallel-for 8007f6c0 on the other executors, whose last chunk
+runs alone ~0.24 ms. 80166100's job is 94-100% f_80166100 > f_801665d0 > f_80168320 > f_8016b620 > f_81b47080 >
+f_81b56de0 / f_81c66a60 / f_81c7ecc0: FP work, with the runtime's FP slow paths ~20-26% of its samples
+(a64_vfpx_mul32_lanes, a64_fpx_mul32_fma32, recomp_fpe_sub32, recomp_fp_estimate). 802ca820's long job: f_80186a00 >
+f_80168320 > f_8016b620 > f_81b47080 55-75%. The three share f_80168320 / f_81b47080 (a model, skeleton or physics
+update; f_80168320 itself is in a -O1 chunk, f_81b47080 is hot).
+
+Cannot be split by the host: each long job is one object's update, on one thread. What scheduling loses: their start
+order (Link at #13-17, 802ca820 at #119-124): had they started first, a stage would end 0.17-0.45 ms earlier (the
+start delay, which is less than the time they run alone). The order is the dispatcher's lock-free lists (f_8004ab40:
+atomic exchanges of a ready list, CAS pushes); changing it is a game patch of that scheduler.
+
+### The module workers and the end of the frame
+
+- 80083580 (call site 0x80081358 in f_8007fe60, on a module worker or the main thread, 2.7 ms a frame standing in 1-2
+  runs) runs across the frame boundary: the main thread waits for it at the next frame's start (0.4-0.6 ms) and it holds
+  its thread's core during the last stage. 23% of its samples are `obj_lookup` (19% walking) and ~9% mutex_lock / give:
+  f_80660320 locks ~8,000 distinct nn::os mutexes a frame through f_80364080 (LockMutex). `HOS_OBJ_STATS`: 4 M object
+  calls a second, 11% miss the per-thread cache (~440 k a second), ~8,000 distinct objects, 1.6 probes a miss, ~220 k
+  objects in the table. The misses are those mutexes, each once a frame, on whichever thread runs the job.
+- The last stage (800b73d0, 82c3d740, 82c46560, 82c3bbb0) always runs on exactly four executors. Each of the main
+  thread and module workers 1-5 posts its own executor's queue in f_83acfb90 (lr 0x83acfca0: main -> executor 0, worker
+  k -> executor k) when it reaches the end of its frame, then waits there (lr 0x83acfcf4). The two threads still running
+  80083580 (or main) post late, so their executors miss the stage; on hardware these pairs share a core. Here they
+  could run, but the six virtual cores (`hos_thread.c`: a guest thread holds one while it runs guest code) are all
+  held then (four executors and the two busy threads).
+
+### Tried: a larger per-thread object cache (env only, not kept)
+
+The per-thread nn::os object cache (1024 direct-mapped entries) misses on those ~8,000 mutexes. With 8,192 entries
+(`HOS_OBJ_STATS`) the misses fell only ~20% (2.2-2.4 M to 1.78 M per 5 s): each mutex is locked once a frame, on whichever
+thread runs the job, and the first lookup of a cold object costs the same memory misses through the cache as through the
+table. A/B, one binary (`build/tick042/bin/dbg3`, the stats and cache-size switches, off), 3 interleaved rounds:
+
+| | kokiri-idle | castle-move |
+|---|---|---|
+| default (1024) | 67.1 69.9 68.9: **68.6 / 36.2 / 22.9** | 67.7 66.7 64.9: **66.4 / 28.4 / 27.5** |
+| `HOS_OBJ_CACHE_BITS=14` | 63.0* 69.2 70.9: **67.7 / 35.5 / 22.6** | 66.3 66.5 62.7: **65.2 / 27.4 / 28.4** |
+
+(*: that run overlapped an analysis job on the same PC; without it, 70.0.) Inside the spread, walking slightly worse.
+Not kept: nn_os_sync.c is as on main; the switch and the stats were removed again.
+
+### Not tried, and why
+
+- Reordering jobs: needs a patch of the game's lock-free scheduler (f_8004ab40) whose lists were not worked out tonight;
+  ranked 2nd below with its measured potential.
+- More executors: the six virtual cores and the per-core tables (TICK-039); a game patch, high risk.
+- Native replacement of the long jobs' code: they spread over hundreds of functions (f_80168320's subtree, f_801d99a0 22%
+  of Link's job at most); no single function is worth more than ~0.2 ms on the chain.
+- HOS_CORES=8, spin, pinning: TICK-039 (no gain).
+
+### Behaviour
+
+No default changed. The committed host change is a function (`hos_jt_job`) that only a job-marked lift calls; the
+default lift and every default path are as on main, so no shots or HOS_SPEED_LOG run were needed. Saves identical after
+every run; no game process left after any run.
+
+### What is next (ranked by the time a frame it could take off the chain)
+
+1. **The main thread's submit (2.1 ms standing, 3.0 walking, nothing else running).** The largest serial piece is now
+   the engine's, not the game's: the capture copy (`stream_memcpy`), collect_in, take_capture, the shadow-page hash. A
+   capture taken asynchronously (the GPU-side wait of TICK-037's two-stage idea), or copying only the pages the
+   submission's bindings read, would let the next frame's calc start ~1-2 ms sooner. Renderer work, with the TICK-006/036
+   ordering to keep.
+2. **Long jobs first (0.2-0.45 ms a frame standing and walking; up to ~0.8 ms in runs where 80166100 and 802ca820 also
+   start late).** A game patch of the BaseProc dispatcher (f_8004ab40) or of whatever builds a stage's ready list, so
+   Link's calc, 802ca820's and 80166100's long objects are taken first. In a parallel stage the order is already free
+   (six executors take jobs in any interleaving), so this keeps the game's semantics; the patch needs the scheduler's
+   lists understood first (CAS pushes, atomic exchange of the whole list).
+3. **The model subsystem behind all three long jobs** (f_80168320 > f_8016b620 > f_81b47080 > f_81b56de0): its runtime
+   FP slow paths (~20-26% of 80166100's samples: whole-vector `a64_vfpx_*_lanes` fallbacks when one lane fails the fast
+   test, scalar exact bodies) are where a faster path pays on the chain. A per-lane fallback in the cold `_lanes`
+   functions leaves their callers (and their profile) unchanged.
+4. **More executors / cores.** "All six executors in a job" is ~3 ms a frame, and the last stage runs on four executors
+   because two virtual cores are taken by the threads still in 80083580. TOTK's port widened the game's per-core tables
+   (totk_cores.c, not in this tree); the same for this game would also need the main / module threads' executor hand-off
+   (f_83acfb90) to stay correct. High risk.
+5. **80083580's mutexes** (~8,000 LockMutex a frame, each a miss in the per-thread object cache): a cheaper first lookup
+   of an nn::os object (key and object in one cache line; or the guest MutexType's own words, which needs proof the game
+   never reads them) would take ~0.3-0.5 ms off that job, which the next frame waits for.
+
+Not verified:
+- the long jobs' identities beyond Link's (80166100's and 802ca820's objects are actors running the model subsystem; which
+  ones was not looked up);
+- the order patch's gain (only estimated from the start delays: the stage ends when its long job ends);
+- other CPUs, Kokiri Forest and Hyrule Field; the Market's two crowd states change which long jobs appear (80166100 /
+  802ca820 long in some runs and not others).
