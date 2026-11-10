@@ -185,6 +185,76 @@ def patch_text_speed(s):
     return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEXT_DECL, 1)
 
 
+# (TICK-047) HOS_JOB_ORDER=1 (host/hos_joborder.c): the BaseProc scheduler's long jobs first. Not adopted (A/B inside the
+# spread), so the lift carries it only with OOT_JOB_ORDER=1 at lift time; without it the lifted code is as before. Control-flow-free statements, so the
+# two hot functions keep their PGO records (clang's profile hash counts branches, loops, labels, comparisons; not calls):
+# - the dispatcher f_8004ab40 times its two indirect job calls by job (the record's first word, x21's: its object);
+# - the push f_8004fa40 puts a long job into its level's A ring, which every executor takes from before that level's B ring:
+#   x0 -= 0x28, so the push code that addresses the level's B ring (x0 + its offsets) addresses the A ring 0x28 below it. One
+#   statement per level, each before the branch to that level's push (the level-0 and level-2 pushes, 0x8004fd88 and 0x8004fc80,
+#   are also retry targets with x0 reloaded from the stack: a statement after their label would move x0 again), each reached
+#   only on the way to that level's push or before the level is known (the host checks the job's level field there).
+# (the inner call statements are left as lifted, so tools/bench/jobmarks.py still finds them)
+JO_DECL = ("uint64_t hos_jo_begin(void);\nvoid hos_jo_end(Ctx *c, uint64_t job, uint64_t t0);\n"
+           "uint64_t hos_jo_shift(Ctx *c, uint64_t sched, uint64_t job, int level);\n")
+JO_RUN_HEAD = "void f_8004ab40(Ctx *__restrict A64_NOESC c) {\n"
+JO_RUN_CALLS = ("{ uint64_t _t = c->x[8]; c->x[30] = 0x8004b3f4ULL; A64_ICALL(c, _t); }\n",
+                "{ uint64_t _t = c->x[9]; c->x[30] = 0x8004b564ULL; A64_ICALL(c, _t); }\n")
+JO_PUSH_HEAD = "void f_8004fa40(Ctx *__restrict A64_NOESC c) {\n"
+JO_PUSH_ADD = "    c->x[0] -= hos_jo_shift(c, c->x[0], c->x[1], %d);   /* (nx2/oot_patches.py: TICK-047 job order) */\n"
+# (where each goes: before the text, or after it for the label; level 2 at 0x8004fa74, level 0 at 0x8004fa84, level 1 at 0x8004fa88)
+JO_PUSH_AT = (
+    (2, ("    c->x[9]=recomp_load16(c,c->x[1] + 12);\nif ((uint32_t)c->x[9] == 0) { goto L_8004fc80; }\n",), "if ("),
+    (0, ("if (c->z) { goto L_8004fd88; }\n",), None),
+    (1, ("L_8004fa88:;\n", "L_8004fa88:; A64_POLL(c);\n"), "end"),
+)
+
+
+def _body(source, head):
+    start = source.find(head)
+    if start < 0:
+        return None, None
+    end = source.find("\n}\n", start)
+    return (start, end) if end >= 0 else (None, None)
+
+
+def patch_job_order(source):
+    """None when neither function is found here; else (text, how many of the two functions are patched, now or before)"""
+    done = 0
+    start, end = _body(source, JO_RUN_HEAD)
+    if start is not None:
+        body = source[start:end]
+        if "hos_jo_begin()" in body:   # (applied before)
+            done += 1
+        elif all(body.count(k) == 1 for k in JO_RUN_CALLS):
+            for k in JO_RUN_CALLS:
+                body = body.replace(k, "{ const uint64_t _jq = hos_jo_begin(); " + k[:-1] + " hos_jo_end(c, c->x[21], _jq); }\n", 1)
+            source = source[:start] + body + source[end:]
+            done += 1
+    start, end = _body(source, JO_PUSH_HEAD)
+    if start is not None:
+        body = source[start:end]
+        at = []
+        for level, texts, where in JO_PUSH_AT:
+            t = next((t for t in texts if body.count(t) == 1), None)
+            if t is None:
+                break
+            i = body.index(t) + (len(t) if where == "end" else t.index(where) if where else 0)
+            at.append((i, level))
+        if "hos_jo_shift(" in body:   # (applied before)
+            done += 1
+        elif len(at) == len(JO_PUSH_AT):
+            for i, level in sorted(at, reverse=True):
+                body = body[:i] + JO_PUSH_ADD % level + body[i:]
+            source = source[:start] + body + source[end:]
+            done += 1
+    if not done:
+        return None
+    if JO_DECL not in source:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\n' + JO_DECL, 1)
+    return source, done
+
+
 def apply(gen, *, protect_hearts=False, required=False):
     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
     The other patches only warn when their place is not found once."""
@@ -192,7 +262,10 @@ def apply(gen, *, protect_hearts=False, required=False):
     oot_native_resolution.apply(gen)
     import native_replace   # (TICK-026: native replacements of hot guest blocks, each behind HOS_NR_<NAME>, host/hos_native.c)
     native_replace.apply(gen)
+    job_order = os.environ.get("OOT_JOB_ORDER") == "1"   # (TICK-047, lift time; off: no job order statements)
     done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0}
+    if job_order:
+        done["job order"] = 0
     if protect_hearts:
         done["player heart protection"] = 0
         done["player flight"] = 0
@@ -237,6 +310,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = mouse
             done["mouse camera"] += 1
             print("oot_patches: native mouse camera in", os.path.basename(path))
+        jo = patch_job_order(out) if job_order else None
+        if jo is not None:
+            out, n = jo
+            done["job order"] += n
+            print("oot_patches: job order (%d of 2 functions) in" % n, os.path.basename(path))
         view = patch_view(out) if protect_hearts else None
         if view is not None:
             out = view
@@ -245,7 +323,7 @@ def apply(gen, *, protect_hearts=False, required=False):
         if out != s:
             whole_write.write_whole(path, out, newline="")
     for what, n in done.items():
-        if n != 1:
+        if n != (2 if what == "job order" else 1):
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
     apply_output_size(gen, required=required)
 
