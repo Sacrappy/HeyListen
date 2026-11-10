@@ -153,7 +153,9 @@ def main():
 
     # 4. the package folder (builder, setup, LICENSE, tracked engine sources under tools/, profile, prebuilt third_party)
     package = os.path.join(work, "package")
-    run(py + [parts_py, "package", package, "--publish", publish, "--setup", setup, "--list", previous], env=env)
+    #    (TICK-045: the play profile from the repository's profile/, recorded on this lifter's default lift, not the previous release's)
+    run(py + [parts_py, "package", package, "--publish", publish, "--setup", setup, "--list", previous,
+              "--profile", os.path.join(ROOT, "profile")], env=env)
     for f in ("THIRD_PARTY_NOTICES.md",):
         shutil.copyfile(os.path.join(ROOT, f), os.path.join(package, f))
 

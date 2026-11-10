@@ -119,3 +119,14 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - A/B, 6 runs each: walking 69.1 -> 70.0 / 71.1, standing 76.1 -> 74.7 / 75.0: inside the spread.
 - Decision: not adopted, no default changed; the game folder keeps the Sync 11 build. The job start order (part 2) was not prototyped. Next: the start-order patch; ship the FP switches with a matching profile at the next refresh.
 
+
+## TICK-045 (2026-11-10): the three lift switches with a profile recorded on their lift
+- Built C: `A64_VFPX_ELEM`, `A64_FPX_SLOWPATH` and `A64_FPX_FMA3` together, with a profile recorded on that lift (TICK-040 method: gen build, our three scenes, 6:1 with upstream's). Also built B: the base lift with a profile recorded the same way. Upstream's hot list and link order kept.
+- A/B, 6 interleaved runs each, against Sync 11 (A):
+  - C: standing 75.3 -> 78.0, walking 68.1 -> 72.9, the street 70.9 -> 74.4. Walking p99 28.7 -> 22.3 ms.
+  - B: inside the spread (+1.9 / -0.6).
+- Decision: C adopted.
+  - The switches are on by default in the lifter, with `=0` to opt out.
+  - The profile lives in the repository under `profile/`, with no game data. dev-build.ps1 installs it, and the release package takes it.
+  - The game folder runs the new default build; Sync 11 is backed up in `build/backup-tick045`.
+- Next: the job start order; inline FRSQRTE / FRECPE and the quiet-NaN test, each with a profile refresh.

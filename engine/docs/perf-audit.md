@@ -2313,3 +2313,104 @@ Saves identical after every run; no game process left after any run.
 Not verified: the job-level effect (no job trace with the switches: whether 80166100's job got shorter on the chain);
 other CPUs (without AVX2 the vector paths are the same SSE2 code; without FMA3 the FMA switch does nothing); Kokiri
 Forest and Hyrule Field.
+
+## TICK-045: the three lift switches together, with a profile recorded on their lift (2026-11-10)
+
+**Result: on by default. `A64_VFPX_ELEM`, `A64_FPX_SLOWPATH` and `A64_FPX_FMA3` together, with a PGO profile recorded on
+that lift, are +2.7 fps standing, +4.8 walking and +3.5 on the street to the gate against the Sync 11 build (6
+interleaved runs a variant). The walking runs do not overlap. The same profile method on the base lift (B) stays inside
+the spread, so the gain is the switches once their code has a matching profile.** Market save by the fountain,
+`--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`, 110 s runs, 66 s cut.
+
+### The profiles (as TICK-040)
+
+1. An `RX_PGO=gen` build of the lift. B-gen: base lift, hot pieces only, 617 s. C-gen: the three switches, every
+   chunk again because a64_fpx.h changed, 822 s. C-gen plays at ~13 fps and B-gen at ~7.7: the FP slow paths cost more
+   in the -O1 instrumented code.
+2. One run of each of kokiri-idle, castle-move and hyrule-walk with `HOS_PGO` (counters reset at 72 s, written at
+   106 s), through run_bench and its save guard. Saves identical after each run.
+3. `llvm-profdata merge` of the three at equal weight (B 1.05e11 counts, C 1.40e11), then merged 6:1 with upstream's
+   `hookshot_pieces.prof` (4.5e11). C's result has 1994 functions.
+4. Upstream's hot list (849 functions) and link order kept. TICK-040's longer list did not clearly help, and keeping
+   them leaves the chunk boundaries as they were.
+
+No mismatched-profile warning in either -O2 build.
+
+### A/B (fps / 1% low / p99 ms; rounds 1-3 in the order A, B, C, rounds 4-6 in C, B, A)
+
+| scene | A: Sync 11 (upstream's profile) | B: base lift, own profile | C: switches, own profile |
+|---|---|---|---|
+| kokiri-idle | 75.3 / 47.6 / 18.0 | 77.2 / 54.2 / 17.2 | 78.0 / 51.1 / 17.2 |
+| castle-move | 68.1 / 29.6 / 28.7 | 67.5 / 29.9 / 24.1 | 72.9 / 35.4 / 22.3 |
+| hyrule-walk | 70.9 / 37.7 / 21.0 | 70.5 / 36.7 / 22.4 | 74.4 / 34.1 / 21.4 |
+
+Ranges (fps):
+
+| | A | C |
+|---|---|---|
+| castle-move | 64.2-69.8 | 70.5-75.2 |
+| kokiri-idle | 73.3-77.1 | 77.1-79.3 |
+| hyrule-walk | 69.1-73.0 | 72.5-76.8 |
+
+- B (+1.9 standing, -0.6 walking) answers TICK-041's question: a profile from our scenes alone is not the gain.
+- C's standing runs are also the tightest (sd 0.8 against A's 1.6).
+- C's 1% low on the street is lower (-3.6, one A run at 41.9). Walking in the square it is +5.8 and the p99 is 28.7 ->
+  22.3 ms.
+
+### What changed (commit 2a359a0)
+
+- `third_party/a64-kit/lift/a64_lift.py`, `a64_rtgen.py`: `lift_switch(name)` makes the switches on unless `<name>=0`.
+  `=0` gives a64_fpx.h, a64_suyu.c and the lifted code byte for byte as before (the tests check that form).
+- `profile/` (HeyListen repository root, `-text` in `.gitattributes`):
+  - `hookshot_pieces.prof`: C's merged profile, 8.9 MB;
+  - `hot_funcs.txt`, `hot_order.txt`: upstream's, unchanged.
+
+  Its text form (`llvm-profdata merge --text`) holds only function names (`f_<guest address>`, the `a64_fpx_*` /
+  `recomp_*` helpers, by file), hashes and counts. The lists are `f_<address>` lines. No game code or data.
+- `scripts/dev-build.ps1`: copies `profile/`'s three files into the work folder when they differ, before the lift.
+- `scripts/release_parts.py package --profile <folder>`, passed by `tools/release/make_release.py`: the package's
+  `tools/work` takes `profile/`'s files over the previous release's. The builder copies `tools/work` into its work
+  folder (make_game.py), so a release ships the lift and its profile together.
+- Tests: `test_vfpx_elem.py` and `test_fpx_slowpath.py` set every switch explicitly (the ones they do not cover to 0).
+- Installed: `%LOCALAPPDATA%\HookshotBuilder\{hookshot_pieces.prof,hot_funcs.txt,hot_order.txt}` (by dev-build). The
+  original upstream files are in `E:\OOT\HeyListen\build\backup-tick045\work-profile`.
+- Not changed: the installed v0.1.0-rc1 builder's `tools\work`. Its lifter predates the switches, so upstream's profile
+  is still the matching one for it. A build by that builder copies upstream's profile back into the work folder; the
+  next `dev-build.ps1` restores ours.
+
+### Behaviour
+
+- HOS_SPEED_LOG ratio, the last 40 one-second lines:
+
+  | | A | C |
+  |---|---|---|
+  | kokiri-idle | 60.01 (58.96-61.22) | 60.01 (59.69-60.41) |
+  | castle-move | 60.01 (58.13-61.45) | 59.99 (59.17-60.68) |
+
+- Shots every 1200 presents (`build/tick045/shots` in the worktree): the same sequence of frames for both builds, mean
+  brightness by frame alike. The Market, people, shadows, HUD and text boxes are drawn alike.
+- run_all: 216 pass, 12 fail (the 10 known, plus the flaky test_nup_verify and test_nup_codec), 33 skip.
+  `test_vfpx_elem` and `test_fpx_slowpath` pass.
+- Saves identical after every run, gen runs included. No game process left after any run. No run stayed on the title
+  screen (TICK-043/044's one-off).
+
+### The installed build
+
+`dev-build.ps1 -Lift` (lifted code key e8dc207cb2, as C; hot pieces again because the profile's path changed in the
+flags, 180 s). Its exe and dll differ from C's only in the PE timestamp and checksum (4 bytes each). Smoke: kokiri-idle
+74.2, castle-move 69.7 fps. That is lower than C's A/B runs because the whole session had slowed: the interleaved check
+that followed (2 runs each) gave A 71.7 / 68.4 against this build 73.9 / 72.5 (standing / walking), still +2.2 / +4.1.
+Shots and speed are as C's above.
+
+### What is next (ranked)
+
+1. **The job start order** (TICK-042: 0.2-0.45 ms a frame), now that the FP slow paths are off the chain's jobs.
+2. **FRSQRTE / FRECPE inline** and **the quiet-NaN test in the inline vector path** (TICK-044 3-4): both change lifted
+   functions. Now that a profile refresh is a routine step, they are worth building and measuring with their own
+   profile.
+3. A release with the new builder (its lifter and `profile/` together) when GitHub is back. Until then only dev builds
+   carry the gain.
+
+Not verified: other CPUs (TICK-041/044: without AVX2 the vector paths are SSE2 code, without FMA3 the FMA switch does
+nothing), Kokiri Forest and Hyrule Field (no saves), a builder release made with `--profile` (no release was
+made), more than 6 runs a variant.
