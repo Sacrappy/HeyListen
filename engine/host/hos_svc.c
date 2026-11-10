@@ -153,7 +153,9 @@ static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
     waiters[nwaiters++] = (Waiter){self, mutex, 0, tag, 0};
     ReleaseSRWLockExclusive(&klock);
     int to;
+    HOS_JT(JT_K_WAIT_B, mutex, hos_jt_lr());
     hos_thread_wait(self, -1, &to);   /* woken once release_locked made us the owner */
+    HOS_JT(JT_K_WAIT_E, mutex, 2);
     return 0;
 }
 
@@ -178,7 +180,9 @@ static uint32_t wait_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t tim
     release_locked(mutex);
     ReleaseSRWLockExclusive(&klock);
     int to;
+    HOS_JT(JT_K_WAIT_B, key, hos_jt_lr());
     hos_thread_wait(self, timeout, &to);
+    HOS_JT(JT_K_WAIT_E, key, to ? 6 : 2);
     if (!to) return 0;
     AcquireSRWLockExclusive(&klock);
     int i = find_thread(self);
@@ -271,7 +275,9 @@ static uint32_t wait_address(uint64_t addr, uint32_t type, uint64_t value, int64
     waiters[nwaiters++] = (Waiter){self, 0, addr, 0, 2};
     ReleaseSRWLockExclusive(&klock);
     int to;
+    HOS_JT(JT_K_WAIT_B, addr, hos_jt_lr());
     hos_thread_wait(self, timeout, &to);
+    HOS_JT(JT_K_WAIT_E, addr, to ? 6 : 2);
     if (!to) return 0;
     AcquireSRWLockExclusive(&klock);
     int i = find_thread(self);

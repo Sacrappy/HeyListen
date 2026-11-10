@@ -145,4 +145,21 @@ uint32_t movie_reader_codec(MovieReader *r);   /* the stream's FourCC: 'VP90', '
 uint64_t hos_ticks(void);
 void hos_sleep_ns(int64_t ns);
 int64_t hos_now_ns(void);
+
+/* ---- (TICK-039) HOS_JOBTRACE=<path>: blocking and waking of every thread for a short window (hos_jobtrace.c) */
+extern volatile int hos_jt_on;
+void hos_jt_rec(int type, uint64_t a, uint64_t b);
+uint64_t hos_jt_lr(void);
+void hos_jt_start(void);
+enum {
+    JT_EV_WAIT_B = 1, JT_EV_WAIT_E, JT_EV_SIGNAL, JT_SPIN_E,   /* event (a key, b lr | b how: 0 ready 1 spun 2 slept, +4 timed out) */
+    JT_CV_WAIT_B, JT_CV_WAIT_E, JT_CV_SIGNAL,                  /* condition variable (a cv; signal b: count, 0 all) */
+    JT_MX_WAIT_B, JT_MX_WAIT_E, JT_MX_GIVE,                    /* contended mutex (a mutex; give: when a thread sleeps on it) */
+    JT_SLEEP_B, JT_SLEEP_E,                                    /* SleepThread (a ns asked, b lr) */
+    JT_VC_WAIT_B, JT_VC_WAIT_E,                                /* a wait for a virtual core */
+    JT_Q_WAIT_B, JT_Q_WAIT_E, JT_Q_SIGNAL,                     /* message queue / semaphore (a object) */
+    JT_K_WAIT_B, JT_K_WAIT_E, JT_K_WAKE,                       /* kernel wait (a address, b lr) / wake (a the HosThread woken) */
+    JT_MARK                                                     /* free use (a, b) */
+};
+#define HOS_JT(t, a, b) do { if (__builtin_expect(hos_jt_on, 0)) hos_jt_rec((t), (uint64_t)(a), (uint64_t)(b)); } while (0)
 #endif

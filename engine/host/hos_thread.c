@@ -394,7 +394,10 @@ void hos_thread_wait(HosThread *t, int64_t timeout_ns, int *timed_out) {
     *timed_out = WaitForSingleObject(t->wake, ms) == WAIT_TIMEOUT;
     if (away) hos_vcore_back();
 }
-void hos_thread_wake(HosThread *t) { SetEvent(t->wake); }
+void hos_thread_wake(HosThread *t) {
+    HOS_JT(JT_K_WAKE, (uint64_t)(uintptr_t)t, hos_jt_lr());
+    SetEvent(t->wake);
+}
 
 HosThread *hos_thread_of(uint64_t guest_tt) {
     HosThread *r = NULL;
@@ -797,6 +800,12 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
     if (poll_cap && ns > poll_cap && ns <= 100000) ns = poll_cap;
     static int on = -1;
     if (on < 0) on = getenv("HOS_SLEEP_LOG") != NULL;
+    if (hos_jt_on) {
+        HOS_JT(JT_SLEEP_B, ns, lr);
+        hos_sleep_ns(ns);
+        HOS_JT(JT_SLEEP_E, ns, lr);
+        return;
+    }
     if (!on) { hos_sleep_ns(ns); return; }
     const int64_t t0 = hos_now_ns();
     hos_sleep_ns(ns);
@@ -1211,6 +1220,7 @@ static void vc_acquire(HosThread *t) {
         ReleaseSRWLockExclusive(&vc_lock);
         return;
     }
+    HOS_JT(JT_VC_WAIT_B, 0, 0);
     const int64_t t0 = hos_now_ns();
     t->vc_since = t0;
     t->vc_queued = 1;
@@ -1268,6 +1278,7 @@ static void vc_acquire(HosThread *t) {
     vc_thread_note(t, waited);
     vc_stats_locked(hos_now_ns());
     ReleaseSRWLockExclusive(&vc_lock);
+    HOS_JT(JT_VC_WAIT_E, 0, 0);
 }
 static void vc_release(HosThread *t) {
     if (!t->vc_held) return;
