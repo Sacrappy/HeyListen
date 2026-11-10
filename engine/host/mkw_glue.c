@@ -575,7 +575,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             }
             CloseHandle(snap);
             t0 = hos_now_ns();
-            hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
+            hos_log("prof: all-thread sampling of %d threads into %s (t0 %lld ns)", nt, path, (long long)t0);
         }
         Sleep(2);
         const long ms = (long)((hos_now_ns() - t0) / 1000000);
@@ -584,6 +584,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             CONTEXT ctx = {0};
             ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
             const BOOL got = GetThreadContext(th[i], &ctx);
+            const int64_t at = hos_now_ns();   /* (the thread is stopped once its context is read) */
             char line[1024];
             int len = snprintf(line, sizeof line, "%ld %s|", ms, tn[i]);
             for (int depth = 0; got && depth < 16 && ctx.Rip && len < (int)sizeof line - 96; depth++) {
@@ -610,6 +611,11 @@ static DWORD WINAPI sample_all_thread(void *p) {
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &hd, &frame, NULL);
             }
             ResumeThread(th[i]);
+            /* (TICK-039) HOS_SAMPLE_NS=1: the instant of this thread's sample in ns (hos_now_ns, the clock of HOS_JOBTRACE)
+               as a last ";@<ns>" frame, to match a sample to a trace's 50-200 us segments (the line's ms is 1 ms coarse) */
+            static int at_ns = -1;
+            if (at_ns < 0) at_ns = getenv("HOS_SAMPLE_NS") != NULL;
+            if (at_ns && len < (int)sizeof line - 24) snprintf(line + len, sizeof line - len, ";@%lld", (long long)at);
             fprintf(out, "%s\n", line);
         }
     }
