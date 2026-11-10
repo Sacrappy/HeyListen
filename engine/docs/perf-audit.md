@@ -1708,3 +1708,171 @@ Not verified:
 - other CPUs and memory systems (the profile's branch weights are the game's, the code layout is the PC's);
 - Kokiri Forest and Hyrule Field (no saves);
 - more than 6 runs a variant.
+
+## TICK-041: where the lifted guest code's time goes, and the NEON FP lane loops (2026-11-10)
+
+**Result: the guest code on the Market job chain is latency-bound, not instruction-bound. Charged to x86 instructions
+(skid-corrected timer samples), its time is guest memory 28%, integer work 25%, FP ops with the FPX exactness checks 17%,
+host-stack traffic 9-10%, context registers 8%, flags 1.1-1.4%, FP-env checks 1.3%, calls/returns 1.3%, polls 0.5-0.7%.
+One pattern stood out: NEON FMUL / FMLA / FMLS by element and vector FMLA / FMLS (.4S) were still per-lane loops of scalar
+helper calls whose results went through the host stack (a store-forwarding stall each op): ~16% of the guest samples. A
+lifter change (`A64_VFPX_ELEM=1`, lift time) makes them SSE/AVX2 ops with the same exactness tests, bit-identical (host
+tests, a new unit test). It is worth +4 fps when neither build has a PGO profile, but only +2.1 standing / +1.7 walking
+against the shipped build once each has a profile recorded on its own lift: inside the 2-4 fps spread. Not adopted: it
+stays opt-in, and the default lift and a64_fpx.h are byte for byte as before. No default changed; the game folder keeps
+the Sync 10 build.** Market save by the fountain, `--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070,
+windowed `run_bench.py`, 110 s runs, 66 s cut.
+
+### Method
+
+- Samples: `HOS_SAMPLE_ALL` (every 2 ms, 36 s at 72-108 s) of the job and main threads (BaseProcExecutor0-5,
+  ModuleSystemWorker1-5, sead::MainThread). Sources: TICK-040's base-*-long runs (castle-move 816k lines, kokiri-idle
+  844k), and this ticket's trace runs (`HOS_JOBTRACE` + `HOS_SAMPLE_NS`, kokiri-idle).
+- Each sample whose leaf is in a guest function is matched to the x86 instruction at its IP. This covers the sections that
+  hold 80% of the guest code's samples (299-312 functions, 2.7-3.0 M instructions, `llvm-objdump`).
+- A timer sample's IP is the instruction after the one that held retirement: the stalled instruction must finish before
+  the interrupt is taken. Uncorrected, the hottest "instructions" were context stores right after guest loads that miss
+  (`mov rax,[rbx+rax]`, then `mov [rsi+0x50],rax` with 40 samples). So each sample is charged to the instruction before it.
+- New tools (committed):
+  - `tools/bench/guestmix.py` classifies every instruction: context load/store by field, guest memory, host stack,
+    flags, poll, FP env, calls by kind;
+  - `tools/bench/guestmix_post.py` groups the classes and finds the FPX lane loops.
+
+### The breakdown (base build, skid-corrected; kokiri-idle / castle-move)
+
+| class | share of the guest samples |
+|---|---:|
+| guest memory loads/stores (`[A64_MEM + addr]`) | 27.8% / 28.1% |
+| integer work (ALU, compares, moves, setcc) | 25.4-25.9% / 25.7% |
+| FP and vector ops with the FPX checks around them | 16.5-17.1% / 16.5% |
+| host stack (spills/reloads, and the lane loops' 16-byte reload) | 9.3-9.6% / 10.0% |
+| context registers c->x[], c->vreg[], SP | 8.3-8.4% / 8.1% |
+| other memory (pointers derived from the context) | 4.1% / 3.9% |
+| branches | 2.4-2.6% / 2.7% |
+| flags (the c->n/z/c/v bytes) | 1.4% / 1.1% |
+| FP env (fpcr/fpsr loads and tests, RECOMP_FPX_OPEN) | 1.3% / 1.2% |
+| calls, returns, prologues | 1.3-1.4% / 1.2% |
+| host globals (dirty-page marks, site caches) | 0.7-0.9% / 0.8% |
+| polls (`cmp [ctx.poll],0`) | 0.5-0.6% / 0.7% |
+| of these: the NEON FP lane loops, body / their 16-byte reload | 10.6-10.8% / 5.3-5.6% |
+
+What the ticket asked to count:
+- **Context loads and stores.** Statically, c->x loads are 1.5% of the instructions and c->x stores 2.7%; c->vreg loads
+  1.1% and stores 1.2%; flag-byte stores 0.8%. Most stores are write-through (the value stays in a host register), so they
+  cost little. 8% of the samples land on them, mostly as the consumer of a slow load.
+- **Spills and reloads around calls.** Per direct guest call: 2.4 context stores before, 1.2 context loads after. The
+  samples within -2..+5 instructions of a direct call are 1.0%. Keeping callee-saved guest registers in host registers
+  across calls can win at most that plus part of the context traffic, a few % of the guest time. Not prototyped.
+- **Polls.** 440k loop-header polls: 0.5-0.7% of the guest samples.
+- **Flags.** 1.1-1.4% (the stores); the setcc that make them are inside "integer work".
+- **Soft-FP and runtime calls.** Leaves of these threads, all their samples, waits included (system 74%, guest 21.4%,
+  runtime 4.4%): spin_until_set 1.2-1.3%, obj_lookup 0.5%, the soft-FP wrappers ~0.8% together, mutex_lock / obj ~0.3%.
+  Calls from the hot sections are 0.7% of the instructions (soft-FP) and 0.6% (runtime); indirect calls 0.06%.
+- **Scalar FMA.** On x86 the binary32 FMA fast path goes through binary64 (three conversions, a midpoint test, one
+  conversion back). 4.1-4.7% of the guest samples sit in those sequences. Using FMA3's fmaf there (TICK-022's change, left
+  on its branch) was prepared but not measured on its own, so it is not committed.
+
+Why slower than native:
+- The hot functions chase pointers through guest memory, the largest class.
+- Every value the code produces also goes to the context (stores) and comes back from it after calls and at block joins.
+  With `-capture-tracking-max-uses-to-explore` and `A64_NOESC`, LLVM keeps most of it in registers within a function.
+- What is left is the latency of the guest loads themselves, and the store-forwarding stalls where a register is written
+  in parts and read whole (the lane loops below).
+- Removing instructions that are not on such a latency chain moves the samples but not the time (v1 below).
+
+### The FPX lane loops
+
+- The lifter vectorized NEON FADD / FSUB / FMUL .4S (a64_vfpx_*, upstream), but not FMUL / FMLA / FMLS by element nor
+  vector FMLA / FMLS. Those were `for (_i < 4)` loops of the scalar helper:
+
+  | | hot code | whole lift |
+  |---|---:|---:|
+  | FMUL by element | 5,657 | 56,761 |
+  | FMLA / FMLS by element | 878 | 7,787 |
+  | vector FMLA / FMLS | 196 | 1,701 |
+
+- Each lane's result went to a 4-byte slot on the host stack, and `a64_vst16` then read the 16 bytes back: a
+  store-forwarding failure every op (`mov dword [rsp+4*r12+0x30], eax` x4, then `vmovaps xmm0, [rsp+0x30]`).
+- `A64_VFPX_ELEM=1` at lift time (`third_party/a64-kit/lift/a64_lift.py`: `VFPX_ELEM`, `VFPX_FMLA`, `VFPX_MULE_HEADER`,
+  `VFPX_FMA_HEADER`):
+  - FMUL by element: one `mulps` with the element broadcast in a register, and a64_vfpx_mul32's tests;
+  - FMLA / FMLS (by element and vector): the scalar FMA fast path's binary64 route on four lanes with AVX2 (`cvtps2pd`,
+    `mulpd`, `addpd`, the midpoint test, `cvtpd2ps`), and recomp_fpx_fma32's keep tests (RECOMP_FPX_KEEP32, FZ);
+  - any lane outside the fast path: all four lanes through the old scalar helpers, in lane order, so FPSR evolves as
+    before. Without AVX2 (x86-64-v2) every FMLA takes that path.
+- Equivalence: the whole Ctx after each op is compared with the old loop's. Inputs: random registers (zeros, subnormals,
+  infinities, quiet and signalling NaNs, extreme normals, binary32 midpoints), random FPCR / FPSR.
+  - In scratch: 20 M + 20 M cases, 0 differences, ~30-40% of them through the vector fast paths.
+  - `tests/test_vfpx_elem.py` (new): the same through a64emit and `op_text`, at x86-64-v3 and v2.
+- A first version (v1) passed the broadcast element through a 16-byte array, written as two 8-byte stores and read as one
+  16-byte load: the same stall in a new place.
+  - A store-forwarding scan of its disassembly: 5% of the guest samples follow such loads.
+  - Its lane-loop samples fell from 15.9% to 2.2% of the guest samples, but the guest code's total did not move (22,425 ->
+    22,273 samples in 36 s; path work 6.87 -> 6.98 ms a frame).
+  - v1b keeps the broadcast in a register.
+
+### A/B (fps / 1% low / p99 ms, interleaved, 3 runs a variant and session unless noted)
+
+| session | variant | kokiri-idle | castle-move |
+|---|---|---|---|
+| 1 | base (main, upstream's profile) | 71.0 / 40.2 / 20.5 | 64.4 / 27.7 / 29.8 |
+| 1 | v1 (upstream's profile, stale for the changed functions) | 70.9 / 38.3 / 21.0 | 63.6 / 27.7 / 30.2 |
+| 2 | base-np (no profile) | 66.3 / 38.2 / 21.9 | 60.5 / 27.7 / 30.1 |
+| 2 | v1b-np (no profile) | **70.7** / 36.7 / 22.1 | **64.5** / 29.5 / 27.9 |
+| 3+4 | base (6 runs) | 71.8 / 39.1 / 20.7 | 64.7 / 30.2 / 28.6 |
+| 3+4 | v1b-p (6 runs; a profile from our 3 scenes on its own lift, merged 6:1 with upstream's) | 73.9 / 38.2 / 20.8 | 66.4 / 28.6 / 29.3 |
+
+The runs (fps):
+
+| | kokiri-idle | castle-move |
+|---|---|---|
+| base-np | 66.3 66.5 66.1 | 59.7 60.9 60.9 |
+| v1b-np | 68.7 71.8 71.7 | 63.0 66.7 63.7 |
+| base (3+4) | 69.7 69.5 71.4 74.8 69.4 76.1 | 66.6 65.1 63.6 63.8 65.2 63.8 |
+| v1b-p | 71.5 75.0 74.0 76.7 73.2 73.2 | 65.4 68.2 68.0 67.4 63.1 66.5 |
+
+- Without a profile, the lifter change is +4.4 / +4.0 fps, the ranges apart: the lane loops cost what the samples said.
+- The PGO profile alone is worth +4-5 fps on the base lift (base vs base-np), and it takes most of the lane loops' cost
+  with it.
+- With a profile on each lift, the change is +2.1 / +1.7 fps, with 1% lows -0.9 / -1.6: inside the spread. The v1b-p
+  profile is also our scenes' (TICK-040: that alone was +1.0 / -0.8).
+- So the change is not adopted. Taking it needs the profile recorded on its lift, shipped with it: a lift with it and
+  upstream's profile is v1's row, no gain. The same holds for the back-edge polls (TICK-040).
+
+### Behaviour
+
+- Game speed (`HOS_SPEED_LOG=1`, castle-move, the last 40 one-second lines above 30): base 60.04 (58.44-61.14), v1b-p
+  60.00 (58.16-61.76); v1 59.9-60.1 in its run.
+- Picture: shots every 1200 presents, walking (`build/tick041/shots/{base,v1b-p}-move` in the worktree). The Market,
+  people, Link and the HUD are drawn alike.
+- Saves identical to the backup after every run; no game process left after any run.
+- Tests: run_all (llvm-mingw on PATH) 176 pass, 10 fail, 25 skip; the 10 are on the known list, test_vfpx_elem passes.
+- With the switch off, `fpx_header` and `vectorize_fpx` give the same text as main's (checked on the same inputs).
+
+### Build cost (8 jobs)
+
+| | time |
+|---|---|
+| lift | 171-179 s |
+| a lift with the change: every chunk compiles again (a64_fpx.h changed) | 581-597 s |
+| hot pieces only (another profile) | 182-194 s |
+| `RX_PGO=gen` build | 503 s |
+
+### What is next (ranked)
+
+1. Ship v1b with its profile, or fold it into the next profile refresh. With a matching profile the change is free (+2 fps
+   here, inside the spread); where the profile does not fit (other scenes, code paths the profile never saw) it is worth
+   up to the +4 fps measured without one. It needs `A64_VFPX_ELEM=1` in the builder's lift and the profile recorded on
+   that lift (a release step).
+2. Store-forwarding stalls on c->vreg: a vector register written in parts (`vset64` then a 4- or 8-byte memcpy, halves)
+   and read as 16 bytes. The scan finds ~860 such loads in the hot sections; 0.3-0.4% of the samples follow them: small.
+3. Callee-saved guest registers in host registers across direct calls: at most the ~1% of samples around calls plus part
+   of the 8% context traffic. A large lifter project for a few %.
+4. Scalar binary32 FMA by FMA3 (4-5% of the guest samples sit in the binary64 route): needs its own profiled A/B.
+5. The guest memory loads (28%) are the game's own pointer chasing: no lifter lever. The job graph (TICK-039) remains the
+   larger lever.
+
+Not verified:
+- other CPUs (without AVX2 the change falls back to the lanes);
+- Kokiri Forest and Hyrule Field;
+- a profile recorded on base with our scenes, to separate the profile's share of v1b-p's +2 fps.

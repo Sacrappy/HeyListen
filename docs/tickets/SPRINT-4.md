@@ -65,3 +65,14 @@ Branch `feature/sync-hookshot-10` (from main 167182c), 10 upstream commits since
   - Take the back-edge polls only together with a profile made on that lift.
   - Next lever: the lifted code's context traffic (a lifter project) or the job graph, not compile levels.
 - Also: `dev-build.ps1 -Lift` now deletes the earlier lift's chunks first (duplicate symbols after a lift with fewer chunks).
+
+## TICK-041 (2026-11-10): faster lifted guest code
+- Measured where the guest code on the Market job chain spends its time, per x86 instruction (skid-corrected timer samples; new `tools/bench/guestmix.py`):
+  - guest memory 28%, integer work 25%, FP with the FPX checks 17%, host stack 9-10%, context registers 8%;
+  - flags 1.1-1.4%, polls 0.5-0.7%, calls 1.3%; the runtime under it (obj_lookup, soft-FP, locks) ~1.6% of the threads' samples.
+  - The code is latency-bound (pointer chasing, store-forwarding stalls). Keeping guest registers in host registers across calls could win a few % at most: not prototyped.
+- Found and fixed (opt-in): NEON FMUL / FMLA / FMLS by element and vector FMLA (.4S) were per-lane loops through the host stack, ~16% of the guest samples. `A64_VFPX_ELEM=1` at lift time vectorizes them, bit-identical (new `tests/test_vfpx_elem.py`).
+- fps:
+  - no PGO profile on either side: +4.4 standing, +4.0 walking;
+  - each with a profile recorded on its own lift (6 runs each): +2.1 / +1.7, inside the 2-4 fps spread.
+- Decision: not adopted; the switch stays off, so the default lift is byte for byte as on main. Take it at the next profile refresh, together with a profile recorded on that lift (as for the back-edge polls). Game folder: the Sync 10 build restored.
