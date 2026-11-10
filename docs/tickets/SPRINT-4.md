@@ -112,3 +112,10 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
   - `RX_VK_CAPTURE_SCAN_SPLIT=1`: the scan split over the copy helpers. 73.0 / 69.8: inside the spread.
 - Correctness: Market shots of the default build alike, standing and walking; game speed ratio ~60. Tests: 215 pass, 12 fail (known and flaky), 33 skip.
 - Decision: no default changed; the game folder keeps the Sync 11 build. Next: fewer capture bytes (bindings' read sets), the late pages' recopy on the GPU, a flat table for the texture shadows; the game's job chain stays the larger lever.
+
+## TICK-044 (2026-11-10): the FP slow paths of the serial actor jobs
+- Measured (probe build): ~5.4 M out-of-line FP calls a second walking, ~3.3 M standing. Quiet-NaN lanes in vector FADD / FSUB / FMUL (59%), FRSQRTE / FRECPE (33%), FDIV by zero with DZC raised (6%); not denormals or FPCR modes. Mostly the model subsystem under 80166100's job.
+- Changed, behind lift-time switches (off; lifted code unchanged): `A64_FPX_SLOWPATH=1` (per-lane fallback with quiet-NaN lanes in the cold `_lanes` helpers, NaN / FDIV rescues in the scalar wrappers, an estimate table fast path; exact bodies 3.6 M -> 0.09 M a second), `A64_FPX_FMA3=1` (scalar binary32 FMA by FMA3). Bit-identical: new `tests/test_fpx_slowpath.py`.
+- A/B, 6 runs each: walking 69.1 -> 70.0 / 71.1, standing 76.1 -> 74.7 / 75.0: inside the spread.
+- Decision: not adopted, no default changed; the game folder keeps the Sync 11 build. The job start order (part 2) was not prototyped. Next: the start-order patch; ship the FP switches with a matching profile at the next refresh.
+
