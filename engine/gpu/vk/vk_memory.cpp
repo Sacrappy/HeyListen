@@ -21,6 +21,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
+#if defined(__AVX2__)
+#include <immintrin.h>   // (TICK-037: the capture's streaming copy)
+#endif
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -1299,6 +1302,55 @@ bool guarded_copy(void* dst, const void* src, size_t n) {
     return true;
 }
 #endif
+// (TICK-037) The capture's copies with streaming stores. The capture buffers (25 kept and the spares, 5-10 MB each) are never in
+// the CPU's cache when a capture fills them, so a plain copy read every line of them from DRAM before writing it (~40 MB a frame of
+// it, on the game's main thread, the other game threads mostly idle meanwhile): bandwidth, not threads, held the copy (four helpers
+// or eight, the same time). Streaming stores skip that read: ~0.43 -> ~0.31 ms for a 10 MB capture on this machine (5 threads,
+// the source just written by 6 others). What the buffers hold is the same; the stores are fenced before the capture is handed on.
+// RX_VK_CAPTURE_STREAM=0: memcpy, as before
+#if defined(__AVX2__)
+__attribute__((noinline)) void* stream_memcpy(void* dst, const void* src, size_t n) {
+    if (((uintptr_t)dst & 31) || (n & 127)) return std::memcpy(dst, src, n);
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    for (size_t o = 0; o < n; o += 128) {
+        const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + o));
+        const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + o + 32));
+        const __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + o + 64));
+        const __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + o + 96));
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + o), a);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + o + 32), b);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + o + 64), c);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + o + 96), e);
+    }
+    return dst;
+}
+void stream_fence() { _mm_sfence(); }
+bool stream_on() {
+    static const bool v = !getenv("RX_VK_CAPTURE_STREAM") || atoi(getenv("RX_VK_CAPTURE_STREAM")) != 0;
+    return v;
+}
+#else
+void* stream_memcpy(void* dst, const void* src, size_t n) { return std::memcpy(dst, src, n); }
+void stream_fence() {}
+bool stream_on() { return false; }
+#endif
+void* (*volatile guarded_stream_memcpy)(void*, const void*, size_t) = stream_memcpy;
+#ifdef _WIN32
+__declspec(noinline) bool guarded_copy_stream(void* dst, const void* src, size_t n) {   // (as guarded_copy)
+    __try {
+        guarded_stream_memcpy(dst, src, n);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+    return true;
+}
+#else
+bool guarded_copy_stream(void* dst, const void* src, size_t n) {
+    guarded_stream_memcpy(dst, src, n);
+    return true;
+}
+#endif
 // ---- a capture's copies: on the submitting thread and two helpers, four from 12 CPU threads (RX_VK_CAPTURE_THREADS=<n>, 0-4): ~9 MB of the
 // game's dynamic data a submit, four submits a frame, ~1.4 ms on the game's thread each with one ----
 // (a page written and then unmapped before the submit faulted a plain copy: ReadProcessMemory fails on it instead.
@@ -1308,12 +1360,14 @@ struct CopyPart { const uint32_t* pages; int64_t i0, i1; uint8_t* out; uint8_t* 
 void copy_part(const CopyPart& w) {
     uint8_t* const base = (uint8_t*)host->guest_base();   // (guest addresses: no GPU translation per page)
     const uint64_t gsize = host->guest_size();
+    const bool stream = stream_on();   // (TICK-037: streaming stores, fenced below)
     for (int64_t i = w.i0; i < w.i1;) {
         const uint64_t ga = (uint64_t)w.pages[i] << kPageShift;
         if (ga + 4096 > gsize) { i++; continue; }
         int64_t j = i + 1;
         while (j < w.i1 && w.pages[j] == w.pages[j - 1] + 1 && ((uint64_t)w.pages[j] << kPageShift) + 4096 <= gsize) j++;
-        if (guarded_copy(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)) {
+        if (stream ? guarded_copy_stream(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)
+                   : guarded_copy(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)) {
             std::memset(w.ok + i, 1, (size_t)(j - i));
         } else {
             for (int64_t q = i; q < j; q++)
@@ -1321,6 +1375,7 @@ void copy_part(const CopyPart& w) {
         }
         i = j;
     }
+    if (stream) stream_fence();   // (the streaming stores visible before the part is counted done)
 }
 struct CopyHelpers {
     std::mutex mu;

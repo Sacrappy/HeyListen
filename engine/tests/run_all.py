@@ -28,6 +28,7 @@ OS = "windows" if WINDOWS else "linux"
 ARGS = {
     "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
+    "tests/test_capture_stream_copy.py": ["--cxx", "{cxx}"],
     "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
     "tests/test_prof_sampling.py": ["--cxx", "{cxx}"],
     "tests/test_screensaver.py": ["--cc", "gcc"],
