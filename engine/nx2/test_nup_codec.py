@@ -67,4 +67,17 @@ with tempfile.TemporaryDirectory(prefix='nup-codec-') as temporary:
         pass
     else:
         raise AssertionError('explicit extent was overread or incomplete frame accepted')
-print('PASS: explicit .zs plaintext, raw game Zstd, legacy detection and truncated extent rejection')
+
+    oversized = compressor.compress(bytes(65536))
+    path.write_bytes(package('oversized.bin', bytes(8), oversized, 1))
+    reader = nup.Nup(str(path))
+    with reader.f:
+        relative, record = next(reader.walk(0))
+        output = io.BytesIO()
+        try:
+            reader.copy_to(record, output, relative)
+        except SystemExit:
+            assert output.tell() == 0, f'wrote {output.tell()} bytes past the declared size'
+        else:
+            raise AssertionError('oversized compressed member accepted')
+print('PASS: explicit and legacy codecs, truncated extent rejection, and oversized output rejection before writing')

@@ -33,7 +33,7 @@
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
-#include "mirror_inherit.h"   // (TICK-036: what a new mirror takes from the retired pools' mirrors)
+#include "mirror_inherit.h"   // (TICK-036 / #1127: what a new mirror takes from the retired pools' mirrors)
 #include "shaders/msync_scatter_comp_spv.h"   // (TICK-021: the mirror syncs' scatter copy)
 #ifdef __linux__
 #include <cerrno>
@@ -357,12 +357,12 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
         }
     } report{t0, t1, t2, t3, t4};
     // (pages the game has not touched yet may be only reserved: committed now, as the pool's memory is usable)
-    // (hookshot) In one call over the range: the guest window is one reservation, committing pages committed already
-    // leaves them as they are, and the guest's pages are all read-write (only the RX_NVN_WATCH_* diagnostics protect
-    // some). The pages were queried one region at a time before, so as to commit only the reserved ones: the queries were
-    // ~33 ms of an import's ~70 ms in the game's huge reservation (on the replay thread, at a pool's first binding), the
-    // call 1.3 ms. Where it fails, as before
-    if (VirtualAlloc(ptr, (SIZE_T)bytes, MEM_COMMIT, PAGE_READWRITE) != ptr)
+    // (hookshot) One commit avoids the slow query walk, but resets protection on committed pages too. Keep the walk
+    // for CPU write watches: commit only reserved pages, leaving the watched pages read-only.
+    // ponytail: add new watch switches here; query the host if watches stop requiring a startup switch.
+    static const bool page_watches = getenv("RX_NVN_WATCH_TEX") || getenv("RX_NVN_WATCH_TEXELS_SRC") ||
+                                     getenv("RX_VK_WATCH_CPU") || getenv("RX_VK_VERIFY_DIM");
+    if (page_watches || VirtualAlloc(ptr, (SIZE_T)bytes, MEM_COMMIT, PAGE_READWRITE) != ptr)
         for (uint8_t* q = ptr; q < ptr + bytes;) {
             MEMORY_BASIC_INFORMATION mi{};
             if (VirtualQuery(q, &mi, sizeof mi) != sizeof mi) break;
@@ -2109,6 +2109,47 @@ bool mirror_on() {
     }();
     return on != 0;
 }
+
+/// (hookshot, smoothness) A read binding in a chunk not imported yet: its import goes to the background thread and the binding is
+/// served from a copy in the recording's stream, rather than the replay waiting for the import. Imports on the replay thread were
+/// the main hitch left in play (54-61 a run of the verification walks, 5-380 ms each, 2026-11-09). True: an import of the range is
+/// under way (sent now or before) and nothing covers it yet; false: the synchronous path as before (covered, outside the game's
+/// pools, or next to an import that would have to grow). RX_VK_ASYNC_IMPORT=1 (opt-in: background imports slowed AMD before) (pools_mu held)
+int64_t st_async_sent, st_async_copies;
+bool import_in_background(uint64_t guest, uint64_t size) {
+    if (guest_pools.empty() || !size || !dev.external_memory_host) return false;
+    bg_drain();
+    auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), guest, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == guest_pools.begin()) return false;
+    --it;
+    if (guest < it->lo || guest >= it->hi || size > it->hi - guest) return false;
+    const uint64_t chunk = import_chunk();
+    if (!chunk || guest + size > UINT64_MAX - chunk) return false;
+    if (auto c = imported.upper_bound(guest); c != imported.begin() && std::prev(c)->second.lo <= guest &&
+                                              std::prev(c)->second.hi >= guest + size)
+        return false;   // (covered)
+    const uint64_t lo = guest / chunk * chunk, hi = (guest + size + chunk - 1) / chunk * chunk;
+    for (auto o = imported.lower_bound(hi); o != imported.begin();) {   // (an import there: the synchronous path grows it)
+        --o;
+        if (o->second.hi <= lo) {
+            if (o->second.hi + (1ull << 30) < lo) break;
+            continue;
+        }
+        return false;
+    }
+    std::lock_guard lk(bg_mu);
+    for (const uint64_t x : bg_inflight)
+        if (x >= lo && x < hi) return true;   // (under way)
+    if (bg_inflight.size() >= 16) return false;
+    bg_start();
+    bg_inflight.push_back(lo);
+    bg_queue.push_back({lo, hi});
+    bg_cv.notify_one();
+    if (st_async_sent++ % 32 == 0)
+        logf("vk: imports in the background: %lld sent, %lld bindings served from a copy meanwhile", (long long)st_async_sent,
+             (long long)st_async_copies);
+    return true;
+}
 } // namespace
 uint64_t device_vram_bytes() {
     uint64_t vram = 0;
@@ -2972,6 +3013,19 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     }
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
+    {   // (hookshot, smoothness: import_in_background above. Reads up to 4 MB; not in a parallel replay's segment)
+        static const bool async_import = [] { const char* e = getenv("RX_VK_ASYNC_IMPORT"); return e && atoi(e) != 0; }();
+        if (async_import && !written && !par && size <= (4u << 20) && guest < (1ull << 40) &&
+            !(last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) && import_in_background(guest, size)) {
+            uint64_t avail = 0;
+            const uint8_t* src = host->gpu_ptr(gpu, &avail);
+            if (src && avail >= size)
+                if (const BufferRef r = stream_copy(src, size)) {
+                    st_async_copies++;
+                    return r;
+                }
+        }
+    }
     Pool* p = pool_of(guest, size);
     if (!p) return {};
     tl = {p, pools_gen.load(std::memory_order_relaxed)};
@@ -3370,35 +3424,40 @@ bool mirror_make(Pool& pool) {
                     barrier_done = true;
                 }
                 const uint64_t a = std::max(r.lo, p->lo), b = std::min(r.hi, p->hi);
-                // (TICK-036) only the pages the CPU has not written since the retired mirror's last sync: the others are
-                // newer in guest memory (and the captures below), as its next sync would have copied them. Copied whole,
-                // a scene's vertices and indices the CPU wrote after that sync (Castle Town Market's ground and fountain,
-                // in a pool remade larger while the scene loaded) came back as the old mirror held them, zeros: every
-                // triangle clipped, the ground flat white. The pages a shader wrote that RX_VK_PROTECT_BARE keeps stay
-                // the GPU's, as in mirror_sync. RX_VK_INHERIT_ALL=1: the whole range, as before
+                // (TICK-036 / upstream #1127) only the pages not stamped since its last sync: one the CPU wrote after it has the
+                // game's newer data in the copy of guest memory above (and the captures below), and the old mirror's over it
+                // counted as synced, stale for good (mirror_inherit.h): Castle Town Market's ground and fountain (a scene's
+                // vertices and indices in a pool remade larger while it loaded) came back as zeros; OoT's light probes stale
+                // in the fog. As mirror_sync, a page a shader wrote through a bare entry keeps the mirror's copy
+                // (RX_VK_PROTECT_BARE=1). Synced in this submission: the whole part. Its synced_gen is raised only at the
+                // submission's end (memory_end_submission), so what the GPU wrote in this submission's earlier segments
+                // (RX_VK_PARALLEL) is stamped above it, and guest memory has that only after the write-back; the CPU's writes
+                // were collected before the sync. RX_VK_INHERIT_ALL=1: the whole part always, as before
                 static const bool inherit_all = getenv("RX_VK_INHERIT_ALL") != nullptr;
-                static thread_local std::vector<std::pair<uint64_t, uint64_t>> keep;
-                keep.clear();
-                if (inherit_all) keep.push_back({a, b});
-                else
-                    mirror_inherit::runs(
-                        a, b, (unsigned)kPageShift, kRegionPages,
-                        [&r](uint64_t page) {
-                            return page_gen(page) > r.synced_gen && !(protect_bare_on() && prot_page_since(page, r.synced_gen));
-                        },
-                        [&r](uint64_t region) { return region_gen[region] <= r.synced_gen; }, keep);
                 static thread_local std::vector<VkBufferCopy> parts;
                 parts.clear();
-                uint64_t kept = 0;
-                for (const auto& [lo, hi] : keep) parts.push_back({lo - r.lo, lo - p->lo, hi - lo}), kept += hi - lo;
-                st_inherit_kept += (int64_t)kept, st_inherit_newer += (int64_t)((b - a) - kept);
+                uint64_t from_guest = 0;
+                const uint32_t synced = r.synced_gen;
+                if (inherit_all || r.synced_epoch == mirror_epoch)
+                    parts.push_back({a - r.lo, a - p->lo, b - a});
+                else
+                    from_guest = mirror_inherit::runs(a, b, r.lo, p->lo, kPageShift, kRegionPages,
+                                                      [&](uint64_t region) { return region_gen[region] <= synced; },
+                                                      [&](uint64_t page) {
+                                                          return page_gen(page) <= synced ||
+                                                                 (protect_bare_on() && prot_page_since(page, synced));
+                                                      },
+                                                      [&](uint64_t src, uint64_t dst, uint64_t size) { parts.push_back({src, dst, size}); });
+                const uint64_t kept = (b - a) - from_guest;
+                st_inherit_kept += (int64_t)kept, st_inherit_newer += (int64_t)from_guest;
                 if (inherit_watch_page() != ~0ull)
                     logf("vk: inherit watch: pool %#llx..%#llx takes retired %#llx..%#llx (synced gen %u epoch %llu; now gen %u epoch %llu): "
                          "%#llx kept, %#llx newer; watched page gen %u%s", (unsigned long long)p->lo, (unsigned long long)p->hi,
                          (unsigned long long)r.lo, (unsigned long long)r.hi, (unsigned)r.synced_gen, (unsigned long long)r.synced_epoch,
-                         gen_now, (unsigned long long)mirror_epoch, (unsigned long long)kept, (unsigned long long)((b - a) - kept),
+                         gen_now, (unsigned long long)mirror_epoch, (unsigned long long)kept, (unsigned long long)from_guest,
                          page_gen(inherit_watch_page()), (inherit_watch_page() << kPageShift) >= a && (inherit_watch_page() << kPageShift) < b ? " (in it)" : "");
-                if (!parts.empty()) vkCmdCopyBuffer(upload_command_buffer(), r.mirror, p->mirror, (uint32_t)parts.size(), parts.data());
+                if (!parts.empty())
+                    vkCmdCopyBuffer(upload_command_buffer(), r.mirror, p->mirror, (uint32_t)parts.size(), parts.data());
                 if (const uint64_t wa = inherit_watch_page() << kPageShift; inherit_watch_page() != ~0ull && wa >= a && wa < b) {
                     static const uint64_t at = getenv("RX_VK_LOG_INHERIT") ? strtoull(getenv("RX_VK_LOG_INHERIT"), nullptr, 16) & ~15ull : 0;
                     if (!iw_buf) create_buffer(4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, iw_buf, iw_alloc, &iw_map);
