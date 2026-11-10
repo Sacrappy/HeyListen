@@ -2184,3 +2184,132 @@ docs/benchmarks/2026-11-10-tick043-async-submit.md.
 
 Not verified: other CPUs (fewer cores make a copy thread costlier, a bigger cache could change the balance); pre-copy
 periods other than 250 us and 2 ms; Kokiri Forest and Hyrule Field.
+
+## TICK-044: the FP slow paths of the Market's model code (2026-11-10)
+
+**Result: the Market's FP slow paths are not denormals or rounding modes. Counted at the exact bodies, walking, the game
+ran ~5.4 M out-of-line FP calls a second (~81,000 a frame), standing ~3.3 M (~44,000): FADD / FSUB / FMUL with a quiet
+NaN operand (59% walking), almost all vector .4S ops where one lane holds a NaN, so the cold `_lanes` helper re-ran all
+four lanes through the scalar wrappers and the NaN lane through the soft-float body; FRSQRTE / FRECPE, which always run
+out of line (33%); and FDIV S by zero with DZC already raised (6%). Nearly all of it in the model subsystem behind the
+long jobs (f_81c86720, f_81c7f880, f_81b8c000, f_81c7d2e0, ...: 80166100's job). Two lift-time switches remove it without
+changing a lifted function (the lifted code's object key is the same): `A64_FPX_SLOWPATH=1` (the exact bodies fall from
+~3.6 M to ~0.09 M a second, the estimates take a table fast path) and `A64_FPX_FMA3=1` (the scalar binary32 FMA by FMA3).
+Both are bit-identical (new `tests/test_fpx_slowpath.py`; 80 M random cases and every binary32 estimate class).
+A/B, 6 interleaved runs each: walking +0.9 / +2.0 fps, standing -1.4 / -1.1: inside the 2-4 fps spread. Not adopted:
+both switches stay off; the default a64_fpx.h, a64_suyu.c and a64_suyu.h are byte for byte as before.** Market save by
+the fountain, `--fps-limit 360`, frame generation off, Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`, 110 s runs,
+66 s cut.
+
+### Method
+
+- A probe build (diagnostic only, never for fps; `build/tick044/fpe_probe.py` in the worktree, not committed): the
+  generated `a64_suyu.c` patched so that every `recomp_fpe_{add,sub,div,fma}32` and `recomp_fp_estimate` call is counted
+  by op and by why the fast path refused it (gate closed by FPSR.IXC or an FPCR bit, quiet / signalling NaN operand,
+  subnormal operand under FZ with or without IDC, infinite operand, overflow with or without OFC, tiny or zero result
+  with or without UFC, binary32 midpoint), with its rdtsc cycles and the FPSR at the call. One call in 256 records its
+  stack (RtlCaptureStackBackTrace), resolved with HeyListen.map to the first lifted function (`stk_sum.py`).
+- Counters written every 2^21 calls; the rates below are over the last 30 s of a run (gameplay).
+
+### Why the slow paths run (base build, probe; calls a second, walking / standing)
+
+| op | why | walking | standing | where |
+|---|---|---:|---:|---|
+| FMUL (.4S, by element) | quiet NaN operand | 1.69 M | 0.76 M | `a64_vfpx_mul32_lanes`, the by-element loops |
+| FSUB .4S | quiet NaN operand | 0.81 M | 0.38 M | `a64_vfpx_sub32_lanes` |
+| FADD .4S | quiet NaN operand | 0.67 M | 0.27 M | `a64_vfpx_add32_lanes` |
+| FRSQRTE S / .4S | always out of line | 1.56 M | 0.89 M | the model subsystem (f_81c86720, f_81c7f880, f_81b8c000, ...) |
+| FRECPE S / .4S | always out of line | 0.23 M | 0.43 M | f_8009bb80 mostly, f_8027d040, f_81281850 |
+| FDIV S | infinity of finite operands (a zero divisor), DZC / OFC raised | 0.33 M | 0.45 M | f_820e2520, f_81779980, f_81e69500, f_820e1d60 |
+| FSUB .4S | subnormal operand under FZ, IDC raised | 0.04 M | 0.06 M | f_8177b2a0 |
+| FADD .4S | infinite operand | 0.02 M | 0.03 M | f_81a1f140, f_81a4ce80 |
+| all others | gate closed (IXC clear), midpoints, tiny results | < 0.02 M | < 0.02 M | |
+
+- FPSR at the calls: 0x9f (every cumulative flag) 89-95%, 0x1f / 0x17 the rest; FPCR.FZ set in 99.6%. No rounding-mode
+  or DN gate closures; denormals are ~1% of the calls; no binary32 midpoint reached the body (the scalar FMA's binary64
+  route is a fast-path cost, not a slow-path one).
+- The NaN lanes look like Vec3 math in 4-lane registers whose fourth lane holds a NaN: each such vector op was one cold
+  call, four noinline scalar calls and one soft-float body.
+- By the stack samples the NaN and FRSQRTE calls are in f_81c86720 (17.5% of the samples), f_81c7f880, f_81b8c000,
+  f_81c7d2e0, f_81c7bd00, f_81ce6500, f_81c88940, f_81b5a3c0: the functions TICK-042 found under 80166100's job
+  (f_80168320 > f_8016b620 > f_81b47080).
+- Cost: the bodies' rdtsc time sums to 41 ms of CPU a second standing, 77 walking (~0.55 / ~1.2 ms of CPU a frame over
+  all threads, rdtsc overhead included), plus the calls and lane re-runs around them.
+
+### The change (`third_party/a64-kit/lift/a64_lift.py`, `a64_rtgen.py`; lift-time switches, off)
+
+`A64_FPX_SLOWPATH=1`:
+- The cold `_lanes` helpers of vector FADD / FSUB (.4S, .2S) and FMUL .4S redo the inline path's tests (copied, so the
+  inline functions keep their text and PGO records), keep every lane the inline path would keep, give a lane with a quiet
+  NaN operand and no signalling NaN the NaN Arm returns (the first NaN operand, quiet; under FZ a subnormal operand only
+  with IDC raised), and call the scalar wrapper only for the lanes left, in lane order. Kept lanes raise no FPSR bit, so
+  FPSR evolves as with the four calls. With the gate closed: the four calls, as before.
+- The scalar wrappers: FADD / FSUB S keep a quiet-NaN result (`a64_fpx_qnan2_32`); FMUL / FMADD S use TICK-022's
+  `a64_fpx_qnan_fma32` (extended: under FZ a subnormal factor when IDC is raised and the addend is no NaN); FDIV S keeps an
+  infinity of finite operands when DZC (zero divisor) or OFC is raised (`a64_fpx_div_inf32`).
+- `recomp_fp_estimate`: binary32 FRSQRTE of a positive normal and FRECPE of a normal with biased exponent <= 252 answered
+  from the existing tables (when the entry is filled), the same arithmetic as the general body; everything else as before.
+
+`A64_FPX_FMA3=1`: `recomp_fpx_fma32` (inlined into the lifted functions) uses `__builtin_fmaf` when built with FMA3 instead
+of the binary64 route with its midpoint fallback (TICK-022's change). Its PGO record no longer matches.
+
+Probe on the `A64_FPX_SLOWPATH` build, walking: the exact bodies fell from ~3.6 M to ~0.09 M calls a second (no NaN or
+FDIV case left; the FZ-subnormal FSUB and the infinite-operand FADD remain), the estimate's measured cost from 78 to 55
+cycles a call (rdtsc included).
+
+Build: the lifted code's object key is the same with either switch (`35c564f1c7`); a64_fpx.h (and a64_suyu.c / .h)
+change, so every chunk recompiles (lift 183-187 s, build 533-538 s at 14 jobs), but no function's code or profile record
+changes except the cold helpers', the wrappers' and, with FMA3, recomp_fpx_fma32's.
+
+### Equivalence
+
+`tests/test_fpx_slowpath.py` + `tests/fpx_slowpath_test.c` (new): 22 guest words (vector FADD / FSUB / FMUL .4S and .2S,
+aliased; scalar FADD / FSUB / FMUL / FNMUL / FDIV / FMADD / FMSUB / FNMADD S; FMUL and FMLA by element; vector FMLA;
+FRSQRTE / FRECPE S and .4S), each lifted once and compiled against the default header and runtime and against the
+switches' (both), plain and hot; random registers (zeros, subnormals, infinities, quiet and signalling NaNs, a quiet NaN in
+lane 3 of normal values, extreme normals, binary32 midpoints), 18 FPSR and 7 FPCR states; the whole Ctx compared. Then
+the estimate: every binary32 sign, exponent and top 10 significand bits with random low bits, both estimates, 7 FPCRs,
+twice (tables empty, then filled); binary64 random. At x86-64-v3 and v2.
+- 3 M cases a march in the test (~5 s); 40 M a march once by hand: 0 mismatches.
+- Teeth (each by hand, then restored): signalling NaNs taken as quiet NaN lanes: 40,539 mismatches in 1 M; the FDIV
+  rescue without its flag test: 1,090; the NaN priority swapped: 2,780; the NaN lanes' FZ/IDC test dropped: 1,637; the
+  FRECPE fast path up to exponent 254: 57,337 estimate mismatches; the FMA3 path computing a*b+z with two roundings:
+  mismatches at v3.
+- `tests/test_vfpx_elem.py` also passes with `A64_FPX_SLOWPATH=1` (the by-element FMUL's cold path then goes through the
+  new `a64_vfpx_mul32_lanes`).
+
+### A/B (fps / 1% low / p99 ms; 6 interleaved runs a variant, base first in rounds 1-3, last in 4-6)
+
+| scene | base | `A64_FPX_SLOWPATH` | `+ A64_FPX_FMA3` |
+|---|---|---|---|
+| kokiri-idle | 78.7 78.3 74.7 76.6 73.2 75.3: **76.1 / 48.6 / 17.6** | 75.3 75.1 73.9 75.4 74.1 74.3: **74.7 / 49.8 / 18.0** | 76.7 75.2 73.7 76.5 73.6 74.0: **75.0 / 46.9 / 18.4** |
+| castle-move | 66.4 68.1 71.9 68.9 67.9 71.4: **69.1 / 35.5 / 23.0** | 68.8 71.4 70.6 68.3 72.2 68.8: **70.0 / 36.3 / 22.7** | 72.0 72.9 72.8 69.7 70.4 68.9: **71.1 / 37.1 / 22.2** |
+
+- Walking +0.9 / +2.0 fps, standing -1.4 / -1.1: inside the spread (each variant's runs span 1.5-5.5 fps).
+- Why so little for ~3.5 M fewer slow calls a second: they were ~0.5-1 ms of CPU a frame spread over seven threads, and
+  only the part inside the long job that ends a stage (80166100's, when it is the last one; not in every frame or run,
+  TICK-042) shortens the chain: ~0.1-0.2 ms of a ~13.5 ms frame, ~1 fps. Walking shows that order; standing does not.
+- One `+ A64_FPX_FMA3` standing run stayed on the title screen (338 fps, 50 draws a frame: the input script never reached
+  the save), as TICK-043 saw once; it was rerun and not counted. Not seen in the other 36 runs.
+
+### Behaviour
+
+Shots every 1200 presents and HOS_SPEED_LOG, base against both switches: docs/benchmarks/2026-11-10-tick044-fp-slowpath.md.
+Saves identical after every run; no game process left after any run.
+
+### What is next (ranked)
+
+1. **The job start order** (TICK-042: 0.2-0.45 ms a frame): not tried. A game patch of f_8004ab40's lock-free lists (PGO
+   caveat) that needs the lists worked out first; still the largest scheduling lever on the chain.
+2. **Ship `A64_FPX_SLOWPATH` + `A64_FPX_FMA3` (and TICK-041's `A64_VFPX_ELEM`) with a profile recorded on that lift** at
+   the next profile refresh: each is bit-identical and ~+1-2 fps walking; none clears the spread alone.
+3. **FRSQRTE / FRECPE inline**: still ~1.8 M out-of-line calls a second (per-lane loops in the lifted code). An inline
+   table lookup in the lifter would remove the calls, but it changes lifted functions (profile).
+4. **The NaN lanes at the inline path** (a vector op whose fourth lane is a NaN still leaves the inline path for one cold
+   call): folding the quiet-NaN test into the inline a64_vfpx_* would make them free, at the cost of those inline
+   functions' profile records.
+5. Link's calc (800b3ce0) is not FP-bound (f_801d99a0, f_81501180: integer and memory work): no FP lever there.
+
+Not verified: the job-level effect (no job trace with the switches: whether 80166100's job got shorter on the chain);
+other CPUs (without AVX2 the vector paths are the same SSE2 code; without FMA3 the FMA switch does nothing); Kokiri
+Forest and Hyrule Field.
