@@ -1213,3 +1213,118 @@ The ground, fountain and trees now drawn cost nothing measurable: both rows are 
 - Other GPUs.
 - `RX_VK_PARALLEL` off (the bug needs segments, so it should not occur there).
 - Whether other pools taken in at other loads were broken in the same way elsewhere. This is likely, given the mechanism; the floating trees and missing meshes of Hookshot #994 are candidates.
+
+## TICK-037: what holds the frame after Sync 9, and the capture's streaming copy (2026-11-10)
+
+**Result: the frame is held by the game's CPU chain: the main thread's own work plus its waits for the game's job threads,
+~80% of a frame. The engine's largest piece on that chain is the submit-time capture on the main thread (~1.1-1.3 ms a frame
+of copying, the other game threads mostly idle meanwhile), and that copy was bound by memory bandwidth. Copying it with
+streaming stores (`RX_VK_CAPTURE_STREAM`, on by default) gave +2.9 fps standing and +3.3 fps walking in the Market (every
+walking run with it above every walking run without it), +2.4 fps on the walk to the gate. The GPU (~8-10 ms a frame), the
+replay threads and the present/fence waits do not hold the frame.** Market save by the fountain, frame limit off
+(`--fps-limit 360`), frame generation off, Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`.
+
+### Attribution (before the change)
+
+Main thread, `HOS_SAMPLE_ALL` 88-104 s after launch (after the scene's late-load hitches; ~3,800 instants), per frame
+(sampled frame 14.3 ms standing, 15.0 ms walking; the sampler itself costs ~1 ms). Method: `crit.py`'s per-thread states,
+then the main thread's state split by what it waits in, and what every other thread does at those instants (ticket
+scratch scripts, not committed).
+
+| main thread | kokiri-idle (standing) | castle-move (walking) | what it is |
+|---|---:|---:|---|
+| waits for the job group (f_8007fe60 -> WaitLightEvent) | 6.4-6.8 ms | 7.1 ms | game: the job threads' chain (BaseProcExecutor0-5 45-50% busy each meanwhile; no job thread working in 8% of it) |
+| runs guest code | 1.9 ms | 1.9 ms | game |
+| waits in f_83acfb90 (an event the job threads set) | 1.2 ms | 1.0 ms | game; the Presentation thread is idle in its queue then |
+| SleepThread poll in f_800998a0 (20 us steps) | 0.7 ms | 0.8 ms | game: polls the ModuleSystemWorkers, which run then |
+| **capture copy in n_nvnQueueSubmitCommands** | **1.1 ms** | **1.3 ms** | **engine**: no other game thread runs in 41% of these instants |
+| rest of the submit path (collect_in scans, take_capture, stamps, recording, the helpers' wait) | ~0.6 ms | ~0.8 ms | engine |
+| host runtime (obj_lookup from LockMutex in f_80364080, NVN command copies) | ~0.5 ms | ~0.5 ms | runtime |
+| GPU waits (vk_timeline_wait, the driver's submit/begin) | < 0.1 ms | ~0.15 ms | sync |
+
+A note on the sampler: `crit.py` counts a thread as running only when its leaf is in the exe or the dll. The capture's copy
+runs in ucrtbase's memcpy, so it shows as "blocked in guarded_copy". It is work: the reverse of the earlier mistake (the
+driver's vkWaitSemaphores counted as a spin). Also: name a sample file only with the maps of the build that made it (a
+rebuild moves the dll's functions).
+
+Other threads: the Presentation Thread (the game's render thread, which runs the replay) is idle in its message queue 39%
+of the time and waits for the parallel replay's workers another 29%: ~5 ms a frame of slack, off the main thread's path.
+The replay workers are mostly idle. Virtual cores: ~5,500 waits in 5 s over all threads, ~0.1 ms each (~1.5 ms a frame
+summed over every thread, spread).
+
+GPU (`RX_VK_PASS_TIMING=1`, kokiri-idle, inflated by its timestamps): 10.0 ms a frame in all: passes 5.4, dispatches 2.0,
+barriers 0.8 + 0.2, msync 0.73 (32.5 MB, 8,300 entries), wb 0.30, rbrefresh 0.19. An unprofiled frame is ~14 ms, so the GPU
+idles a few ms of each frame. It is the next limit, at ~8-10 ms (100-125 fps), after the CPU chain. Nsight Systems was not
+used: it would have to launch the game outside run_bench.py.
+
+What the capture copies: 1,200-1,750 pages (4.6-6.8 MB) a submit, 6 submits a frame, 25-40 MB a frame, written by the game
+since the submit before. A diagnostic during the ticket showed 0.0% of a capture's pages in the capture before it (rings of
+fresh data, nothing copied twice); ~75% of it is synced to the mirrors.
+
+Why the copy was slow (an in-game probe, and a scratch microbenchmark of the same shape: ~2,400 pages in runs, the source
+just written by six other threads, 37 rotating 16 MB destinations):
+- In game, 9.7 MB copies took 0.35 ms for the main thread's 1/5 share and 0.36 ms on each helper (started 11 us after being posted): ~27 GB/s in all.
+- Eight helpers instead of four: the same time (0.37 ms for 6.8 MB). Bandwidth-bound, not thread-bound.
+- The destinations (25 kept captures + 12 spares) are never in the cache, so a plain copy reads each line from DRAM before writing it.
+- Microbenchmark: memcpy 0.43 ms, streaming stores 0.31 ms, a destination kept in the cache 0.22 ms.
+
+### Change: the capture's copy with streaming stores (vk_memory.cpp)
+
+`copy_part` copies each run of pages with `stream_memcpy`: AVX2 loads and `_mm256_stream_si256` stores, 128 bytes a step,
+memcpy for a destination not 32-byte aligned or a size not a multiple of 128 (never in practice: pages into page slots).
+Same SEH guard (`guarded_copy_stream`), same per-page retry with memcpy after a fault. The stores are fenced (`_mm_sfence`)
+at the end of each part, before the helper counts it done and so before the capture is handed on. The GPU and the CPU's
+later reads (take_capture's texture shadows, the replay's reads as submitted) see the same bytes. Built only with AVX2
+(x86-64-v3, the default target); else memcpy. `RX_VK_CAPTURE_STREAM=0`: memcpy, as before. Not a shader-stamp input: no
+`--prepare-shaders`. Test: `tests/test_capture_stream_copy.py` (the function against memcpy over sizes and alignments).
+`RX_VK_CAPTURE_THREADS` now accepts up to 15 helpers (it was 0-4), for experiments; the default is unchanged.
+
+Capture time a submit (log, `capture: a submit`): kokiri-idle 0.31-0.37 -> 0.27-0.29 ms, castle-move 0.42-0.45 -> 0.32-0.34 ms.
+
+A/B, the same binary, interleaved, env switch only (fps / 1% low / p99 with the 66 s cut, and in brackets fps 80-110 s, the
+steady part after the late scene-load hitches):
+
+| scene | run | off (`RX_VK_CAPTURE_STREAM=0`) | on (default) |
+|---|---|---|---|
+| kokiri-idle | 1 | 66.5 / 35.4 / 23.0 ms (67.6) | 71.8 / 38.2 / 21.9 ms (73.4) |
+| | 2 | 66.4 / 32.8 / 24.3 ms (67.3) | 69.8 / 35.1 / 21.9 ms (71.0) |
+| | 3 | 69.4 / 36.5 / 21.7 ms (71.0) | 69.4 / 33.6 / 22.8 ms (70.4) |
+| | mean | **67.4 / 34.9 / 23.0 ms** (68.6) | **70.3 / 35.6 / 22.2 ms** (71.6) |
+| castle-move | 1 | 62.5 / 24.7 / 30.5 ms (61.6) | 66.7 / 26.5 / 26.1 ms (66.7) |
+| | 2 | 64.3 / 27.8 / 26.4 ms (64.2) | 66.1 / 23.9 / 30.4 ms (65.0) |
+| | 3 | 62.2 / 24.7 / 30.2 ms (60.9) | 66.2 / 25.3 / 28.7 ms (65.4) |
+| | mean | **63.0 / 25.7 / 29.0 ms** (62.2) | **66.3 / 25.2 / 28.4 ms** (65.7) |
+| hyrule-walk (the street to the gate) | 1 | 62.8 / 14.7 / 41.5 ms (62.5) | 65.1 / 7.4 / 75.4 ms (72.7; a hitch after 66 s) |
+| | 2 | 63.9 / 15.5 / 38.7 ms (62.5) | 66.5 / 28.6 / 27.7 ms (66.6) |
+
+The standing Market has two states from run to run (~3,050 draws a frame, or ~2,450 with fewer people about; idle-off-3 and
+idle-on-1 had the lighter one). In the same state: 3,050 draws 66.4-66.5 -> 69.4-69.8, 2,450 draws 69.4 -> 71.8. The gain is
+larger than the ~0.5 ms of copy the main thread saves: the copy's DRAM traffic also competed with the job threads. 1% lows
+are unchanged (they are the scene's hitches, not the copy).
+
+Picture: shots every 1200 presents (`RX_VK_SHOTS`, windowed; the folder must exist), on and off, standing and walking: `build/shots/tick037-idle-on`, `tick037-idle-off`, `tick037-move-on` in the worktree (not committed). Ground, fountain, trees, people, shadows and HUD as in the off run (not pixel-equal: the frames are at other moments).
+
+### Tried, not kept
+
+- **Two-stage capture** (copy into a staging slot that stays in the cache, then two drain threads copy it into the buffer):
+  no gain in this form. The capture is taken (take_capture) ~0.01 ms after it is made, on the same thread, so the drain was
+  always waited for, and 120 of 600 captures were bigger than the 8 MB slot. Making it pay needs the drain's wait moved to
+  the GPU (a host-signalled timeline semaphore before the submission) and the CPU's reads of capture buffers gated. That
+  touches the TICK-006/036 ordering, so it was not done.
+- **More capture helpers** (8 instead of 4): the same time, bandwidth-bound.
+
+### What is next (ranked)
+
+1. The game's job chain (~6.5-7 ms of the main thread's waits plus its own ~2 ms), spread over many guest functions. The
+   largest self time while main waits is f_801d99a0, 4.5% of the job threads' samples (entangled actor/scene code, not a
+   replacement candidate), then f_8009bb80 3.6%, f_800a8400 2.5%, f_81501180 2.0% (docs/hotmap.md). Native replacements of
+   the FP kernels (f_800a8400, f_81501180, f_80ba6d80, f_820e2520) are worth ~1-2% each at best.
+2. The capture copy is still ~0.8-1 ms a frame on the main thread: the two-stage form above with a GPU-side wait, or copying
+   only the pages a submission's bindings can read (needs the read sets).
+3. obj_lookup from LockMutex in f_80364080 on the main thread (~0.2 ms a frame): a cache kept in the guest's MutexType would
+   need proof that the game never reads those fields.
+4. Then the GPU (~8-10 ms with timestamps): the game's passes and dispatches; the engine's copies are ~1.2 ms of it.
+
+Not verified: other CPUs (a smaller L3 or another memory system changes the copy's balance; without AVX2 it is memcpy), long
+sessions, Kokiri Forest, AMD/Intel GPUs. No Hyrule Field save exists (hyrule-walk is the Market street to the gate). No
+Nsight run.
