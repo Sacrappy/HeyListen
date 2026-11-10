@@ -1328,3 +1328,42 @@ Picture: shots every 1200 presents (`RX_VK_SHOTS`, windowed; the folder must exi
 Not verified: other CPUs (a smaller L3 or another memory system changes the copy's balance; without AVX2 it is memcpy), long
 sessions, Kokiri Forest, AMD/Intel GPUs. No Hyrule Field save exists (hyrule-walk is the Market street to the gate). No
 Nsight run.
+
+## TICK-033: real occlusion counts, measured (2026-11-10)
+
+**Real counts are right; only same-frame counts give a correct picture, and waiting for them costs more than culling saves.**
+Ryzen 7 7800X3D, RTX 5070, windowed `run_bench.py`, `--fps-limit 360`, frame generation off, Market save, 66 s cut.
+
+Instrument (vk_draw.cpp "real occlusion counts", hooks in vk_replay.cpp): `RX_VK_OCC_REAL=<mode>`, default 0 (off: no
+queries, the fixed 4096 as before). Each recorded draw runs inside a precise occlusion query whose slot is the draw's serial
+number in the stream (counted on the replay thread in serial and dry passes, carried into each parallel segment), in a
+64K-slot host-reset ring (4K chunks reset ahead of use once their last lap's submission is done). A report's count is the
+sum of its window's slots, read when its submission is done (polled at each present). Modes: 1 log only; 2 / 3 one frame
+late by report address (zero-or-fixed / the count); 4 same frame: a render condition on a report not read yet stops the
+dry pass (or the serial recording) there, what is recorded is submitted and waited for, and every pending report's count
+is written over the fixed value in guest memory; 5 one frame late keyed by the bound program, the window's draws and the
+place among the frame's reports. `RX_VK_OCC_LOG=<dir>` writes reports, conditions and each window's draws with pipeline
+statistics for `RX_VK_OCC_LOG_FRAMES` frames every `RX_VK_OCC_LOG_EVERY` presents. Not a shader-stamp input.
+
+What OoT does: ~1,840 samples-passed reports a frame (windows of 1.1-1.2 draws); a block of ~900 proxy tests (plain indexed
+draws) first, then ~920 render conditions, all "render if count != 0", each reading a report of the same frame and stream
+557-2,170 draws earlier. ~880 reports a frame read 0: ~150 empty windows, ~720 plain draws whose primitives reach the
+clipper and whose fragments all fail depth (really hidden). Report addresses never repeat in consecutive frames.
+
+| Market | fixed (default) | mode 4, same frame | mode 5, late by place | mode 2, late by address |
+|---|---|---|---|---|
+| kokiri-idle fps / 1% low / p99 | 70.2 / 34.8 / 20.8 ms | 61.7 / 33.6 / 24.2 ms | 68.6 / 34.9 / 22.5 ms | 70.3 / 33.9 / 21.9 ms |
+| castle-move | 65.4 / 25.1 / 29.0 ms | 59.7 / 24.8 / 30.0 ms | - | - |
+| picture | right | right (standing, walking) | buildings missing for frames | washed out, meshes missing |
+
+GPU time (the log's "GPU time", serial replay `RX_VK_PARALLEL=0`, where every submission is timed; the parallel replay's
+segments are not), kokiri-idle: fixed 8.5-8.6 ms a frame (63.9 fps serial), mode 4 8.1 ms (57.1 fps serial): the hidden
+objects are worth ~0.4 ms of GPU (~5%).
+
+Decision: default unchanged. The wait (~2 ms a frame of the CPU chain) is not paid back: the GPU is not the limit and the
+hidden objects are one cheap draw each. A no-wait correct form would be `VK_EXT_conditional_rendering` (a predicate word
+per report copied from its query slot at the next pass end, the gated draws recorded under it); it saves no CPU (the
+draws are still recorded), so it is not worth it now.
+
+Not verified: other scenes than the Market (no Hyrule Field save; Kokiri not reached), other GPUs (precise queries,
+NVIDIA's counts), long sessions with mode 4, the sun's behaviour under mode 4 at sunset/night.

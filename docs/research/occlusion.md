@@ -122,3 +122,67 @@ An instrumented real-count run (one submit per frame, `RX_VK_PARALLEL` off) that
 and only *logs* the real count next to it, per report: `{addr, draws, mesh draws with 0 groups, skipped draws, real samples}`.
 If most 0-count reports trace to zero-group or skipped indirect mesh proxies, H1 is confirmed and the fix is in culling /
 mesh translation, not in the query plumbing. It changes no picture.
+
+## 6. Measured answer (TICK-033, 2026-11-10, after Sync 9 / upstream #994)
+
+New engine switch `RX_VK_OCC_REAL=<mode>` (vk_draw.cpp "real occlusion counts", vk_replay.cpp hooks); 0 = off, the default.
+Every draw the replay records runs in a Vulkan occlusion query (precise), one slot per draw/dispatch of the stream, numbered
+in stream order on the replay thread (serial and dry passes) and handed to the parallel segments (`Segment::serial`), in a
+host-reset ring of 64K slots (chunks of 4K reset ahead of use after their last lap's submission is done). A report's count
+is the sum of the slots between the samples-passed reset before it and it, read once its submission is done.
+`RX_VK_OCC_LOG=<dir>` (+ `RX_VK_OCC_LOG_FRAMES`, `RX_VK_OCC_LOG_EVERY`) writes every report (address, window, draws,
+unrecorded/skipped/mesh/indirect draws, count), every render condition, and every draw of a window with its pipeline
+statistics (clipping invocations, fragment invocations, task/mesh invocations). Modes: 1 log only (picture unchanged),
+2 zero-or-fixed by address one frame late, 3 last count by address, 4 same frame (synchronous), 5 one frame late keyed by
+the report's place in the frame.
+
+Measured at the Market save (kokiri-idle; castle-move for walking), RTX 5070, windowed, limit 360, parallel replay on.
+
+What the game does (logs `build/occ/log1/occ/occ_16200.txt` in the worktree, 2 frames):
+- ~1,840 samples-passed reports a frame, windows of 1.1-1.2 draws. The frame starts with a block of ~900 reports (the
+  object proxy tests, one draw each), then the colour pass: ~920 render conditions a frame, all `mode 1` (render if the
+  count at addr differs from the word at addr+16), the y word always 0, i.e. "render if count != 0". Each condition gates
+  about one draw, and is followed by a report of its own (next frame's information, not read in this frame).
+- Every condition reads a report of the **same frame and same command-buffer stream**, at least 557 draws (median ~1,690)
+  after it. ~62 more conditions a frame read CPU-written flags (x 1 or 0, the clear requests), unaffected.
+- **Report addresses never repeat between consecutive frames** (0 of 1,825 common at lags 1, 2, 4; 49 at lag 3). But the
+  k-th report of a frame tests the same object as the k-th of the frame before: zero/non-zero agree for 1,828-1,840 of
+  ~1,845 (standing).
+
+Which hypothesis holds:
+- **H1 does not hold (in this game today).** The proxy test draws are plain indexed draws, not GPU-culled mesh draws:
+  of the ~880 zero-count reports a frame, ~150 have no draw in their window, 3 had their draw not recorded, 0 skipped,
+  4-8 contain a mesh draw, ~720 are plain draws. Their pipeline statistics: primitives reach the clipper (clip > 0) and
+  no fragment survives early depth (fs = 0): genuinely hidden. Non-zero counts: median 949 samples, up to 1.27 M.
+  #994 was not needed for this.
+- **H2 holds, in the form "the condition needs the same frame's count".** Conditions are evaluated in stream order and
+  their report is in the same stream; the counts can only be known after the GPU ran the proxies. A late value can only be
+  found by address, and addresses change every frame: modes 2/3 (and TICK-027's implementation) read the count of some
+  older frame's unrelated report at that address. That is the washed-out mint/white picture with missing buildings and
+  white characters (`build/occ/late2-idle/shots/vk_016800.png`): 1,110 of 1,850 reports a frame written 0.
+- H3 (scope across segments/submits): not a cause; the serial number spans command buffers and segments and the counts
+  agree with the serial replay (`sync4-idle`, RX_VK_PARALLEL off implied by its sync).
+- H4 (sun magnitude): with the real counts written, the sun, haze and shadows are right (mode 4 shots).
+- H5/H6: not involved (counts are written on the CPU; conditions mode 1 against a 0 word).
+
+Same-frame real counts give a **correct picture**: mode 4 (a condition on a report not read yet stops the dry pass there,
+the segments up to it are recorded and submitted, the CPU waits for the GPU, every pending report's count is written over
+the fixed value in guest memory; one wait a frame in OoT) - Market standing `build/occ/par4-idle/shots`, serial
+`build/occ/sync4-idle/shots`, walking and turning `build/occ/move-m4/shots`: same image as the fixed value (fountain,
+houses, trees, sun, shadows, NPCs), ~350 of ~920 conditions a frame off (hidden objects not drawn).
+
+But it is **slower**: kokiri-idle 61.7 fps / 1% low 33.6 / p99 24.2 ms against 70.2 / 34.8 / 20.8 with the fixed value
+(same build); castle-move 59.7 / 24.8 / 30.0 against the default's numbers in the SPRINT-4 log. The mid-frame wait
+costs ~2 ms of the CPU chain a frame, and the GPU gains little: 8.5 -> 8.1 ms a frame (serial replay, where every
+submission is timed), the hidden objects being one cheap draw each.
+Mode 5 (one frame late, keyed by program + window + place among the frame's reports, no wait) is no faster (68.6 fps)
+and shows wrong culls: house fronts missing behind the tent and the shop at load-in (`build/occ/key5-idle/shots/vk_015600.png`,
+`vk_016800.png`): a 1% key mismatch is enough to delete a building for a frame.
+
+**Decision**: the fixed value stays the default (`RX_VK_OCC_REAL=0`); the switch stays as the instrument.
+
+Next fix, if real occlusion is ever wanted: GPU-side conditions (`VK_EXT_conditional_rendering`): at the next pass end
+after a report, copy its slot (windows of one draw) into a predicate word with `vkCmdCopyQueryPoolResults`, and record
+the gated draws under `vkCmdBeginConditionalRenderingEXT` instead of deciding on the CPU (windows of several draws, or a
+draw not recorded: visible). No wait and a correct picture, but no CPU saving either (the gated draws are still
+recorded), and the GPU work it skips is small, so it is not a performance lever for this game now.

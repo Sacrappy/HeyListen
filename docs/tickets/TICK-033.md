@@ -5,3 +5,10 @@
 **Branch**: `feature/TICK-033-occlusion-log`
 
 **Update 2026-11-10**: Sync 9 brought upstream #994 (task/mesh stages inline the global-load helper): the proxy test draws are GPU-culled mesh/indirect draws, so H1 may be fixed by it. First step now: rerun with real counts (occlusion on) at the Market and Hyrule, compare shots with the fixed value; then the logging experiment if still broken. Real occlusion would also let the game cull hidden objects (a GPU-time lever for TICK-037). Runs after TICK-037 (one ticket runs the game at a time).
+
+**Result 2026-11-10** (branch `feature/TICK-033-occlusion-log`; details docs/research/occlusion.md section 6, engine/docs/perf-audit.md "TICK-033"):
+- New switch `RX_VK_OCC_REAL` (0 default = the fixed value; 1 log only; 2/3 one frame late by address; 4 same frame, synchronous; 5 one frame late by place in the frame) and `RX_VK_OCC_LOG=<dir>` (reports, conditions, draws with pipeline statistics).
+- #994 did not change the outcome: H1 does not hold here (the ~900 proxy test draws a frame are plain indexed draws; their zero counts are fragments hidden by depth, not empty draws).
+- H2 holds: every render condition reads a report of the same frame and stream (557+ draws earlier), and report addresses never repeat between frames, so any late-by-address value is another object's: that is the washed-out/missing-mesh picture (mode 2 reproduces it).
+- Same-frame counts (mode 4) give a correct picture standing and walking, but cost ~8.5 fps standing and ~5.7 walking (one GPU wait a frame) and save only ~0.4 ms of GPU (8.5 -> 8.1 ms a frame, serial replay). Mode 5 (late, keyed by place) is not faster and deletes buildings for frames.
+- Decision: default unchanged (fixed value); the switch stays as the instrument. Next fix if ever wanted: `VK_EXT_conditional_rendering` with per-report predicate words (no wait, correct, but no CPU saving).
