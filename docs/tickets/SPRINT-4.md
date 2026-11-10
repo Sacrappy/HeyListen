@@ -102,3 +102,13 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
   - No loss: +2.9 / +3.6 fps, about the spread, and p99 -4 to -7 ms, 1% low standing +15 (not attributed per change; likely the target pool and upload budget).
 - Tests: run_all 214 pass, 12 fail, 33 skip: the 10 known failures plus the flaky test_nup_verify / test_nup_codec; none fixed upstream. Four new failures fixed by adapting checks to the kept code (test_gpl_cold_library, test_target_image_pool, test_pipeline_notes_open rewritten for our notes format) and F10 in two fixtures (test_menu_keys, test_screensaver). test_mirror_inherit, test_capture_stream_copy, test_vfpx_elem pass. Builder not compiled (no .NET SDK here).
 - Game folder: this build.
+
+## TICK-043 (2026-11-10): the engine's submit off the main thread
+- Measured (default build, samples): the main thread's submit is 1.8 ms a frame standing and 2.4 walking.
+  - The capture copy is ~1.0 ms of it, the mark scan 0.23, take_capture 0.2-0.5 (a GPU wait for late pages 0.1-0.2), memory_collect_written 0.06-0.15.
+  - The overlay's "GPU frame prep" is the replay summed over all threads, mostly the Presentation Thread's, off main's path.
+- Tried, both behind env switches (off):
+  - `RX_VK_CAPTURE_PRECOPY=1`: a thread copies the written pages ahead of the submit; the submit copies only the pages written or written back since (`capture_merge.h`, new `tests/test_capture_merge.py`). It took ~0.6 ms a frame off main, but fps fell: 75.4 -> 71.4 standing, 68.8 -> 66.3 walking (2 ms period: 73.3 / 67.2). The copy thread costs the job threads more than main gains.
+  - `RX_VK_CAPTURE_SCAN_SPLIT=1`: the scan split over the copy helpers. 73.0 / 69.8: inside the spread.
+- Correctness: Market shots of the default build alike, standing and walking; game speed ratio ~60. Tests: 215 pass, 12 fail (known and flaky), 33 skip.
+- Decision: no default changed; the game folder keeps the Sync 11 build. Next: fewer capture bytes (bindings' read sets), the late pages' recopy on the GPU, a flat table for the texture shadows; the game's job chain stays the larger lever.
