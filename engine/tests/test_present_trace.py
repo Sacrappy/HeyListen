@@ -46,7 +46,8 @@ static void scan_dt(long long frame) { (void)frame; ++scans; }
 static void realtime_step(int64_t now) { (void)now; ++steps; }
 static void hos_log(const char *fmt, ...) { (void)fmt; }
 static uint64_t hos_ticks(void) { return 0; }
-static int fps_max(void) { return 60; }   /* (nn_vi.c's Frame rate cap: the console's 60 here) */
+static int fps_limit(void) { return 60; }   /* (nn_vi.c's Frame rate limit: the console's 60 here) */
+static void speed_log(int64_t now) { (void)now; }   /* (HOS_SPEED_LOG, TICK-014: a diagnostic of its own; its argument is a clock read) */
 '''
 
 SUFFIX = r'''
@@ -66,7 +67,7 @@ int main(int argc, char **argv) {
             if (lines != 5) return 2; /* header + four returned frames flushed after the stall */
         }
     }
-    if (presents != 5 || shown_count != 5 || scans != 5 || steps != 5 || sleeps != 0 || reads != 5) return 3;
+    if (presents != 5 || shown_count != 5 || scans != 5 || steps != 5 || sleeps != 0 || reads != 10) return 3;   /* (two clock reads a frame: speed_log's argument, then the pacing's) */
     printf("STATE %lld %lld %lld %d %d %d %d\n", (long long)presents, (long long)shown_count,
            (long long)next_frame_at, scans, steps, sleeps, reads);
     if (!enabled) {

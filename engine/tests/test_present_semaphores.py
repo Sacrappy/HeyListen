@@ -15,7 +15,8 @@ a = p.parse_args()
 source = a.source.resolve()
 main = (source/'gpu/vk/vk_main.cpp').read_text()
 replay = (source/'gpu/vk/vk_replay.cpp').read_text()
-present = replay[replay.index('void present_image('):replay.index('void present_image(')+12000]
+present_at = replay.index('void present_image(')
+present = replay[present_at:replay.index('\n}\n', present_at) + 3]   # (the whole function: it outgrew a fixed-size window)
 signal = re.search(r'    signal\.semaphore = [^;]+;', present)[0]
 wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', present)[0]
 acquire_wait = re.search(r'    waits\[0\]\.semaphore = [^;]+;', present)[0]
@@ -44,7 +45,7 @@ struct VkSemaphoreCreateInfo { int type; };
 struct Extent { uint32_t width,height; };
 struct Device { int device=1;uint64_t swapchain=0;int swap_format=0;Extent swap_extent{};bool swap_mutable=false;
     std::vector<VkImage> swap_images;std::vector<VkSemaphore> swap_rendered;
-    std::atomic<uint64_t> swap_resize{0};std::mutex present_mu; } dev;
+    std::atomic<uint64_t> swap_resize{0};std::mutex present_mu;const char* present_mode_name=""; } dev;
 struct { int hdr=0; } opts;   // (the Insert menu's HDR row: present_image remakes the swapchain when it changes)
 unsigned image_count=4, made=0, fail_at=0;uint64_t serial=1000;
 int query_result=0,data_result=0;uint64_t destroyed_swapchain=0;

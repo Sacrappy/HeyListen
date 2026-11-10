@@ -82,6 +82,11 @@ void mirror_sync(Pool& p) {   // (model: no CPU page is dirty here)
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
 }
+// (TICK-021: the refresh queues its copies for one scatter dispatch when it can; this model has the scatter off, as
+// RX_VK_MSYNC_SCATTER=0 does, so scatter_add declines and the refresh copies page runs, which is what is checked here)
+VkDeviceAddress buffer_address(VkBuffer) { return 0; }
+bool scatter_add(VkDeviceAddress, VkDeviceAddress, const std::vector<VkBufferCopy>&) { return false; }
+bool scatter_flush(VkCommandBuffer, const char*) { return false; }
 #include "rb_refresh.inc"
 
 /// gpu_buffer_bind: the pool's mirror when it has one (model of its front), then its actual last lines
@@ -268,7 +273,8 @@ int main(int argc, char** argv) {
         expect("untracked writer: segment 3 reads what segment 1 stored past the bare entry's head", read->val, 7);
     } else if (which == "serial") {
         // serial replay: one recording a submission, then one after its end (frame generation's); the CPU writes A
-        // between them. The copies the GPU runs must be today's, exactly
+        // between them. The copies the GPU runs must be today's, exactly: since TICK-006 the refresh is once a submission part
+        // (a mirror_epoch), in its first recording, so the recording after the submission's end (frame generation's) has none
         for (int f = 1; f <= 3; f++) {
             Rec r = begin_recording(("serial" + std::to_string(f)).c_str());
             begin_submission();
@@ -283,9 +289,9 @@ int main(int argc, char** argv) {
             run_gpu();
         }
         static const char* const want =
-            "serial1.up: G->M +0x2000 0x1000\nserial1.cmd: M->G +0x2000 0x10\nframegen1.up: G->M +0x2000 0x1000\n"
-            "serial2.up: G->M +0x2000 0x1000\nserial2.cmd: M->G +0x2000 0x10\nframegen2.up: G->M +0x2000 0x1000\n"
-            "serial3.up: G->M +0x2000 0x1000\nserial3.cmd: M->G +0x2000 0x10\nframegen3.up: G->M +0x2000 0x1000\n";
+            "serial1.up: G->M +0x2000 0x1000\nserial1.cmd: M->G +0x2000 0x10\n"
+            "serial2.up: G->M +0x2000 0x1000\nserial2.cmd: M->G +0x2000 0x10\n"
+            "serial3.up: G->M +0x2000 0x1000\nserial3.cmd: M->G +0x2000 0x10\n";
         if (stream != want) std::printf("FAIL serial: the copies differ from today's:\n%s", stream.c_str());
         fails += stream != want;
         expect("serial: the meter in guest memory", word(G, A), 12);
