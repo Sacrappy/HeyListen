@@ -159,3 +159,10 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - A/B (5 runs, main b17b933): castle-move 1% low 10.8 -> 14.0, p99 75.8 -> 58.1 ms, spikes 8.6 -> 2.4; standing and Hyrule inside the spread.
 - Found on the way: main b17b933's NVML link check reads Gen3 x16 on PC 3050 (slot is x4): the chunk diff is off there (-3 to -4 fps).
 - Branch `feature/TICK-051-stutter`, not merged; main PC not checked.
+
+## TICK-053 (2026-11-11): the CPU's per-frame wait for the GPU, PC 3050
+- Found: the frame is serial (CPU ~13 ms of GPU-idle + GPU ~22 ms = 35 ms): the game's thread drains the GPU at its first submit (the late-page wait) and records the frame while the GPU idles. GPU 63% busy.
+- Found: without the wait, 24-26 ms frames (40 fps) for a while, then a mode of 66 ms frames: the queue idles 25-50 ms a frame between our own recordings while both game threads wait for the GPU. Not the acquire, present mode, present queue, blit, VRAM, clocks or event ordering. Not placed; session 0 (SSH) may be part of it.
+- Built, behind switches (off): `RX_VK_LATE_MERGE` (late pages merged word by word against a shadow, no wait), `RX_VK_ACQUIRE_FENCE`; on: GPU timestamps for uploads, the queue's gaps and the blit (`gpu_up_ms`, `gpu_gap_ms`).
+- Screen (castle-move, 3 runs each): see docs/benchmarks/2026-11-12-tick053.md.
+- Decision: not adopted. Branch `feature/TICK-053-gpu-sync`, bundle `E:\OOT\tick053.bundle`, not merged. Next: the queue's gap on the desktop, then the overlap.
