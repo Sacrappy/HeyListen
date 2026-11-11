@@ -4062,8 +4062,19 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     // when their own budget is short (1.3-1.4 GB of mirrors held through a walk with the heaps at 83-89%)
     bool vram_tight = false;
     {
-        uint64_t used = 0, allowed = 0;
-        vram_tight = vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 80;
+        // (TICK-057, RX_VK_MIRROR_VRAM_FREE=1) what the process holds less the free space in VMA's blocks, as the textures'
+        // budget counts it (texture_evict): measured by the blocks alone, castle-move on PC 3050 read 84-87% with ~0.7 GB of
+        // the blocks free, and the mirrors went and came back ~3 times a second
+        static const bool count_free = [] {
+            const char* e = getenv("RX_VK_MIRROR_VRAM_FREE");
+            const bool v = e && atoi(e) != 0;
+            logf("vk: the mirrors' VRAM rule: %s (RX_VK_MIRROR_VRAM_FREE)", v ? "the free space in VMA's blocks counted as free" : "by the blocks, as before");
+            return v;
+        }();
+        uint64_t used = 0, allowed = 0, block_free = 0;
+        const bool known = vram_usage(&used, &allowed, &block_free);
+        if (count_free) used -= std::min(used, block_free);
+        vram_tight = known && allowed && used > allowed / 100 * 80;
     }
     const uint64_t want_own = want_bytes;   // (TICK-057: what the mirrors' own budget needs, without the VRAM rule)
     if (vram_tight) want_bytes = std::max(want_bytes, mirror_budget());
