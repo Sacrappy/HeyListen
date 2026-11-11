@@ -3191,3 +3191,131 @@ The loop's critical part is the game's chain again: the main thread's draw code 
 (capture 1.5-1.7 ms and memory work ~1.3 ms in the walking traces). The capture pre-copy (TICK-043/054) copies for "the next
 capture", often one of the PT's small ones: it would have to aim at the held submits' capture. FAST and SEG_EARLY are ready to
 turn on with whichever lever makes the PT's part the limit again.
+
+## TICK-058: the hand-offs of the game's chain, and the main thread's fence poll behind the replay's lock (2026-11-12)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs cut at
+66 s. Branch `feature/TICK-058-game-chain` (main 0db10b3: TICK-054's defaults on, TICK-056's switches off).
+
+### Instruments (kept)
+
+- `tools/bench/wakelat.py <jobtrace>`: every wait that slept, from the signal that ended it (the event / condition variable /
+  queue / mutex signal on the same object after the wait began; the kernel wake naming the thread) to the waiter running again,
+  by primitive, caller (lr) and thread; the virtual-core wait inside that span apart; SleepThread by caller (asked / slept).
+- `tools/bench/critpath.py <jobtrace> --anchor main [--samples all.txt --maps <dir>]`: the game chain's critical path walked
+  back from each end of the main thread's end-of-frame wait (lr 83acfcf4) to the one before: work by thread, hand-off wake and
+  vcore time, lone vcore waits with their holder, polls (lr 8009a478: the job thread that stopped working within the poll's
+  last 20 us step, else "setter not traced"); with `HOS_SAMPLE_ALL` + `HOS_SAMPLE_NS` samples, the path's work by leaf, by
+  innermost runtime function and by guest function. `--anchor present` walks the loop through the replay instead.
+  `tests/test_critpath.py`.
+- The virtual-core wait record (`JT_VC_WAIT_B`) now says whom it waits behind: a = allowed cores | priority << 8 | the
+  holder's priority << 16, b = the holder of its first allowed core.
+- Trace marks 30/31: nvnSyncWait's first look (b: the caller, then 1 signalled / 0 not); 32/33 the renderer's wait taking
+  `sync_order_mu`, 34/35 taking `dev.present_mu` (gpu/vk/vk_replay.cpp).
+
+### Wake latency (castle-move, base, `HOS_JOBTRACE` 90-93 s, 192 frames; `wakelat.py`)
+
+All 57,000 sleeping hand-offs of the window (297 a frame): signal to running **p50 6.4 us, p90 10.1, p99 75** (the tail:
+virtual-core waits). By the game's waits (us):
+
+| wait | thread | a frame | mean | p90 |
+|---|---|---:|---:|---:|
+| job-group event (lr 80080188) | main | 13.3 | 6.3 | 9.3 |
+| job-group event | module workers | 12.8-15.1 each | 6.7-10.0 | 8.9-10.2 |
+| end-of-frame event (lr 83acfcf4) | main | 0.95 | 8.1 | 10.6 |
+| end-of-frame event | module workers | 0.9-1.0 each | 8.1-10.5 | 11-17 |
+| present event (lr 81207a6c) | main | 0.24 (+0.75 ready at once) | 7.3 | 9.6 |
+| job-ready event (lr 8004af4c) | executors | 18.6-27.2 each | 5.7-8.2 | 9.0-10.1 |
+| BaseProc message queue (lr 834a3084) | executors | 2.8-3.0 each | 7.7-31 | 10-19 |
+| svcArbitrateLock / WaitProcessWideKeyAtomic (lr 8510cda0) | main, module workers | < 0.4 each | 7.3-9.3 | 9-11 |
+| contended nn::os mutexes (lr 8007ff4c, 80080038, 82bd0354) | all | < 0.6 each | 0.5-1.5 | 0.6-2.8 |
+
+SleepThread: the module poll (lr 8009a478) asks 20 us and sleeps 20.6-21.9 us (44 a frame on main, ~43 on each module worker:
+a sleep under 1 ms is a SwitchToThread loop with the virtual core given up, no timer); the 100 ms and 16 ms sleeps are background
+threads'. No 1 ms or 15.6 ms timer granularity on any wait of the game's chain: every blocking wait is an SRW condition variable or
+a per-thread event (WaitForSingleObject), woken by WakeConditionVariable / SetEvent. The ~6 us is the host's cross-core wake (the
+signaller's wake call, the scheduler, an idle core's exit) plus the waiter's SRW lock and virtual core; only a spin removes it, and
+TICK-039 measured the 20 us spin as the best of 0-100 us. WaitOnAddress would use the same kernel wake (NtAlertThreadByThreadId).
+
+### The game chain's critical path (`critpath.py --anchor main`, base; ms a frame of a 15.6-15.9 ms traced frame)
+
+| part | trace 1 (191 frames) | trace 2, with samples (188) |
+|---|---:|---:|
+| work: main / executors (each) / module workers (each) | 1.9 / 0.7-1.1 / 0.3-0.5 | 1.4 / 0.7-1.5 / 0.4-0.8 |
+| hand-offs: wake (signal to running) | 0.23 | 0.21 |
+| hand-offs: virtual-core wait | 0.02 | 0.13 |
+| lone virtual-core waits (a kick, a yield) | 0.07 | 0.18 |
+| poll lag (within the last 20 us step) | 0.09 | 0.03 |
+
+The host's synchronization primitives cost ~0.3-0.5 ms a frame on the chain (2-3%): not the limit (TICK-039 found the same for the
+job group alone). The virtual-core waits on the path are mostly NavMeshCAStepDepWorker1 (priority 22, core 1) behind EX1 (16) and
+Resource_Memory (21), reached through the module polls; the job threads wait 0.4-2 ms a second for a core (`HOS_VCORE_LOG`).
+Priorities among guest threads are the virtual cores' (Horizon's order, kept); host priorities were measured in TICK-011 and
+TICK-054 (inside the spread) and not repeated. 80083580's lookups: `obj_lookup` + `obj` are 2.6% of the path's samples (~0.4 ms a
+frame), `mutex_lock` below 0.5%; TICK-042's larger object cache did not help (the misses are cold objects, once a frame each).
+
+**What the samples showed instead** (`HOS_SAMPLE_ALL`, 715 main-thread samples): 61 of them (8.5% of the main thread's time)
+blocked in `std::mutex::lock` under `mkwvk::wait` < `n_nvnSyncWait`. The marks: the game's two nvnSyncWait first looks a frame
+(lr 8042cde0 and 8042ce34, in f_8042cd20, the main thread's busiest guest function on the path) took **1.42 ms a frame, 1.41 of
+it waiting for `sync_order_mu`** (0.53 times a frame, 2.65 ms mean, p90 4.5 ms), and both always answered "signalled". The renderer
+holds `sync_order_mu` in `submit_q` and `present` for a whole replay (the Presentation Thread's ~7 ms submit, the held flush's
+capture and replay); `wait_inner` takes it only to decide whether the fence's queue is "mine" (its work up to f recorded whole).
+So a zero-timeout fence poll on the main thread waited for a whole submission replay, holding its virtual core (core 0, which
+BaseProcExecutor0 shares): the game's chain was tied to the replay's progress. `dev.present_mu` on the same path: ~2 us.
+
+### RX_VK_FENCE_POLL_FAST (gpu/vk/vk_replay.cpp, off): measured, not adopted (the lock's wait is load-bearing)
+
+A submission finished whole on a queue (run_submit's no-stop branch, beside `rec_open_values`, with a queue) is marked by value
+(`whole_val[value & 16383] = value`, release) under `rec_map_mu` once `value_rec` has its recording. A poll (timeout 0) of fence f
+whose slot holds exactly f (acquire), with f within the last 8000 values, skips `sync_order_mu` and answers through
+`wait_recorded(f, 0)`, as the locked path does when "mine". The answer is the locked path's: "mine" is true for a submission
+finished whole (a queue's submissions run in order, so none of its queue at or below f is unfinished, and a finished one never
+becomes unfinished; `value_queue` keeps the last 8192 values); `wait_recorded` looks f up under `rec_map_mu`, which the mark is
+stored under after `value_rec` has f. Only polls (a wait with a timeout keeps the locked path: RADV's batched submits could miss a
+flush); no new lock order (`rec_map_mu` and `dev.present_mu` are leaves); no wake-up involved. `tests/test_fence_poll_fast.py`.
+
+**But the lock did more than decide "mine"**: it ordered the poll after the replay in progress, and the CPU's readbacks of GPU
+results need that. With the fast poll the main thread went on to its exposure readback (`invalidate` -> `memory_writeback_value`)
+before the replay in progress had registered its write-backs, read the old state, and the standing Market's scene was blown out to
+white (shots: mean luma 249, 95% of pixels near white, against 105; walking washed out, luma 140-223); `HOS_SPEED_LOG` stayed
+~60.0. The same mechanism as the white flashes the EvilBoyce comment in `invalidate` describes. The screens and the confirms below
+were measured with that picture, so their fps does not count.
+
+The fix kept in the code (still off): with the switch on, a readback of a range that has write-backs waits for the replay in
+progress (`sync_order_mu`) before it reads the range's write-back value: the order the poll's lock gave. Shots right again (luma
+102-106, as the base). But those readbacks are ~12 a frame on the main thread and 2-12 on each module worker (marks 36/37: main
+1.9 ms a frame, module workers 0.5-1.9 ms each): screen 3 (castle-move x3, bin/v3) base 69.1 / 69.5 / 70.0 = **69.6**, fast
+62.6 / 64.6 / 62.3 = **63.2**. The wait cannot leave the main thread's chain this way.
+
+| run (castle-move unless named; fps / 1% low / p99) | base | fast poll |
+|---|---|---|
+| screen 1 (no readback wait: white picture) | 67.8 56.4 68.5 = 64.2 / 15.6 / 72.4 | 73.2 66.1 71.2 = 70.2 / 37.3 / 21.8 |
+| screen 2 (no readback wait) | 68.1 68.8 68.2 = 68.3 / 29.5 / 24.5 | 70.4 70.3 68.5 = 69.7; + MSYNC_FAST + SEG_EARLY 72.5 73.6 70.9 = 72.4 |
+| confirm 1, + MSYNC_FAST + SEG_EARLY (no readback wait), 6 rounds: kokiri / castle / hyrule | 76.9 / 70.0 / 70.6 | 78.1 / 71.6 / 74.2 (13 of 18 rounds above) |
+| confirm 2, alone (no readback wait), 6 rounds: kokiri / castle / hyrule | 74.2 / 69.9 / 71.7 | 77.2 / 71.4 / 73.6 (16 of 18 rounds above) |
+| screen 3 (with the readback wait: right picture) | 69.1 69.5 70.0 = 69.6 / 31.3 / 24.0 | 62.6 64.6 62.3 = 63.2 / 29.9 / 24.4 |
+
+One trace with the first version (castle-move): the first looks 0.02 ms a frame (from 1.42), all answered "signalled"; the main
+thread's part of the loop 1.82 -> 0.59 ms, the Presentation Thread's idle 2.0 -> 0.8 ms. That is the upper bound of this lever
+(~+2 fps, and +4 with TICK-056's PT-chain switches), if the readbacks' ordering can be had more cheaply.
+
+### Correctness and state
+
+- Nothing adopted; every default is main 0db10b3's. The instruments add trace records only while `HOS_JOBTRACE`'s window is open
+  (the vcore record's fields, marks 30-37); `RX_VK_FENCE_POLL_FAST` off.
+- Shots (`RX_VK_SHOTS`, every 600 presents) and `HOS_SPEED_LOG` (last 40 s, median / min): base standing 60.00 / 59.17, walking
+  59.95 / 59.25; first fast version 60.02 / 59.56 and 60.03 / 59.24 (the white picture above); v3 standing: right picture.
+- Every run loaded the title -> the Market (103 runs), no hang or crash; saves identical to the backup after every run; no game left.
+- `run_all` (llvm-mingw on PATH): 243 pass, 2 fail (the nup tests, known), 35 skip.
+- Game folder: TICK-054's build restored (exe b6462ab3, dll 07b8dcd6).
+
+### What is next
+
+1. **The readbacks' ordering without the replay's whole lock.** The poll's wait is the main thread waiting for the Presentation
+   Thread's replay; what it protects is narrower: the write-back registrations of the submission being replayed. A per-range
+   "write-back pending" state published at the replay's start (before its long recording, from the captured submission's
+   bindings), or a sequence the readback compares, would let the poll and most readbacks go on. Worth ~1.4 ms on the main
+   thread's chain (+2 fps; +4 with MSYNC_FAST + SEG_EARLY, which are ready).
+2. `submit_q` holding `sync_order_mu` for the capture and the whole replay is the coupling between the two chains in general
+   (PR 430 took the texture releases off it with `held_mu` for the same reason).
+3. The host's sync primitives themselves: no further lever (wake p50 6.4 us, ~0.3-0.5 ms a frame on the chain).

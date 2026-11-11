@@ -205,3 +205,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Confirm (FAST + SEG_EARLY against base, 6 rounds): kokiri-idle 74.7 -> 76.6, castle-move 69.9 -> 70.2, hyrule-walk 72.7 -> 72.4 fps; frame prep -0.86 / -0.94 / -0.58 ms. Inside the spread, not above base in every round.
 - Decision: not adopted; the game's own chain (main thread) is the limit again. Shots alike, speed ~60, validation clean of new VUIDs, saves identical. Game folder: TICK-054's build. Branch `feature/TICK-056-chain-b`, not merged.
 - Next: the main thread's chain (draw code, job group, module phase), then the held flush's capture (pre-copy aimed at the held submits).
+
+## TICK-058 (2026-11-12): the game's own chain: hand-offs, and the main thread's fence poll
+- Measured: the host's hand-offs are not the limit. Wake latency p50 6.4 us, p90 10 (`tools/bench/wakelat.py`); on the game chain's critical path (`tools/bench/critpath.py`) wakes, virtual-core waits and poll lag ~0.3-0.5 ms a frame (2-3%); no timer-granularity path; 80083580's lookups ~0.4 ms on the path; priorities kept (the virtual cores' Horizon order).
+- Found: the main thread's two nvnSyncWait polls a frame wait 1.42 ms for the renderer's `sync_order_mu`, held by `submit_q` / `present` for whole replays. `RX_VK_FENCE_POLL_FAST` (off) answers them without it: +1.4..+6 fps in screens, +3.0 / +1.5 / +1.9 in a confirm (16 of 18 rounds above), but the Market's exposure blew out to white. The lock also ordered the exposure readback after the replay's write-back registrations. With that wait moved to the readbacks (the picture right), castle-move 69.6 -> 63.2.
+- Decision: nothing adopted; the switch stays off. Game folder: TICK-054's build. Saves identical after every run (103 runs), no hang.
+- Next: the readbacks' ordering without the replay's whole lock (per-range write-back state published at a replay's start): ~1.4 ms off the main thread's chain, then MSYNC_FAST + SEG_EARLY.
