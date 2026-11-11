@@ -17,9 +17,9 @@ without the switch.
 
     python -I -B tests/test_fpx_xmm.py [--cases 3000000] [--cc clang] [--cxx clang++]
 
-It has teeth (each by hand, then restored): the add's keep test without its FZ sum test (`RECOMP_FPX_FZSUM32` -> 1):
-mismatches at once (subnormal sums under FZ); the FNMUL's negation dropped: mismatches; a64_vld32 loading 8 bytes:
-mismatches (the upper lanes).
+It has teeth (each by hand, then restored; 200,000 runs): the add's keep test without its FZ sum test: 447 mismatches
+(subnormal sums under FZ); the FNMUL's negation dropped: 12,861; a64_vld32 loading 8 bytes: 31,735 (the upper lanes);
+the FMA's FZ test without the addend's: 224 at v3 (v2 has no FMA3: the default route, 0).
 Skipped (exit 0) on a host that is not x86-64, without a C/C++ compiler, or on a CPU without x86-64-v2.
 """
 import argparse
