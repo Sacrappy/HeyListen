@@ -3026,15 +3026,19 @@ double pcie_link_gbps() {
     auto init = (fn_init)GetProcAddress(h, "nvmlInit_v2");
     auto byidx = (fn_idx)GetProcAddress(h, "nvmlDeviceGetHandleByIndex_v2");
     auto mgen = (fn_u)GetProcAddress(h, "nvmlDeviceGetMaxPcieLinkGeneration");
-    auto mw = (fn_u)GetProcAddress(h, "nvmlDeviceGetMaxPcieLinkWidth");
+    // (the width is the slot's, the current one: the maximum width is the card's, x16 for an RTX 3050 in an x4 slot. The
+    // width does not drop at idle as the generation does, so the generation stays the maximum)
+    auto mw = (fn_u)GetProcAddress(h, "nvmlDeviceGetCurrPcieLinkWidth");
+    auto mwmax = (fn_u)GetProcAddress(h, "nvmlDeviceGetMaxPcieLinkWidth");
     double gbps = -1;
     if (init && byidx && mgen && mw && init() == 0) {
         void* dev = nullptr;
-        unsigned gen = 0, w = 0;
+        unsigned gen = 0, w = 0, wmax = 0;
         if (byidx(0, &dev) == 0 && mgen(dev, &gen) == 0 && mw(dev, &w) == 0 && gen >= 1 && gen <= 6 && w) {
+            if (mwmax && mwmax(dev, &wmax) == 0 && wmax && wmax < w) w = wmax;
             static const double per_lane[] = {0, 0.25, 0.5, 0.985, 1.969, 3.938, 7.563};   // GB/s a lane a direction
             gbps = per_lane[gen] * w;
-            logf("vk: mirror syncs: PCIe link maximum Gen%u x%u (%.1f GB/s)", gen, w, gbps);
+            logf("vk: mirror syncs: PCIe link Gen%u (maximum) x%u (current; card maximum x%u) (%.1f GB/s)", gen, w, wmax, gbps);
         }
         if (auto sd = (int (*)())GetProcAddress(h, "nvmlShutdown")) sd();
     }

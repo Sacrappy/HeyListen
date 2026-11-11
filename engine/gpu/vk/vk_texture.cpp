@@ -1093,6 +1093,9 @@ struct BcCacheEntry {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
     uint64_t bytes = 0, last_value = 0, tick = 0;
+    uint64_t made_value = 0;   // (the submission that writes its blocks: read only once the GPU is done with it. The parallel
+                               // replay's segments are queued in their order, not in the order they record: a hit in an
+                               // earlier segment of the same submission would copy blocks not yet written)
 };
 std::mutex bcc_mu;
 std::unordered_map<uint64_t, BcCacheEntry> bcc;   // (bcc_mu)
@@ -1182,7 +1185,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         {
             std::lock_guard lk(bcc_mu);
             auto it = bcc.find(cache_key);
-            if (it != bcc.end() && it->second.bytes == bcc_size(tex, pieces)) {
+            if (it != bcc.end() && it->second.bytes == bcc_size(tex, pieces) && it->second.made_value <= completed_value) {
                 it->second.tick = ++bcc_tick;
                 it->second.last_value = std::max(it->second.last_value, rec_value);
                 hit = it->second;
@@ -1255,7 +1258,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             astc_bc_batched(cmd, tex, pieces, staged, s, entry.buf ? &entry : nullptr);
             if (entry.buf) {
                 std::lock_guard lk(bcc_mu);
-                entry.last_value = rec_value, entry.tick = ++bcc_tick;
+                entry.last_value = entry.made_value = rec_value, entry.tick = ++bcc_tick;
                 auto [it, fresh] = bcc.emplace(cache_key, entry);
                 if (!fresh) {   // (another thread's of the same bytes meanwhile: one kept)
                     bcc_dead.push_back(entry);
