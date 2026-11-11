@@ -2757,6 +2757,11 @@ to session 0 (no DWM). TICK-017 saw the GPU "slow" under overlap on the main PC 
   and `gpu_gap_ms`; `vk: GPU time ... uploads ... gaps between recordings` every 120 presents; `vk: the blit on the GPU` with the
   queue's gaps before and after it.
 
+### Screen and decisions (castle-move, 3 interleaved runs, PC 3050; `docs/benchmarks/2026-11-12-tick053.md`)
+main 28.21 fps (1% low 14.4, p99 56.6 ms), branch defaults 28.64 (14.9, 54.4), `RX_VK_RB_RANGES=1` 27.97 (13.8, 53.9): no gain, so
+RB_RANGES, LATE_MERGE and ACQUIRE_FENCE all stay off; the timestamps and trace columns stay on. Default speed ratio ~60.0; with
+the merge on several Market shots are white with only the HUD, so the merge needs a look before any run-ahead. The +20 fps is not
+reached here. Desktop A/B (`RX_VK_LATE_MERGE=1` against the default) in the benchmark doc.
 ### What is next
 - The gap: a GPU-side trace of the queue (Nsight Systems with the WDDM trace, admin) or, without it, the game's two threads'
   waits and the engine's submits on one timeline (`HOS_JOBTRACE` with the submit and signal values) in the slow mode, to see
