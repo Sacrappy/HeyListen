@@ -69,7 +69,78 @@ int hos_gpu_guest_ranges(uint64_t (*out)[2], int max);
 /* The soft write watch's marks (rt/a64.h A64_MARK, hos_mark_written) over the GPU-visible ranges, read and cleared:
    the Vulkan back end's own collection (gpu/render's rx_collect_written works only with the WebGPU renderer started).
    One consumer: with Vulkan the WebGPU renderer never runs. */
+/* (HeyListen, TICK-061, C2) RX_VK_COLLECT_FAST=1 (off by default): the same scan with unaligned loads at the ranges' edges.
+   collect_in below skips clean marks 256, 32 or 8 at a time only from a page number aligned to that size, so each of the
+   ~1,500 capture ranges (and ~760 the replay collects) began and ended with up to ~17 single-page atomic loads: the scan took
+   0.05-0.07 ms for ~830 KB of marks, twice a submit, six submits a frame. Here the blocks are read wherever the walk is (the
+   marks are bytes: no alignment is needed, memcpy into words is an unaligned load), and only a non-zero byte of a non-zero
+   block is exchanged.
+   Same result: a page is taken when its mark reads non-zero and the exchange that clears it returns non-zero (acquire), in
+   ascending page order within a range and in range order, as collect_in. A mark the game sets after the block was read is left
+   for the next scan, as collect_in leaves a mark set after its own load of that byte (the scan was never a snapshot: it reads
+   marks one after another while the game runs). The block reads are plain loads of bytes others store atomically, as
+   collect_in's skip checks always were (x86-64: a byte load is atomic). tests/test_collect_fast.py compares the page lists. */
+static int collect_fast_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RX_VK_COLLECT_FAST");
+        v = e && atoi(e) != 0;
+    }
+    return v;
+}
+static inline void collect_take(uint64_t p, uint32_t **out, size_t *n, size_t *cap) {
+    if (__atomic_exchange_n(&a64_dirty[p], 0, __ATOMIC_ACQUIRE)) {
+        if (*n == *cap) *out = realloc(*out, (*cap *= 2) * sizeof **out);
+        (*out)[(*n)++] = (uint32_t)p;
+    }
+}
+static int64_t collect_in_fast(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
+    size_t n = 0, cap = 4096;
+    uint32_t *out = malloc(cap * sizeof *out);
+    for (int r = 0; r < nranges; r++) {
+        const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
+        uint64_t p1 = (hi + 4095) >> 12;
+        if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
+        uint64_t p = lo >> 12;
+        while (p < p1) {
+            if (p + 256 <= p1) {   /* (256 pages a look; the marked bytes taken from the block as read) */
+                uint64_t w[32], any = 0;
+                memcpy(w, &a64_dirty[p], 256);
+                for (int k = 0; k < 32; k++) any |= w[k];
+                if (any)
+                    for (int k = 0; k < 32; k++)
+                        for (int b = 0; w[k] && b < 8; b++)
+                            if ((w[k] >> (8 * b)) & 0xFF) collect_take(p + 8 * k + b, &out, &n, &cap);
+                p += 256;
+                continue;
+            }
+            if (p + 32 <= p1) {   /* (32 pages a load; the marked bytes of a block taken from the block as read) */
+                uint64_t w[4];
+                memcpy(w, &a64_dirty[p], 32);
+                if (w[0] | w[1] | w[2] | w[3])
+                    for (int k = 0; k < 4; k++)
+                        for (int b = 0; w[k] && b < 8; b++)
+                            if ((w[k] >> (8 * b)) & 0xFF) collect_take(p + 8 * k + b, &out, &n, &cap);
+                p += 32;
+                continue;
+            }
+            if (p + 8 <= p1) {
+                uint64_t w;
+                memcpy(&w, &a64_dirty[p], 8);
+                for (int b = 0; w && b < 8; b++)
+                    if ((w >> (8 * b)) & 0xFF) collect_take(p + b, &out, &n, &cap);
+                p += 8;
+                continue;
+            }
+            if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED)) collect_take(p, &out, &n, &cap);
+            p++;
+        }
+    }
+    *pages = out;
+    return (int64_t)n;
+}
 static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
+    if (collect_fast_on()) return collect_in_fast(ranges, nranges, pages);
     size_t n = 0, cap = 4096;
     uint32_t *out = malloc(cap * sizeof *out);
     for (int r = 0; r < nranges; r++) {

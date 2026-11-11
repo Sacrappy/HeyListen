@@ -1009,6 +1009,8 @@ std::atomic<bool> captures_seen{false};
 std::atomic<uint64_t> cap_view_gen{1};   // (bumped when a capture is published or a page is stamped: cached reads go stale)
 void cap_view_bump() { cap_view_gen.fetch_add(1, std::memory_order_release); }
 double st_tk_all, st_tk_stamp, st_tk_copy, st_tk_late, st_tk_lock;   // (memory_take_capture's parts, ms)
+double st_tk_stamps, st_tk_shadow, st_tk_entries;   // (TICK-061: inside "retires and stamps": the page stamps, the texture shadow, the table entries)
+int64_t st_tk_shadow_fast;   // (TICK-061: takes whose shadow block took RX_VK_SHADOW_FAST's path)
 std::atomic<int64_t> st_tr_late_ns{0}, st_tr_late_n{0};   // (TICK-051: the same, never reset, for the frame trace)
 int64_t st_tk_late_n;   // (the takes that waited for the GPU for their late pages)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
@@ -1068,6 +1070,83 @@ void shadow_drop_range(uint64_t lo, uint64_t hi) {   // (shadow_mu held)
         const uint64_t p0 = std::max(lo >> 12, r << 9), p1 = std::min((hi + 4095) >> 12, (r + 1) << 9);
         for (uint64_t p = p0; p < p1; p++) shadow_erase((uint32_t)p);
     }
+}
+// ---- (TICK-061, C3 = E2) RX_VK_SHADOW_FAST=1 (off by default): take_capture's texture-shadow block with less work a page ----
+// The block (shadow_mu and pools_mu held, on the replay thread or the held flush) did for every page of a capture two binary
+// searches of tex_merged (one in the erase pass, one in the insert pass), a hash erase, then for every copied texture page a hash
+// insert, a fresh `new uint8_t[4096]` and a 4 KB copy: each page the capture just copied was first erased and then made again.
+// Here (shadow_take_fast):
+// - whether a page is texture storage comes from one merge walk of the sorted page list against the sorted, disjoint tex_merged
+//   (the same answer as in_tex_merged); a page list not in ascending order (the TICK-043 pre-copy's merged list) takes the old code;
+// - a copied texture page keeps its entry and its 4 KB block, which the copy overwrites; only texture pages written but not copied
+//   (a failed copy, a deferred page) are erased, as before;
+// - a page new to the shadow takes a block left by an erased one when there is one (shadow_slab, up to 1024 blocks), else new[].
+// The shadow after the block is the same: the old code erased every texture page of c->pages and then inserted each copied one,
+// so a copied page ends with an entry holding the capture's bytes and seq = shadow_seq, a written but not copied one with none,
+// every other entry as it was; shadow_n and shadow_regions (each region's count of entries; a region at 0 leaves the map) follow
+// from that membership alone, whichever way the counts moved on the way. The sweeps decide per entry by seq (no early stop), so
+// the map's iteration order does not change what they keep. The only path where the order of the old code mattered is the cap
+// (kShadowMax reached inside the insert loop, a sweep or a stop part way): the fast path runs only when it cannot be reached,
+// shadow_n + (copied texture pages) <= kShadowMax before anything is erased (the old count after its erase pass is at most
+// shadow_n, and each insert adds one), else the old code runs as it was. The readers (memory_as_submitted, memory_has_shadow)
+// take shadow_mu, held throughout, so none sees a state in between.
+bool shadow_fast_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_SHADOW_FAST");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: a capture's texture shadow: %s (RX_VK_SHADOW_FAST)", v ? "one walk, blocks kept" : "searched, made again, as before");
+        return v;
+    }();
+    return on;
+}
+std::vector<std::unique_ptr<uint8_t[]>> shadow_slab;   // (4 KB blocks of pages that left the shadow, for new ones; shadow_mu)
+constexpr size_t kShadowSlab = 1024;
+void shadow_erase_keep(uint32_t page) {   // (shadow_mu held: shadow_erase, the block kept for the next page)
+    auto it = shadow.find(page);
+    if (it == shadow.end()) return;
+    if (it->second.b && shadow_slab.size() < kShadowSlab) shadow_slab.push_back(std::move(it->second.b));
+    shadow.erase(it);
+    auto r = shadow_regions.find(page >> 9);
+    if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
+    shadow_n--;
+}
+/// The block for a capture: pages (c->pages), the copied ones and their slots (c->copied, c->slots: slot = index in pages), the
+/// capture's mapped copy. False: not taken (the old code runs). shadow_mu held, shadow_seq already advanced
+bool shadow_take_fast(const uint32_t* pages, size_t n, const uint32_t* copied, const uint32_t* slots, size_t m, const uint8_t* map) {
+    if (!map || !std::is_sorted(pages, pages + n)) return false;
+    static thread_local std::vector<uint8_t> flag;   // (bit 0: texture storage, bit 1: copied)
+    flag.assign(n, 0);
+    size_t r = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t g = (uint64_t)pages[i] << 12;
+        while (r < tex_merged.size() && tex_merged[r].second <= g) r++;
+        if (r < tex_merged.size() && g >= tex_merged[r].first) flag[i] = 1;
+    }
+    size_t copied_tex = 0;
+    for (size_t j = 0; j < m; j++) {
+        if (slots[j] >= n || pages[slots[j]] != copied[j]) return false;   // (not the layout described: the old code)
+        if (flag[slots[j]] & 1) flag[slots[j]] |= 2, copied_tex++;
+    }
+    if (shadow_n.load(std::memory_order_relaxed) + copied_tex > kShadowMax) return false;   // (the cap could be reached: the old code)
+    for (size_t i = 0; i < n; i++)
+        if (flag[i] == 1) shadow_erase_keep(pages[i]);   // (written, not copied: its old copy is stale)
+    for (size_t j = 0; j < m; j++) {
+        if (flag[slots[j]] != 3) continue;
+        const uint32_t p = copied[j];
+        auto [it, made] = shadow.try_emplace(p);
+        ShadowPage& slot = it->second;
+        if (!slot.b) {
+            if (!shadow_slab.empty()) slot.b = std::move(shadow_slab.back()), shadow_slab.pop_back();
+            else slot.b.reset(new uint8_t[4096]);
+        }
+        if (made) {
+            shadow_regions[p >> 9]++;
+            shadow_n++;
+        }
+        slot.seq = shadow_seq;
+        std::memcpy(slot.b.get(), map + (uint64_t)slots[j] * 4096, 4096);
+    }
+    return true;
 }
 /// (the spans unused for 1800 presents dropped with their shadow pages; the rest published for the capture)
 void publish_tex_spans(uint64_t frame) {
@@ -1408,10 +1487,12 @@ bool guarded_copy_stream(void* dst, const void* src, size_t n) {
 // (a page written and then unmapped before the submit faulted a plain copy: ReadProcessMemory fails on it instead.
 // VirtualQuery per page took ~1 ms each in this address space: 22 ms a submit for 18 pages) (runs of adjacent pages
 // in one copy each, page by page only where a run fails; page i into slot i)
+struct ClaimJob;
 struct CopyPart {
     const uint32_t* pages; int64_t i0, i1; uint8_t* out; uint8_t* ok;
     // (TICK-043, RX_VK_CAPTURE_SCAN_SPLIT: a part of the submit's scan of the write marks instead: these ranges, the pages into *res)
     const uint64_t (*ranges)[2] = nullptr; int nr = 0; uint32_t** res = nullptr; int64_t* res_n = nullptr;
+    ClaimJob* claim = nullptr;   // (TICK-061, RX_VK_CAPTURE_CLAIM: a token for a copy whose chunks are claimed, see copy_pages)
 };
 void copy_part(const CopyPart& w) {
     uint8_t* const base = (uint8_t*)host->guest_base();   // (guest addresses: no GPU translation per page)
@@ -1440,6 +1521,82 @@ struct CopyHelpers {
     int pending = 0;
     bool started = false;
 } copy_helpers;
+// ---- (TICK-061, C1) RX_VK_CAPTURE_CLAIM=1 (off by default): the capture's copy in chunks claimed by whoever is free ----
+// The copy was cut into k = helpers + 1 equal parts; the submitter copied part 0 and then slept until the slowest helper was
+// through. With the game's job group on every core (HOS_NVN_HOLD=2's held flush runs beside it) a helper was often scheduled
+// late, and the copy ended with the last part to start (1.36 ms held against 0.6 ms on an idle machine, TICK-054). Here the
+// pages are cut into chunks of `chunk` pages, claimed from one atomic counter by the submitter and every helper that wakes in
+// time; the submitter claims until none is left, so a helper that never got a core leaves nothing undone.
+// Same output, by construction: chunk [i0, i1) is copied by exactly one thread with copy_part, which writes page i into slot i
+// (out + i * 4096) and ok[i], as before; a run of adjacent pages cut at a chunk's edge is two copies of the same bytes into the
+// same slots (and a failing run falls back page by page within each chunk, so ok[] gets the same per-page answer). The copy reads
+// guest memory as before: the order the threads read pages in changes, and the capture always allowed any order (it ran on 5
+// threads already). Visibility: copy_part fences its streaming stores; a helper drops its use count under copy_helpers.mu after
+// its last chunk, and the submitter waits on that mutex for the count to reach 0, so every store is visible to it when
+// copy_pages returns, as with the pending count before.
+// Lifetime: the job lives on the submitter's stack. A token not popped yet is removed by the submitter (under the mutex) before
+// it waits; a token popped holds `users`, which the submitter waits for. No helper touches the job after copy_pages returns.
+struct ClaimJob {
+    const uint32_t* pages;
+    int64_t n;
+    uint8_t* out;
+    uint8_t* ok;
+    int64_t chunk;
+    std::atomic<int64_t> next{0};
+    int users = 0;   // (helpers that popped a token and have not finished: copy_helpers.mu)
+    // (TICK-061, E3: other work cut the same way: fn(ctx, i0, i1) for each chunk instead of copy_part; null: the copy)
+    void (*fn)(void* ctx, int64_t i0, int64_t i1) = nullptr;
+    void* ctx = nullptr;
+};
+bool capture_claim_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_CAPTURE_CLAIM");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: the capture's copy: %s (RX_VK_CAPTURE_CLAIM)", v ? "chunks claimed by the submitter and the helpers" : "equal parts, as before");
+        return v;
+    }();
+    return on;
+}
+int64_t claim_chunk_pages(int64_t n, int participants) {
+    // (RX_VK_CAPTURE_CLAIM=<n> >= 8: n pages a chunk; 1: about four chunks a participant, 16 to 256 pages (64 KB to 1 MB))
+    static const int64_t fixed = getenv("RX_VK_CAPTURE_CLAIM") ? atoll(getenv("RX_VK_CAPTURE_CLAIM")) : 0;
+    if (fixed >= 8) return fixed;
+    return std::clamp<int64_t>(n / (4 * std::max(participants, 1)), 16, 256);
+}
+void claim_run(ClaimJob& j) {
+    for (;;) {
+        const int64_t i0 = j.next.fetch_add(j.chunk, std::memory_order_relaxed);
+        if (i0 >= j.n) return;
+        if (j.fn) j.fn(j.ctx, i0, std::min(i0 + j.chunk, j.n));
+        else copy_part({j.pages, i0, std::min(i0 + j.chunk, j.n), j.out, j.ok});
+    }
+}
+void copy_helpers_start_locked();
+/// The job's chunks on this thread and `helpers` copy helpers (those that wake in time), until every chunk is done (see ClaimJob:
+/// the tokens no helper took are removed, the ones taken waited for). One at a time: the captures' submit_order_mu, or pools_mu
+void claim_all(ClaimJob& job, int helpers) {
+    {
+        std::lock_guard lk(copy_helpers.mu);
+        copy_helpers_start_locked();
+        for (int i = 0; i < helpers; i++) {
+            CopyPart t{job.pages, 0, 0, job.out, job.ok};
+            t.claim = &job;
+            copy_helpers.parts.push_back(t);
+        }
+        copy_helpers.pending += helpers;
+    }
+    copy_helpers.cv.notify_all();
+    claim_run(job);   // (returns once every chunk is claimed: by it or by a helper still on one)
+    std::unique_lock lk(copy_helpers.mu);
+    int left = 0;   // (tokens no helper took in time: nobody will, they go)
+    for (auto it = copy_helpers.parts.begin(); it != copy_helpers.parts.end();)
+        if (it->claim == &job) it = copy_helpers.parts.erase(it), left++;
+        else ++it;
+    copy_helpers.pending -= left;
+    if (copy_helpers.pending == 0) copy_helpers.done.notify_all();
+    copy_helpers.done.wait(lk, [&job] { return job.users == 0; });
+}
+std::atomic<int64_t> st_claim_copies{0}, st_claim_helped{0};   // (copies made with claiming; tokens a helper took in time)
 void copy_helper_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk capture copy");
     // (TICK-054) RX_VK_CAPTURE_PRIO=1: above normal, as the replay's workers (a capture made while the game's job threads run)
@@ -1451,10 +1608,18 @@ void copy_helper_main() {
             copy_helpers.cv.wait(lk, [] { return !copy_helpers.parts.empty(); });
             w = copy_helpers.parts.front();
             copy_helpers.parts.pop_front();
+            if (w.claim) w.claim->users++;   // (TICK-061: the job stays alive until this helper is through)
         }
-        if (w.ranges) *w.res_n = host->collect_written_in(w.ranges, w.nr, w.res);
-        else copy_part(w);
+        if (w.claim) {
+            st_claim_helped.fetch_add(1, std::memory_order_relaxed);
+            claim_run(*w.claim);
+        } else if (w.ranges) {
+            *w.res_n = host->collect_written_in(w.ranges, w.nr, w.res);
+        } else {
+            copy_part(w);
+        }
         std::lock_guard lk(copy_helpers.mu);
+        if (w.claim && --w.claim->users == 0) copy_helpers.done.notify_all();
         if (--copy_helpers.pending == 0) copy_helpers.done.notify_all();
     }
 }
@@ -1473,6 +1638,12 @@ void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok) {  
     const int helpers = copy_helper_count();
     if (!helpers || n < 128) return copy_part({pages, 0, n, out, ok});
     const int k = helpers + 1;
+    if (capture_claim_on()) {   // (TICK-061, C1: see ClaimJob)
+        ClaimJob job{pages, n, out, ok, claim_chunk_pages(n, k)};
+        claim_all(job, helpers);
+        st_claim_copies.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     {
         std::lock_guard lk(copy_helpers.mu);
         copy_helpers_start_locked();
@@ -2152,6 +2323,72 @@ int late_diff_runs(const uint8_t* now, const uint8_t* shadow, uint32_t* off, uin
 }
 
 bool memory_is_rb_page_locked(uint32_t page);
+// ---- (TICK-061, E3) RX_VK_STAMP_SPLIT=1 (off by default): a take's page stamps and table entries on the copy helpers ----
+// take_capture stamps each page of the capture with its generation (stamp_page) and points each copied page's table entry at its
+// slot (cap_entry_set), ~1,000-2,000 pages a take, serially under pools_mu. Here the two loops become one job of chunks claimed by
+// the taking thread and the copy helpers (claim_all, as RX_VK_CAPTURE_CLAIM's copy), for takes of 1,024 pages or more.
+// The same stores, at the same point of the critical section: the job runs and ends while the taking thread holds pools_mu (and
+// waits for every chunk, claim_all), so no thread that reads the stamps or the table under that lock sees the take half done.
+// The tables' chunks are made first, on the taking thread (the only allocation either store makes: stamp_page and cap_entry_set
+// allocate a chunk on its first use, which two helpers must not race on); then each store is to its own page's word, by one
+// thread. region_gen[r] = g is stored by every page of the region: the same value from each thread (g is the newest generation,
+// so the result is g whichever store lands last), done with an atomic store so the threads do not race on the plain word.
+// The stamps move after the texture-shadow block, which reads no stamp (both under the same locks).
+bool stamp_split_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_STAMP_SPLIT");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: a capture's page stamps: %s (RX_VK_STAMP_SPLIT)", v ? "on the copy helpers from 1,024 pages" : "on the taking thread, as before");
+        return v;
+    }();
+    return on;
+}
+struct StampSplit {
+    const uint32_t *pages, *copied, *slots;
+    size_t n, m;
+    uint32_t g;
+    const uint8_t* late;
+};
+void stamp_split_chunk(void* ctx, int64_t i0, int64_t i1) {
+    const StampSplit& w = *(const StampSplit*)ctx;
+    for (int64_t i = i0; i < i1; i++) {
+        if ((size_t)i < w.n) {
+            const uint64_t p = w.pages[i];
+            if (p >= kPages) continue;
+            if (p == inherit_watch_page()) logf("vk: inherit watch: page %#llx stamped, gen %u", (unsigned long long)(p << kPageShift), w.g);
+            store_u32(gen_chunks[p / kChunkPages][p % kChunkPages], w.g);
+            std::atomic_ref<uint32_t>(region_gen[p / kRegionPages]).store(w.g, std::memory_order_relaxed);
+        } else {
+            const size_t j = (size_t)i - w.n;
+            const uint64_t page = w.copied[j];
+            cap_table[page / kCapChunkPages][page % kCapChunkPages] = CapEntry{w.g, w.slots[j] | (w.late[w.slots[j]] ? kCapLateBit : 0u)};
+        }
+    }
+}
+void stamp_split_run(const uint32_t* pages, size_t n, const uint32_t* copied, const uint32_t* slots, size_t m, uint32_t g,
+                     const uint8_t* late) {
+    for (size_t i = 0; i < n; i++) {   // (the chunks first: see above)
+        const uint64_t p = pages[i];
+        if (p >= kPages) continue;
+        auto& c = gen_chunks[p / kChunkPages];
+        if (!c) {
+            c.reset(new uint32_t[kChunkPages]);
+            std::fill(c.get(), c.get() + kChunkPages, 0u);
+        }
+    }
+    for (size_t j = 0; j < m; j++) {
+        const uint64_t c = copied[j] / kCapChunkPages;
+        if (c >= cap_table.size()) cap_table.resize(c + 1);
+        if (!cap_table[c]) {
+            cap_table[c].reset(new CapEntry[kCapChunkPages]);
+            std::memset(cap_table[c].get(), 0, kCapChunkPages * sizeof(CapEntry));
+        }
+    }
+    StampSplit w{pages, copied, slots, n, m, g, late};
+    ClaimJob job{nullptr, (int64_t)(n + m), nullptr, nullptr, 256};
+    job.fn = stamp_split_chunk, job.ctx = &w;
+    claim_all(job, copy_helper_count());
+}
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
     // (TICK-053) the late pages merged at their syncs instead (RX_VK_LATE_MERGE): no wait when every one of them has a shadow
@@ -2205,9 +2442,15 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         cap_buf_retire(oldest);
     }
     uint32_t g = 0;
+    // (TICK-061, E3: RX_VK_STAMP_SPLIT=1 stamps the pages and sets the table entries on the copy helpers, below)
+    const bool split = stamp_split_on() && copy_helper_count() > 0 && c->pages.size() >= 1024;
     if (!c->pages.empty()) {
         g = ++gen_now;
-        for (uint32_t p : c->pages) stamp_page(p, g);
+        if (!split) {
+            const auto ts0 = std::chrono::steady_clock::now();
+            for (uint32_t p : c->pages) stamp_page(p, g);
+            st_tk_stamps += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
+        }
         pages_collected += c->pages.size();
     }
     if (!c->pages.empty() && tex_capture_on()) {   // (the texture storage it took: the shadow, as of this submit)
@@ -2224,7 +2467,12 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 it = shadow.erase(it);
                 shadow_n--;
             }
-        if (!tex_merged.empty()) {
+        const auto tsh0 = std::chrono::steady_clock::now();
+        if (!tex_merged.empty() && shadow_fast_on() &&   // (TICK-061: see shadow_take_fast)
+            shadow_take_fast(c->pages.data(), c->pages.size(), c->copied.data(), c->slots.data(), c->copied.size(),
+                             (const uint8_t*)c->map)) {
+            st_tk_shadow_fast++;
+        } else if (!tex_merged.empty()) {
             // (every page written since the last capture: its old copy is stale; the ones copied now replace it)
             for (uint32_t p : c->pages)
                 if (in_tex_merged((uint64_t)p << 12)) shadow_erase(p);
@@ -2254,6 +2502,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 std::memcpy(slot.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096, 4096);
             }
         }
+        st_tk_shadow += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tsh0).count();
     }
     if (!c->deferred.empty()) {   // (TICK-017: the pages the wait was for, logged: the evidence of which reads need the GPU's results)
         static int64_t caps, pages_n, logged;
@@ -2273,6 +2522,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                  pages_n / 600.0), pages_n = 0;
     }
     const auto tk1 = std::chrono::steady_clock::now();
+    bool split_done = false;
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
         CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
         c->buffer = VK_NULL_HANDLE, c->alloc = nullptr, c->map = nullptr, c->bsize = 0;
@@ -2284,8 +2534,20 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         late_mark.assign(c->pages.size(), 0);
         if (late_merge)
             for (uint32_t i : c->late) late_mark[i] = 1;
-        for (size_t i = 0; i < c->copied.size(); i++)
-            cap_entry_set(c->copied[i], CapEntry{g, c->slots[i] | (late_mark[c->slots[i]] ? kCapLateBit : 0u)});
+        const auto te0 = std::chrono::steady_clock::now();
+        if (split) {
+            stamp_split_run(c->pages.data(), c->pages.size(), c->copied.data(), c->slots.data(), c->copied.size(), g, late_mark.data());
+            split_done = true;
+        } else {
+            for (size_t i = 0; i < c->copied.size(); i++)
+                cap_entry_set(c->copied[i], CapEntry{g, c->slots[i] | (late_mark[c->slots[i]] ? kCapLateBit : 0u)});
+        }
+        st_tk_entries += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
+    }
+    if (split && !split_done) {   // (no buffer kept: the stamps alone)
+        const auto te0 = std::chrono::steady_clock::now();
+        stamp_split_run(c->pages.data(), c->pages.size(), nullptr, nullptr, 0, g, nullptr);
+        st_tk_entries += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
     }
     cap_view_bump();
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
@@ -2305,6 +2567,13 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                  cap_bufs.size(), (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
                  (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
             st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_lock = 0, st_tk_late_n = 0;
+            // (TICK-061) inside it: the page stamps, the texture shadow block, the table entries (with RX_VK_STAMP_SPLIT the stamps
+            // are in the entries' part); and the capture copies made by claiming (RX_VK_CAPTURE_CLAIM) and the helpers' tokens taken
+            logf("vk: a capture taken, in parts (ms): page stamps %.3f, texture shadow %.3f (%lld of 600 by RX_VK_SHADOW_FAST), table "
+                 "entries %.3f; copies by claiming %lld, helpers in time %lld", st_tk_stamps / 600, st_tk_shadow / 600,
+                 (long long)st_tk_shadow_fast, st_tk_entries / 600, (long long)st_claim_copies.exchange(0),
+                 (long long)st_claim_helped.exchange(0));
+            st_tk_stamps = st_tk_shadow = st_tk_entries = 0, st_tk_shadow_fast = 0;
             if (late_merge_on()) {   // (TICK-053)
                 static int64_t l_m, l_w, l_ns, l_b, l_seg;
                 const int64_t m = st_late_merged.load(), w = st_late_waited.load(), ns = st_late_no_shadow.load();

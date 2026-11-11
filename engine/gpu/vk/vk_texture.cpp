@@ -2582,6 +2582,24 @@ bool barrier_dedupe_par_on() {
     return on;
 }
 int64_t barriers_left_out_par() { return st_barriers_left_out_par.load(std::memory_order_relaxed); }
+bool barrier_trust_on();
+// (TICK-061, D6: vk_work.h) a parallel segment's recording starts and ends on this thread
+void work_seg_begin() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_WORK_LOCAL");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: the work counts inside parallel segments: %s (RX_VK_WORK_LOCAL)", v ? "left alone where nothing reads them" : "bumped at every command, as before");
+        return v;
+    }();
+    static const bool skip_all = on && !barrier_dedupe_par_on() && !barrier_trust_on();
+    work_seg_local = on;
+    work_seg_skip_all = skip_all;
+}
+void work_seg_end() {
+    if (!work_seg_local) return;
+    work_seg_local = false, work_seg_skip_all = false;
+    work_epoch.fetch_add(1, std::memory_order_relaxed);   // (the segment's work, counted once: see vk_work.h)
+}
 namespace {
 std::atomic<uint64_t>& xfer_slot(VkCommandBuffer c) {
     const uintptr_t v = (uintptr_t)c;
