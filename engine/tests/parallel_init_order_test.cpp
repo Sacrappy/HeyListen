@@ -274,6 +274,8 @@ const bool par_stats_on = false;   // (TICK-052, RX_VK_PARLOCK_STATS: off by def
 void par_counts_sum(int64_t* locks, int64_t* wait_ns) { *locks = par_locks.load(), *wait_ns = par_lock_wait_ns.load(); }
 void par_stats_segment_parts(int64_t, int64_t, int64_t, int64_t) {}
 void jt_mark(int, uint64_t) {}   // (TICK-054: the frame-timeline marks)
+template <class R> void gpu_time_begin(R&) {}   // (TICK-057: the segments' GPU timestamps)
+template <class R> void gpu_time_end(R&, bool) {}
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
 std::vector<std::thread> workers;
