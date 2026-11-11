@@ -35,3 +35,6 @@ Every diff run is above every base run standing and walking; on the street the l
 **To check on the main PC (not run there)**: fps standing/walking/street with `RX_VK_MSYNC_DIFF=0` vs default (the hashing costs the replay thread ~2-4 ms a frame; the bytes there cost only 0.4-0.8 ms of GPU, so the diff may lose a little); shots; `HOS_SPEED_LOG`; Kokiri Forest (exposure, foliage records); the dll built with the builder's own tools.
 
 Docs: engine/docs/perf-audit.md "TICK-048", docs/benchmarks/2026-11-10-tick048-upload-bytes.md.
+
+## Main PC check (2026-11-11): the diff loses on a full link; the default follows the PCIe link
+castle-move, 3 interleaved runs, one dll: diff off 70.5 fps, diff on 62.9 (-7.6, frame prep +3.2 ms; every on run below every off run). msync GPU 0.5 ms / 22 MB off, 0.14 ms / 3.7 MB on: the hashing costs more than the bytes. Default now: on only when NVML reports a maximum PCIe link <= 8 GB/s (PC 3050: Gen3 x4), else off; `RX_VK_MSYNC_DIFF` still overrides. Details: docs/benchmarks/2026-11-11-tick048mainpc.md.

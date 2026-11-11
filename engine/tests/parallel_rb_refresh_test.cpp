@@ -64,6 +64,7 @@ std::atomic<bool> par_active{false};
 void memory_table_begin() {}
 bool memory_table_flush() { return false; }
 void memory_protect_gpu(uint64_t, uint64_t) {}
+void diff_gpu_wrote(uint64_t, uint64_t) {}   // (TICK-048: the chunk diff's GPU-write note; off in the model)
 bool slow_desc_timing() { return false; }
 uint64_t texture_segment();
 void memory_rb_recording_begun();
