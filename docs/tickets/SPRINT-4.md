@@ -172,3 +172,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Built, behind switches (off): `RX_VK_LATE_MERGE` (late pages merged word by word against a shadow, no wait), `RX_VK_ACQUIRE_FENCE`; on: GPU timestamps for uploads, the queue's gaps and the blit (`gpu_up_ms`, `gpu_gap_ms`).
 - Screen (castle-move, 3 runs each): main 28.21 fps, branch defaults 28.64, `RX_VK_RB_RANGES=1` 27.97 (1% low 14.4 / 14.9 / 13.8): no gain, RB_RANGES stays off. Merge shots show white world-less frames; speed ratio ~60.0 on the default. docs/benchmarks/2026-11-12-tick053.md has the desktop-check instructions (`RX_VK_LATE_MERGE=1` against the default).
 - Decision: not adopted. Branch `feature/TICK-053-gpu-sync`, bundle `E:\OOT\tick053.bundle`, not merged. Next: the queue's gap on the desktop, then the overlap.
+
+## TICK-055 (2026-11-11): the lifted code on x86-64
+- Audit (`docs/research/lifter-x86.md`): guest loads 33.5% of the guest samples, integer 22.9%, FP 18.2%, context 8.9%; lifter overheads ranked: GPR <-> XMM crossings of scalar FP (5.6%), FPX gate re-reads (~1.6%), dirty marks (~1.7%), flags, LR store-forwarding at function entry (~0.9%), calling convention (~1.1%). Guest addressing, atomics, barriers already minimal.
+- Built, lift time, off by default (default lift byte-identical): `A64_FPX_XMM` (scalar FP, S/D/Q loads and scalar results in XMM registers) and `A64_LR_SCALAR`; `tests/test_fpx_xmm.py` (bit-exact, 1 M runs a -march, teeth), `tools/bench/lifter_mb` (synthetic: -13% to -61%).
+- PC 3050, both builds unprofiled: guest CPU ~21.9 -> ~22.3 ms a frame, castle-move 29.0 -> 28.3 fps (3 rounds): inside the spread. Not adopted.
+- Branch `feature/TICK-055-lifter-x86` (main 8ece4b3 merged), not merged. Next: guest registers across calls (the loads are the critical path); large pages need the user's privilege.
