@@ -163,3 +163,60 @@ must agree. Expected ~0.5-1%; risk medium; effort high.
 3. The FPX gate (finding 2), if time allows; it touches the same helpers as 1.
 
 Fixes, their tests and measurements: see below and `docs/tickets/TICK-055.md`.
+
+## Phase 2: what was built (lift-time switches, off by default)
+
+### `A64_FPX_XMM=1` (finding 1)
+
+`a64_lift.xmm_text` runs on the hot functions' text (in `hot_text`, after the FPX helpers' hot names) and
+`xmm_header` adds its helpers to `a64_fpx.h`. With the switch off, `fpx_header` and `hot_text` give the text they gave before
+(checked by the test), so the default lift is byte for byte the same (PC 3050's base lift: lifted-code key e8dc207cb2, as
+TICK-045's).
+- Scalar binary32 FADD / FSUB / FMUL / FNMUL / FDIV / FMADD / FMSUB / FNMADD / FNMSUB: the operands are `float`s read from
+  `c->vreg` and pinned in XMM registers (`A64_XF`, an empty asm with an `x` constraint, so their bits are a copy and not
+  their source); `a64_fpxf_hot_*` runs the same IEEE op under the same gate and the same keep tests (the
+  `RECOMP_FPX_*` macros on copies of the bits); past them a `noinline` wrapper calls the default out-of-line helper
+  (`a64_fpx_*`, with its rescues and the exact body) and returns a float. The result is written by `a64_vset_f32`: the
+  lane zero-extended (`_mm_set_ss`) and stored as one 16-byte store, as `a64_vset64` did. The FMA's fast path is the
+  hardware FMA only where the default one is (`A64_FPX_FMA3` and an FMA3 build); elsewhere it takes the default inline
+  helper. The negations of FNMUL / FMSUB / FNMADD / FNMSUB are float negations (a sign flip, as the `^= 0x80000000`).
+- LDR S / LDR D / LDP S into vector registers: `a64_vld32` / `a64_vld64` load straight into an XMM register
+  (`movd` / `movq` from guest memory, upper lanes zero); LDR Q / LDP Q: `a64_vld128`, one 16-byte load and store instead of
+  two 8-byte halves that a later 16-byte read could not forward from.
+- A scalar result written as a zeroed register plus a 4- or 8-byte store (`a64_vset64(v,0); memcpy(&v[0],&r,n)`: FNEG,
+  FABS, FMOV, FCVT...): `a64_vset_lo4f` / `a64_vset_lo8f`, one store.
+- Sites in the hot pieces: FMUL 15,288, FMA 12,461, FADD 4,759, FSUB 4,101, FDIV 2,378, LDR S 17,714, LDR D 1,602, LDP S
+  4,452, LDR Q 13,495, scalar writes 8,619. Every game patch (oot_patches) still applies (the same 14 places).
+
+### `A64_LR_SCALAR=1` (finding 5)
+
+In `op_text`, the frame record's `STP x29, x30, [sp, ...]` (`recomp_stp64_sp(c, ..., c->x[29], c->x[30])`) becomes
+`recomp_stp64_lr`, which passes LR through an empty asm (`"+r"`): the SLP vectorizer can no longer merge the two context
+reads into one 16- or 32-byte load. The guest stores are the same two 8-byte stores. (`MG_PLAIN` knows the new name, so mark
+grouping treats it like `recomp_stp64_sp`.)
+
+### Equivalence (`engine/tests/test_fpx_xmm.py` + `fpx_xmm_test.c`)
+
+34 guest words and sequences, lifted with the switches off and on, compiled in one file against the switches' header and the
+build's own guest model (nx2/rtgen: 64-bit window, soft write watch, polls), run on random registers, random guest memory
+(aligned and unaligned addresses) and random FPCR / FPSR (FZ, DN, rounding modes, other control bits, the host inhibit
+bit), comparing the whole Ctx and the guest memory; at x86-64-v3 and x86-64-v2. The sequences chain ops through the register
+the previous one wrote (as a lane and as a whole). 1 M runs a -march: 0 mismatches. Teeth (by hand, 200 k runs): the add's
+FZ sum test dropped: 447 mismatches; the FNMUL negation dropped: 12,861; `a64_vld32` loading 8 bytes: 31,735; the FMA's
+FZ addend test dropped: 224 at v3. `test_vfpx_elem`, `test_fpx_slowpath`, `test_fpx_sticky`, `test_mark_groups` pass;
+run_all (laptop): 235 pass, 2 fail (both from main's TICK-053 merge: test_parallel_rb_refresh, test_present_semaphores).
+
+### Micro-benchmarks (`tools/bench/lifter_mb/lifter_mb.py`, both switches, ns per guest instruction)
+
+| kernel | laptop (Zen 2) base | new | |
+|---|---:|---:|---:|
+| FMUL / FADD / FMADD / FSUB S chain | 4.14 | 1.60 | -61% |
+| vec3 dot from memory | 1.08 | 0.91 | -16% |
+| FDIV S -> FMUL S chain | 4.78 | 2.29 | -52% |
+| FNEG S -> FADD .4S -> FNEG S | 3.04 | 1.45 | -52% |
+| LDR S -> FADD S -> STR S | 2.07 | 1.19 | -43% |
+| LDR Q -> FADD .4S | 4.26 | 2.11 | -51% |
+
+Static, one hot piece (code_hot_7, -O2, no profile): GPR -> XMM moves 25,605 -> 10,441; XMM -> GPR 9,186 -> 24,092 (the
+keep tests' copies of the result bits, off the data path); `vpinsr*` 1,278 -> 1,026; `vextractps`/`vpextr*` 4,889 -> 3,239;
+instructions +0.7%, object -0.07%.
