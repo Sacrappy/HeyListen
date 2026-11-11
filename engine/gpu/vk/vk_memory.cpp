@@ -1622,6 +1622,16 @@ bool precopy_grow(std::unique_lock<std::mutex>& lk) {
     pre.st_grown++;
     return true;
 }
+// (HeyListen, TICK-054) RX_VK_PRECOPY_KICK=1 (with RX_VK_CAPTURE_PRECOPY=1): the thread copies once per kick from the host
+// (mkwvk_precopy_kick, called when the game's main thread leaves its end-of-frame wait: the job threads' writes of the
+// frame are final then and the main thread's draw code and submits are still 2-4 ms away), not on the 250 us timer whose
+// rounds during the job threads' work cost more than they saved (TICK-043). The copies then run while the job threads idle.
+bool precopy_kick_on() {
+    static const bool v = getenv("RX_VK_PRECOPY_KICK") && atoi(getenv("RX_VK_PRECOPY_KICK")) != 0;
+    return v;
+}
+HANDLE precopy_kick_event = nullptr;
+std::atomic<int64_t> st_precopy_kicks{0};
 void precopy_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk capture pre-copy");
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -1636,7 +1646,8 @@ void precopy_main() {
     for (;;) {
         LARGE_INTEGER due;
         due.QuadPart = -(LONGLONG)precopy_period_us() * 10;
-        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+        if (precopy_kick_on() && precopy_kick_event) WaitForSingleObject(precopy_kick_event, INFINITE);   // (TICK-054: a kick a frame)
+        else if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
         else Sleep(1);
         if (pre.stop.load(std::memory_order_relaxed)) continue;
         {
@@ -1712,6 +1723,7 @@ void precopy_take(PreTaken& t) {
     std::lock_guard lk(pre.mu);
     if (!pre.started) {
         pre.started = true;
+        if (precopy_kick_on()) precopy_kick_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         std::thread(precopy_main).detach();
     }
     t.pages.swap(pre.pages), t.done.swap(pre.done), t.ok.swap(pre.ok);
@@ -4792,6 +4804,17 @@ void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, in
 
 // (TICK-015) a second export, resolved by host/rx_backend.c if present: a game pool made, with its NVNmemoryPoolFlags (outside
 // MkwVkRenderer, whose header (vk_api.h) is in the shader caches' stamp)
+/// (TICK-054) the host's kick of the pre-copy thread (RX_VK_PRECOPY_KICK=1): host/rx_backend.c rx_precopy_kick
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void mkwvk_precopy_kick(void) {
+    using namespace mkwvk;
+    if (precopy_kick_event) SetEvent(precopy_kick_event), st_precopy_kicks.fetch_add(1, std::memory_order_relaxed);
+}
 #ifdef _WIN32
 extern "C" __declspec(dllexport) void mkwvk_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
 #else

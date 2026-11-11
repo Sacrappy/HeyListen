@@ -210,6 +210,9 @@ static const MkwVkHost vk_host = {
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
+static void (*vk_precopy_kick)(void);   /* (TICK-054) the renderer's pre-copy thread kicked (RX_VK_PRECOPY_KICK=1) */
+/* (TICK-054) HOS_PRECOPY_KICK=1 (host/nn_os_sync.c): the capture's pre-copy thread starts a round now */
+void rx_precopy_kick(void) { if (vk_precopy_kick) vk_precopy_kick(); }
 static HMODULE vk_module;   /* (the last back end loaded: rx_close_asked) */
 
 /* The game registers its first textures and samplers before the window's thread starts the renderer (NVN is up
@@ -293,6 +296,7 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
     vk_module = m;
     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
     vk_pool_flags = (void (*)(uint64_t, uint64_t, uint32_t))(void *)GetProcAddress(m, "mkwvk_pool_flags");   /* (TICK-015; optional) */
+    vk_precopy_kick = (void (*)(void))(void *)GetProcAddress(m, "mkwvk_precopy_kick");   /* (TICK-054; optional) */
     const MkwVkRenderer *r = init ? init(&vk_host) : NULL;
     if (!r || r->version != MKWVK_API_VERSION) {
         hos_log("rx: the Vulkan back end did not start: WebGPU");

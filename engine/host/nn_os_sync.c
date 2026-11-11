@@ -832,12 +832,23 @@ static int prof_gate_match(Ctx *c) {
     }
     return on && c->x[30] == lr && strstr(hos_thread_name(hos_self()), thread) != NULL;
 }
+/* (HeyListen, TICK-054) HOS_PRECOPY_KICK=1: when the game's main thread leaves its end-of-frame wait (OoT's f_83acfb90,
+   lr 0x83acfcf4: the last BaseProc stage is done, every job thread's writes of the frame are final, and the main thread's
+   draw code and its submits are still 2-4 ms away), the renderer's capture pre-copy thread is kicked (rx_backend.c
+   rx_precopy_kick, with RX_VK_CAPTURE_PRECOPY=1 RX_VK_PRECOPY_KICK=1): the frame's pages are copied while the job threads
+   idle, and the submit copies only what was written since. */
+static int precopy_kick_lr(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("HOS_PRECOPY_KICK") && atoi(getenv("HOS_PRECOPY_KICK")) != 0;
+    return v;
+}
 HLE(_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE) {
     who_note_wait(c, ARG(0));
     const int gate = prof_gate_match(c);
     if (gate) __atomic_add_fetch(&hos_prof_gate, 1, __ATOMIC_SEQ_CST);
     logged_wait(c, obj(ARG(0), K_EVENT), 0, 0, "light");
     if (gate) __atomic_sub_fetch(&hos_prof_gate, 1, __ATOMIC_SEQ_CST);
+    if (c->x[30] == 0x83acfcf4ULL && precopy_kick_lr()) { void rx_precopy_kick(void); rx_precopy_kick(); }
 }
 HLE(_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE) {
     RET(event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0));
