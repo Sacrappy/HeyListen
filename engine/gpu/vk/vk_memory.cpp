@@ -2174,7 +2174,12 @@ int late_diff_runs(const uint8_t* now, const uint8_t* shadow, uint32_t* off, uin
 // and the replay goes on recording. Nothing that reads the capture buffer reaches the GPU before the fix: until it is applied
 // every recording is held back (vk_replay.cpp submit_recording, the batched path), and every submit and flush applies the
 // pending fixes first (queue_flush_locked: a wait for the value, then the same copies the take made after its wait: the late
-// pages from guest memory into their slots). A thread of its own (vk_replay.cpp late_fix_main) waits for the value and applies
+// pages from guest memory into their slots); a thread that has to send something waits for the value before it takes the
+// queue's lock (late_fix_wait_unlocked), and a poll of a fence neither waits nor flushes (what is held is not done anyway: a
+// poll of the main thread's that waited under the lock held up the Presentation Thread 7.5 ms a frame in the first try). The
+// CPU's own readers of a capture buffer (a replay read as submitted, the mirror sync's chunk hashes) ask late_fix_slot_pending:
+// a read waits for the value and reads guest memory, a sync copies the page whole and keeps no hash of it. A thread of its own
+// (vk_replay.cpp late_fix_main) waits for the value and applies
 // the fix and sends the held recordings as soon as it is reached, so the GPU gets the new frame when the old one ends, as it
 // did, with the CPU's recording done meanwhile. What the GPU reads is what the take's copies after the wait gave: the same
 // bytes, copied at the same moment (the value's end), by another thread. Not deferred, as before: a late value not yet sent
