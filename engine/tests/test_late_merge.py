@@ -58,7 +58,7 @@ def check_source(src):
     for needle in (
             # (the switch, and the wait as the off path)
             'static const bool v = getenv("RX_VK_LATE_MERGE") && atoi(getenv("RX_VK_LATE_MERGE")) != 0;',
-            "if (!late_merge) {\n            st_late_waited.fetch_add(1, std::memory_order_relaxed);",
+            "if (!late_merge && !late_defer) {\n            st_late_waited.fetch_add(1, std::memory_order_relaxed);",   # (TICK-060: or deferred, RX_VK_LATE_DEFER)
             "std::lock_guard sl(pools_mu);\n            late_merge = true;",
             "vk_timeline_wait(c->late_value);",
             # (no wait only when every late page has a shadow of its mirror; else one wanted for each)
