@@ -48,6 +48,7 @@
 #include "host_shaders/bc_encoder_comp_spv.h"
 #include "shaders/astc_bc_encode_comp_spv.h"
 #include "bc_levels.h"
+#include "msync_diff.h"   // (TICK-051: the BC cache's content hash)
 #include "astc_bc_policy.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
@@ -357,6 +358,22 @@ thread_local bool up_used = false;
 thread_local uint64_t tl_seg = 0;
 uint32_t epoch = 0;
 int64_t st_uploads, st_astc, st_bytes;
+// (TICK-051, RX_VK_FRAME_TRACE=1) the ASTC transcodes of storage transcoded before (the same address, size, layers and
+// format: a texture the game made again), and the texels transcoded, for the frame trace
+std::atomic<int64_t> st_astc_again{0}, st_astc_texels{0};
+void astc_trace_note(const Texture& tex) {
+    static const bool on = getenv("RX_VK_FRAME_TRACE") && atoi(getenv("RX_VK_FRAME_TRACE")) != 0;
+    if (!on) return;
+    uint64_t texels = 0;
+    for (uint32_t l = 0; l < tex.levels; l++)
+        texels += (uint64_t)std::max(1u, tex.width >> l) * std::max(1u, tex.height >> l);
+    st_astc_texels.fetch_add((int64_t)(texels * tex.layers), std::memory_order_relaxed);
+    static std::mutex mu;
+    static std::unordered_set<uint64_t> seen;
+    const uint64_t key = tex.gpu * 0x9E3779B97F4A7C15ull ^ ((uint64_t)tex.width << 40 | (uint64_t)tex.height << 20 | tex.layers) * 0xBF58476D1CE4E5B9ull ^ tex.nvn_format;
+    std::lock_guard lk(mu);
+    if (!seen.insert(key).second) st_astc_again.fetch_add(1, std::memory_order_relaxed);
+}
 
 VkCommandBuffer upload_cmd() {
     if (!up_used) {
@@ -563,6 +580,7 @@ constexpr uint32_t kBcDim = 2048, kBcLayers = 8;   // the scratch: the largest l
 VkImage bc_scratch = VK_NULL_HANDLE;
 VmaAllocation bc_scratch_alloc = nullptr;
 VkImageView bc_scratch_view = VK_NULL_HANDLE;
+VkImageView bc_layer_views[8] = {};   // (TICK-051: one view a scratch layer, for the batched transcodes; kBcLayers of them)
 VkBuffer bc_out = VK_NULL_HANDLE;
 VmaAllocation bc_out_alloc = nullptr;
 bool bc_scratch_fresh = false;   // (its layout still to be set, in the next upload command buffer)
@@ -614,6 +632,10 @@ bool bc_scratch_make() {   // (bc_mu held)
         destroy_image(bc_scratch, bc_scratch_alloc);
         bc_scratch = VK_NULL_HANDLE, bc_scratch_view = VK_NULL_HANDLE;
         return false;
+    }
+    for (uint32_t j = 0; j < kBcLayers; j++) {   // (TICK-051: a view a layer; one that fails leaves the batched path off)
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, j, 1};
+        if (vkCreateImageView(dev.device, &vi, nullptr, &bc_layer_views[j]) != VK_SUCCESS) bc_layer_views[j] = VK_NULL_HANDLE;
     }
     bc_scratch_fresh = true;
     bc_have = true;
@@ -925,6 +947,8 @@ void bc_scratch_idle() {
     std::lock_guard lk(bc_mu);
     if (!bc_have || std::chrono::steady_clock::now() - bc_used_at < std::chrono::seconds(bc_idle_s())) return;
     Dead d{bc_last_value, bc_scratch, bc_scratch_alloc, {bc_scratch_view}, {}};
+    for (VkImageView& v : bc_layer_views)
+        if (v) d.views.push_back(v), v = VK_NULL_HANDLE;
     d.buffer = bc_out, d.buffer_alloc = bc_out_alloc;
     dead.push_back(std::move(d));
     bc_scratch = VK_NULL_HANDLE, bc_scratch_alloc = nullptr, bc_scratch_view = VK_NULL_HANDLE, bc_out = VK_NULL_HANDLE, bc_out_alloc = nullptr;
@@ -1039,6 +1063,85 @@ VkImageView astc_level_view(Texture* tex, uint32_t level, uint32_t layer) {
     return v;
 }
 
+/// (TICK-051) RX_VK_ASTC_BATCH (on; =0: one piece at a time, as before): an ASTC texture kept as BC1 / BC7 is decoded, encoded and copied up to kBcLayers (level, layer)
+/// pieces at a time, each piece in a scratch layer of its own and a part of the encoder's buffer of its own, with three full
+/// barriers a group instead of three a piece. The same dispatches with the same inputs as one piece at a time (the decoder
+/// writes layer 0 of a one-layer view, the encoder reads it there and writes at an offset): the same blocks. A 512 x 512
+/// texture of 10 levels drained the GPU 30 times; walking in the Market, 30-60 of them a frame waited the game's next frame.
+bool astc_batch_on() {
+    static const bool v = getenv("RX_VK_ASTC_BATCH") ? atoi(getenv("RX_VK_ASTC_BATCH")) != 0 : true;
+    return v;
+}
+/// A (level, layer) piece of a batched transcode: where its ASTC blocks are in the staged bytes, the decoder's constants, the
+/// level's size
+struct AstcPiece { uint32_t level, layer, iw, ih; uint64_t from; AstcPush pc; uint32_t gx, gy; };
+std::vector<AstcPiece> astc_pieces(const Texture& tex, const std::vector<uint32_t>& layers, uint64_t tail, uint64_t tail0,
+                                   uint64_t align);
+struct BcCacheEntry;
+void astc_bc_batched(VkCommandBuffer cmd, Texture& tex, const std::vector<AstcPiece>& pieces, uint64_t staged, const Staging& s,
+                     BcCacheEntry* store);
+
+// ---- (TICK-051) RX_VK_BC_CACHE_MB=<MB> (1024 by default; 0: off): the BC blocks of transcoded ASTC textures kept in system memory, by their ASTC bytes ----
+// The textures over the budget are evicted once unused for 60 frames, and walking brings them back: 82% of the Market walk's
+// ASTC transcodes were of storage transcoded before, 1.2-1.8 ms of GPU each on an RTX 3050. A transcode (batched path) also
+// copies its blocks into a buffer in system memory (host-cached, not VRAM), kept under the key of the texture's shape and a hash
+// of the ASTC bytes it read; a texture made again whose bytes hash the same has the blocks copied into its image from there,
+// with no decode and no encode. The same blocks: the key holds everything the decoder and encoder read (the bytes, the pieces'
+// constants and sizes, the format). Least recently used entries go past the cap. It needs the batched path (RX_VK_ASTC_BATCH).
+// Its cost: up to the cap of system memory (the Market walk filled ~900 MB)
+struct BcCacheEntry {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    uint64_t bytes = 0, last_value = 0, tick = 0;
+};
+std::mutex bcc_mu;
+std::unordered_map<uint64_t, BcCacheEntry> bcc;   // (bcc_mu)
+std::vector<BcCacheEntry> bcc_dead;               // (bcc_mu; freed once the GPU is done with them)
+uint64_t bcc_bytes = 0, bcc_tick = 0;
+std::atomic<int64_t> st_bcc_hits{0}, st_bcc_stores{0}, st_bcc_hit_bytes{0};
+uint64_t bcc_cap() {
+    static const uint64_t v = (uint64_t)(getenv("RX_VK_BC_CACHE_MB") ? std::max(0, atoi(getenv("RX_VK_BC_CACHE_MB"))) : 1024) << 20;
+    return v;
+}
+uint64_t bcc_fold(uint64_t h, uint64_t v) { return msync_diff::fmix64((h ^ v) + 0x9E3779B97F4A7C15ull); }
+uint64_t bcc_bytes_hash(uint64_t h, const uint8_t* p, uint64_t n) {
+    uint64_t i = 0;
+    for (; i + 256 <= n; i += 256) h = bcc_fold(h, msync_diff::chunk_hash(p + i));
+    if (i < n) {
+        uint8_t t[256] = {};
+        std::memcpy(t, p + i, (size_t)(n - i));
+        h = bcc_fold(h, msync_diff::chunk_hash(t));
+    }
+    return bcc_fold(h, n);
+}
+/// The bytes of all the pieces' blocks, in their order
+uint64_t bcc_size(const Texture& tex, const std::vector<AstcPiece>& pieces) {
+    const uint64_t bb = bc_mode(tex.format) == 1 ? 8 : 16;
+    uint64_t n = 0;
+    for (const AstcPiece& p : pieces) n += (uint64_t)((p.iw + 3) / 4) * ((p.ih + 3) / 4) * bb;
+    return n;
+}
+/// Entries past the cap go, least recently used first (bcc_mu held)
+void bcc_trim_locked() {
+    while (bcc_bytes > bcc_cap() && !bcc.empty()) {
+        auto old = bcc.begin();
+        for (auto it = bcc.begin(); it != bcc.end(); ++it)
+            if (it->second.tick < old->second.tick) old = it;
+        bcc_bytes -= old->second.bytes;
+        bcc_dead.push_back(old->second);
+        bcc.erase(old);
+    }
+}
+/// (texture_frame) the entries let go once the GPU is done with them
+void bcc_free_done(uint64_t completed) {
+    std::lock_guard lk(bcc_mu);
+    for (auto it = bcc_dead.begin(); it != bcc_dead.end();) {
+        if (it->last_value > completed) { ++it; continue; }
+        destroy_buffer(it->buf, it->alloc);
+        it = bcc_dead.erase(it);
+    }
+}
+
 /// ASTC decoded on the GPU (Eden's decoder): the layers dirty overlaps (all of them without dirty), each layer's
 /// levels from the first one the image keeps (a texture that leaves out its top levels stages only the tail of
 /// every layer's chain: Eden's AssembleInto does the same)
@@ -1053,6 +1156,57 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         if (overlaps(dirty, (uint64_t)layer * layer_size + tail0, (uint64_t)(layer + 1) * layer_size)) layers.push_back(layer);
     if (layers.empty()) return true;
     const bool all = layers.size() == tex.layers;
+    // (TICK-051) the BC cache: a whole upload of a texture the batched path transcodes, looked up by its bytes
+    const uint64_t align0 = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
+    const bool cache_this = bcc_cap() && astc_batch_on() && all && tex.bc && !tex.bc_resized && bc_mode(tex.format) != 3;
+    uint64_t cache_key = 0;
+    std::vector<AstcPiece> pieces;
+    if (cache_this) {
+        pieces = astc_pieces(tex, layers, tail, tail0, align0);
+        uint64_t h = bcc_fold(bcc_fold(bcc_fold(0x42434361636865ull, (uint64_t)tex.format), (uint64_t)tex.width << 32 | tex.height),
+                              (uint64_t)tex.layers << 32 | tex.levels);
+        for (const AstcPiece& pc : pieces) {
+            h = bcc_fold(h, (uint64_t)pc.level << 32 | pc.layer);
+            h = bcc_fold(h, pc.from);
+            h = bcc_bytes_hash(h, (const uint8_t*)&pc.pc, sizeof pc.pc);
+        }
+        std::vector<uint8_t> hs;
+        for (size_t k = 0; k < layers.size(); k++) {
+            const uint64_t at = (uint64_t)layers[k] * layer_size + tail0;
+            if (at >= total) { h = bcc_fold(h, ~0ull); continue; }
+            const uint64_t n = std::min(tail, total - at);
+            h = bcc_bytes_hash(h, guest_bytes(tex.gpu + at, n, hs), n);
+        }
+        cache_key = h | 1;
+        BcCacheEntry hit;
+        {
+            std::lock_guard lk(bcc_mu);
+            auto it = bcc.find(cache_key);
+            if (it != bcc.end() && it->second.bytes == bcc_size(tex, pieces)) {
+                it->second.tick = ++bcc_tick;
+                it->second.last_value = std::max(it->second.last_value, rec_value);
+                hit = it->second;
+            }
+        }
+        if (hit.buf) {
+            VkCommandBuffer cmd = upload_cmd();
+            GprofSpan gp_hit(cmd, "astc from the BC cache (copies)");
+            gp_hit.bytes = hit.bytes;
+            const uint64_t bb = bc_mode(tex.format) == 1 ? 8 : 16;
+            std::vector<VkBufferImageCopy> regions;
+            uint64_t at = 0;
+            for (const AstcPiece& pc : pieces) {
+                regions.push_back(VkBufferImageCopy{at, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, pc.level, pc.layer, 1}, {0, 0, 0}, {pc.iw, pc.ih, 1}});
+                at += (uint64_t)((pc.iw + 3) / 4) * ((pc.ih + 3) / 4) * bb;
+            }
+            full_barrier(cmd);
+            vkCmdCopyBufferToImage(cmd, hit.buf, tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)regions.size(), regions.data());
+            full_barrier(cmd);
+            st_bcc_hits.fetch_add(1, std::memory_order_relaxed);
+            st_bcc_hit_bytes.fetch_add((int64_t)hit.bytes, std::memory_order_relaxed);
+            return true;
+        }
+    }
     const Staging s = staging(tail * layers.size(), std::max<uint64_t>(256, dev.props.limits.minStorageBufferOffsetAlignment));
     if (!s.buffer) return false;
     std::vector<uint8_t> scratch;
@@ -1082,10 +1236,39 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         }
     }
     VkCommandBuffer cmd = upload_cmd();
+    GprofSpan gp_astc(cmd, "astc transcode (decode, BC encode, copies)");   // (TICK-051, RX_VK_PASS_TIMING: the whole of it, one span)
+    gp_astc.bytes = staged;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
     if (tex.bc) {   // (decoded into the scratch a run of consecutive layers at a time, re-encoded, copied in)
         if (!bc_scratch_layout(cmd, tex.bc_resized)) return false;
+        if (astc_batch_on() && !tex.bc_resized && bc_mode(tex.format) != 3 && bc_layer_views[kBcLayers - 1]) {
+            if (pieces.empty()) pieces = astc_pieces(tex, layers, tail, tail0, align);
+            BcCacheEntry entry;   // (TICK-051: a whole one with no alpha found for a BC1 image: its blocks kept)
+            if (cache_key && !alpha) {
+                entry.bytes = bcc_size(tex, pieces);
+                MemKindScope mem_kind_(MemKind::Staging);
+                if (!create_buffer_cached(entry.bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, entry.buf,
+                                          entry.alloc, nullptr))
+                    entry = BcCacheEntry{};
+            }
+            astc_bc_batched(cmd, tex, pieces, staged, s, entry.buf ? &entry : nullptr);
+            if (entry.buf) {
+                std::lock_guard lk(bcc_mu);
+                entry.last_value = rec_value, entry.tick = ++bcc_tick;
+                auto [it, fresh] = bcc.emplace(cache_key, entry);
+                if (!fresh) {   // (another thread's of the same bytes meanwhile: one kept)
+                    bcc_dead.push_back(entry);
+                } else {
+                    bcc_bytes += entry.bytes;
+                    st_bcc_stores.fetch_add(1, std::memory_order_relaxed);
+                    bcc_trim_locked();
+                }
+            }
+            st_astc++;
+            astc_trace_note(tex);
+            return true;
+        }
         for (uint32_t level = 0; level < tex.levels; level++) {
             const LevelGeo g = level_geo(tex, level);
             const uint64_t off = g.offset - tail0;
@@ -1130,6 +1313,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             }
         }
         st_astc++;
+        astc_trace_note(tex);
         return true;
     }
     for (uint32_t level = 0; level < tex.levels; level++) {
@@ -1162,7 +1346,104 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         }
     }
     st_astc++;
+    astc_trace_note(tex);
     return true;
+}
+
+std::vector<AstcPiece> astc_pieces(const Texture& tex, const std::vector<uint32_t>& layers, uint64_t tail, uint64_t tail0,
+                                   uint64_t align) {
+    std::vector<AstcPiece> pieces;
+    for (uint32_t level = 0; level < tex.levels; level++) {
+        const LevelGeo g = level_geo(tex, level);
+        const uint64_t off = g.offset - tail0;
+        if (g.offset < tail0 || off >= tail || (off % align)) continue;
+        AstcPiece pc0{};
+        pc0.level = level;
+        pc0.iw = std::max(1u, tex.width >> level), pc0.ih = std::max(1u, tex.height >> level);
+        AstcPush& pc = pc0.pc;
+        pc.block_dims[0] = (uint32_t)tex.block_w, pc.block_dims[1] = (uint32_t)tex.block_h;
+        pc.layer_stride = (uint32_t)tail;
+        const uint32_t gobs_x = (g.tw * 16 + 63) >> 6;
+        pc.x_shift = 9 + g.tile_h + g.tile_d;
+        pc.block_size = gobs_x << pc.x_shift;
+        pc.block_height = g.tile_h;
+        pc.block_height_mask = (1u << g.tile_h) - 1;
+        pc.native_tiling = 1;
+        pc0.gx = (g.tw + 7) / 8, pc0.gy = (g.th + 7) / 8;
+        for (size_t k = 0; k < layers.size(); k++) {
+            AstcPiece p = pc0;
+            p.layer = layers[k];
+            p.from = k * tail + off;
+            pieces.push_back(p);
+        }
+    }
+    return pieces;
+}
+
+void astc_bc_batched(VkCommandBuffer cmd, Texture& tex, const std::vector<AstcPiece>& pieces, uint64_t staged, const Staging& s,
+                     BcCacheEntry* store) {
+    const uint32_t mode = bc_mode(tex.format);
+    const uint64_t block_bytes = mode == 1 ? 8 : 16;
+    const uint64_t out_cap = (uint64_t)(kBcDim / 4) * (kBcDim / 4) * kBcLayers * 16;
+    uint64_t stored = 0;   // (TICK-051: where the group's blocks go in the cache entry)
+    for (size_t i0 = 0; i0 < pieces.size();) {
+        // (a group: up to kBcLayers pieces whose blocks fit the encoder's buffer together)
+        size_t i1 = i0;
+        uint64_t used = 0;
+        while (i1 < pieces.size() && i1 - i0 < kBcLayers) {
+            const uint64_t b = (uint64_t)((pieces[i1].iw + 3) / 4) * ((pieces[i1].ih + 3) / 4) * block_bytes;
+            if (i1 > i0 && used + b > out_cap) break;
+            used += b, i1++;
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
+        for (size_t i = i0; i < i1; i++) {
+            const AstcPiece& p = pieces[i];
+            VkDescriptorBufferInfo bi{s.buffer, s.offset + p.from, staged - p.from};
+            VkDescriptorImageInfo ii{VK_NULL_HANDLE, bc_layer_views[i - i0], VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[0].pBufferInfo = &bi;
+            w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[1].pImageInfo = &ii;
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_layout, 0, 2, w);
+            vkCmdPushConstants(cmd, astc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p.pc, &p.pc);
+            vkCmdDispatch(cmd, p.gx, p.gy, 1);
+        }
+        full_barrier(cmd);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc17_pipe);
+        descriptors_disturbed();
+        std::vector<VkDeviceSize> at(i1 - i0);
+        uint64_t blocks = 0;
+        for (size_t i = i0; i < i1; i++) {
+            const AstcPiece& p = pieces[i];
+            VkDescriptorImageInfo ii{VK_NULL_HANDLE, bc_layer_views[i - i0], VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorBufferInfo bi{bc_out, 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet wr[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            wr[0].dstBinding = 0, wr[0].descriptorCount = 1, wr[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            wr[0].pImageInfo = &ii;
+            wr[1].dstBinding = 1, wr[1].descriptorCount = 1, wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[1].pBufferInfo = &bi;
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_layout, 0, 2, wr);
+            const BcPush pc{(p.iw + 3) / 4, (p.ih + 3) / 4, p.iw, p.ih, mode, (uint32_t)blocks};
+            vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            vkCmdDispatch(cmd, (pc.blocks_x + 7) / 8, (pc.blocks_y + 7) / 8, 1);
+            at[i - i0] = blocks * block_bytes;
+            blocks += (uint64_t)pc.blocks_x * pc.blocks_y;
+        }
+        full_barrier(cmd);
+        for (size_t i = i0; i < i1; i++) {
+            const AstcPiece& p = pieces[i];
+            const VkBufferImageCopy c{at[i - i0], 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, p.level, p.layer, 1}, {0, 0, 0}, {p.iw, p.ih, 1}};
+            vkCmdCopyBufferToImage(cmd, bc_out, tex.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        }
+        if (store && blocks) {   // (TICK-051: and into the cache entry, in the pieces' order)
+            const VkBufferCopy bcp{0, stored, blocks * block_bytes};
+            vkCmdCopyBuffer(cmd, bc_out, store->buf, 1, &bcp);
+            stored += blocks * block_bytes;
+        }
+        full_barrier(cmd);   // (the scratch and the buffer are the next group's)
+        i0 = i1;
+    }
 }
 
 // ---- big block-linear textures unswizzled on the GPU (Eden's block_linear_unswizzle_2d.comp, GPL, with the Switch
@@ -3528,6 +3809,15 @@ Texture* texture_for_present(const nvn_tex* t) {
 
 void texture_frame(uint64_t completed) {
     upload_frame_report();
+    if (bcc_cap()) {   // (TICK-051: the BC cache's entries let go, and every 600 frames what it did)
+        bcc_free_done(completed);
+        if (frame_no % 600 == 0) {
+            std::lock_guard lk(bcc_mu);
+            logf("vk: BC cache (RX_VK_BC_CACHE_MB): %zu entries, %llu MB; %lld textures from it (%llu MB copied), %lld stored, so far",
+                 bcc.size(), (unsigned long long)(bcc_bytes >> 20), (long long)st_bcc_hits.load(),
+                 (unsigned long long)(st_bcc_hit_bytes.load() >> 20), (long long)st_bcc_stores.load());
+        }
+    }
     frame_upload_ns.store(0, std::memory_order_relaxed);
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
         // (the views and descriptor sets resolved to the placeholder this frame go stale, as when textures go: the next frame
@@ -4264,6 +4554,9 @@ size_t texture_count() {
 }
 uint64_t texture_bytes() {
     return total_bytes;
+}
+void texture_trace_counts(int64_t* astc_again, int64_t* astc_texels) {
+    *astc_again = st_astc_again.load(std::memory_order_relaxed), *astc_texels = st_astc_texels.load(std::memory_order_relaxed);
 }
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded) {
     *uploads = st_uploads, *astc_gpu = st_astc, *bytes_uploaded = st_bytes;

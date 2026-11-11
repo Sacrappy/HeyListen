@@ -199,6 +199,8 @@ void pass_start_barrier(VkCommandBuffer cmd);
 /// Pass starts with the fragment-stage barrier, since the start
 int64_t pass_barriers_relaxed();
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
+/// (TICK-051, RX_VK_FRAME_TRACE=1) ASTC transcodes of storage transcoded before, and the texels transcoded (running totals)
+void texture_trace_counts(int64_t* astc_again, int64_t* astc_texels);
 /// (hookshot) whether texture_read_texels' walk of r at that row stride (0: the region's own) and its own image stride
 /// stays within avail bytes of the data it is given (overflow-checked: the stride is the game's)
 bool texels_fit(const nvn_tex* t, const NVNcopyRegion* r, uint64_t row, uint64_t avail);

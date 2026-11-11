@@ -3076,8 +3076,21 @@ void status_tick() {
         std::string dir(exe, n);
         FILE* f = fopen((dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_frames.csv").c_str(), "w");
         if (f) fprintf(f, "frame,ms,pipe_waits,pipe_wait_ms,left_out,translate_ms,uploads,upload_mb,textures,memsync_ms,pipelines_ms,"
-                          "uploads_ms,programs_ms,slot_wait_ms,gpu_behind_ms,draw_ms,desc_ms,cmds_ms,tex_lookup_ms,textures_gone\n");
+                          "uploads_ms,programs_ms,slot_wait_ms,gpu_behind_ms,draw_ms,desc_ms,cmds_ms,tex_lookup_ms,textures_gone,"
+                          // (TICK-051: the time since launch, the GPU's time, the captures' waits for late pages, the submits'
+                          // and presents' own time, the driver's submit, ASTC transcodes, textures made, the scatter's bytes, VRAM)
+                          "t_s,gpu_ms,late_wait_ms,late_waits,submit_ms,present_ms,qsubmit_ms,dispatch_ms,astc,tex_made,scatter_mb,"
+                          "vram_mb,astc_again,astc_mtexels\n");
         return f;
+    }();
+    // (TICK-051) seconds since the process started, for the bench's 66 s cut: the steady clock's offset from the creation time
+    static const int64_t launch_offset_ns = [&] {
+        if (!trace) return (int64_t)0;
+        FILETIME c, e, k, u, now;
+        if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return (int64_t)0;
+        GetSystemTimePreciseAsFileTime(&now);
+        const auto ft = [](const FILETIME& f) { return (int64_t)(((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime); };
+        return (ft(now) - ft(c)) * 100 - now_ns;
     }();
     if (trace && last_ns) {
         static int64_t l_ps, l_pw, l_up, l_upb, l_wait, l_prof[PROF_COUNT];
@@ -3090,11 +3103,27 @@ void status_tick() {
         const auto dp = [](int i) { return (prof_ns[i] - l_prof[i]) / 1e6; };
         static uint64_t l_gone;
         const uint64_t gone = texture_destroy_generation();
-        fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu\n",
+        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc;
+        static uint64_t l_made_t;
+        int64_t late_ns = 0, late_n = 0, sc = 0;
+        memory_trace_counts(&late_ns, &late_n, &sc);
+        static int64_t l_again, l_texels;
+        int64_t again = 0, texels = 0;
+        texture_trace_counts(&again, &texels);
+        const uint64_t made = texture_made();
+        uint64_t vused = 0, vallowed = 0;
+        vram_usage_now(&vused, &vallowed);
+        fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
+                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f\n",
                 (unsigned long long)frames, (now_ns - last_ns) / 1e6, (long long)(pw - l_pw), pwms - l_pwms, (long long)(ps - l_ps),
                 tr - l_tr, (long long)(up - l_up), (upb - l_upb) / 1048576.0, texture_count(), dp(PROF_MEMSYNC), dp(PROF_PIPE),
                 dp(PROF_UPLOAD), dp(PROF_PROGRAM), dp(PROF_SLOTWAIT), (st_wait_ns - l_wait) / 1e6, dp(PROF_DRAW), dp(PROF_DESC),
-                dp(PROF_CMDS), dp(PROF_TEXGET), (unsigned long long)(gone - l_gone));
+                dp(PROF_CMDS), dp(PROF_TEXGET), (unsigned long long)(gone - l_gone),
+                (now_ns + launch_offset_ns) / 1e9, (st_gpu_ns - l_gpu_t) / 1e6, (late_ns - l_late_ns) / 1e6, (long long)(late_n - l_late_n),
+                dp(PROF_SUBMIT), dp(PROF_PRESENT), dp(PROF_QSUBMIT), dp(PROF_DISPATCH), (long long)(astc - l_astc),
+                (unsigned long long)(made - l_made_t), (sc - l_sc) / 1048576.0, (unsigned long long)(vused >> 20),
+                (long long)(again - l_again), (texels - l_texels) / 1e6);
+        l_gpu_t = st_gpu_ns, l_late_ns = late_ns, l_late_n = late_n, l_sc = sc, l_astc = astc, l_made_t = made; l_again = again, l_texels = texels;
         l_gone = gone;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;

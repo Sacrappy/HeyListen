@@ -996,6 +996,7 @@ std::atomic<bool> captures_seen{false};
 std::atomic<uint64_t> cap_view_gen{1};   // (bumped when a capture is published or a page is stamped: cached reads go stale)
 void cap_view_bump() { cap_view_gen.fetch_add(1, std::memory_order_release); }
 double st_tk_all, st_tk_stamp, st_tk_copy, st_tk_late, st_tk_lock;   // (memory_take_capture's parts, ms)
+std::atomic<int64_t> st_tr_late_ns{0}, st_tr_late_n{0};   // (TICK-051: the same, never reset, for the frame trace)
 int64_t st_tk_late_n;   // (the takes that waited for the GPU for their late pages)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
 // ---- texture storage in the capture ----
@@ -2034,6 +2035,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         vk_timeline_wait(c->late_value);
         st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
         st_tk_late_n++;
+        st_tr_late_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
+                                std::memory_order_relaxed);
+        st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
         uint8_t* const base = (uint8_t*)host->guest_base();
         for (uint32_t i : c->late)
             guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
@@ -4747,6 +4751,12 @@ void memory_res_log() {
     logf("vk: pipelines: %zu graphics made, %zu pipelines bound so far; %lld compute shader modules let go", g, used,
          (long long)dropped);
     mem_kinds_log();
+}
+/// (TICK-051, RX_VK_FRAME_TRACE) running totals for the frame trace: the captures' GPU waits for their late pages, and the
+/// mirror syncs' scatter bytes
+void memory_trace_counts(int64_t* late_ns, int64_t* late_n, int64_t* scatter_bytes) {
+    *late_ns = st_tr_late_ns.load(std::memory_order_relaxed), *late_n = st_tr_late_n.load(std::memory_order_relaxed);
+    *scatter_bytes = st_scatter_bytes.load(std::memory_order_relaxed);
 }
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;
