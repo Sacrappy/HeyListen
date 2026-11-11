@@ -288,6 +288,10 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
     char *slash = n ? (strrchr(path, '\\') ? strrchr(path, '\\') : strrchr(path, '/')) : NULL;   /* (linux: '/') */
     if (!slash) return NULL;
     strcpy(slash + 1, dll);
+    /* (TICK-054) RX_VK_GONE_RING on by default (=0: off): its switch is read in gpu/vk/vk_texture.cpp, which TICK-053 works on;
+       set for the back end here, before it loads, when the user has not set it (the back end and this exe share the UCRT's
+       environment: the renderer logs it at its first parallel replay) */
+    if (!getenv("RX_VK_GONE_RING")) _putenv("RX_VK_GONE_RING=1");
     HMODULE m = LoadLibraryA(path);
     if (!m) {
         hos_log("rx: RX_BACKEND=vulkan, but %s did not load (%lu): WebGPU", path, GetLastError());

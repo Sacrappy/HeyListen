@@ -2906,3 +2906,62 @@ while chain B had slack.
 their own, with chain B slack) show once HOLD=2 makes chain B critical. The main thread's two captures copy ~30 MB a frame
 (the frame's writes; 0.6 ms mean, 1.2 ms p90 each by the trace marks: the capture log's 0.27 ms is the mean over the
 Presentation Thread's small ones too) and that copy is on both chains whichever thread does it.
+
+### The renderer's marks and the frame's loop (`chainb.py`)
+
+The renderer now marks too (`jt_mark` in gpu/vk/vk_replay.cpp, through `hos_jt_mark_ext`, which the exe exports and the dll looks
+up by name: no host header in the renderer): 9/10 the replay thread waiting for a segment, 11/12 a capture made, 13/14 a dry
+pass, 15/16 a submission's memory work (the capture taken), 17-21 the parallel replay's setup points. `python -I
+tools/bench/chainb.py <jobtrace.txt>` gives, per frame, the loop below and each step's time (`tests/test_chainb.py`).
+
+With the combo the frame is **one serial loop**, not two chains: the main thread's draw code waits for the previous present
+(lr 81207a6c), then it submits (held), the held flush runs on the host thread, the Presentation Thread's first submit waits for
+it, and the present follows the PT's last submit. Castle-move, means of ~200 frames (13.6 ms with the trace):
+
+| part of the loop | ms |
+|---|---:|
+| the present's end -> the main thread's last held submit (its wait for the present, then its draw code) | 3.0 |
+| the held flush: capture made 1.36 (0.6 on the main thread in the base: here it runs beside the frame's job group), memory work 0.6 | 2.1 |
+| the Presentation Thread's four submits (three small, then one of ~7 ms) | 7.8 |
+| its last submit -> the present's end | 0.6 |
+
+Inside the PT's big submit (two parallel command buffers a frame): dry passes 1.0-1.3 ms, the mirrors synced before the segments
+0.78, the setup after it 0.2, **its own segment 2.35** (RX_VK_PARALLEL_SELF=1: the slowest of the five, the workers waiting ~0
+for it), then 0.68 waiting for the others. The rest (~2 ms) is the small command buffers recorded serially.
+
+### Screens 3-6 (castle-move, 3 interleaved runs a variant; fps / 1% low / p99)
+
+- **The pre-copy kick** (TICK-043's thread kicked once a frame when the main thread leaves its end-of-frame wait): 68.8 -> 68.2;
+  with its buffer at least 12 MB (coordinator's question: room for the main thread's captures) 68.9 -> 68.6. Not kept: the
+  thread copies only 100-300 pages a submit ahead; ~800-1000 are "given back", and that counter counts the capture stopping the
+  thread before it is through, not only a full buffer. The switches stay, off.
+- **HOS_NVN_HOLD=3** (tried, removed): the held submits' capture made on the main thread at the submit, only the replay held
+  (a renderer export pair, the captures kept in submission order). One trace: the main thread's capture took 1.26 ms there too,
+  its part of the loop grew 3.0 -> 5.9 ms (its second capture waited for the host thread's replay of the first), the flush fell
+  2.1 -> 0.55: the copy moves along the loop, it does not leave it. Not screened.
+- **Priorities** (`HOS_NVN_HOLD_PRIO=1`: the held submits' thread, `RX_VK_CAPTURE_PRIO=1`: the capture's copy helpers, above
+  normal): 68.9 -> 70.1 in screen 4, nothing in screen 6 (69.3 with against 69.8 without). Off.
+- **`RX_VK_PARALLEL_SELF=2`** (the PT also records segments no worker has started) 68.5 -> **71.6 / 36.0 / 22.7**, and
+  **`RX_VK_PARALLEL=5`** (six recorders, kMaxBatch's six segments) 68.5 -> **71.2 / 38.9 / 22.0**, every run of each above every
+  reference run (screen 5); both together 70.2 / 37.5 / 22.4 against SELF=2's 69.3 (screen 6).
+
+### Confirm and adoption (one binary, base = no switch, combo = the combo + SELF=2 + PARALLEL=5; 6 rounds, 4-6 reversed)
+
+| scene | base fps / 1% low / p99 / frame prep | combo | gain |
+|---|---|---|---:|
+| kokiri-idle | 72.3 / 45.3 / 18.9 / 8.11 | **76.1** / 47.3 / 18.6 / 6.77 | +3.8 |
+| castle-move | 68.3 / 31.8 / 24.7 / 8.80 | **70.2** / 31.2 / 24.2 / 8.49 | +1.9 |
+| hyrule-walk | 69.9 / 26.7 / 23.4 / 8.61 | **72.1** / 36.4 / 21.7 / 7.90 | +2.2 |
+
+The combo is above the base in all six rounds of every scene. **On by default since TICK-054** (each `=0` turns it off):
+`HOS_NVN_HOLD=2`, `RX_VK_PARALLEL_ROUNDS`, `RX_VK_PARALLEL_SELF=2`, `RX_VK_PARALLEL_BALANCE`, `RX_VK_PARALLEL_POINT=32` (=0:
+64), `RX_VK_PARLOCK_SPIN=4000`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_GONE_RING` (read in vk_texture.cpp, which TICK-053 works on: the
+host sets it before the back end loads, when unset); `RX_VK_PARALLEL` 5 with 16+ hardware threads, 4 from 8 (not measured on a
+6-core PC yet). Shots alike, `HOS_SPEED_LOG` ~60, saves unchanged: docs/benchmarks/2026-11-12-tick054.md.
+
+**Next**: the loop is the main thread's draw code (3.0 ms, game code) + the held flush (2.1: the capture of ~30 MB beside the job
+group, and its take) + the PT's replay (7.8: dry passes ~1.2, the mirror pre-sync 0.78 before any segment starts, then the
+segments). Levers: the mirror pre-sync off the PT's path (before the dry pass, or on a worker while the dry pass runs: it records
+into the recording's upload buffer under pools_mu); the segments started as the dry pass passes their boundaries (the boundaries
+from the last frame's profile); a smaller capture (the main thread's pages copied ahead while it runs its draw code: the
+pre-copy thread is stopped by the first capture before it is through).

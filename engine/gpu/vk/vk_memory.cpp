@@ -2201,13 +2201,13 @@ struct TlPool {
     uint64_t gen;
 };
 thread_local TlPool tl_pools[1024];   // (a parallel replay thread's: by 64 KB page, read without the lock)
-// (TICK-052) RX_VK_TL_POOLS_WIDE=1 (off by default): 16384 entries (1 GB before two pages share one) instead of 1024 (64 MB): the game's
+// (TICK-052) RX_VK_TL_POOLS_WIDE (on by default since TICK-054; =0: off): 16384 entries (1 GB before two pages share one) instead of 1024 (64 MB): the game's
 // pools lie further apart than that, and pages 64 MB apart took turns in one entry (a third of a command buffer's buffer binds went
 // to the lock, "bind page range")
 constexpr uint64_t kTlWide = 16384;
 thread_local TlPool* tl_pools_wide = nullptr;
 bool tl_wide_on() {
-    static const bool on = getenv("RX_VK_TL_POOLS_WIDE") && atoi(getenv("RX_VK_TL_POOLS_WIDE")) != 0;   // (off by default: TICK-052 not adopted)
+    static const bool on = !getenv("RX_VK_TL_POOLS_WIDE") || atoi(getenv("RX_VK_TL_POOLS_WIDE")) != 0;   // (TICK-054: on by default)
     return on;
 }
 TlPool& tl_pool_entry(uint64_t guest) {

@@ -34,7 +34,7 @@ class NvnHoldTests(unittest.TestCase):
     def test_mode_is_a_number(self):
         init = block(self.nvn, "static void held_init(void)")
         self.assertIn('getenv("HOS_NVN_HOLD")', init)
-        self.assertRegex(init, r"hold_on = e \? atoi\(e\) : 0;")
+        self.assertRegex(init, r"hold_on = e \? atoi\(e\) : 2;")   # (TICK-054: 2 by default)
         self.assertIn('getenv("HOS_NVN_HOLD_CHECK")', init)
 
     def test_presenting_thread_learned_at_the_present(self):

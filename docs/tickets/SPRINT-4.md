@@ -165,3 +165,12 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Built, off by default: `RX_VK_GONE_RING`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_PARLOCK_SPIN`, `RX_VK_PARALLEL_AFFINITY`, `RX_VK_PARALLEL_IDEAL`; split per-thread counters always on.
 - Confirm (29/36 runs, stopped for the next ticket): draw CPU -5..8%, frame prep -0.21 / +0.11 / -0.11 ms, fps inside the spread.
 - Decision: not adopted. Game folder: main build restored. Next: the program pick's slow path (needs --prepare-shaders), the touches ahead of segments.
+
+## TICK-054 (2026-11-12): the frame's critical path, and the switches that shorten it
+- Instrument: `HOS_JOBTRACE` marks for submits, presents, held submits, the GPU's progress and the renderer's steps (capture, take, dry pass, parallel setup, segment waits: `hos_jt_mark_ext`); `tools/bench/frameline.py` (per-frame gantt) and `tools/bench/chainb.py` (the loop); tests.
+- Found: base = two chains ending ~1 ms apart (main thread / Presentation Thread). With `HOS_NVN_HOLD=2` (the main thread's submits replayed by a host thread) one serial loop: present -> main draw code 3.0 -> held flush 2.1 -> PT replay 7.8 -> present 0.6. The GPU is never waited for.
+- Tried and not kept: the capture pre-copy kicked once a frame (also with a 12 MB buffer), HOLD=3 (capture at the submit, replay held), thread priorities.
+- Confirm (6 rounds, 4-6 reversed): kokiri-idle 72.3 -> 76.1, castle-move 68.3 -> 70.2, hyrule-walk 69.9 -> 72.1 fps; 1% low 45.3 -> 47.3, 31.8 -> 31.2, 26.7 -> 36.4.
+- Adopted (on by default, `=0` off): `HOS_NVN_HOLD=2`, `RX_VK_PARALLEL_ROUNDS`, `RX_VK_PARALLEL_SELF=2`, `RX_VK_PARALLEL_BALANCE`, `RX_VK_PARALLEL_POINT=32`, `RX_VK_PARLOCK_SPIN=4000`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_GONE_RING`; `RX_VK_PARALLEL` 5 at 16+ threads.
+- Shots alike, speed ratio ~60, saves identical, run_all 235/2 (nup)/35. Not checked on PC 3050. Game folder holds this build. Branch `feature/TICK-054-cpu-frame`, not merged.
+- Next: the mirror pre-sync off the PT's path, segments started during the dry pass, a smaller held-flush capture.

@@ -1050,8 +1050,9 @@ static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: f
    fence): NVN starts a submission's work only then, and the game writes what it reads in between. Handed to the replay
    at the submit, a frame's draws read some of their constants before the game had written them: MKW's terrain tiles
    flashed as walls for a frame, we thought; measured, holding made them far more frequent (61 vs 0-9 in a 60 s drive):
-   MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then. Off by
-   default; HOS_NVN_HOLD=1: held. */
+   MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then.
+   HOS_NVN_HOLD=1: every submit held. HOS_NVN_HOLD=2 (below; the default since TICK-054, =0: none held): only those of threads
+   other than the presenting one, replayed ~20 us later by a host thread. */
 typedef struct { int n; uint64_t h[64]; uint64_t queue; uint32_t *pages; int64_t npages; uint8_t *copy; int64_t t; } held_submit;
 static held_submit held[256];
 static volatile LONG nheld;
@@ -1090,7 +1091,7 @@ static void held_init(void) {
     if (!held_ready) { InitializeCriticalSection(&held_cs); InitializeCriticalSection(&flush_cs); held_ready = 1; }
     if (hold_on < 0) {   /* (off: see below; 2: TICK-054) */
         const char *e = getenv("HOS_NVN_HOLD");
-        hold_on = e ? atoi(e) : 0;
+        hold_on = e ? atoi(e) : 2;   /* (TICK-054: 2 by default; =0: off) */
         hold_check = getenv("HOS_NVN_HOLD_CHECK") && atoi(getenv("HOS_NVN_HOLD_CHECK")) != 0;
         if (hold_on) hos_log("nvn: submits held (HOS_NVN_HOLD=%d%s)", hold_on, hold_check ? ", checked" : "");
         if (hold_on == 2) {
