@@ -220,3 +220,59 @@ run_all (laptop): 235 pass, 2 fail (both from main's TICK-053 merge: test_parall
 Static, one hot piece (code_hot_7, -O2, no profile): GPR -> XMM moves 25,605 -> 10,441; XMM -> GPR 9,186 -> 24,092 (the
 keep tests' copies of the result bits, off the data path); `vpinsr*` 1,278 -> 1,026; `vextractps`/`vpextr*` 4,889 -> 3,239;
 instructions +0.7%, object -0.07%.
+
+## Phase 2: measured in the game (PC 3050, i5-10400F, castle-move)
+
+Both builds from the same source (this branch, main 8ece4b3 merged in), lifted and built on PC 3050, **neither with a PGO
+profile** (like with like; the shipped profile matches only the default lift): `t55base` (switches off; lifted code key
+e8dc207cb2, TICK-045's lift) and `t55xmm` (`A64_FPX_XMM=1 A64_LR_SCALAR=1`, key ce778b52cd). Exe 448 / 450 MB.
+
+**CPU of the job threads** (`HOS_PROFILE` + `HOS_SAMPLE_ALL`, 72-104 s, 2 ms samples, runs base, xmm, xmm, base), ms of
+CPU per second of wall time:
+
+| run | fps | busy | guest leaf | Link 800b3ce0 | 80166100 | 802ca820 | dispatcher 8004ab40 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| base 1 | 27.5 | 746 | 599 | 85 | 41 | 13 | 409 |
+| base 4 | 27.9 | 776 | 612 | 84 | 51 | 14 | 429 |
+| xmm 2 | 27.8 | 781 | 625 | 82 | 50 | 18 | 442 |
+| xmm 3 | 27.7 | 774 | 616 | 87 | 49 | 13 | 426 |
+
+Guest code ~21.9 ms of CPU a frame (base) against ~22.3 (xmm): no reduction, inside the run-to-run spread; the serial jobs
+the same.
+
+**Where the samples moved** (guestmix, skid-corrected, base 4 against xmm 3): GPR -> XMM moves 2.55% -> 1.13%, `vpinsr*`
+0.74% -> 0.51%, lane extracts 0.78% -> 0.42%, but XMM -> GPR copies 0.90% -> 1.84% and the scalar FP ops 3.17% -> 3.82%:
+the crossings fell from 5.0% to 3.9% of the guest samples, and the time went to the ops and the bit copies that feed the
+keep tests. FP/vector as a whole 17.4% -> 18.6%. Prologue/epilogue samples 2.4% -> 2.0% (`A64_LR_SCALAR`), small.
+
+**fps** (3 interleaved rounds, `ab53.py`, 110 s runs, 66 s cut; fps / 1% low / p99 ms):
+
+| | r1 | r2 | r3 | mean |
+|---|---|---|---|---|
+| base | 28.1 / 14.7 / 56.7 | 29.0 / 15.2 / 53.9 | 30.0 / 15.9 / 48.9 | **29.0** / 15.3 / 53.2 |
+| xmm | 28.2 / 11.4 / 59.3 | 28.5 / 15.7 / 54.1 | 28.3 / 15.4 / 52.7 | **28.3** / 14.2 / 55.4 |
+
+-0.7 fps, inside PC 3050's 6-13% spread. Saves identical to the backup after all 10 runs; no game process left; the game
+folder has the t53f build back.
+
+**Why the micro-benchmark gain does not show.** The kernels are one long dependent FP chain, where the domain crossings sit
+on the critical path. In the game the FP code is short chains between guest loads (the 31% class): the out-of-order core
+already overlaps the crossings with the load latency, so taking them off the chain moves the samples (to the ops and the
+keep tests' bit copies) but not the time, as TICK-041 found for its v1. The crossing count in the hot code fell less than
+the static count suggests (the keep tests still need the result's bits in a general register).
+
+**Decision: not adopted.** Both switches stay off; the default lift is byte for byte as before. They stay in the lifter
+(tested) for a later PGO-profiled A/B on the main PC (TICK-045 showed a profile can change such a result by 2-4 fps), but
+the in-game sampler gives no reason to expect a gain.
+
+## What this leaves (ranked again with the phase 2 result)
+
+1. **The guest loads (31-34% of the guest time) are the critical path**, not the instructions around them. Lifter-side
+   levers that act on that path: guest-register values carried in host registers across calls (the call-boundary
+   store/reload hops, TICK-040/041's large project) and anything that shortens a load's address dependency. Host-side:
+   large pages for the guest heap (dTLB reach; needs the "Lock pages in memory" right, a user decision).
+2. Instruction-count cuts off the critical path (findings 2-4, 7: FPX gate, marks, flags, calling convention) each
+   0.5-1.5% of samples; by this ticket's evidence they would move samples more than time. Worth trying only as one
+   combined lift with its own profile, measured on the job chain's CPU first.
+3. The PGO A/B of `A64_FPX_XMM` + `A64_LR_SCALAR` on the main PC once TICK-054 is done: a gen build of each lift, the three
+   scenes' profiles, and the screen (castle-move x3). Not expected to clear the spread.
