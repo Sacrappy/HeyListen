@@ -64,7 +64,7 @@ def check_source(src):
             # (no wait only when every late page has a shadow of its mirror; else one wanted for each)
             "if (!late_shadow_valid_locked(c->pages[i])) {\n                    late_merge = false;",
             "for (uint32_t i : c->late) late_shadow_want(c->pages[i]);",
-            "p.mstate == Pool::MIRROR_ON && p.mirror && p.mirror_id == it->second.mid;",
+            "p.mstate == Pool::MIRROR_ON && p.mirror && p.mirror_id == it->second.mid) return true;",
             # (the late bit rides in the capture table's slot, stripped by cap_entry)
             "constexpr uint32_t kCapLateBit = 0x80000000u;",
             "e.slot &= ~kCapLateBit;",

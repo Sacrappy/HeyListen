@@ -2075,15 +2075,19 @@ void late_shadow_want(uint64_t page) {
     late_shadows.try_emplace((uint32_t)page);
 }
 /// Whether the page's shadow holds what its pool's mirror has for the page now (pools_mu held)
+std::atomic<int64_t> st_late_why[4];   // (why a late page had no shadow: no entry, bytes not yet taken, void, another mirror)
 bool late_shadow_valid_locked(uint64_t page) {
     const auto it = late_shadows.find((uint32_t)page);
-    if (it == late_shadows.end() || !it->second.mid || !it->second.bytes) return false;
+    if (it == late_shadows.end()) return st_late_why[0]++, false;
+    if (!it->second.bytes) return st_late_why[1]++, false;
+    if (!it->second.mid) return st_late_why[2]++, false;
     const uint64_t g = page << kPageShift;
     auto pit = imported.upper_bound(g);
     if (pit == imported.begin()) return false;
     --pit;
     const Pool& p = pit->second;
-    return g >= p.lo && g < p.hi && p.mstate == Pool::MIRROR_ON && p.mirror && p.mirror_id == it->second.mid;
+    if (g >= p.lo && g < p.hi && p.mstate == Pool::MIRROR_ON && p.mirror && p.mirror_id == it->second.mid) return true;
+    return st_late_why[3]++, false;
 }
 /// The page's shadow made or refreshed with the capture's bytes: the mirror holds them from this sync on (pools_mu held)
 void late_shadow_set(uint64_t page, uint32_t mid, const uint8_t* bytes) {
@@ -2284,11 +2288,16 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 static int64_t l_m, l_w, l_ns, l_b, l_seg;
                 const int64_t m = st_late_merged.load(), w = st_late_waited.load(), ns = st_late_no_shadow.load();
                 const int64_t b = st_late_merged_bytes.load(), seg = st_late_seg.load();
+                static int64_t l_why[4];
+                int64_t why[4];
+                for (int k = 0; k < 4; k++) why[k] = st_late_why[k].load();
                 logf("vk: late pages merged (RX_VK_LATE_MERGE): %lld takes merged (no wait), %lld waited (%lld for a page with no "
-                     "shadow yet), %.1f KB of changed words a take, %lld pages in a segment; %zu shadows", (long long)(m - l_m),
-                     (long long)(w - l_w), (long long)(ns - l_ns), m - l_m ? (b - l_b) / 1024.0 / (m - l_m) : 0.0, (long long)(seg - l_seg),
-                     late_shadows.size());
+                     "shadow yet: %lld never late, %lld not synced since, %lld void, %lld another mirror), %.1f KB of changed words a "
+                     "take, %lld pages in a segment; %zu shadows", (long long)(m - l_m), (long long)(w - l_w), (long long)(ns - l_ns),
+                     (long long)(why[0] - l_why[0]), (long long)(why[1] - l_why[1]), (long long)(why[2] - l_why[2]), (long long)(why[3] - l_why[3]),
+                     m - l_m ? (b - l_b) / 1024.0 / (m - l_m) : 0.0, (long long)(seg - l_seg), late_shadows.size());
                 l_m = m, l_w = w, l_ns = ns, l_b = b, l_seg = seg;
+                std::memcpy(l_why, why, sizeof why);
             }
         }
     }
