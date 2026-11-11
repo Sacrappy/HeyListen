@@ -270,6 +270,9 @@ struct {
     std::mutex present_mu;
 } dev;
 std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
+const bool par_stats_on = false;   // (TICK-052, RX_VK_PARLOCK_STATS: off by default)
+void par_counts_sum(int64_t* locks, int64_t* wait_ns) { *locks = par_locks.load(), *wait_ns = par_lock_wait_ns.load(); }
+void par_stats_segment_parts(int64_t, int64_t, int64_t, int64_t) {}
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
 std::vector<std::thread> workers;
@@ -363,6 +366,7 @@ void submit_segments(std::vector<Segment> seg, std::vector<int> order) {
     const uint8_t* const stop = kStop;
     const uint8_t* const occ_stop = nullptr;   // (TICK-033: a dry pass stopped for a report's count: not in these cases)
     const bool may_stop = false;
+    const int threads = 2;   // (par_threads(): the workers)
     const bool self_rec = false, self_help = false;   // (TICK-050, RX_VK_PARALLEL_SELF: off by default)
     uint64_t seq = 10;
     const uint64_t base = 1;
