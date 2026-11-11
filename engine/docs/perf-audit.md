@@ -3066,3 +3066,39 @@ segments). Levers: the mirror pre-sync off the PT's path (before the dry pass, o
 into the recording's upload buffer under pools_mu); the segments started as the dry pass passes their boundaries (the boundaries
 from the last frame's profile); a smaller capture (the main thread's pages copied ahead while it runs its draw code: the
 pre-copy thread is stopped by the first capture before it is through).
+
+## TICK-057: PC 3050's GPU frame, by what the late wait waits for (2026-11-12)
+
+**Result: on PC 3050 (RTX 3050, PCIe 3.0 x4, castle-move, the game composing 2560x1440 by the PC's `output_res=1`) the GPU frame
+is ~19.4 ms of recordings and ~2.6 ms of uploads, nearly all of it the game's own passes and dispatches. The GPU runs ~15 ms with
+no gap before each late-page wait ends, so GPU cuts there do shorten the wait (the barrier-drop bound: -2.8 ms of GPU, -2.3 ms of
+wait, +2.5 fps). But every engine-side cut tried (mirror churn, barrier repeats inside segments, readback-refresh ranges,
+robustness, trusted pass-start and dispatch barriers, the game's ORDER_FRAGMENTS barriers narrowed) moved gpu_ms by 0-0.4 ms and
+fps inside the spread. All switches off.**
+
+### Measuring it
+- The segments of a parallel replay had no GPU timestamps, so since TICK-054 the trace's `gpu_ms` read ~5 ms and `gpu_gap_ms`
+  ~26 ms on PC 3050; now they are timed (19.4 / 12.0).
+- `vk: GPU tail before the late waits` (every 120 presents): for each late-page wait, the GPU time with no gap of 20 us or more
+  up to the waited value's end; with `RX_VK_PASS_TIMING` the spans in it by kind and label (`gprof_tail`). GPU cut inside the
+  tail shortens the wait; before a gap it does not.
+- Pass timing inflates the engine's small spans: profiled mmake 1-1.7, rbrefresh 1.9, msync 1.5-1.7, barriers 1.4 ms a frame;
+  unprofiled, removing them moved gpu_ms by 0.3 at most.
+
+### What was tried (castle-move, 3 interleaved runs each; `docs/benchmarks/2026-11-12-tick057.md`)
+- Mirror churn: VRAM at 84-90% of the allowance trips TICK-023's 80% rule; 111 mirrors went in 40 s and 101 came back within 6000
+  submissions (1.8 GB of 16 MB copies). `RX_VK_MIRROR_STICKY` ends it (29.29 -> 29.37 fps), `RX_VK_MIRROR_VRAM_FREE` (the rule
+  counting VMA's free block space, ~0.7-1.3 GB, as the textures' budget does) does not change fps; `RX_VK_MIRROR_KEEP` loses.
+- Barriers: `RX_VK_BARRIER_DEDUPE_PAR` (repeats inside segments, ~110 a frame) 29.38; `RX_VK_BARRIER_TRUST` (pass-start
+  attachment-only, dispatch barriers left out after draws/dispatches: ~235 a frame) 29.18 against 29.27; `RX_VK_GAME_BARRIER_NARROW`
+  (the game's 0x12 barriers wait in the fragment stages, ~90 a frame) 29.50; both 29.51. A narrower destination drains like a
+  full barrier on this driver. `RX_VK_TEST_BARRIER_DROP` (measurement: pass-start, dispatch and game barriers left out) 31.47
+  against 28.95: the cost is the game's own barriers' drains.
+- `RX_VK_RB_RANGES=1` with the two above (29.50 against 29.52); `RX_VK_ROBUST=0` 29.93 (one run of 30.8; gpu_ms unchanged).
+- Not changed: load/store ops (GENERAL, LOAD/STORE, immediate-mode GPU: TICK-016), clears (1 a frame), the write-backs (already
+  diffed: 14.6 MB compared, little copied).
+
+### What is next
+- Fewer game barriers where two passes touch disjoint targets, or split barriers at the pass end, with sync validation
+  (`C:\OOT\scripts\val57.bat`, the layer in `C:\OOT\tools\vkvalid`).
+- The serial frame (12 ms of queue gaps a frame) is still the larger prize: TICK-053's run-ahead and its stall.
