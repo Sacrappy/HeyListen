@@ -294,34 +294,85 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 // GPU time: a timestamp at the start and the end of each recording's command buffer, read when its slot comes
 // round again (the work done by then)
 VkQueryPool ts_pool = VK_NULL_HANDLE;
-bool ts_pending[kRecordings];
+bool ts_pending[kRecordings], ts_up_pending[kRecordings];
 int64_t st_gpu_ns, st_gpu_max_ns;
+// (TICK-053) the upload command buffer's time too, and the gaps on the queue between one recording's command buffers and the
+// next's (the GPU idle, or held in something of the driver's: a semaphore, paging): absolute timestamps, 4 a slot (the
+// upload's start and end, the recording's). The frame trace has them as gpu_up_ms and gpu_gap_ms
+int64_t st_gpu_up_ns, st_gpu_gap_ns, st_gpu_gap_max_ns;
+uint64_t ts_last_end;   // (the last collected command buffer's end, GPU ticks)
+// (TICK-053) the recordings' starts and ends by submission order, and the blits' places among them (blit_ts_mark at each
+// present's submit): ts_last_end_seen gives, for the oldest blit not yet matched, the last recording end before it and the
+// first start after it
+struct TsRec { uint64_t seq, start, end; };
+std::mutex ts_mu;
+std::deque<TsRec> ts_recs;
+std::deque<uint64_t> ts_blit_seqs;   // (the submission count at each blit)
+uint64_t ts_seq_submitted, ts_seq_collected;
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
-    uint64_t t[2] = {0, 0};
-    if (vkGetQueryPoolResults(dev.device, ts_pool, 2 * r.slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+    const bool up = ts_up_pending[r.slot];
+    ts_up_pending[r.slot] = false;
+    uint64_t t[4] = {0, 0, 0, 0};
+    if (vkGetQueryPoolResults(dev.device, ts_pool, 4 * r.slot + 2, 2, sizeof t[0] * 2, t + 2, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
         return;
-    if (t[1] <= t[0]) return;
-    const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
+    if (up && vkGetQueryPoolResults(dev.device, ts_pool, 4 * r.slot, 2, sizeof t[0] * 2, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        t[0] = t[1] = 0;
+    if (t[3] <= t[2]) return;
+    const double period = (double)dev.props.limits.timestampPeriod;
+    const int64_t ns = (int64_t)((t[3] - t[2]) * period);
     st_gpu_ns += ns;
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
+    if (t[1] > t[0]) st_gpu_up_ns += (int64_t)((t[1] - t[0]) * period);
+    const uint64_t start = t[0] && t[0] < t[2] ? t[0] : t[2], end = std::max(t[1], t[3]);
+    if (ts_last_end && start > ts_last_end && (start - ts_last_end) * period < 2e9) {   // (in order on the one queue; a gap)
+        const int64_t gap = (int64_t)((start - ts_last_end) * period);
+        st_gpu_gap_ns += gap;
+        st_gpu_gap_max_ns = std::max(st_gpu_gap_max_ns, gap);
+    }
+    if (end > ts_last_end) ts_last_end = end;
+    std::lock_guard lk(ts_mu);
+    ts_recs.push_back({++ts_seq_collected, start, end});
+    while (ts_recs.size() > 256) ts_recs.pop_front();
+}
+void blit_ts_mark() {
+    std::lock_guard lk(ts_mu);
+    ts_blit_seqs.push_back(ts_seq_submitted);
+    while (ts_blit_seqs.size() > 8) ts_blit_seqs.pop_front();
+}
+uint64_t ts_last_end_seen(uint64_t* after_start) {
+    std::lock_guard lk(ts_mu);
+    *after_start = 0;
+    if (ts_blit_seqs.empty()) return 0;
+    const uint64_t at = ts_blit_seqs.front();
+    ts_blit_seqs.pop_front();
+    uint64_t before = 0;
+    for (const TsRec& r : ts_recs) {
+        if (r.seq <= at) before = std::max(before, r.end);
+        else if (!*after_start) *after_start = r.start;
+    }
+    return before;
 }
 void gpu_time_begin(Recording& r) {
     if (!ts_pool) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qi.queryCount = 2 * kRecordings;
+        qi.queryCount = 4 * kRecordings;
         if (vkCreateQueryPool(dev.device, &qi, nullptr, &ts_pool) != VK_SUCCESS) ts_pool = VK_NULL_HANDLE;
         if (!ts_pool) return;
     }
-    vkCmdResetQueryPool(r.cmd, ts_pool, 2 * r.slot, 2);
-    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 2 * r.slot);
+    vkCmdResetQueryPool(r.upload, ts_pool, 4 * r.slot, 2);   // (each command buffer resets its own: the upload one is not always sent)
+    vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot);
+    vkCmdResetQueryPool(r.cmd, ts_pool, 4 * r.slot + 2, 2);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot + 2);
 }
-void gpu_time_end(Recording& r) {
+void gpu_time_end(Recording& r, bool uploads) {
     if (!ts_pool) return;
-    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * r.slot + 1);
+    vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, ts_pool, 4 * r.slot + 1);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, ts_pool, 4 * r.slot + 3);
     ts_pending[r.slot] = true;
+    ts_up_pending[r.slot] = uploads;
 }
 
 /// The next recording slot, begun, for the submission that will signal value
@@ -362,7 +413,11 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
-    gpu_time_end(r);
+    gpu_time_end(r, uploads);
+    {
+        std::lock_guard lk(ts_mu);
+        ts_seq_submitted++;
+    }
     vkEndCommandBuffer(r.upload);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -2647,7 +2702,27 @@ struct Frame {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
+    VkFence acq = VK_NULL_HANDLE;   // (TICK-053, RX_VK_ACQUIRE_FENCE: the acquire's fence, waited for here instead of the semaphore on the queue)
 };
+// (HeyListen TICK-053) The blit's submit waits on the queue for the acquired image's semaphore: the only wait the GPU is ever
+// given. With the game's thread let run ahead of the GPU (RX_VK_LATE_MERGE) the GPU sat in that wait 30-50 ms a frame on PC 3050
+// (the gaps between recordings, gpu_time_collect), every later submission behind it: 66 ms frames at "99% busy". With
+// RX_VK_ACQUIRE_FENCE=1 the acquire signals a fence instead, waited for on this thread before the blit is submitted without a wait:
+// the queue never stops, the presentation thread waits for the image. Timed: "vk: acquire waits"
+bool acquire_fence_on() {
+    static const bool v = getenv("RX_VK_ACQUIRE_FENCE") && atoi(getenv("RX_VK_ACQUIRE_FENCE")) != 0;
+    return v;
+}
+double st_acq_wait_ms, st_acq_wait_max_ms;
+int64_t st_acq_waits;
+// (TICK-053) the blit's own GPU time and the queue's gaps around it: a timestamp at the blit's start and end, read 3 presents
+// later (the slot's fence waited for). With the recordings' absolute timestamps (gpu_time_collect) the gap before the blit
+// (the last recording's end to the blit's start) and after it (to the next recording's start) tell where the queue stops
+VkQueryPool blit_ts_pool = VK_NULL_HANDLE;
+bool blit_ts_pending[3];
+double st_blit_ms, st_blit_before_ms, st_blit_after_ms, st_blit_before_max_ms, st_blit_after_max_ms;
+int64_t st_blit_n;
+uint64_t blit_last_end;
 Frame frames[3];
 uint32_t frame_index = 0;
 int64_t presents = 0;
@@ -3075,8 +3150,12 @@ void log_frame_stats() {
         }
         static int64_t l_gpu;
         static uint64_t l_made;
-        logf("vk: GPU time %.1f ms a frame (the longest submission %.1f ms); %.1f textures made a frame",
-             (st_gpu_ns - l_gpu) / 120.0 / 1e6, st_gpu_max_ns / 1e6, (texture_made() - l_made) / 120.0);
+        static int64_t l_gpu_up, l_gpu_gap;
+        logf("vk: GPU time %.1f ms a frame (the longest submission %.1f ms), uploads %.1f ms, gaps between recordings %.1f ms "
+             "(the longest %.1f); %.1f textures made a frame",
+             (st_gpu_ns - l_gpu) / 120.0 / 1e6, st_gpu_max_ns / 1e6, (st_gpu_up_ns - l_gpu_up) / 120.0 / 1e6,
+             (st_gpu_gap_ns - l_gpu_gap) / 120.0 / 1e6, st_gpu_gap_max_ns / 1e6, (texture_made() - l_made) / 120.0);
+        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns, st_gpu_gap_max_ns = 0;
         {   // (issue 109: the movie networks too slow on this card: left out from now on, vk_draw.cpp movie_networks_slow)
             static const bool keep_all = getenv("RX_VK_NETWORK_KEEP") && !strcmp(getenv("RX_VK_NETWORK_KEEP"), "all");
             const double gpu_ms = (st_gpu_ns - l_gpu) / 120.0 / 1e6, draws = (d - l_d) / 120.0;
@@ -3133,7 +3212,9 @@ void status_tick() {
                           // (TICK-051: the time since launch, the GPU's time, the captures' waits for late pages, the submits'
                           // and presents' own time, the driver's submit, ASTC transcodes, textures made, the scatter's bytes, VRAM)
                           "t_s,gpu_ms,late_wait_ms,late_waits,submit_ms,present_ms,qsubmit_ms,dispatch_ms,astc,tex_made,scatter_mb,"
-                          "vram_mb,astc_again,astc_mtexels\n");
+                          "vram_mb,astc_again,astc_mtexels,"
+                          // (TICK-053: the upload command buffers' GPU time, the gaps between recordings on the queue)
+                          "gpu_up_ms,gpu_gap_ms\n");
         return f;
     }();
     // (TICK-051) seconds since the process started, for the bench's 66 s cut: the steady clock's offset from the creation time
@@ -3156,7 +3237,7 @@ void status_tick() {
         const auto dp = [](int i) { return (prof_ns[i] - l_prof[i]) / 1e6; };
         static uint64_t l_gone;
         const uint64_t gone = texture_destroy_generation();
-        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc;
+        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc, l_gpu_up, l_gpu_gap;
         static uint64_t l_made_t;
         int64_t late_ns = 0, late_n = 0, sc = 0;
         memory_trace_counts(&late_ns, &late_n, &sc);
@@ -3167,7 +3248,7 @@ void status_tick() {
         uint64_t vused = 0, vallowed = 0;
         vram_usage_now(&vused, &vallowed);
         fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
-                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f\n",
+                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f,%.2f,%.2f\n",
                 (unsigned long long)frames, (now_ns - last_ns) / 1e6, (long long)(pw - l_pw), pwms - l_pwms, (long long)(ps - l_ps),
                 tr - l_tr, (long long)(up - l_up), (upb - l_upb) / 1048576.0, texture_count(), dp(PROF_MEMSYNC), dp(PROF_PIPE),
                 dp(PROF_UPLOAD), dp(PROF_PROGRAM), dp(PROF_SLOTWAIT), (st_wait_ns - l_wait) / 1e6, dp(PROF_DRAW), dp(PROF_DESC),
@@ -3175,8 +3256,9 @@ void status_tick() {
                 (now_ns + launch_offset_ns) / 1e9, (st_gpu_ns - l_gpu_t) / 1e6, (late_ns - l_late_ns) / 1e6, (long long)(late_n - l_late_n),
                 dp(PROF_SUBMIT), dp(PROF_PRESENT), dp(PROF_QSUBMIT), dp(PROF_DISPATCH), (long long)(astc - l_astc),
                 (unsigned long long)(made - l_made_t), (sc - l_sc) / 1048576.0, (unsigned long long)(vused >> 20),
-                (long long)(again - l_again), (texels - l_texels) / 1e6);
+                (long long)(again - l_again), (texels - l_texels) / 1e6, (st_gpu_up_ns - l_gpu_up) / 1e6, (st_gpu_gap_ns - l_gpu_gap) / 1e6);
         l_gpu_t = st_gpu_ns, l_late_ns = late_ns, l_late_n = late_n, l_sc = sc, l_astc = astc, l_made_t = made; l_again = again, l_texels = texels;
+        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns;
         l_gone = gone;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;
@@ -3806,7 +3888,20 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     static bool unseen = false;
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
-    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
+    const bool acq_fence = acquire_fence_on() && f.acq;
+    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, acq_fence ? VK_NULL_HANDLE : f.acquired,
+                                         acq_fence ? f.acq : VK_NULL_HANDLE, &index);
+    if (acq_fence && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {   // (the image free: waited for here, not on the queue)
+        const auto t0 = std::chrono::steady_clock::now();
+        vkWaitForFences(dev.device, 1, &f.acq, VK_TRUE, UINT64_MAX);
+        vkResetFences(dev.device, 1, &f.acq);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        st_acq_wait_ms += ms, st_acq_wait_max_ms = std::max(st_acq_wait_max_ms, ms);
+        if (++st_acq_waits % 600 == 0) {
+            logf("vk: acquire waits (RX_VK_ACQUIRE_FENCE): %.2f ms each over 600 presents, the longest %.2f", st_acq_wait_ms / 600, st_acq_wait_max_ms);
+            st_acq_wait_ms = st_acq_wait_max_ms = 0;
+        }
+    }
 #ifndef _WIN32
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
         if (!unseen) logf("vk: the window is not shown (no image back in 100 ms): frames are not shown until it is");
@@ -3825,11 +3920,47 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) return;
     vkResetFences(dev.device, 1, &f.done);
+    if (!blit_ts_pool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 6;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &blit_ts_pool) != VK_SUCCESS) blit_ts_pool = VK_NULL_HANDLE;
+    }
+    if (blit_ts_pool && blit_ts_pending[log_slot]) {   // (this slot's last blit: its fence is waited for above)
+        blit_ts_pending[log_slot] = false;
+        uint64_t t[2] = {0, 0};
+        if (vkGetQueryPoolResults(dev.device, blit_ts_pool, 2 * log_slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
+            const double period = (double)dev.props.limits.timestampPeriod;
+            st_blit_ms += (t[1] - t[0]) * period / 1e6;
+            uint64_t after_start = 0;
+            const uint64_t rec_end = ts_last_end_seen(&after_start);   // (the recordings' last end before this blit, the first start after)
+            if (rec_end && t[0] > rec_end) {
+                const double b = (t[0] - rec_end) * period / 1e6;
+                st_blit_before_ms += b, st_blit_before_max_ms = std::max(st_blit_before_max_ms, b);
+            }
+            if (after_start && after_start > t[1]) {
+                const double a = (after_start - t[1]) * period / 1e6;
+                st_blit_after_ms += a, st_blit_after_max_ms = std::max(st_blit_after_max_ms, a);
+            }
+            if (++st_blit_n % 120 == 0) {
+                logf("vk: the blit on the GPU: %.2f ms a present; the queue's gap before it %.2f ms (the longest %.2f), after it to the next "
+                     "recording %.2f ms (the longest %.2f)", st_blit_ms / 120, st_blit_before_ms / 120, st_blit_before_max_ms,
+                     st_blit_after_ms / 120, st_blit_after_max_ms);
+                st_blit_ms = st_blit_before_ms = st_blit_after_ms = st_blit_before_max_ms = st_blit_after_max_ms = 0;
+            }
+        }
+    }
     vkResetCommandPool(dev.device, f.pool, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f.cmd, &bi);
     VkImage dst = dev.swap_images[index];
+    if (blit_ts_pool) {
+        vkCmdResetQueryPool(f.cmd, blit_ts_pool, 2 * log_slot, 2);
+        vkCmdWriteTimestamp2(f.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, blit_ts_pool, 2 * log_slot);
+        blit_ts_pending[log_slot] = true;
+        blit_ts_mark();   // (the recordings' timeline: which recording ends before this blit, which starts after)
+    }
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
@@ -3911,6 +4042,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (blit_ts_pool) vkCmdWriteTimestamp2(f.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, blit_ts_pool, 2 * log_slot + 1);
     vkEndCommandBuffer(f.cmd);
     // after the image's acquisition. (Not on the timeline: one queue runs submits in order, and a wait for a value
     // another thread had counted but not yet submitted blocked the queue for good)
@@ -3923,7 +4055,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     cb.commandBuffer = f.cmd;
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.waitSemaphoreInfoCount = 1;
+    si.waitSemaphoreInfoCount = acq_fence ? 0 : 1;   // (TICK-053: with the acquire's fence waited for above, no wait on the queue)
     si.pWaitSemaphoreInfos = waits;
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cb;
@@ -4479,6 +4611,8 @@ bool replay_start() {
         vkCreateFence(dev.device, &fi, nullptr, &f.done);
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(dev.device, &si, nullptr, &f.acquired);
+        VkFenceCreateInfo fa{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};   // (TICK-053: the acquire's fence, unsignalled)
+        if (vkCreateFence(dev.device, &fa, nullptr, &f.acq) != VK_SUCCESS) f.acq = VK_NULL_HANDLE;
     }
     if (par_threads() >= 2 && !init_pools_make(pi)) return false;   // (last: nothing after it fails and leaves them made)
     logf("vk: replay ready (%s; push descriptors %s (%u), extended dynamic state 3 %s, custom border colours %s)",

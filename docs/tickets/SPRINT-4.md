@@ -165,3 +165,10 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Built, off by default: `RX_VK_GONE_RING`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_PARLOCK_SPIN`, `RX_VK_PARALLEL_AFFINITY`, `RX_VK_PARALLEL_IDEAL`; split per-thread counters always on.
 - Confirm (29/36 runs, stopped for the next ticket): draw CPU -5..8%, frame prep -0.21 / +0.11 / -0.11 ms, fps inside the spread.
 - Decision: not adopted. Game folder: main build restored. Next: the program pick's slow path (needs --prepare-shaders), the touches ahead of segments.
+
+## TICK-053 (2026-11-11): the CPU's per-frame wait for the GPU, PC 3050
+- Found: the frame is serial (CPU ~13 ms of GPU-idle + GPU ~22 ms = 35 ms): the game's thread drains the GPU at its first submit (the late-page wait) and records the frame while the GPU idles. GPU 63% busy.
+- Found: without the wait, 24-26 ms frames (40 fps) for a while, then a mode of 66 ms frames: the queue idles 25-50 ms a frame between our own recordings while both game threads wait for the GPU. Not the acquire, present mode, present queue, blit, VRAM, clocks or event ordering. Not placed; session 0 (SSH) may be part of it.
+- Built, behind switches (off): `RX_VK_LATE_MERGE` (late pages merged word by word against a shadow, no wait), `RX_VK_ACQUIRE_FENCE`; on: GPU timestamps for uploads, the queue's gaps and the blit (`gpu_up_ms`, `gpu_gap_ms`).
+- Screen (castle-move, 3 runs each): main 28.21 fps, branch defaults 28.64, `RX_VK_RB_RANGES=1` 27.97 (1% low 14.4 / 14.9 / 13.8): no gain, RB_RANGES stays off. Merge shots show white world-less frames; speed ratio ~60.0 on the default. docs/benchmarks/2026-11-12-tick053.md has the desktop-check instructions (`RX_VK_LATE_MERGE=1` against the default).
+- Decision: not adopted. Branch `feature/TICK-053-gpu-sync`, bundle `E:\OOT\tick053.bundle`, not merged. Next: the queue's gap on the desktop, then the overlap.
