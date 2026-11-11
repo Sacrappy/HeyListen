@@ -2451,7 +2451,7 @@ uint64_t texture_destroy_generation() {
     return destroy_gens.generation();
 }
 bool texture_gone_ring_on() {
-    static const bool on = !getenv("RX_VK_GONE_RING") || atoi(getenv("RX_VK_GONE_RING")) != 0;
+    static const bool on = getenv("RX_VK_GONE_RING") && atoi(getenv("RX_VK_GONE_RING")) != 0;   // (off by default: TICK-052 not adopted)
     return on;
 }
 bool texture_kept_since(const Texture* tex, uint64_t from, uint64_t to) {

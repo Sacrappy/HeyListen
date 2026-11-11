@@ -148,7 +148,7 @@ enum ParWhy : int {
     PW_SLOT_DGEN, PW_QUICK_NOT_UPLOADED, PW_QUICK_LATER_SEG, PW_QUICK_EPOCH, PW_COUNT
 };
 void par_why(int kind);
-/// (TICK-052, vk_texture.cpp) RX_VK_GONE_RING=1 (default on): whether a texture resolved at destroy generation `from` is still
+/// (TICK-052, vk_texture.cpp) RX_VK_GONE_RING=1 (off by default): whether a texture resolved at destroy generation `from` is still
 /// alive at `to`: no texture_destroy_generation bump between them was its own (or a sweep of all, the deferred ASTC uploads').
 /// A recording thread's view and slot caches then outlive another texture's eviction instead of all going stale at each one
 bool texture_gone_ring_on();

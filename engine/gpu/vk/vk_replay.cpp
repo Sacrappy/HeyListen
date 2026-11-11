@@ -1573,11 +1573,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     }
     if (!par_pool.started) {
         par_pool.started = true;
-        // (TICK-052) RX_VK_PARLOCK_SPIN=<n> (default 4000): ParLock spins that many times before it sleeps. It is held ~0.1-0.6 us a
+        // (TICK-052) RX_VK_PARLOCK_SPIN=<n> (default 0; 4000 tried): ParLock spins that many times before it sleeps. It is held ~0.1-0.6 us a
         // taking, but a taker that found it held slept in the kernel and woke ~9 us later (castle-move: 70 such waits a command buffer,
         // 0.6 ms of the recording threads'). 0: no spin, as before
         {
-            static const int spin = getenv("RX_VK_PARLOCK_SPIN") ? std::max(0, atoi(getenv("RX_VK_PARLOCK_SPIN"))) : 4000;
+            static const int spin = getenv("RX_VK_PARLOCK_SPIN") ? std::max(0, atoi(getenv("RX_VK_PARLOCK_SPIN"))) : 0;   // (off by default: TICK-052 not adopted)
 #ifdef _WIN32   // (libc++'s recursive_mutex is a CRITICAL_SECTION there)
             static_assert(sizeof(std::recursive_mutex) >= sizeof(CRITICAL_SECTION));
             if (spin) SetCriticalSectionSpinCount(reinterpret_cast<CRITICAL_SECTION*>(par_mu.native_handle()), (DWORD)spin);

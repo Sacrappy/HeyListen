@@ -151,3 +151,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 ### TICK-048 on the main PC (2026-11-11)
 - Diff on loses here: castle-move 70.5 -> 62.9 fps (3 runs each), frame prep +3.2 ms; the bytes it saves cost only 0.4 ms of GPU on Gen5 x16.
 - The default now follows the card's maximum PCIe link (NVML): on at <= 8 GB/s (PC 3050 Gen3 x4), off otherwise. Tests fixed (2 broken by TICK-048). Game folder holds this build. Branch `verify/TICK-048-mainpc`, not merged. See docs/benchmarks/2026-11-11-tick048-mainpc.md.
+
+## TICK-052 (2026-11-11): why parallel replay draws cost more
+- Found (sampler with waits counted, new `RX_VK_PARLOCK_STATS`): ParLock is 10-14% of the workers' time, ~1,050 takings a command buffer; caches stale for the wrong reasons (pool table aliasing, every eviction voiding all views and slots) feed it; a segment's first 32 draws cost ~7 us. Driver 20%, program pick 14%.
+- Built, off by default: `RX_VK_GONE_RING`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_PARLOCK_SPIN`, `RX_VK_PARALLEL_AFFINITY`, `RX_VK_PARALLEL_IDEAL`; split per-thread counters always on.
+- Confirm (29/36 runs, stopped for the next ticket): draw CPU -5..8%, frame prep -0.21 / +0.11 / -0.11 ms, fps inside the spread.
+- Decision: not adopted. Game folder: main build restored. Next: the program pick's slow path (needs --prepare-shaders), the touches ahead of segments.
