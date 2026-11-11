@@ -1445,7 +1445,7 @@ struct CopyPart {
 // them (hok) and hashes it as before otherwise: a page the copy could not read whole, the pre-copy's (RX_VK_CAPTURE_PRECOPY), a
 // late page copied again after the take (its slot's hashes dropped). Same hashes, same copies, same mirror. Only with the diff on
 // (RX_VK_MSYNC_DIFF, by default on links of 8 GB/s or less) and AVX2 builds. Off by default (=1: on). tests/test_msync_diff.cpp
-int diff_mode();
+namespace { int diff_mode(); }   // (below, in this file's anonymous namespace)
 bool capture_hash_on() {
 #if defined(__AVX2__)
     static const bool v = [] {
