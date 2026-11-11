@@ -18,9 +18,10 @@ without the switch), and that the block path was taken in a fair share of the ru
 
     python -I -B tests/test_fpx_block.py [--cases 2000000] [--cc clang] [--cxx clang++]
 
-Teeth (each by hand, then restored; 300,000 runs at v3): the product keep test without its FZ operand test: 1,236 mismatches;
-the sum's FZ "big or zero" dropped: 2,811; FMLS's negation dropped: 24,207; the scalar FMA's addend FZ test dropped: 191;
-EXT's byte map shifted by one: 55,003.
+Teeth (each by hand, then restored; 100,000 runs at v3): the product keep test without its FZ operand test: 100 mismatches;
+FMLS's negation dropped: 122; EXT's byte map shifted by one: 577; the sum's FZ "big or zero" test dropped: 4; the scalar FMA's
+addend FZ test dropped: 3; FCMP's unordered test dropped: 100; FCMP's FZ subnormal test dropped: 18; a general register
+written in a block but not committed: 981.
 Skipped (exit 0) on a host that is not x86-64, without llvm-mingw's clang (the AArch64 assembler), or on a CPU without x86-64-v2.
 """
 import argparse
@@ -79,7 +80,8 @@ GUEST = (
     ("aliased registers", "fmul v0.4s, v0.4s, v0.4s\nfadd v0.4s, v0.4s, v0.4s\nfmla v0.4s, v0.4s, v0.s[1]\nfaddp v0.2s, v0.2s, v0.2s\nfmul s0, s0, s0\nfmadd s0, s0, s0, s0", 1),
     ("read back through memory", "fmul v0.4s, v1.4s, v2.4s\nfadd v3.4s, v0.4s, v1.4s\nstr q3, [x0]\nldr q4, [x0]\nfmul v5.4s, v4.4s, v3.4s\nfsub v6.4s, v5.4s, v4.4s", 1),
     ("fcmp ends a block", "fmul s0, s1, s2\nfadd s3, s0, s1\nfcmp s3, s2\nfsub s4, s3, s0\nfmul s5, s4, s4\nfcmp s5, #0.0\nfadd s6, s5, s1\nfmul s7, s6, s2\nfcmp s7, s6", 1),
-    ("fmov immediates", "fmov s0, #1.0\nfmov d1, #2.5\nmovi v2.2d, #0\nfmov v3.4s, #-0.5\nfmul s4, s0, s5\nfadd s6, s4, s3\nfmul v7.4s, v3.4s, v2.4s\nfadd v8.4s, v7.4s, v1.4s", 1),
+    ("fcmp of registers the block did not compute", "fmul s0, s1, s2\nfadd s3, s0, s1\nfcmp s4, s5\nfmul s6, s3, s1\nfsub s7, s6, s0\nfcmp s8, #0.0", 1),
+    ("fmov immediates","fmov s0, #1.0\nfmov d1, #2.5\nmovi v2.2d, #0\nfmov v3.4s, #-0.5\nfmul s4, s0, s5\nfadd s6, s4, s3\nfmul v7.4s, v3.4s, v2.4s\nfadd v8.4s, v7.4s, v1.4s", 1),
     ("zip/ext 8-byte, fneg vector", "zip2 v0.2s, v1.2s, v2.2s\nzip1 v3.2s, v1.2s, v2.2s\next v4.8b, v0.8b, v3.8b, #4\nfneg v5.4s, v4.4s\nfmul v6.2s, v5.2s, v0.2s\nfadd v7.2s, v6.2s, v3.2s", 1),
     ("scalar fmul/fmla by element", "fmul s0, s1, v2.s[1]\nfmla s3, s0, v2.s[3]\nfmls s4, s3, v1.s[0]\nfmul s5, s4, v4.s[2]", 1),
     # general-register statements inside a block: pointer loads, address arithmetic, immediates, a conditional select
