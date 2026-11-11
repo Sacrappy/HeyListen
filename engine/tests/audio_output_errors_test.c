@@ -33,6 +33,8 @@ static unsigned last_device, last_channels;
 static uint64_t now_ms;
 static int fail_prepare, fail_write, fail_unprepare, fail_open, fail_open6, fail_write_all;
 static unsigned fail_device = 99;   /* (a waveOut number that does not open; the default's opening clears fail_write_all) */
+static int gone_write_at, gone_unprepare, opens_fail;   /* (the device gone: "no driver" 6, "invalid handle" 5) */
+static uint32_t default_key = 11;                       /* (Windows' default output, as au_default_key says) */
 static int queued[10];
 static WAVEHDR *known[10];
 static char last_log[512];
@@ -61,6 +63,7 @@ static MMRESULT test_open(HWAVEOUT *out, unsigned device, const WAVEFORMATEX *f,
     open_calls++;
     if (device == WAVE_MAPPER) fail_write_all = 0;
     if (device == fail_device && (fail_open6 ? f->nChannels == 6 : 1)) return 7;
+    if (opens_fail) return 6;   /* (MMSYSERR_NODRIVER: the audio service down) */
     if (fail_open || (fail_open6 && f->nChannels == 6)) return 7;   /* (MMSYSERR_NOMEM; a device without 5.1: 32) */
     *out = (void *)(uintptr_t)1;
     return 0;
@@ -79,6 +82,7 @@ static MMRESULT test_write(HWAVEOUT out, WAVEHDR *h, unsigned size) {
     CHECK(!queued[i]);
     write_calls++;
     if (fail_write_all) return 7;   /* (an unplugged device) */
+    if (gone_write_at && write_calls == gone_write_at) return 6;   /* (MMSYSERR_NODRIVER) */
     if (!(h->dwFlags & WHDR_PREPARED)) return 34; /* WAVERR_UNPREPARED: no completion follows. */
     if (fail_write && write_calls == 1) return 7; /* MMSYSERR_NOMEM: no buffer was queued. */
     queued[i] = 1;
@@ -90,6 +94,7 @@ static MMRESULT test_unprepare(HWAVEOUT out, WAVEHDR *h, unsigned size) {
     (void)out; (void)size;
     CHECK(!queued[slot(h)]);
     unprepare_calls++;
+    if (gone_unprepare) return 5;   /* (MMSYSERR_INVALHANDLE, every call until the handle is closed) */
     if (fail_unprepare && unprepare_calls == 1) return 33; /* WAVERR_STILLPLAYING: do not reuse. */
     h->dwFlags &= ~WHDR_PREPARED;
     return 0;
@@ -103,11 +108,12 @@ static MMRESULT test_reset(HWAVEOUT out) {
     }
     return 0;
 }
-static MMRESULT test_close(HWAVEOUT out) { (void)out; close_calls++; return 0; }
+static MMRESULT test_close(HWAVEOUT out) { (void)out; close_calls++; gone_unprepare = 0; return 0; }
 /* (the platform helpers nn_audio.c defines before its output section) */
 static unsigned au_device_count(void) { return 2; }
 static void au_device_name(unsigned device, char *out, size_t size) { snprintf(out, size, "test device %u", device); }
 static uint64_t au_ms(void) { return now_ms; }
+static uint32_t au_default_key(void) { return default_key; }
 static void au_opened(HWAVEOUT w) { (void)w; }
 static int speakers = 2;   /* (the game's speakers: 6 in the "surround" and "fallback" cases) */
 static int au_speakers(void) { return speakers; }
@@ -188,6 +194,11 @@ static void chosen_run(void) {
         const int before = accepted;
         frames(40, 1);
         CHECK(accepted == before + 20);
+    } else if (!strcmp(scenario, "chosen_gone")) {   /* (the chosen device says "no driver": given up at once, the default stands in) */
+        gone_write_at = 25;
+        frames(60, 1);
+        CHECK(open_calls == 2 && close_calls == 1 && last_device == WAVE_MAPPER && !on_selected && marked_bad == 1);
+        CHECK(accepted >= 28);
     } else {
         CHECK(!strcmp(scenario, "chosen_stalls"));   /* (no block ever done: 1.5 s, then the default) */
         frames(20, 0);
@@ -238,6 +249,52 @@ int main(int argc, char **argv) {
         CHECK(accepted == 20 && prepare_calls == 20 && write_calls == 20 && !logs);
         CHECK(blocks[9][0] == 38 * 31 && blocks[9][FRAME * 6] == 39 * 31);
         CHECK(blocks[9][FRAME * 6 - 1] == (int16_t)(38 * 31 + FRAME * 6 - 1));
+    } else if (!strcmp(scenario, "lost")) {
+        gone_write_at = 25;              /* a Bluetooth headset off: its 25th block, "no driver" */
+        frames(60, 1);
+        CHECK(reset_calls == 1 && close_calls == 1 && open_calls == 2 && last_device == WAVE_MAPPER);
+        CHECK(accepted >= 28);           /* the default took the blocks after it */
+    } else if (!strcmp(scenario, "gone")) {
+        frames(20, 1);
+        gone_unprepare = 1;              /* the audio service restarted: every call on the old handle "invalid" */
+        frames(2, 1);
+        CHECK(close_calls == 1 && open_calls == 2 && last_device == WAVE_MAPPER);
+        const int before = accepted;
+        frames(10, 1);
+        CHECK(accepted == before + 5);   /* (before, the same block tried again for good: no sound for the run) */
+    } else if (!strcmp(scenario, "service")) {
+        frames(10, 1);
+        opens_fail = 1;                  /* the service down: no device opens */
+        gone_write_at = write_calls + 1;
+        frames(2, 1);
+        CHECK(close_calls == 1 && !wout && open_calls == 4);   /* (the first open, then the default and both devices) */
+        frames(5, 1);
+        CHECK(open_calls == 4);          /* not again within the second */
+        now_ms += 1000;
+        frames(1, 1);
+        CHECK(open_calls == 7 && !wout); /* a second later: all three again, the service still down */
+        opens_fail = 0;
+        now_ms += 1000;
+        frames(1, 1);
+        CHECK(wout && open_calls == 8 && last_device == WAVE_MAPPER);   /* the service back: the default first */
+        const int before = accepted;
+        frames(4, 1);
+        CHECK(accepted == before + 2);
+    } else if (!strcmp(scenario, "default")) {
+        frames(10, 1);
+        default_key = 12;                /* Windows moves its default (the headset back) */
+        now_ms += 500;
+        frames(1, 1);
+        CHECK(open_calls == 1);          /* looked at once a second */
+        now_ms += 600;
+        frames(1, 1);
+        CHECK(close_calls == 1 && open_calls == 2 && last_device == WAVE_MAPPER && out_default_key == 12);
+        now_ms += 2000;
+        frames(2, 1);
+        CHECK(open_calls == 2);          /* the same default: not opened again */
+        const int before = accepted;
+        frames(4, 1);
+        CHECK(accepted == before + 2);
     } else if (!strcmp(scenario, "stall")) {
         frames(20, 0);                   /* every block queued, none ever completes: the device takes nothing */
         now_ms += 1000;

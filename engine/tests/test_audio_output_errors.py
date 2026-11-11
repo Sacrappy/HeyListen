@@ -12,7 +12,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("normal", "busy", "prepare", "write", "unprepare", "open", "bounded", "stall", "surround", "fallback",
-         "chosen", "chosen_open_fails", "chosen_stereo", "chosen_unplugged", "chosen_stalls", "chosen_changed")
+         "chosen", "chosen_open_fails", "chosen_stereo", "chosen_unplugged", "chosen_stalls", "chosen_changed", "chosen_gone",
+         "lost", "gone", "service", "default")
 
 
 def main():
