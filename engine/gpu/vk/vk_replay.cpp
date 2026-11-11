@@ -301,6 +301,14 @@ int64_t st_gpu_ns, st_gpu_max_ns;
 // upload's start and end, the recording's). The frame trace has them as gpu_up_ms and gpu_gap_ms
 int64_t st_gpu_up_ns, st_gpu_gap_ns, st_gpu_gap_max_ns;
 uint64_t ts_last_end;   // (the last collected command buffer's end, GPU ticks)
+// (TICK-053) the recordings' starts and ends by submission order, and the blits' places among them (blit_ts_mark at each
+// present's submit): ts_last_end_seen gives, for the oldest blit not yet matched, the last recording end before it and the
+// first start after it
+struct TsRec { uint64_t seq, start, end; };
+std::mutex ts_mu;
+std::deque<TsRec> ts_recs;
+std::deque<uint64_t> ts_blit_seqs;   // (the submission count at each blit)
+uint64_t ts_seq_submitted, ts_seq_collected;
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
@@ -324,6 +332,27 @@ void gpu_time_collect(Recording& r) {
         st_gpu_gap_max_ns = std::max(st_gpu_gap_max_ns, gap);
     }
     if (end > ts_last_end) ts_last_end = end;
+    std::lock_guard lk(ts_mu);
+    ts_recs.push_back({++ts_seq_collected, start, end});
+    while (ts_recs.size() > 256) ts_recs.pop_front();
+}
+void blit_ts_mark() {
+    std::lock_guard lk(ts_mu);
+    ts_blit_seqs.push_back(ts_seq_submitted);
+    while (ts_blit_seqs.size() > 8) ts_blit_seqs.pop_front();
+}
+uint64_t ts_last_end_seen(uint64_t* after_start) {
+    std::lock_guard lk(ts_mu);
+    *after_start = 0;
+    if (ts_blit_seqs.empty()) return 0;
+    const uint64_t at = ts_blit_seqs.front();
+    ts_blit_seqs.pop_front();
+    uint64_t before = 0;
+    for (const TsRec& r : ts_recs) {
+        if (r.seq <= at) before = std::max(before, r.end);
+        else if (!*after_start) *after_start = r.start;
+    }
+    return before;
 }
 void gpu_time_begin(Recording& r) {
     if (!ts_pool) {
@@ -385,6 +414,10 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
     gpu_time_end(r, uploads);
+    {
+        std::lock_guard lk(ts_mu);
+        ts_seq_submitted++;
+    }
     vkEndCommandBuffer(r.upload);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -2629,6 +2662,14 @@ bool acquire_fence_on() {
 }
 double st_acq_wait_ms, st_acq_wait_max_ms;
 int64_t st_acq_waits;
+// (TICK-053) the blit's own GPU time and the queue's gaps around it: a timestamp at the blit's start and end, read 3 presents
+// later (the slot's fence waited for). With the recordings' absolute timestamps (gpu_time_collect) the gap before the blit
+// (the last recording's end to the blit's start) and after it (to the next recording's start) tell where the queue stops
+VkQueryPool blit_ts_pool = VK_NULL_HANDLE;
+bool blit_ts_pending[3];
+double st_blit_ms, st_blit_before_ms, st_blit_after_ms, st_blit_before_max_ms, st_blit_after_max_ms;
+int64_t st_blit_n;
+uint64_t blit_last_end;
 Frame frames[3];
 uint32_t frame_index = 0;
 int64_t presents = 0;
@@ -3826,11 +3867,47 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) return;
     vkResetFences(dev.device, 1, &f.done);
+    if (!blit_ts_pool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 6;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &blit_ts_pool) != VK_SUCCESS) blit_ts_pool = VK_NULL_HANDLE;
+    }
+    if (blit_ts_pool && blit_ts_pending[log_slot]) {   // (this slot's last blit: its fence is waited for above)
+        blit_ts_pending[log_slot] = false;
+        uint64_t t[2] = {0, 0};
+        if (vkGetQueryPoolResults(dev.device, blit_ts_pool, 2 * log_slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
+            const double period = (double)dev.props.limits.timestampPeriod;
+            st_blit_ms += (t[1] - t[0]) * period / 1e6;
+            uint64_t after_start = 0;
+            const uint64_t rec_end = ts_last_end_seen(&after_start);   // (the recordings' last end before this blit, the first start after)
+            if (rec_end && t[0] > rec_end) {
+                const double b = (t[0] - rec_end) * period / 1e6;
+                st_blit_before_ms += b, st_blit_before_max_ms = std::max(st_blit_before_max_ms, b);
+            }
+            if (after_start && after_start > t[1]) {
+                const double a = (after_start - t[1]) * period / 1e6;
+                st_blit_after_ms += a, st_blit_after_max_ms = std::max(st_blit_after_max_ms, a);
+            }
+            if (++st_blit_n % 120 == 0) {
+                logf("vk: the blit on the GPU: %.2f ms a present; the queue's gap before it %.2f ms (the longest %.2f), after it to the next "
+                     "recording %.2f ms (the longest %.2f)", st_blit_ms / 120, st_blit_before_ms / 120, st_blit_before_max_ms,
+                     st_blit_after_ms / 120, st_blit_after_max_ms);
+                st_blit_ms = st_blit_before_ms = st_blit_after_ms = st_blit_before_max_ms = st_blit_after_max_ms = 0;
+            }
+        }
+    }
     vkResetCommandPool(dev.device, f.pool, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f.cmd, &bi);
     VkImage dst = dev.swap_images[index];
+    if (blit_ts_pool) {
+        vkCmdResetQueryPool(f.cmd, blit_ts_pool, 2 * log_slot, 2);
+        vkCmdWriteTimestamp2(f.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, blit_ts_pool, 2 * log_slot);
+        blit_ts_pending[log_slot] = true;
+        blit_ts_mark();   // (the recordings' timeline: which recording ends before this blit, which starts after)
+    }
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
@@ -3912,6 +3989,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (blit_ts_pool) vkCmdWriteTimestamp2(f.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, blit_ts_pool, 2 * log_slot + 1);
     vkEndCommandBuffer(f.cmd);
     // after the image's acquisition. (Not on the timeline: one queue runs submits in order, and a wait for a value
     // another thread had counted but not yet submitted blocked the queue for good)
