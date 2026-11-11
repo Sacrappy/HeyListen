@@ -2178,8 +2178,10 @@ int late_diff_runs(const uint8_t* now, const uint8_t* shadow, uint32_t* off, uin
 // the fix and sends the held recordings as soon as it is reached, so the GPU gets the new frame when the old one ends, as it
 // did, with the CPU's recording done meanwhile. What the GPU reads is what the take's copies after the wait gave: the same
 // bytes, copied at the same moment (the value's end), by another thread. Not deferred, as before: a late value not yet sent
-// (held recordings, a queue stopped at an event), RX_VK_LATE_MERGE, a late page in the texture storage (the shadow copies
-// the capture buffer at the take: the take waits as before). Off by default (=1: on). tests/test_late_defer.py
+// (held recordings, a queue stopped at an event), RX_VK_LATE_MERGE, a late page in a live texture's storage (uploads read it as
+// submitted from the shadow the take copies: the take waits as before); a deferred late page in a pool with textures gets no
+// shadow copy (an upload over it would read guest memory). At most kLateFixMax pending. Off by default (=1: on).
+// tests/test_late_defer.py
 bool late_defer_on() {
     static const bool v = [] {
         const bool on = getenv("RX_VK_LATE_DEFER") && atoi(getenv("RX_VK_LATE_DEFER")) != 0;
@@ -2272,15 +2274,12 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 for (uint32_t i : c->late) late_shadow_want(c->pages[i]);
             }
         }
-        // (TICK-060) RX_VK_LATE_DEFER: no wait here when the queue has the late value already and no late page is texture storage
+        // (TICK-060) RX_VK_LATE_DEFER: no wait here when the queue has the late value already and no late page is a live texture's
+        // storage (the uploads read such pages as submitted, from the shadow the take copies below)
         if (!late_merge_on() && late_defer_on() && c->late_value > vk_timeline_completed()) {
             bool tex = false;
-            if (tex_capture_on()) {
-                std::lock_guard sk(shadow_mu);
-                if (!tex_merged.empty())
-                    for (uint32_t i : c->late)
-                        if (in_tex_merged((uint64_t)c->pages[i] << 12)) { tex = true; break; }
-            }
+            for (uint32_t i : c->late)
+                if (replay_tex_storage_in((uint64_t)c->pages[i] << kPageShift, 4096)) { tex = true; break; }
             if (tex) st_late_def_tex.fetch_add(1, std::memory_order_relaxed);
             else if (c->late_value > vk_timeline_signal_sent()) st_late_def_unsent.fetch_add(1, std::memory_order_relaxed);
             else if (late_fix_count() >= kLateFixMax) st_late_def_full.fetch_add(1, std::memory_order_relaxed);
@@ -2346,6 +2345,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             for (size_t i = 0; i < c->copied.size(); i++) {
                 const uint32_t p = c->copied[i];
                 if (!in_tex_merged((uint64_t)p << 12)) continue;
+                // (TICK-060: a deferred late page's slot is not the write-back's yet: no shadow of it (no live texture's storage
+                // is there: a later upload over it reads guest memory)
+                if (late_defer && std::find(c->late.begin(), c->late.end(), c->slots[i]) != c->late.end()) continue;
                 if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) {
                     if (swept) break;
                     swept = true;
@@ -2450,7 +2452,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 static int64_t l_d, l_p, l_t, l_u, l_f, l_r, l_s;
                 const int64_t d = st_late_deferred.load(), pg = st_late_def_pages.load(), t = st_late_def_tex.load(), u = st_late_def_unsent.load();
                 logf("vk: late pages deferred (RX_VK_LATE_DEFER): %lld takes not waited (%.1f late pages each), waited as before: %lld "
-                     "(a late page in texture storage), %lld (the value not sent yet), %lld (%d fixes pending); before their fix, %lld replay "
+                     "(a late page in a live texture's storage), %lld (the value not sent yet), %lld (%d fixes pending); before their fix, %lld replay "
                      "reads of a late slot (waited), %lld syncs of one (copied whole)", (long long)(d - l_d),
                      d - l_d ? (double)(pg - l_p) / (double)(d - l_d) : 0.0, (long long)(t - l_t), (long long)(u - l_u),
                      (long long)(st_late_def_full.load() - l_f), kLateFixMax, (long long)(st_late_reads.load() - l_r),
