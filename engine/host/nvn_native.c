@@ -1188,7 +1188,16 @@ NV(nvnSyncWait) {
     if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush_why(HF_SYNC);   /* (a wait flushes what it waits for) */
     /* (TICK-058) trace marks 30/31: the wait's first look (b: the caller; then 1 signalled, 0 not) */
     HOS_JT(JT_MARK, 30, c->x[30]);
-    if (rx_nvn_wait(s->fence, 0)) { HOS_JT(JT_MARK, 31, 1); RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    /* (HeyListen, TICK-059) HOS_NVN_POLL_AWAY=1: the first look without the virtual core. It answers the same, in the same order
+       (the renderer's sync_order_mu still waits for the replay in progress, the order the readbacks after it need: TICK-058),
+       but that wait (1.4 ms a frame on the main thread, behind the Presentation Thread's replay) held core 0, which
+       BaseProcExecutor0 shares; invalidate's waits give it up already (rx_backend.c). Nothing in it runs guest code */
+    static int poll_away = -1;
+    if (poll_away < 0) poll_away = getenv("HOS_NVN_POLL_AWAY") && atoi(getenv("HOS_NVN_POLL_AWAY")) != 0;
+    const int away0 = poll_away ? hos_vcore_away() : 0;
+    const int first = rx_nvn_wait(s->fence, 0);
+    if (away0) hos_vcore_back();
+    if (first) { HOS_JT(JT_MARK, 31, 1); RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     HOS_JT(JT_MARK, 31, 0);
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */
     if (block < 0) block = getenv("HOS_NVN_SYNC_BLOCK") != NULL;
