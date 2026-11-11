@@ -177,6 +177,7 @@ bool memory_rb_refresh(VkCommandBuffer) { return false; }
 void memory_rb_recording_begun() {}
 VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
 thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;
+thread_local VkCommandBuffer trust_cmd = VK_NULL_HANDLE;   // (TICK-057: the barrier trust point)
 bool is_bc(VkFormat) { return false; }
 bool is_astc(VkFormat) { return false; }
 struct Texture {   // (the fields texture.cpp's astc_trace_note reads (TICK-051 frame trace) are never set here: it returns at once)
