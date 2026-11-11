@@ -7927,6 +7927,7 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
         if (!first && !std::memcmp(&last, &s.rt, sizeof last)) return;
         std::memcpy((void*)&last, (const void*)&s.rt, sizeof last);
         const Targets at = targets(s);
+        ParLock lk;   // (TICK-056, RX_VK_SEG_EARLY: segments recorded meanwhile read these marks; nothing when none is)
         for (int i = 0; i < at.n; i++)
             if (at.color[i]) texture_written(at.color[i]);
         if (at.depth) texture_written(at.depth);
@@ -7943,8 +7944,10 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
                 const uint32_t handle = handle_of(s, st, d, k);
                 Texture* tex = nullptr;
                 uint32_t level = 0;
-                if (handle && texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level) && tex)
+                if (handle && texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level) && tex) {
+                    ParLock lk;   // (TICK-056, as above)
                     texture_written(tex);
+                }
             }
         }
 }

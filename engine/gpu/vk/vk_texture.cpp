@@ -2662,6 +2662,16 @@ void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
 VkCommandBuffer upload_command_buffer() {
     return upload_cmd();
 }
+UploadTarget texture_upload_swap(UploadTarget to) {
+    const UploadTarget was{up_cmd, up_used};
+    up_cmd = to.cmd, up_used = to.used;
+    last_barrier_cmd = VK_NULL_HANDLE;   // (a command buffer handle comes round again: its first full barrier is never left out)
+    return was;
+}
+bool texture_rb_refresh_now() {
+    if (memory_rb_refresh(up_cmd)) up_used = true;
+    return up_used;
+}
 bool texture_uploads_recorded() {
     if (memory_rb_refresh(up_cmd)) up_used = true;   // (PR 430: readback pages from guest memory, last of the uploads)
     memory_table_flush();   // (vk_memory.cpp: the page table's changes, after this recording's mirror copies)
