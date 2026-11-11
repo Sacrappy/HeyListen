@@ -115,7 +115,8 @@ std::mutex rec_map_mu;
 // (slot = value & 16383 holds the value), marked once value_rec has their recording: a fence poll (a wait of timeout 0) on one of
 // them answers from the recordings' timeline without sync_order_mu, which submit_q and present hold for whole replays (the main
 // thread's two nvnSyncWait looks a frame, f_8042cd20, waited 1.4 ms a frame for it behind the Presentation Thread's replay).
-// See wait_inner.
+// See wait_inner and invalidate. Off: with the wait moved to the readbacks that need it, the readbacks (~12 a frame on the main
+// thread, 2-12 on each module worker) waited 0.5-1.9 ms a frame each thread (TICK-058).
 constexpr uint64_t kWholeSlots = 16384;
 std::atomic<uint64_t> whole_val[kWholeSlots];
 bool fence_poll_fast_on() {
@@ -3026,7 +3027,9 @@ int wait_inner(uint64_t f, uint64_t timeout_ns) {
     // reverts, so the lock would only have made the same decision later; (2) then wait_recorded(f) as there, under rec_map_mu,
     // which the mark is set under (after value_rec has f). Only a poll: a wait with a timeout keeps the locked path (with
     // batched submits, a wait right after the mark could miss the flush of its recording: RADV's load hang). Any other case
-    // (not marked, an older value, a slot reused by a newer one) takes the locked path.
+    // (not marked, an older value, a slot reused by a newer one) takes the locked path. The lock also ordered the poll after the
+    // replay in progress, which the CPU's readbacks of GPU results need (their write-back registrations): invalidate waits for it
+    // there instead, with this switch on (without that wait the Market's exposure blew the scene out to white).
     if (!timeout_ns && fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off() &&
         whole_val[f & (kWholeSlots - 1)].load(std::memory_order_acquire) == f && f + 8000 > q_values.load()) {
         int ok = 0;
@@ -3173,6 +3176,17 @@ void invalidate(uint64_t gpu, uint64_t size) {
         static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
         bool ever = false;
         if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
+            // (TICK-058) RX_VK_FENCE_POLL_FAST: the fence poll no longer waits for a replay in progress (submit_q / present hold
+            // sync_order_mu for it), and that wait was what kept this readback right: OoT's exposure readback after its fence
+            // poll read the write-back state of before that replay (the scene blown out to white, standing). The wait moves
+            // here, to the CPU's read of GPU results that have write-backs: their write-back value below then has that replay's
+            // registrations, the order the poll's lock gave. (Every invalidate waiting cost the main thread and the module
+            // workers 1.2-1.8 ms a frame each: most ranges have no write-backs.)
+            if (fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off()) {
+                jt_mark(36, 0);   // (36/37: the readback waiting for the replay in progress)
+                { std::lock_guard lk(sync_order_mu); }
+                jt_mark(37, 0);
+            }
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();
