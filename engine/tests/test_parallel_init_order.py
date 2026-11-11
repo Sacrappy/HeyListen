@@ -66,7 +66,8 @@ def main():
     create = create[create.index("\n") + 1:]   # (from the line after: the image's initialization, to its Texture*)
     if "// into GENERAL, and cleared" not in create or "Texture* p = tex.get();" not in create:
         raise SystemExit("create()'s initialization moved: update this test")
-    jobs = cut(replay, "    struct Job {", "    seg_ms += std::chrono::duration")
+    # (TICK-056 added a second "struct Job {" in replay_handle_early: this is the other path's, after its submit_recording)
+    jobs = cut(replay, "    struct Job {", "    seg_ms += std::chrono::duration", after="    jt_mark(20, 0);")
     have_seg_init = "std::mutex seg_init_mu;" in texture
     exits = {"init_end_fail": 3} if have_seg_init else {}   # (replay_fatal ends the process)
     for step in ("record_segment(c, j->g);", "texture_begin_recording(j->r->upload, j->r->value);", "vkQueueSubmit2(",
