@@ -452,9 +452,11 @@ SHAPES = [(rx, (zip_builder if fn is None else fn)) for rx, fn in SHAPES]
 
 
 # ---- stores (A64_FPX_BLOCK_ST=1): the value's part of a register: lo32 / lo64 / hi64 ------------------------------------
-def st_op(fn, addr, parts):
-    op = Op("st", None, sorted({r for r, _ in parts}, key=int), "")
-    op.store = (fn, addr, parts)
+def st_op(fn, addr, parts, more=()):
+    """a store statement: one helper call (fn, addr, parts), or several in order (more: further (fn, addr, parts))"""
+    calls = [(fn, addr, parts)] + list(more)
+    op = Op("st", None, sorted({r for _, _, ps in calls for r, _ in ps}, key=int), "")
+    op.store = calls
     return op
 
 
@@ -479,11 +481,23 @@ def sh_stp(m):
     return st_op("recomp_stp%s%s" % (bits, sp or ""), "c->x[%s]+(%s)" % (xb, off), [(r1, "lo" + bits), (r2, "lo" + bits)])
 
 
+def sh_stpq(m):
+    xb, off, sp, r, r_, sp2, r2, r2_ = m.groups()
+    if r != r_ or (r2 is not None and r2 != r2_):
+        return None
+    base = "c->x[%s]+(%s)" % (xb, off)
+    more = [("recomp_stp64%s" % (sp2 or ""), "(%s)+16" % base, [(r2, "lo64"), (r2, "hi64")])] if r2 is not None else []
+    return st_op("recomp_stp64%s" % (sp or ""), base, [(r, "lo64"), (r, "hi64")], more)
+
+
 STORE_SHAPES = [
     (re.compile(r"\{ \{ uint64_t _v=0; memcpy\(&_v,&" + V + r"\[0\],(4|8)\); recomp_store(32|64)(_sp)?\(c,\(" + ADDR + r"\),_v\); \} \}"), sh_st1),
     (re.compile(r"\{ recomp_stp64(_sp)?\(c,\(" + ADDR + r"\)," + V + r"\[0\]," + V + r"\[1\]\); \}"), sh_stq),
     (re.compile(r"\{ uint64_t _b=c->x\[(\d+)\]; int64_t _o=(-?\d+); \{ uint64_t _p0=0,_p1=0; memcpy\(&_p0,&" + V + r"\[0\],(4|8)\); "
                 r"memcpy\(&_p1,&" + V + r"\[0\],\4\); recomp_stp(32|64)(_sp)?\(c,\(_b\+_o\),_p0,_p1\); \}\}"), sh_stp),
+    # (STP Q / STR Q with an offset: one or two 16-byte stores from the base and offset)
+    (re.compile(r"\{ uint64_t _b=c->x\[(\d+)\]; int64_t _o=(-?\d+); recomp_stp64(_sp)?\(c,\(_b\+_o\)," + V + r"\[0\]," + V + r"\[1\]\);"
+                r"(?: recomp_stp64(_sp)?\(c,\(_b\+_o\)\+16," + V + r"\[0\]," + V + r"\[1\]\);)? \}"), sh_stpq),
 ]
 LOAD_KINDS = {"ldq", "ld32", "ld64", "ldp32", "ldp64", "ldpq"}
 
@@ -577,12 +591,14 @@ def emit_block(ops):
     stores = []
     for op in ops:
         if op.store is not None:
-            k = len(stores)
-            fn, addr, parts = op.store
-            regs = sorted({r for r, _ in parts}, key=int)
-            op.code = "const uint64_t _sa%d = (uint64_t)(%s); %s" % (k, addr, " ".join(
-                "const __m128i _sv%d_%s = %s;" % (k, r, bv(r)) for r in regs))
-            stores.append("%s(c, _sa%d, %s);" % (fn, k, ", ".join("a64_bk_%s(_sv%d_%s)" % (part, k, r) for r, part in parts)))
+            code = []
+            for fn, addr, parts in op.store:
+                k = len(stores)
+                regs = sorted({r for r, _ in parts}, key=int)
+                code.append("const uint64_t _sa%d = (uint64_t)(%s); %s" % (k, addr, " ".join(
+                    "const __m128i _sv%d_%s = %s;" % (k, r, bv(r)) for r in regs)))
+                stores.append("%s(c, _sa%d, %s);" % (fn, k, ", ".join("a64_bk_%s(_sv%d_%s)" % (part, k, r) for r, part in parts)))
+            op.code = " ".join(code)
     gpr_used, gpr_written = [], []
     for op in ops:
         for r in op.gpr_reads + op.gpr_writes + [int(x) for x in GPR_X.findall(op.code)]:

@@ -104,12 +104,14 @@ GUEST = (
                            "fmul s5, s4, s3\nfadd s7, s5, s6\nstr s7, [x0, #4]\nldp s8, s9, [x0]\nfmul s10, s8, s9\nfadd s11, s10, s8", 2),
     ("gpr load after a store", "fmul v0.4s, v1.4s, v2.4s\nfadd v3.4s, v0.4s, v1.4s\nstr q3, [x0]\nfsub v6.4s, v3.4s, v0.4s\nldr x8, [x0]\n"
                                "and x8, x8, #0x70\nfmul v4.4s, v6.4s, v3.4s\nldr q5, [x0, x8]\nfadd v7.4s, v5.4s, v4.4s\nfmul v8.4s, v7.4s, v7.4s", 2),
+    ("stp q, stur q", "fmul v0.4s, v1.4s, v2.4s\nstp q0, q1, [sp, #32]\nfadd v3.4s, v0.4s, v1.4s\nstp q3, q0, [x1, #32]\nfmul v4.4s, v3.4s, v0.4s\n"
+                      "stur q4, [x1, #17]\nfsub v5.4s, v4.4s, v3.4s\nstr q5, [x2, #48]\nfmul v6.4s, v5.4s, v5.4s", 2),
     ("one op alone", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x0]\nfadd s3, s1, s2\nstr s3, [x1]", 0),
     ("moves alone", "dup v0.4s, v1.s[2]\nins v0.s[1], v3.s[0]\next v4.16b, v0.16b, v3.16b, #4", 0),
 )
 # (A64_FPX_BLOCK_ST=1 must change these, against the switch alone)
 ST_CHANGES = {"store between runs", "stores inside a run", "stores that overlap", "stored then overwritten", "base moved between stores",
-              "load after a store", "gpr load after a store", "read back through memory", "one op alone"}
+              "load after a store", "gpr load after a store", "read back through memory", "one op alone", "stp q, stur q"}
 NEEDS = {("add32", "add32", 2, 2), ("sub32", "sub32", 2, 2), ("mul32", "fma32", 2, 3), ("fma32", "fma32", 3, 3),
          ("div32", "div32", 2, 2), ("sqrt32", "sqrt32", 1, 1)}
 
