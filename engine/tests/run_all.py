@@ -39,6 +39,7 @@ ARGS = {
     "tests/test_present_aspect_vulkan.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
+    "tests/test_msync_fast.py": ["--cxx", "{cxx}"],
     "tests/test_capture_stream_copy.py": ["--cxx", "{cxx}"],
     "tests/test_capture_merge.py": ["--cxx", "{cxx}"],
     "tests/test_flash_sampling.py": ["--cxx", "{cxx}"],

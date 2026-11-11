@@ -198,3 +198,10 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
   31.47 against 28.95 (gpu_ms -2.8, late wait -2.3): the game's own barriers' drains, which narrowing does not shorten here.
 - Decision: nothing adopted. Game folder: main32d. Branch `feature/TICK-057-gpu-time`, bundle `E:\OOT\tick057.bundle`, not merged.
   Next: fewer game barriers (disjoint targets, split barriers) under sync validation; the serial frame's 12 ms of queue gaps.
+
+## TICK-056 (2026-11-12): the Presentation Thread's part of the frame's loop
+- Found: the mirror pre-sync (0.78 ms of the loop) is one job a frame of ~8,900 dirty pages among ~105,000 looked at (0.86 ms): its per-page work, not its place. Run on a worker beside the dry pass it does not fit (dry pass ~0.25 ms).
+- Built, off by default: `RX_VK_MSYNC_FAST` (the sync's walk and write-back notes cut, same copies: pre-sync 0.86 -> 0.45 ms), `RX_VK_PRESYNC_EARLY` (not kept), `RX_VK_SEG_EARLY` (segments handed out as the dry pass passes their planned ends; the PT's segment waits 0.71 -> 0.28 ms; plans used / no boundary reached / rejected logged), `RX_VK_PRESYNC_STATS`; chainb marks; tests.
+- Confirm (FAST + SEG_EARLY against base, 6 rounds): kokiri-idle 74.7 -> 76.6, castle-move 69.9 -> 70.2, hyrule-walk 72.7 -> 72.4 fps; frame prep -0.86 / -0.94 / -0.58 ms. Inside the spread, not above base in every round.
+- Decision: not adopted; the game's own chain (main thread) is the limit again. Shots alike, speed ~60, validation clean of new VUIDs, saves identical. Game folder: TICK-054's build. Branch `feature/TICK-056-chain-b`, not merged.
+- Next: the main thread's chain (draw code, job group, module phase), then the held flush's capture (pre-copy aimed at the held submits).

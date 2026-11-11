@@ -99,8 +99,15 @@ void texture_resident_flush(Texture* tex);
 void texture_begin_recording(VkCommandBuffer upload_cmd, uint64_t value);
 /// true when anything was recorded into the upload command buffer since texture_begin_recording
 bool texture_uploads_recorded();
+/// (TICK-056, RX_VK_SEG_EARLY) the submission part's readback refresh (memory_rb_refresh, once a part) into this thread's upload
+/// command buffer now, as texture_uploads_recorded makes it: before any segment's worker can end its recording first
+bool texture_rb_refresh_now();
 /// The recording's upload command buffer, to record into (its first use orders it after the work before)
 VkCommandBuffer upload_command_buffer();
+/// (TICK-056) this thread's upload command buffer set to `to` (and whether it was used), the one before returned to be set back
+/// the same way: the early mirror pre-sync records its copies on a worker into a command buffer of its own (vk_replay.cpp)
+struct UploadTarget { VkCommandBuffer cmd = VK_NULL_HANDLE; bool used = false; };
+UploadTarget texture_upload_swap(UploadTarget to);
 /// A copy of an RGBA8 region (decoded ASTC kept as RGBA8) into a texture kept as BC3: through the encoder
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
                           Texture* dst, uint32_t dst_level, uint32_t dst_layer, int dx, int dy, uint32_t w, uint32_t h,

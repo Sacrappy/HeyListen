@@ -2849,6 +2849,46 @@ void lazy_cpu_page(uint64_t page) {
                  "from now on", (unsigned long long)(page << kPageShift), np->flags);
     }
 }
+// (TICK-056, RX_VK_MSYNC_FAST) lazy_cpu_page for a mirror sync's dirty pages at once, in their order: the lock taken once, and the
+// game pool looked up only when a page leaves the last one found (a sync's pages are in address order). The same sets result.
+// A page already put in cpu_pages here is marked in a bitmap (by chunks of 64K pages) and skipped: cpu_pages never loses a page,
+// and skipped_pages takes only pages cpu_pages does not hold (lazy_filter), so for such a page both calls below change nothing
+// (the castle-move pre-sync's ~8,600 dirty pages a frame were each a hash insert and erase)
+std::vector<std::unique_ptr<uint64_t[]>> cpu_page_bits;   // (nvn_pools_mu held)
+void lazy_cpu_pages(const std::vector<uint32_t>& pages) {
+    if (pages.empty()) return;
+    std::lock_guard lk(nvn_pools_mu);
+    if (cpu_page_bits.empty()) cpu_page_bits.resize((size_t)(kPages / 65536));
+    uint64_t lo = 1, hi = 0;   // (the last pool found, or the gap between two: [lo, hi))
+    NvnPool* np = nullptr;
+    for (const uint32_t page : pages) {
+        const uint64_t g = (uint64_t)page << kPageShift;
+        if (!(g >= lo && g < hi)) {
+            np = nvn_pool_at(g, &lo);
+            if (np) {
+                hi = np->hi;
+            } else {   // (no pool here: none up to the next one's start)
+                const auto nx = nvn_pools.upper_bound(g);
+                lo = g, hi = nx == nvn_pools.end() ? UINT64_MAX : nx->first;
+            }
+        }
+        if (!np || np->eager) continue;
+        std::unique_ptr<uint64_t[]>& bits = cpu_page_bits[page >> 16];
+        if (!bits) bits.reset(new uint64_t[65536 / 64]());   // (zeroed)
+        uint64_t& word = bits[(page & 65535) >> 6];
+        const uint64_t bit = 1ull << (page & 63);
+        if (word & bit) continue;   // (in cpu_pages already, and so not in skipped_pages)
+        word |= bit;
+        cpu_pages.insert(page);
+        if (skipped_pages.erase(page)) {
+            st_lazy_cpu++;
+            static int logged;
+            if (logged++ < 16)
+                logf("vk: write-backs: page %#llx (pool flags %#x) written by the CPU after its GPU writes were left out: written back "
+                     "from now on", (unsigned long long)g, np->flags);
+        }
+    }
+}
 // (the runs of p to copy back: the parts left out removed)
 void lazy_filter(Pool& p, std::vector<VkBufferCopy>& runs) {
     std::lock_guard lk(nvn_pools_mu);
@@ -3293,9 +3333,54 @@ std::unordered_map<uint64_t, PoolSync> sync_by_pool;
 struct PresyncNote { Pool* p; uint64_t key, bound_before; int64_t bytes; };
 std::vector<PresyncNote> presync_notes;   // (this submission's presync, checked against its bindings at its end)
 thread_local bool in_presync = false;
+// (TICK-056, RX_VK_PRESYNC_STATS=1, diagnosis) the pre-syncs' work: pages looked at and dirty ones, pools synced, time, logged
+// every 600 pre-syncs that copied anything
+struct PresyncScan { int64_t pages = 0, dirty = 0, loop_ns = 0, lazy_ns = 0, cap_pages = 0, live_pages = 0; };
+thread_local PresyncScan presync_scan;
+bool presync_stats_on() {
+    static const bool v = getenv("RX_VK_PRESYNC_STATS") && atoi(getenv("RX_VK_PRESYNC_STATS")) != 0;
+    return v;
+}
+
+/// (TICK-056) RX_VK_MSYNC_FAST=1: a mirror sync's per-page work cut, the same copies made. Per dirty page the sync took the game
+/// pools' lock and looked its pool up (lazy_cpu_page), found its capture's buffer in cap_bufs and its runs in cap_runs (two map
+/// lookups): ~0.13 us a page, ~1 ms for the frame's big pre-sync (castle-move). Now the dirty pages go to lazy_cpu_pages once, in
+/// order, and the last capture buffer and run list found are kept while the next pages have the same ones
+bool msync_fast_on() {
+    static const bool v = getenv("RX_VK_MSYNC_FAST") && atoi(getenv("RX_VK_MSYNC_FAST")) != 0;
+    return v;
+}
+
+/// (TICK-056, RX_VK_MSYNC_FAST) the first page in [page, end) written after generation `synced` (page_gen > synced), or end: a region
+/// whose newest generation is not past it is skipped whole wherever the range starts in it, and a region's pages are read from
+/// its chunk directly (the castle-move pre-sync looked at ~105,000 pages a frame for ~9,000 dirty ones)
+uint64_t next_dirty_page(uint64_t page, uint64_t end, uint32_t synced) {
+    while (page < end) {
+        const uint64_t r = page / kRegionPages;
+        const uint64_t rend = std::min(end, (r + 1) * kRegionPages);
+        if (region_gen[r] <= synced) {   // (page_gen <= region_gen: every stamp of the region's pages set it)
+            page = rend;
+            continue;
+        }
+        if (load_u32(region_full[r]) > synced) return page;   // (every page of the region is at least that new)
+        const auto& c = gen_chunks[page / kChunkPages];   // (a region lies in one chunk)
+        if (c)
+            for (uint64_t i = page; i < rend; i++)
+                if (load_u32(c[i % kChunkPages]) > synced) return i;
+        page = rend;
+    }
+    return end;
+}
 
 /// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer)
 int64_t mirror_sync(Pool& p) {
+    const bool fast = msync_fast_on();
+    static thread_local std::vector<uint32_t> lazy_pages;   // (fast: the dirty pages for lazy_cpu_pages)
+    lazy_pages.clear();
+    uint32_t last_gen = 0;   // (fast: the last capture generation looked up, its buffer and its runs)
+    auto last_buf = cap_bufs.end();
+    std::vector<VkBufferCopy>* last_runs = nullptr;
+    VkBuffer last_runs_buf = VK_NULL_HANDLE;
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
     mirror_synced.push_back(&p);
@@ -3316,14 +3401,24 @@ int64_t mirror_sync(Pool& p) {
         if (!dmode) return;
         if (DiffPage* d = diff_page(page, false); d && d->rec) d->rec = 0, sst.d_inval++;
     };
-    for (uint64_t page = p.lo >> kPageShift; page < (p.hi + 4095) >> kPageShift;) {
-        if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen) {
+    const bool pstats = in_presync && presync_stats_on();
+    const auto lt0 = pstats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const uint64_t page_end = (p.hi + 4095) >> kPageShift;
+    for (uint64_t page = p.lo >> kPageShift; page < page_end;) {
+        if (fast) {   // (TICK-056: straight to the next dirty page; the pages skipped are those the loop leaves alone)
+            page = next_dirty_page(page, page_end, p.synced_gen);
+            if (page >= page_end) break;
+        } else if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen) {
             page += kRegionPages;   // (a clean 2 MB region)
             continue;
         }
         const uint32_t pg = page_gen(page);
         const bool dirty = pg > p.synced_gen;
-        if (dirty && wb_lazy_on()) lazy_cpu_page(page);   // (TICK-015: the CPU writes this pool: written back)
+        presync_scan.pages++, presync_scan.dirty += dirty;
+        if (dirty && wb_lazy_on()) {   // (TICK-015: the CPU writes this pool: written back)
+            if (fast) lazy_pages.push_back((uint32_t)page);
+            else lazy_cpu_page(page);
+        }
         if (dirty && gpu_page(page)) {   // (diagnostic: see memory_stamp_gpu)
             st_sync_gpu_pages++;
             const CapEntry e0 = cap_entry(page);
@@ -3345,7 +3440,8 @@ int64_t mirror_sync(Pool& p) {
         if (dirty && !sync_live()) {   // (as a capture took it, if the page was not written since)
             const CapEntry e = cap_entry(page);
             if (e.gen && e.gen == pg) {
-                auto b = cap_bufs.find(e.gen);
+                auto b = fast && e.gen == last_gen ? last_buf : cap_bufs.find(e.gen);
+                if (fast) last_gen = e.gen, last_buf = b;
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
                     const uint64_t src0 = (uint64_t)e.slot * 4096 + (ga - (page << kPageShift));
@@ -3403,14 +3499,16 @@ int64_t mirror_sync(Pool& p) {
                         }
                     }
                     int64_t copied = 0;
+                    std::vector<VkBufferCopy>& cr = fast && last_runs && last_runs_buf == b->second.buffer ? *last_runs : cap_runs[b->second.buffer];
+                    if (fast) last_runs = &cr, last_runs_buf = b->second.buffer;
                     if (mask == 0xffff) {
-                        append_capture_copy(cap_runs[b->second.buffer], {src0, ga - p.lo, gb - ga});
+                        append_capture_copy(cr, {src0, ga - p.lo, gb - ga});
                         copied = (int64_t)(gb - ga);
                     } else if (mask) {
                         uint32_t off[8], len[8];
                         const int nr = msync_diff::mask_runs(mask, off, len);
                         for (int k = 0; k < nr; k++) {
-                            append_capture_copy(cap_runs[b->second.buffer], {src0 + off[k], ga - p.lo + off[k], len[k]});
+                            append_capture_copy(cr, {src0 + off[k], ga - p.lo + off[k], len[k]});
                             copied += len[k];
                         }
                     }
@@ -3457,6 +3555,13 @@ int64_t mirror_sync(Pool& p) {
         page++;
     }
     if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
+    const auto lt1 = pstats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (fast) lazy_cpu_pages(lazy_pages);
+    if (pstats) {
+        presync_scan.loop_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(lt1 - lt0).count();
+        presync_scan.lazy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lt1).count();
+        presync_scan.cap_pages += b_cap + b_old, presync_scan.live_pages += b_live;
+    }
     if (dmode) {
         sst.d_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - d_t0).count();
         dlk.unlock();
@@ -4235,20 +4340,48 @@ void memory_begin_submission() {
 void memory_sync_mirrors_before_segments() {
     static const bool off = getenv("RX_VK_NO_PRESYNC") != nullptr;
     if (off || !mirror_on() || !mirror_upload) return;
+    const bool stats = presync_stats_on();
+    const auto t0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::lock_guard lk(pools_mu);
+    const auto t1 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    presync_scan = {};
+    int64_t pools = 0, synced = 0, bytes_all = 0;
     scatter_batch = true;   // (TICK-021: every pool's in one dispatch)
     in_presync = true;
     for (auto& kv : imported) {
         Pool& p = kv.second;
+        pools++;
         if (p.mstate != Pool::MIRROR_ON || p.synced_epoch == mirror_epoch) continue;
         const uint64_t bound_before = p.last_value;
         const int64_t bytes = mirror_sync(p);
+        synced++, bytes_all += bytes;
         if (bytes && msync_stats_on()) presync_notes.push_back({&p, kv.first, bound_before, bytes});
         p.sync_seg = 0;
     }
     in_presync = false;
     scatter_batch = false;
+    const size_t entries = scatter_pending.size();
+    const auto t2 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     scatter_flush(upload_command_buffer(), "msync scatter (CPU pages -> mirrors, one dispatch)");
+    if (stats && bytes_all) {
+        const auto t3 = std::chrono::steady_clock::now();
+        static int64_t n, s_pools, s_synced, s_pages, s_dirty, s_bytes, s_entries, s_loop, s_lazy, s_capb, s_liveb;
+        static double s_lock, s_scan, s_flush, s_max;
+        s_loop += presync_scan.loop_ns, s_lazy += presync_scan.lazy_ns, s_capb += presync_scan.cap_pages, s_liveb += presync_scan.live_pages;
+        using ms = std::chrono::duration<double, std::milli>;
+        n++, s_pools += pools, s_synced += synced, s_pages += presync_scan.pages, s_dirty += presync_scan.dirty, s_bytes += bytes_all;
+        s_entries += (int64_t)entries, s_lock += ms(t1 - t0).count(), s_scan += ms(t2 - t1).count(), s_flush += ms(t3 - t2).count();
+        s_max = std::max(s_max, ms(t3 - t0).count());
+        if (n == 600) {
+            logf("vk: pre-sync (RX_VK_PRESYNC_STATS), a pre-sync with copies: pools %.1f (synced %.1f), pages looked at %.0f, dirty %.0f, "
+                 "%.2f MB (%.2f from captures, %.2f live), %.0f scatter entries; ms: lock %.3f, pools %.3f (their page loops %.3f, the "
+                 "write-back notes %.3f), scatter %.3f, worst %.2f", s_pools / 600.0, s_synced / 600.0,
+                 s_pages / 600.0, s_dirty / 600.0, s_bytes / 600.0 / 1048576.0, s_capb / 600.0 / 1048576.0, s_liveb / 600.0 / 1048576.0,
+                 s_entries / 600.0, s_lock / 600, s_scan / 600, s_loop / 600e6, s_lazy / 600e6, s_flush / 600, s_max);
+            n = s_pools = s_synced = s_pages = s_dirty = s_bytes = s_entries = s_loop = s_lazy = s_capb = s_liveb = 0;
+            s_lock = s_scan = s_flush = s_max = 0;
+        }
+    }
 }
 
 /// A pool's mirror made, filled in the recording's upload command buffer: all of it, then the pages a capture holds

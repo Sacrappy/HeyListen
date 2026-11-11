@@ -3102,3 +3102,92 @@ fps inside the spread. All switches off.**
 - Fewer game barriers where two passes touch disjoint targets, or split barriers at the pass end, with sync validation
   (`C:\OOT\scripts\val57.bat`, the layer in `C:\OOT\tools\vkvalid`).
 - The serial frame (12 ms of queue gaps a frame) is still the larger prize: TICK-053's run-ahead and its stall.
+
+## TICK-056: the frame's loop shortened on the Presentation Thread: the mirror pre-sync's walk, and segments started during the dry pass (2026-11-12)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs cut at
+66 s. Branch `feature/TICK-056-chain-b` (main 32dc46f: TICK-054's defaults on). Raw data in the worktree's `build/tick056/` (not
+committed). One binary per screen, variants as environment.
+
+### The mirror pre-sync, measured (`RX_VK_PRESYNC_STATS=1`, diagnosis)
+
+TICK-054's "mirrors synced before the segments" (0.78 ms a frame on the loop) is one pre-sync a frame that copies anything: the
+first big command buffer's. Castle-move, means over 600 of them: 52 pools looked at (49 synced), **105,000 pages looked at for
+8,900 dirty ones** (35 MB, all from captures), 0.86 ms, of it the scatter's list 0.02 ms. Per dirty page the sync took the game
+pools' lock and looked its pool up and inserted it into a hash set (`lazy_cpu_page`), looked up its capture buffer and its run
+list in two maps; and it walked every page of a dirty 2 MB region (the clean-region skip only fired at region-aligned pages).
+
+### `RX_VK_MSYNC_FAST=1`: the same copies, less work a page (vk_memory.cpp)
+
+- `next_dirty_page`: straight to the next page written after the pool's sync; a region whose newest generation is not past it is
+  skipped whole wherever the walk is in it, a region's pages read from its chunk directly. The pages skipped are exactly those
+  the loop left alone (`tests/test_msync_fast.py` checks it against the page-by-page walk on random tables).
+- the last capture buffer and run list kept while the next pages have the same ones;
+- the write-back notes (`lazy_cpu_pages`) once a sync, in page order: the lock once, the pool looked up when a page leaves the
+  last one (or the last gap between two), and a bitmap of the pages already put in `cpu_pages`: `cpu_pages` never loses a page
+  and `skipped_pages` only takes pages it does not hold, so both calls are no-ops for them (the test checks the sets match).
+Pre-sync 0.86 -> 0.52 -> **0.45 ms** (the walk, then the bitmap); its page loops 0.26 ms, the notes 0.10-0.14. In the loop
+(chainb, one trace each): "mirrors synced" 0.78 -> 0.51 ms. The bind-time syncs (serial part and segments) use the same code.
+
+### `RX_VK_PRESYNC_EARLY=<draw>` (1: 64): the pre-sync on a worker during the dry pass (vk_replay.cpp, off, not kept)
+
+A replay worker runs `memory_sync_mirrors_before_segments` into a recording slot's command buffer of its own (the thread's upload
+command buffer swapped, `texture_upload_swap`), submitted after the dry pass and before rec_cur: its copies keep their place
+(after the work before, before rec_cur's and the segments'). Each pool is synced once under pools_mu, whichever thread gets
+there; the dry pass binds no buffer and mirror_epoch moves only between recordings. Kicked at the dry pass's start when the
+same-order command buffer was cut last frame, else at its 64th draw (at the start for every dry pass, the held submits' tiny
+ones got a 0.6 ms pre-sync each: the held flush grew 2.1 -> 3.9 ms). Result: the job takes ~0.49 ms on a worker against a dry
+pass of ~0.25 ms for that buffer; the replay thread still waits ~0.29 ms, and the extra submit and slot eat the rest (screen 1).
+
+### `RX_VK_SEG_EARLY=1`: segments handed out as the dry pass passes their boundaries (vk_replay.cpp `replay_handle_early`)
+
+The plan (segment count, boundary targets) comes from the replay thread's command buffer of the same order in the last frame,
+when it was cut then (its draw count and time profile, kept by that order: TICK-050's profiles are by the order among dry
+passes, the fourth and later sharing one). Before the dry pass, in rec_cur: pass ended, the pre-sync, the part's readback
+refresh (`texture_rb_refresh_now`: a worker ending its recording first would have made it in a segment's uploads, after
+rec_cur's work), the slots, orders and init command buffers of the planned count, `par_active` on. During the dry pass a hook
+at each kept point hands segment k out once the point is at or past its planned end: its end is that point, its start state a
+copy (the points' vector moves). The replay thread records the last segment after the dry pass, after submitting rec_cur;
+the segments are submitted in order as before.
+
+Shared state while segments run beside the dry pass:
+- `ub_updates` (a deque) and `par_conds` (a vector) grow while the workers read them. While `ub_growing`, the dry pass's appends
+  hold `ub_grow_mu` exclusively and a worker's reads hold it shared (`ub_overlay`, `ub_read`, a render condition; nested reads
+  once). A worker reads only entries appended before its segment was handed out. **No reader keeps a pointer or reference into
+  either container past its guard**: `ub_overlay` / `ub_read` / `ub_try_gap` take `const UbUpdate&` only inside the guarded
+  call and copy what they keep (the gap caches hold addresses and the list's epoch, the copy caches the stream's own buffer);
+  a render condition is read by value. So a reallocation under the exclusive lock cannot leave a dangling reference.
+- the dry pass's written-image marks (`dry_mark_written`) take ParLock; its texture lookups (targets, views, program picks) are
+  the draws' own, which take ParLock while `par_active`.
+- images the dry pass makes get their first layout change in rec_cur's uploads (it has no segment index), submitted before any
+  segment.
+Fallbacks: every boundary is a point of the current dry pass in this buffer's own stream, so a buffer unlike last frame's (a
+scene change, a menu, a cutscene, a new size, another draw count) only moves the boundaries; planned ones never reached leave
+their slots unused (init command buffers ended) and the last segment takes the rest; none reached records the whole buffer on
+the replay thread into rec_cur, as a one-segment one; a last count under two segments' worth takes the old path. Logged:
+`plans used / used but no boundary reached / rejected`.
+
+### Screens and confirm (one binary each; fps / 1% low / p99 / frame prep)
+
+- Screen 1 (castle-move, 3 runs): base 69.7 / 23.3 / 36.5 / 7.96; FAST **71.1** / 33.1 / 22.1 / 7.72; FAST + PRESYNC_EARLY 69.9 /
+  29.1 / 30.4 / 7.94.
+- Screen 2: FAST 70.9 / 23.8 / 32.6 / 7.34; FAST + SEG_EARLY **71.7** / 37.9 / 22.0 / 7.33. In one trace each the PT's waits for
+  segments fall 0.71 -> 0.28 ms a frame and its submits 7.72 -> 7.40 ms; its dry passes grow ~0.2 ms (beside the workers).
+- Confirm (base = no switch, new = FAST + SEG_EARLY, 6 rounds, 4-6 reversed): kokiri-idle 74.7 -> **76.6** (4 of 6 rounds
+  above), castle-move 69.9 -> **70.2** (4 of 6), hyrule-walk 72.7 -> 72.4 (2 of 6, one tie); frame prep 7.27 -> 6.41, 8.67 ->
+  7.73, 7.60 -> 7.02 ms. Plans: ~9,600-12,000 used a run, 3-18 with no boundary reached (the first at the title -> Market load),
+  0-10 rejected.
+- **Not adopted**: frame prep falls 0.6-0.9 ms in every scene, fps stays inside the spread. One walking trace each: the main
+  thread's part of the loop grows as the PT's shrinks (2.40 -> 3.08 ms against 8.24 -> 8.02): the game's own chain (the main
+  thread's job group and module phase, TICK-054's chain A) ends next to the PT's again. The switches stay off.
+
+### Correctness (new against base)
+Shots alike standing and walking, brightness series in the same range (black only at the load); `HOS_SPEED_LOG` median 60.01 /
+60.00 standing, 60.05 / 59.97 walking; validation: the same pre-existing shader denorm VUIDs, a pre-existing `viewType-07752`
+(seen with FAST alone too), no layout or synchronization VUID; saves identical; no game left. docs/benchmarks/2026-11-12-tick056.md.
+
+### What is next
+The loop's critical part is the game's chain again: the main thread's draw code and what it waits for. Then the held flush
+(capture 1.5-1.7 ms and memory work ~1.3 ms in the walking traces). The capture pre-copy (TICK-043/054) copies for "the next
+capture", often one of the PT's small ones: it would have to aim at the held submits' capture. FAST and SEG_EARLY are ready to
+turn on with whichever lever makes the PT's part the limit again.

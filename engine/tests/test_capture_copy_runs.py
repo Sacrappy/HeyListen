@@ -29,7 +29,8 @@ def main():
     source = (ROOT / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
     helper = function(source, "void append_capture_copy(")
     sync = function(source, "int64_t mirror_sync(Pool& p)")
-    if "append_capture_copy(cap_runs[b->second.buffer]," not in sync:
+    # (TICK-056: the run list is cap_runs[b->second.buffer], or the same one kept from the page before with RX_VK_MSYNC_FAST)
+    if "append_capture_copy(cr," not in sync or "? *last_runs : cap_runs[b->second.buffer];" not in sync:
         raise SystemExit("the captured-page path does not use the helper")
     fixture = r'''
 #include <algorithm>
