@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
     source = (ROOT / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
     helper = function(source, "void append_capture_copy(")
-    sync = function(source, "void mirror_sync(Pool& p)")
+    sync = function(source, "int64_t mirror_sync(Pool& p)")
     if "append_capture_copy(cap_runs[b->second.buffer]," not in sync:
         raise SystemExit("the captured-page path does not use the helper")
     fixture = r'''

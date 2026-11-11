@@ -2998,7 +2998,7 @@ void append_capture_copy(std::vector<VkBufferCopy>& runs, const VkBufferCopy& ne
 // way (from guest memory as it is at the replay, a segment's sync, kept for the GPU by RX_VK_PROTECT_BARE) lose theirs.
 // Not seen: shader stores through the guest page table past what a binding or a bare entry's guess covers (the syncs already
 // copy the CPU's whole page over those today). RX_VK_MSYNC_DIFF=0: off (whole pages, as before), 1: hashed and counted but
-// whole pages copied (the measure), 2 (the default): changed chunks only. The cost: hashing the synced pages on the replay
+// whole pages copied (the measure), 2: changed chunks only (the default on a PCIe link of <= 8 GB/s, see pcie_link_gbps) The cost: hashing the synced pages on the replay
 // thread, ~0.13 ms a submission part on an i5-10400F (~30 parts a frame at the Market). RX_VK_MSYNC_DIFF_GROUP=<chunks> (1, 2, 4, 8): copy granularity
 // (default 1, 256 bytes). RX_VK_MSYNC_STATS=1: the syncs' bytes by pool and kind every 600 submits, without the diff
 struct DiffPage { uint32_t rec, gw, mid, pad; uint64_t h[msync_diff::kChunks]; };
@@ -3008,10 +3008,45 @@ std::vector<std::unique_ptr<DiffPage[]>> diff_table;
 uint32_t diff_gw_all = 0;   // (a GPU write too large to note by page: every hash older than this epoch is void)
 uint32_t diff_mirror_ids = 0;
 uint64_t diff_table_bytes = 0;
+// (HeyListen TICK-048 verify) The default depends on the card's PCIe link: the diff gained 10-16% on a PCIe 3.0 x4 link (PC 3050,
+// ~3.9 GB/s) and lost ~10% on a full Gen4/5 x16 link (RTX 5070: the bytes cost 1 ms of GPU, the hashing ~3 ms of replay thread).
+// NVML (nvml.dll of the NVIDIA driver) gives the link's maximum generation and width; the link is throttled at idle, so the
+// maximum is read, not the current state. On when the maximum is <= 8 GB/s (Gen3 x8, Gen4 x4 and narrower); off when it is
+// wider, or when NVML is missing (other vendors, integrated GPUs: no known slow link).
+double pcie_link_gbps() {
+    HMODULE h = LoadLibraryA("nvml.dll");
+    if (!h) return -1;
+    typedef int (*fn_init)();
+    typedef int (*fn_idx)(unsigned, void**);
+    typedef int (*fn_u)(void*, unsigned*);
+    auto init = (fn_init)GetProcAddress(h, "nvmlInit_v2");
+    auto byidx = (fn_idx)GetProcAddress(h, "nvmlDeviceGetHandleByIndex_v2");
+    auto mgen = (fn_u)GetProcAddress(h, "nvmlDeviceGetMaxPcieLinkGeneration");
+    auto mw = (fn_u)GetProcAddress(h, "nvmlDeviceGetMaxPcieLinkWidth");
+    double gbps = -1;
+    if (init && byidx && mgen && mw && init() == 0) {
+        void* dev = nullptr;
+        unsigned gen = 0, w = 0;
+        if (byidx(0, &dev) == 0 && mgen(dev, &gen) == 0 && mw(dev, &w) == 0 && gen >= 1 && gen <= 6 && w) {
+            static const double per_lane[] = {0, 0.25, 0.5, 0.985, 1.969, 3.938, 7.563};   // GB/s a lane a direction
+            gbps = per_lane[gen] * w;
+            logf("vk: mirror syncs: PCIe link maximum Gen%u x%u (%.1f GB/s)", gen, w, gbps);
+        }
+        if (auto sd = (int (*)())GetProcAddress(h, "nvmlShutdown")) sd();
+    }
+    FreeLibrary(h);
+    return gbps;
+}
 int diff_mode() {
     static const int v = [] {
         const char* e = getenv("RX_VK_MSYNC_DIFF");
-        const int m = e ? std::clamp(atoi(e), 0, 2) : 2;   // (on by default: PC 3050, PCIe 3.0 x4, +4 to +6 fps)
+        int m;
+        if (e) m = std::clamp(atoi(e), 0, 2);
+        else {
+            const double g = pcie_link_gbps();
+            m = (g > 0 && g <= 8.0) ? 2 : 0;   // (on by default only on a slow link: PC 3050, Gen3 x4, +10..16%; off on x16 Gen4/5: -10%)
+            logf("vk: mirror syncs: chunk diff %s by default (RX_VK_MSYNC_DIFF unset)", m ? "on" : "off");
+        }
         if (m) logf("vk: mirror syncs: chunk diff %s (RX_VK_MSYNC_DIFF=%d)", m == 2 ? "on: changed 256-byte chunks only" : "measured only", m);
         return m;
     }();
