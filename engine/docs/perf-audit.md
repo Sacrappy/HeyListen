@@ -2874,3 +2874,47 @@ reached here. Desktop A/B (`RX_VK_LATE_MERGE=1` against the default) in the benc
   what the first submission after a gap waited for. On the desktop first: if the stall is session 0's, the run-ahead is 40 fps.
 - With the stall gone, the merge's remaining waits: the live path voids the shadow of a late page written again after its
   capture; a shadow refreshed from that live copy (the page as guest memory holds it at the record) would end most of them.
+
+## TICK-055: the lifted code on x86-64, audited; scalar FP kept in XMM registers (2026-11-11)
+
+**Result: the lifter's own overheads are each 0.5-6% of the guest samples, and the largest, scalar FP values moved between
+general and XMM registers around every op (5.6%), was removed behind a lift switch, bit-exact, 1.5-2.5x faster on synthetic
+FP chains, and worth nothing in the game: guest CPU ~21.9 -> ~22.3 ms a frame, castle-move 29.0 -> 28.3 fps on PC 3050
+(both builds without a profile), inside the spread. Not adopted.** Details: `docs/research/lifter-x86.md`, ticket
+`docs/tickets/TICK-055.md`.
+
+### The audit (castle-move, TICK-052's sampled build, skid-corrected, 13,462 samples over 370 sections)
+
+guest loads/stores 33.5%, integer work 22.9%, FP/vector with FPX checks 18.2%, context registers 8.9%, host stack 4.0%, other
+memory 3.6%, branches 3.4%, flags 1.5%, calls/prologues 1.2%, FP env 1.1%, dirty marks 1.0%, polls 0.7%. Already minimal:
+guest addressing (64-bit window: one `[base + reg + disp]`), atomics, barriers (`recomp_barrier` 0.01%; 870 DMB ISHLD would
+need no fence on x86, not worth it), exclusives (absent), the icall site cache. Ranked candidates: GPR <-> XMM crossings
+(5.6%), the FPX gate re-read per op (~1.6%), the dirty marks (~1.7%: `.refptr.a64_dirty` loads, mask, a pinned register), flag
+stores, LR store-forwarding at function entry (~0.9%: SLP merges the prologue's x29/x30 context loads into one wide load just
+after the caller's 8-byte store of LR), context write-through, the Win64 calling convention (~1.1%).
+
+### Built (lift time, off: the default lift unchanged, key e8dc207cb2)
+
+- `A64_FPX_XMM=1`: hot functions' scalar binary32 FADD/FSUB/FMUL/FNMUL/FDIV/FMA as float ops on operands pinned in XMM
+  registers, the default keep tests on copies of the bits, the default out-of-line helpers past them; S/D/Q loads straight
+  into XMM; scalar results as one 16-byte store.
+- `A64_LR_SCALAR=1`: the frame record's STP reads LR through an empty asm (no merged wide load).
+- `engine/tests/test_fpx_xmm.py`: old against new lowering, whole Ctx + guest memory, 1 M random runs at v3 and v2, 0
+  mismatches, teeth checked. `tools/bench/lifter_mb/lifter_mb.py`: game-free micro-benchmarks.
+
+### Measured (PC 3050, same source, neither build profiled)
+
+| | guest CPU / frame (sampler, 2 runs) | Link's job ms/s | castle-move fps (3 rounds) | 1% low |
+|---|---:|---:|---:|---:|
+| base | 21.8, 21.9 ms | 85, 84 | 28.1 29.0 30.0 -> **29.0** | 15.3 |
+| both switches | 22.5, 22.2 ms | 82, 87 | 28.2 28.5 28.3 -> **28.3** | 14.2 |
+
+The crossings' samples fell 5.0% -> 3.9% and reappeared on the FP ops and the bit copies: the game's FP chains are short and
+lie between guest loads, which are the critical path (TICK-041's conclusion again). Saves identical after all 10 runs; no
+game left; the game folder has t53f back.
+
+### What is next
+The guest loads are the frame's lifted-code critical path: the lever left in the lifter is carrying guest registers in host
+registers across calls (the call-boundary hops), a large project. Large pages for the guest heap need the user's
+"Lock pages in memory" right. The smaller instruction cuts (gate, marks, flags, calling convention) only as one combined,
+profiled lift judged on the job chain's CPU first.

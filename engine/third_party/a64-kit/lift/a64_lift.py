@@ -274,7 +274,7 @@ MG_ADEF = re.compile(r"uint64_t _a=c->x\[(\d+)\];")
 # (call-like tokens that are plain: keywords, guest loads and stores without ordering (the stores are what is grouped),
 # and helpers that only compute or move values between locals, registers and vector registers)
 MG_PLAIN = re.compile(r"(?:if|for|while|sizeof|memcpy|memset|UINT64_C|INT64_C|fabsf|fabs|__builtin_add_overflow|"
-                      r"recomp_(?:load|ldp|store|stp)(?:8|16|32|64)(?:_sp)?|"
+                      r"recomp_(?:load|ldp|store|stp)(?:8|16|32|64)(?:_sp|_lr)?|"
                       r"recomp_(?:fixed_to_fp|fp_to_fixed|fp_to_int|fp_estimate|umulh|smulh|aes_sbox)|"
                       r"a64_(?:vset64|vset128|vset_lo|vst16|fcmp32|fcmp64|vfcmp)|a64_v?fpx_\w+)\Z")
 MG_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
@@ -1182,9 +1182,181 @@ static inline __attribute__((always_inline)) int a64_fpx_sticky32(const Ctx *c, 
 HOT_FPX = re.compile(r"\ba64_fpx_(?!hot_|fz_)(\w+)\(c,")
 
 
+def lift_opt(name):
+    """(HeyListen TICK-055) a lift-time switch that is off unless <name>=1 (lift_switch's are on unless =0)"""
+    return os.environ.get(name, "0") == "1"
+
+
 def hot_text(text):
     """a hot function's text: its FPX helper calls go through the copies with the fast path inline"""
-    return HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
+    text = HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
+    return xmm_text(text) if lift_opt("A64_FPX_XMM") else text
+
+
+# (HeyListen TICK-055) A64_FPX_XMM=1 at lift time (off by default): the hot functions' scalar binary32 FP ops, the S / D / Q
+# loads into vector registers and the scalar FP results keep their values in XMM registers. The translation handles every
+# FP value as an integer bit pattern (uint64_t, memcpy from c->vreg), and the FPX fast paths test the result's bits, so
+# clang kept the values in general registers and moved them to an XMM register for each op and back after it: on a
+# dependent chain ~4 GPR <-> XMM moves of ~3 cycles around each 3-4 cycle op (5.6% of the castle's guest samples sat on such
+# moves, more than on the FP arithmetic itself). Here the operands are floats pinned in XMM registers (A64_XF), the fast
+# path's keep tests read copies of their bits, the slow path returns a float (a64_fpxf_slow_*), and the result is written
+# as one 16-byte store of the zero-extended lane (a64_vset_f32). The ops, the keep tests and the slow paths are the default
+# ones: only where the values live changes (tests/test_fpx_xmm.py compares the whole Ctx with the default lowering).
+# Also: LDR S / LDR D / LDP S / LDR Q / LDP Q into vector registers load straight into an XMM register (they went through a
+# general register, or two 8-byte halves that a later 16-byte read could not forward from), and a scalar result written
+# as a zeroed register plus a 4- or 8-byte store (FNEG, FABS, FMOV, ...: a store-forwarding failure when read whole) is one
+# store. It changes the hot functions' text: the PGO profile must be recorded on a lift with it (TICK-045).
+XMM_MUL = re.compile(r"\{uint64_t _a=0,_b=0,_z,_v;memcpy\(&_a,c->vreg\[(\d+)\],4\);memcpy\(&_b,c->vreg\[(\d+)\],4\);"
+                     r"_z=\(_a\^_b\)&0x80000000ULL;\s*(\(void\)_z;\s*)?_v=a64_fpx_hot_(mul32_fma32|div32_div32)\(c,_a,_b(,_z)?\);"
+                     r"\s*(_v\^=0x80000000ULL;\s*)?a64_vset64\(c->vreg\[(\d+)\],_v\);\}")
+XMM_FMA = re.compile(r"\{ uint64_t _a=0,_b=0,_z=0,_v; memcpy\(&_a,c->vreg\[(\d+)\],4\);memcpy\(&_b,c->vreg\[(\d+)\],4\);"
+                     r"memcpy\(&_z,c->vreg\[(\d+)\],4\);\s*(_a\^=0x80000000ULL;\s*)?(_z\^=0x80000000ULL;\s*)?"
+                     r"_v=a64_fpx_hot_fma32_fma32\(c,_a,_b,_z\);\s*a64_vset64\(c->vreg\[(\d+)\],_v\);\}")
+XMM_ADD = re.compile(r"\{ uint32_t _n\[4\],_m\[4\],_r\[4\]=\{0\};memcpy\(_n,c->vreg\[(\d+)\],16\);memcpy\(_m,c->vreg\[(\d+)\],16\);"
+                     r"\s*\{uint64_t _a=_n\[0\],_b=_m\[0\],_v=0;_v=a64_fpx_hot_(add32_add32|sub32_sub32)\(c,_a,_b\);"
+                     r"_r\[0\]=\(uint32_t\)_v;\}\s*a64_vst16\(c->vreg\[(\d+)\],_r\);\}")
+XMM_LD = re.compile(r"\{ uint64_t _v=recomp_load(32|64)\(c,([^;]*)\); a64_vset64\(c->vreg\[(\d+)\],_v\); \}")
+XMM_LDP = re.compile(r"\{ uint64_t _p0,_p1; recomp_ldp32\(c,([^;]*),&_p0,&_p1\); a64_vset64\(c->vreg\[(\d+)\],_p0\); "
+                     r"a64_vset64\(c->vreg\[(\d+)\],_p1\); \}")
+XMM_LDQ = re.compile(r"recomp_ldp64\(c,([^;]*?),&c->vreg\[(\d+)\]\[0\],&c->vreg\[\2\]\[1\]\);")
+XMM_LO = re.compile(r"a64_vset64\(c->vreg\[(\d+)\],0\); memcpy\(&c->vreg\[\1\]\[0\],(&[\w\[\]>-]+),([48])\);")
+XMM_STATS = Counter()
+
+
+def xmm_text(text):
+    if "c->vreg[" not in text:
+        return text
+
+    def mul(m):
+        a, b, _, op, _, neg, d = m.groups()
+        XMM_STATS[op[:5]] += 1
+        e = "a64_fpxf_hot_%s(c,_fa,_fb)" % op[:5]
+        return "{ float _fa,_fb; memcpy(&_fa,c->vreg[%s],4); memcpy(&_fb,c->vreg[%s],4); a64_vset_f32(c->vreg[%s],%s%s); }" % (
+            a, b, d, "-" if neg else "", e)
+
+    def fma(m):
+        a, b, z, na, nz, d = m.groups()
+        XMM_STATS["fma32"] += 1
+        return ("{ float _fa,_fb,_fz; memcpy(&_fa,c->vreg[%s],4); memcpy(&_fb,c->vreg[%s],4); memcpy(&_fz,c->vreg[%s],4); "
+                "a64_vset_f32(c->vreg[%s],a64_fpxf_hot_fma32(c,%s_fa,_fb,%s_fz)); }" % (a, b, z, d, "-" if na else "", "-" if nz else ""))
+
+    def add(m):
+        a, b, op, d = m.groups()
+        XMM_STATS[op[:5]] += 1
+        return "{ float _fa,_fb; memcpy(&_fa,c->vreg[%s],4); memcpy(&_fb,c->vreg[%s],4); a64_vset_f32(c->vreg[%s],a64_fpxf_hot_%s(c,_fa,_fb)); }" % (
+            a, b, d, op[:5])
+
+    def ld(m):
+        XMM_STATS["ldr" + m.group(1)] += 1
+        return "{ a64_vld%s(c->vreg[%s],%s); }" % (m.group(1), m.group(3), m.group(2))
+
+    def ldp(m):
+        XMM_STATS["ldp32"] += 1
+        return "{ const uint64_t _q=%s; a64_vld32(c->vreg[%s],_q); a64_vld32(c->vreg[%s],_q+4); }" % m.groups()
+
+    def ldq(m):
+        XMM_STATS["ldr128"] += 1
+        return "a64_vld128(c->vreg[%s],%s);" % (m.group(2), m.group(1))
+
+    def lo(m):
+        XMM_STATS["lo%s" % m.group(3)] += 1
+        return "a64_vset_lo%sf(c->vreg[%s],%s);" % (m.group(3), m.group(1), m.group(2))
+    text = XMM_MUL.sub(mul, text)
+    text = XMM_FMA.sub(fma, text)
+    text = XMM_ADD.sub(add, text)
+    text = XMM_LD.sub(ld, text)
+    text = XMM_LDP.sub(ldp, text)
+    text = XMM_LDQ.sub(ldq, text)
+    return XMM_LO.sub(lo, text)
+
+
+XMM_HEADER = r"""
+/* ---- (TICK-055) A64_FPX_XMM: scalar FP values kept in XMM registers (xmm_text in a64_lift.py) ---- */
+#if defined(__x86_64__) || defined(_M_X64)
+#define A64_XF(x) __asm__("" : "+x"(x))   /* (the value comes from an XMM register: its bits are a copy, not its source) */
+#else
+#define A64_XF(x) ((void)0)
+#endif
+static inline __attribute__((always_inline)) uint32_t a64_f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline __attribute__((always_inline)) float a64_u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+#if RECOMP_FPX_HOST == 2
+static inline __attribute__((always_inline)) void a64_vset_f32(uint64_t *d, float f) {
+    __m128 x = _mm_set_ss(f);
+    A64_OPAQUE(x);
+    _mm_storeu_ps((float *)d, x);
+}
+static inline __attribute__((always_inline)) void a64_vset_f64(uint64_t *d, double f) {
+    __m128d x = _mm_set_sd(f);
+    A64_OPAQUE(x);
+    _mm_storeu_pd((double *)d, x);
+}
+static inline __attribute__((always_inline)) void a64_vld32(uint64_t *d, uint64_t a) {
+    __m128i x = _mm_loadu_si32(A64_PTR(a));
+    A64_OPAQUE(x);
+    _mm_storeu_si128((__m128i *)d, x);
+}
+static inline __attribute__((always_inline)) void a64_vld64(uint64_t *d, uint64_t a) {
+    __m128i x = _mm_loadl_epi64((const __m128i *)A64_PTR(a));
+    A64_OPAQUE(x);
+    _mm_storeu_si128((__m128i *)d, x);
+}
+static inline __attribute__((always_inline)) void a64_vld128(uint64_t *d, uint64_t a) {
+    __m128i x = _mm_loadu_si128((const __m128i *)A64_PTR(a));
+    A64_OPAQUE(x);
+    _mm_storeu_si128((__m128i *)d, x);
+}
+#else
+static inline void a64_vset_f32(uint64_t *d, float f) { uint32_t u; memcpy(&u, &f, 4); d[0] = u; d[1] = 0; }
+static inline void a64_vset_f64(uint64_t *d, double f) { memcpy(&d[0], &f, 8); d[1] = 0; }
+static inline void a64_vld32(uint64_t *d, uint64_t a) { uint32_t u; memcpy(&u, A64_PTR(a), 4); d[0] = u; d[1] = 0; }
+static inline void a64_vld64(uint64_t *d, uint64_t a) { memcpy(&d[0], A64_PTR(a), 8); d[1] = 0; }
+static inline void a64_vld128(uint64_t *d, uint64_t a) { memcpy(d, A64_PTR(a), 16); }
+#endif
+static inline __attribute__((always_inline)) void a64_vset_lo4f(uint64_t *d, const void *s) { float f; memcpy(&f, s, 4); a64_vset_f32(d, f); }
+static inline __attribute__((always_inline)) void a64_vset_lo8f(uint64_t *d, const void *s) { double f; memcpy(&f, s, 8); a64_vset_f64(d, f); }
+"""
+# per shape (fast, exact, params): the slow wrapper (a float back from the default out-of-line helper) and the hot copy (the
+# default keep tests on copies of the bits; past them the wrapper). Without the host fast path every op takes the wrapper.
+XMM_OPS = {
+    ("add32", "add32"): ("add32", "a + b", "RECOMP_FPX_FIN32(tb) && (!RECOMP_FPX_FZ(c) || RECOMP_FPX_FZSUM32(tb, ab, bb))",
+                         "a64_fpx_add32_add32(c, a64_f2u(a), a64_f2u(b))"),
+    ("sub32", "sub32"): ("sub32", "a - b", "RECOMP_FPX_FIN32(tb) && (!RECOMP_FPX_FZ(c) || RECOMP_FPX_FZSUM32(tb, ab, bb))",
+                         "a64_fpx_sub32_sub32(c, a64_f2u(a), a64_f2u(b))"),
+    ("mul32", "fma32"): ("mul32", "a * b", "RECOMP_FPX_KEEP32(tb, ab, bb) && (!RECOMP_FPX_FZ(c) || RECOMP_FPX_FZOK32(ab, bb))",
+                         "a64_fpx_mul32_fma32(c, a64_f2u(a), a64_f2u(b), (a64_f2u(a) ^ a64_f2u(b)) & 0x80000000u)"),
+    ("div32", "div32"): ("div32", "a / b", "RECOMP_FPX_KEEPDIV32(tb, ab) && (!RECOMP_FPX_FZ(c) || RECOMP_FPX_FZOK32(ab, bb))",
+                         "a64_fpx_div32_div32(c, a64_f2u(a), a64_f2u(b))"),
+}
+
+
+def xmm_header(used):
+    out = [XMM_HEADER]
+    shapes = {(f, e) for f, e, _, _ in used}
+    for key, (name, expr, keep, slow) in sorted(XMM_OPS.items()):
+        if key not in shapes:
+            continue
+        out.append("static __attribute__((noinline)) float a64_fpxf_slow_%s(Ctx *c, float a, float b) { return a64_u2f((uint32_t)%s); }"
+                   % (name, slow))
+        out.append("static inline __attribute__((always_inline)) float a64_fpxf_hot_%s(Ctx *c, float a, float b) {\n"
+                   "    A64_XF(a); A64_XF(b);\n#if RECOMP_FPX_HOST\n"
+                   "    if (RECOMP_FPX_OPEN(c)) {\n        const float t = %s;\n"
+                   "        const uint32_t tb = a64_f2u(t), ab = a64_f2u(a), bb = a64_f2u(b);\n        (void)ab; (void)bb;\n"
+                   "        if (RECOMP_LIKELY(%s)) return t;\n    }\n#endif\n"
+                   "    return a64_fpxf_slow_%s(c, a, b);\n}" % (name, expr, keep, name))
+    if ("fma32", "fma32") in shapes:
+        out.append("static __attribute__((noinline)) float a64_fpxf_slow_fma32(Ctx *c, float a, float b, float z) { "
+                   "return a64_u2f((uint32_t)a64_fpx_fma32_fma32(c, a64_f2u(a), a64_f2u(b), a64_f2u(z))); }")
+        # (the hardware FMA only where recomp_fpx_fma32 uses it: A64_FPX_FMA3 and an FMA3 build; else the default route)
+        fast = lift_switch("A64_FPX_FMA3")
+        out.append("static inline __attribute__((always_inline)) float a64_fpxf_hot_fma32(Ctx *c, float a, float b, float z) {\n"
+                   "    A64_XF(a); A64_XF(b); A64_XF(z);\n#if %s\n"
+                   "    if (RECOMP_FPX_OPEN(c)) {\n        const float t = __builtin_fmaf(a, b, z);\n"
+                   "        const uint32_t tb = a64_f2u(t), ab = a64_f2u(a), bb = a64_f2u(b), zb = a64_f2u(z);\n"
+                   "        if (RECOMP_LIKELY(RECOMP_FPX_KEEP32(tb, ab, bb) && (!RECOMP_FPX_FZ(c) || (RECOMP_FPX_FZOK32(ab, bb) && "
+                   "!RECOMP_FPX_SUBN32(zb))))) return t;\n    }\n    return a64_fpxf_slow_fma32(c, a, b, z);\n#else\n"
+                   "    return a64_u2f((uint32_t)a64_fpx_hot_fma32_fma32(c, a64_f2u(a), a64_f2u(b), a64_f2u(z)));\n#endif\n}"
+                   % ("RECOMP_FPX_HOST == 2 && RECOMP_FPX_FMA64" if fast else "0"))
+    return "\n".join(out) + "\n"
 
 
 def hot_functions():
@@ -1262,13 +1434,36 @@ def fpx_header(used):
                 out.append(VFPX_MULE_HEADER)
         if elem and ("fma32", "fma32", 3, 3) in used:
             out.append(VFPX_FMA_HEADER)
+    if lift_opt("A64_FPX_XMM"):   # (TICK-055; off by default: a64_fpx.h as before)
+        out.append(xmm_header(used))
+    if lift_opt("A64_LR_SCALAR"):   # (TICK-055; off by default)
+        out.append(LR_HEADER)
     return "\n".join(out) + "\n"
 
 
 def op_text(text, fpx):
     """one instruction's emitted C as lifted code has it: FPX guards outlined (their shapes added to fpx, which
     fpx_header turns into a64_fpx.h), NEON FP vectorized, stores widened, flags packed"""
-    return stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
+    text = stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
+    return LR_STP.sub(r"recomp_stp64_lr(c,\1,c->x[29],c->x[30])", text) if lift_opt("A64_LR_SCALAR") else text
+
+
+# (HeyListen TICK-055) A64_LR_SCALAR=1 at lift time (off by default): the frame record's STP x29, x30 to the stack reads LR as
+# a scalar. clang's SLP vectorizer merged the two context reads (c->x[29], c->x[30]) into one 16-byte load (and with the
+# STPs after it, 32-byte ones), but the caller has just stored c->x[30] (the return address) with an 8-byte store: the wide
+# load cannot take its data from that store and waits for it to commit, at the entry of nearly every non-leaf function
+# (0.9% of the castle's guest samples sat there). recomp_stp64_lr passes LR through an empty asm, which the vectorizer
+# cannot see through; the stores are the same.
+LR_STP = re.compile(r"recomp_stp64_sp\(c,([^;]*?),c->x\[29\],c->x\[30\]\)")
+LR_HEADER = r"""
+/* (TICK-055) A64_LR_SCALAR: STP x29, x30 to the stack with LR read as a scalar (LR_STP in a64_lift.py) */
+static inline __attribute__((always_inline)) void recomp_stp64_lr(GuestContext *c, uint64_t a, uint64_t v0, uint64_t v1) {
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__("" : "+r"(v1));
+#endif
+    recomp_stp64_sp(c, a, v0, v1);
+}
+"""
 
 
 class Lifter:
@@ -2116,6 +2311,8 @@ class Lifter:
         if hot:
             print("hot functions (A64_HOT_FUNCS): %d of %d listed found%s" % (nhot, len(hot),
                                                                          ", in code_hot.c" if hot_chunk else ""))
+        if lift_opt("A64_FPX_XMM"):
+            print("A64_FPX_XMM: %s" % ", ".join("%s %d" % kv for kv in sorted(XMM_STATS.items())))
         self._write_table(out_dir)
         with open(os.path.join(out_dir, "functions.txt"), "w") as f:
             for e in sorted(self.funcs):
