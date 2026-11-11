@@ -2048,9 +2048,12 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
 // mirror takes the page another way (live from guest memory, a readback refresh, a parallel segment's sync, a new mirror).
 // A late page with no shadow yet is waited for as before (once; then it has one). The words the GPU wrote and the write-back
 // landed in guest memory since the shadow was taken read as changed: copied again with the mirror's own value, harmless.
-// RX_VK_LATE_MERGE=0: the wait, as before. The late bit rides in the capture table's slot (kCapLateBit, above).
+// RX_VK_LATE_MERGE=1: on; off by default: without the wait the game's thread runs ahead of the GPU, and on PC 3050 (over SSH, in
+// session 0) the queue then idles 25-50 ms a frame between our own command buffers while both game threads wait for the GPU
+// (TICK-053 in docs/perf-audit.md: not placed; the presentation, VRAM headroom and clocks ruled out), 23 fps against 28.5. The
+// late bit rides in the capture table's slot (kCapLateBit, above).
 bool late_merge_on() {
-    static const bool v = !getenv("RX_VK_LATE_MERGE") || atoi(getenv("RX_VK_LATE_MERGE")) != 0;
+    static const bool v = getenv("RX_VK_LATE_MERGE") && atoi(getenv("RX_VK_LATE_MERGE")) != 0;
     return v;
 }
 struct LateShadow {

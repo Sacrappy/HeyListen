@@ -1,7 +1,7 @@
 """(HeyListen TICK-053) The late pages merged: the capture's wait for the GPU ended (gpu/vk/vk_memory.cpp, "the late pages merged").
 
 Compiles late_diff_runs (cut out of vk_memory.cpp) and checks its runs: 4-byte granular, adjacent words joined, nothing for
-equal pages, a whole page of changes one run, alternating words 512 runs. Then reads the source: RX_VK_LATE_MERGE with the
+equal pages, a whole page of changes one run, alternating words 512 runs. Then reads the source: RX_VK_LATE_MERGE (off by default) with the
 wait as the off path, the shadow checked before the wait is skipped and wanted after it, the late bit in the capture table's
 slot, the merge at the sync with the chunk hashes voided, the shadow refreshed by a whole or chunked sync, and void where the
 mirror takes the page another way (live from guest memory, a readback refresh, a kept bare page, a segment's sync).
@@ -57,7 +57,7 @@ def cut(src, start, end_marker="\n}\n"):
 def check_source(src):
     for needle in (
             # (the switch, and the wait as the off path)
-            'static const bool v = !getenv("RX_VK_LATE_MERGE") || atoi(getenv("RX_VK_LATE_MERGE")) != 0;',
+            'static const bool v = getenv("RX_VK_LATE_MERGE") && atoi(getenv("RX_VK_LATE_MERGE")) != 0;',
             "if (!late_merge) {\n            st_late_waited.fetch_add(1, std::memory_order_relaxed);",
             "std::lock_guard sl(pools_mu);\n            late_merge = true;",
             "vk_timeline_wait(c->late_value);",
