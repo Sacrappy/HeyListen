@@ -36,6 +36,7 @@
 #include "capture_merge.h"    // (TICK-043: the capture copied ahead)
 #include "mirror_inherit.h"   // (TICK-036 / #1127: what a new mirror takes from the retired pools' mirrors)
 #include "msync_diff.h"       // (TICK-048: the mirror syncs' diff)
+#include "gone_ring.h"        // (TICK-052: the recording threads' pool table)
 #include "shaders/msync_scatter_comp_spv.h"   // (TICK-021: the mirror syncs' scatter copy)
 #ifdef __linux__
 #include <cerrno>
@@ -2186,6 +2187,20 @@ struct TlPool {
     uint64_t gen;
 };
 thread_local TlPool tl_pools[1024];   // (a parallel replay thread's: by 64 KB page, read without the lock)
+// (TICK-052) RX_VK_TL_POOLS_WIDE=1 (off by default): 16384 entries (1 GB before two pages share one) instead of 1024 (64 MB): the game's
+// pools lie further apart than that, and pages 64 MB apart took turns in one entry (a third of a command buffer's buffer binds went
+// to the lock, "bind page range")
+constexpr uint64_t kTlWide = 16384;
+thread_local TlPool* tl_pools_wide = nullptr;
+bool tl_wide_on() {
+    static const bool on = getenv("RX_VK_TL_POOLS_WIDE") && atoi(getenv("RX_VK_TL_POOLS_WIDE")) != 0;   // (off by default: TICK-052 not adopted)
+    return on;
+}
+TlPool& tl_pool_entry(uint64_t guest) {
+    if (!tl_wide_on()) return tl_pools[(guest >> 16) & 1023];
+    if (!tl_pools_wide) tl_pools_wide = new TlPool[kTlWide]();   // (once a thread; kept for its life)
+    return tl_pools_wide[gone_ring::page_slot(guest, kTlWide)];
+}
 
 Pool* pool_of(uint64_t guest, uint64_t size) {
     if (!size || size > UINT64_MAX - guest) return nullptr;
@@ -3617,7 +3632,14 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // without the lock: every thread's, the replay thread's too (each draw binds several uniform buffers: the pool's
     // lookup under the lock was ~8% of the replay's time in a race); the rest under it, as below)
     const bool par = par_active.load(std::memory_order_relaxed);
-    TlPool& tl = tl_pools[(guest >> 16) & 1023];
+    TlPool& tl = tl_pool_entry(guest);
+    if (par_stats_on && par)
+        par_why(written ? PW_BIND_WRITTEN : !tl.p ? PW_BIND_NO_TL : tl.gen != pools_gen.load(std::memory_order_relaxed) ? PW_BIND_TL_GEN
+                : !(guest >= tl.p->lo && guest <= tl.p->hi) ? PW_BIND_TL_RANGE
+                : !(size <= tl.p->hi - guest) ? PW_BIND_SIZE
+                : (!mirror_on() || !mirror_upload || tl.p->mstate == Pool::MIRROR_REFUSED || tl.p->mstate == Pool::MIRROR_WANTED) ? PW_COUNT
+                : tl.p->mstate != Pool::MIRROR_ON ? PW_BIND_MIRROR_STATE : tl.p->synced_epoch != mirror_epoch ? PW_BIND_SYNC_EPOCH
+                : tl.p->sync_seg > texture_segment() ? PW_BIND_SYNC_SEG : PW_COUNT);
     if (!written && tl.p && tl.gen == pools_gen.load(std::memory_order_relaxed) && guest >= tl.p->lo &&
         guest <= tl.p->hi && size <= tl.p->hi - guest) {   // (hookshot: no wrap-around for a huge size, as pool_of)
         Pool* p = tl.p;

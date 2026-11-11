@@ -2711,3 +2711,109 @@ with the maximum generation would read x4 there.
   overlap question, now that the spikes are gone).
 - The eviction's working set: a budget that keeps the walk's textures would remove the remaining re-made uploads.
 - Pipelines (~1 spike a run, 40-70 ms) and the unattributed ~1 a run (HOS_SAMPLE_ALL around them).
+
+## TICK-052: why parallel replay draws cost more, and the shared lock's traffic cut (2026-11-11)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, 110 s runs cut at 66 s. No pass timing, dumps
+or probes (they make the replay serial). Raw data in the worktree's `build/tick052/` (not committed).
+
+### The sampler (castle-move, main b17b933, `HOS_PROFILE` + `HOS_SAMPLE_ALL` 72-104 s, the dll's map)
+
+`vkprof.py` drops every sample whose leaf is outside our code and the driver, so lock waits (their leaf is in ntdll) were invisible
+to it. `build/tick052/contend.py` keeps them, names ntdll/KERNELBASE/ucrtbase by their exports and the leaf by our innermost frame.
+
+The 4 replay workers run 17.7% of the time (82.3% waiting for a job). Of their running samples:
+
+| what | share | where |
+|---|---:|---|
+| waiting for `ParLock` (`recursive_mutex`, a CRITICAL_SECTION) | 13.1% (+0.8% waking the next) | `gpu_buffer_bind`'s locked path 4.9, `texture_view_of`'s miss path and its touch 4.9, `build_descriptors`' slot touch 1.2, `targets` 0.6 |
+| the driver (`nvoglv64.dll`) | 20.6% | from `draw` 6.9, `bind_descriptors` (the push) 5.5, push constants 1.7, `begin_pass` 1.5, barriers 1.3 |
+| `program_for` | 14.2% | `answer_handles` 5.3, `still_valid` 4.7 (the "other textures" picks) |
+| `texture_view_of` | 12.2% | lock 4.9 (above), its map 3.2, `texture_get` / `texture_view` under the lock ~2 |
+| `gpu_buffer_bind` | 9.3% | lock 4.9 (above), its memo 3.4 |
+| the heap | ~1.3% | `operator new` -> `RtlAllocateHeap` |
+| `pools_mu`, `seg_mu`, other mutexes | < 0.5% | |
+
+Not seen: driver locks (no ntdll wait under `nvoglv64.dll`), `pools_mu` (it is taken after ParLock, so its waits show as
+ParLock's), the heap (1.3%).
+
+### A new instrument, `RX_VK_PARLOCK_STATS=1` (diagnostic, off)
+
+Every 240 parallel command buffers:
+- `vk: parallel replay, the lock by place, a command buffer: taken (waited, waiting ms; held ms)` by file:line (`ParLock` takes
+  `__builtin_FILE/LINE`);
+- `vk: parallel replay, a draw by its place in its segment` (blocks of 32: wall us a draw, locks a draw);
+- `vk: parallel replay, why the lookups went to the lock` (the reasons below);
+- `vk: parallel replay, a segment in parts` (set up, before the first draw, the draws, after the last, ended).
+
+Main's behaviour (castle-move, one run each):
+- ~1,050 takings a command buffer (~1.3 a draw): `gpu_buffer_bind` ~330, `texture_view_of`'s miss ~250, the touches ~300.
+  Waiting 0.45 ms and holding 0.35 ms a command buffer, summed over the threads. A taking that found the lock held slept in the
+  kernel and woke ~9 us later, for a hold of ~0.1-0.6 us.
+- A segment's draws by place: 0-31: 6.9-7.4 us a draw (1.2-1.3 takings), 32-63: 4.7-5.1, 64-191: 3.5-4.1, 192+: 2.8-3.1. The set
+  up, the lead to the first draw and the end are ~0.03 ms a segment together: a segment is its draws.
+- Why the lookups went to the lock, a command buffer:
+  - **bind page range ~340**: the workers' pool table (`tl_pools`, 1024 entries by 64 KB page) puts pages 64 MB apart in one entry,
+    and the game's pools are further apart: the uniform buffers of two pools took turns in it;
+  - **view destroyed ~220, slot destroyed ~550**: the views by handle (`handle_hits`) and the programs' texture slots are stale at
+    every `texture_destroy_generation` bump, and the Market walking evicts some texture nearly every frame: each thread looked
+    every texture up again, under the lock;
+  - **touches ~300**: the first use of a texture in a submission checks its memory under the lock (once a submission, the
+    first thread to get there);
+  - bind written 13, view version 23.
+
+So, the answer to "why are the first draws dearer": a segment starts with every thread at once looking up what its caches lost
+since the last submission or frame (the generation bumps, the aliased pool entries, the touches), under the one lock, all at
+the same moment. And a segment's later draws are cheaper when fewer threads are recording (the short segments end first).
+
+### The fixes (switches; all off by default: not adopted)
+
+| switch | default | what |
+|---|---|---|
+| `RX_VK_GONE_RING` | 0 (1 tried) | the destroy generation remembers which texture each bump was for (`gone_ring.h`, a ring of 1024, a window of 256): a cached view or slot whose own texture did not go since stands, instead of every cache going stale at any eviction. The deferred-ASTC sweep bumps for all, as before. A cache entry with no texture keeps the old rule |
+| `RX_VK_TL_POOLS_WIDE` | 0 (1 tried) | the workers' pool table has 16384 entries (1 GB before two pages share one) |
+| `RX_VK_PARLOCK_SPIN` | 0 (4000 tried) | `SetCriticalSectionSpinCount` on the ParLock mutex: a taker spins before it sleeps |
+| (always) | | the counters every draw bumped (`st_draws`, `st_mesh`, `st_passes`, `st_dispatches`, `st_skipped`, `st_desc_reused`, `prof_ns`, ParLock's own counts) are split one cache line a thread (`split_count.h`); `texture_touch_quick` stores `last_frame` / `last_value` only when they differ |
+| `RX_VK_PARALLEL_AFFINITY` | 0 | a segment's place goes to the same worker every command buffer. Tried: fewer misses, no time saved (below). Off |
+| `RX_VK_PARALLEL_IDEAL` | 0 | each worker's ideal processor on a physical core of its own. Tried: no change. Off |
+
+What they did (castle-move, `RX_VK_PARLOCK_STATS=1`, one run): bind page range 347 -> 6-18, view destroyed 206 -> 4-30, slot
+destroyed 502 -> 20-74 a command buffer; takings ~1,050 -> ~690; waiting 0.45 -> ~0.27 ms a command buffer with the spin. The
+first 32 draws stay ~7 us: the touches (0.86 a draw there) and the per-recording state (pipelines, pushes, dynamic state, the
+banks bound again in each new command buffer) remain. The sampler with the fixes: ParLock 13.1% -> 8.7% of the workers' running
+samples (now nearly all the touches), `gpu_buffer_bind` 9.3 -> 4.7%, `texture_view_of` 12.2 -> 7.6%; the driver 23%,
+`program_for` 16.5%.
+
+### Confirm A/B (main b17b933 = B, against the fixes on; 110 s, 66 s cut; stopped at 29 of 36 runs, the main PC was needed)
+
+fps, GPU frame prep (`submit`, ms a frame), the slowest segment and the Presentation Thread's wait (ms a command buffer), the
+draws' summed CPU per 1000 draws (`draw` / draws):
+
+| scene | variant | runs | fps | frame prep | slowest | PT wait | draw CPU / k draws |
+|---|---|---:|---:|---:|---:|---:|---:|
+| castle-move | B | 5 | 71.1 | 8.12 | 1.32 | 1.44 | 4.19 |
+| castle-move | fixes | 5 | 72.2 | 7.91 | 1.24 | 1.36 | 3.89 |
+| hyrule-walk | B | 4 | 74.3 | 7.75 | 1.20 | 1.34 | 3.94 |
+| hyrule-walk | fixes | 5 | 72.5 | 7.86 | 1.15 | 1.29 | 3.74 |
+| kokiri-idle | B | 5 | 77.8 | 7.40 | 1.16 | 1.33 | 3.79 |
+| kokiri-idle | fixes | 4 valid | 77.1 | 7.29 | 1.13 | 1.31 | ~3.4 |
+
+(kokiri-idle fixes r4: the game stayed in the menus, 0 frames after 66 s, no fault in its log: left out.) The segments' CPU falls
+5-8% and the slowest segment 0.03-0.08 ms a command buffer, but frame prep moves -0.21 / +0.11 / -0.11 ms, inside its 0.5-0.9 ms
+run-to-run spread, and fps inside the 2-4 fps spread. **Not adopted**: the three switches stay off. The split counters and the
+store-only-changes in `texture_touch_quick` are always on (no behaviour change). Screen 1 (castle-move, 3 runs, one binary): base
+8.23 / fixes 7.66 / fixes + affinity 8.37 ms; per 1000 draws 3.34 / 3.33 / 3.38: the drop followed the draw count.
+
+### Correctness
+Saves equal the backup after every run; no game process left. `run_all`: 229 pass, 2 fail (nup only), 35 skip. Shots and
+`HOS_SPEED_LOG` were not taken (nothing adopted; the switches change only which cached view or pool entry is reused).
+
+### What the extra ~1.4 us a parallel draw is, and next
+- ~10-14% of the workers' time was ParLock (sleep/wake for sub-microsecond holds), driven by caches that went stale for the
+  wrong reasons (above). Fixed behind switches; the time came back as cheaper draws, not as a shorter frame prep.
+- The rest is per-recording state at each segment's start (first 32 draws ~7 us: the per-submission texture touches, pipelines,
+  full pushes, dynamic state and banks bound again) and the draw path's shared reads; the driver is 20-23% and `program_for` 14-16%
+  of the workers' time.
+- Next: (1) the program pick's "other textures" path (`still_valid` + `answer_handles`, ~10% of the workers; vk_shader.cpp, needs
+  `--prepare-shaders`), and its shared statics `st_calls` / `st_hit` bumped at every pick; (2) the per-submission touches (~390 a
+  command buffer) done once ahead of the segments; (3) TICK-050's ROUNDS+SELF+BALANCE again with these switches on (fewer segment starts).

@@ -159,3 +159,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - A/B (5 runs, main b17b933): castle-move 1% low 10.8 -> 14.0, p99 75.8 -> 58.1 ms, spikes 8.6 -> 2.4; standing and Hyrule inside the spread.
 - Found on the way: main b17b933's NVML link check reads Gen3 x16 on PC 3050 (slot is x4): the chunk diff is off there (-3 to -4 fps).
 - Branch `feature/TICK-051-stutter`, not merged; main PC not checked.
+
+## TICK-052 (2026-11-11): why parallel replay draws cost more
+- Found (sampler with waits counted, new `RX_VK_PARLOCK_STATS`): ParLock is 10-14% of the workers' time, ~1,050 takings a command buffer; caches stale for the wrong reasons (pool table aliasing, every eviction voiding all views and slots) feed it; a segment's first 32 draws cost ~7 us. Driver 20%, program pick 14%.
+- Built, off by default: `RX_VK_GONE_RING`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_PARLOCK_SPIN`, `RX_VK_PARALLEL_AFFINITY`, `RX_VK_PARALLEL_IDEAL`; split per-thread counters always on.
+- Confirm (29/36 runs, stopped for the next ticket): draw CPU -5..8%, frame prep -0.21 / +0.11 / -0.11 ms, fps inside the spread.
+- Decision: not adopted. Game folder: main build restored. Next: the program pick's slow path (needs --prepare-shaders), the touches ahead of segments.

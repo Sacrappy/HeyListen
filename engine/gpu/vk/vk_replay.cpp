@@ -1380,20 +1380,44 @@ struct ParPool {
     std::mutex mu;
     std::condition_variable cv, done;
     std::deque<std::function<void()>> jobs;
+    std::deque<std::function<void()>> own[8];   // (TICK-052, RX_VK_PARALLEL_AFFINITY: a worker's own jobs)
     int pending = 0;
     bool started = false;
 };
 ParPool par_pool;
-void par_worker_main() {
+/// (TICK-052) RX_VK_PARALLEL_IDEAL=1: each worker's ideal processor is a physical core of its own (its first logical processor),
+/// from the second core on: two recorders on one core's two hardware threads share its caches and units
+void par_worker_ideal(int index) {
+    static const bool on = getenv("RX_VK_PARALLEL_IDEAL") && atoi(getenv("RX_VK_PARALLEL_IDEAL")) != 0;
+    if (!on) return;
+    DWORD len = 0;
+    GetLogicalProcessorInformation(nullptr, &len);
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
+    if (!GetLogicalProcessorInformation(info.data(), &len)) return;
+    std::vector<int> firsts;   // (each physical core's first logical processor)
+    for (size_t i = 0; i < len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION); i++)
+        if (info[i].Relationship == RelationProcessorCore && info[i].ProcessorMask)
+            firsts.push_back(__builtin_ctzll((unsigned long long)info[i].ProcessorMask));
+    std::sort(firsts.begin(), firsts.end());
+    if (firsts.size() < 2) return;
+    const int cpu = firsts[1 + index % (int)(firsts.size() - 1)];
+    const DWORD prev = SetThreadIdealProcessor(GetCurrentThread(), (DWORD)cpu);
+    logf("vk: parallel replay worker %d: ideal processor %d (was %d; %d cores) (RX_VK_PARALLEL_IDEAL)", index, cpu, (int)prev,
+         (int)firsts.size());
+}
+void par_worker_main(int index) {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk replay worker");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    par_worker_ideal(index);
+    std::deque<std::function<void()>>& own = par_pool.own[index & 7];
     for (;;) {
         std::function<void()> fn;
         {
             std::unique_lock lk(par_pool.mu);
-            par_pool.cv.wait(lk, [] { return !par_pool.jobs.empty(); });
-            fn = std::move(par_pool.jobs.front());
-            par_pool.jobs.pop_front();
+            par_pool.cv.wait(lk, [&own] { return !own.empty() || !par_pool.jobs.empty(); });
+            std::deque<std::function<void()>>& q = !own.empty() ? own : par_pool.jobs;
+            fn = std::move(q.front());
+            q.pop_front();
         }
         fn();
         std::lock_guard lk(par_pool.mu);
@@ -1426,8 +1450,10 @@ struct Segment {
     uint64_t serial = 0;   // (TICK-033: the stream number of its first draw or dispatch)
 };
 /// One segment recorded into cmd from the state at its start (any thread: the replay thread's own included)
+
 void record_segment(VkCommandBuffer& cmd, const Segment& g) {
     rmode = Mode::Worker;
+    par_stats_segment(true);
     NvnState s = *g.s;
     ub_limit = g.ub, cond_at = g.cond;
     occ_wserial = g.serial;
@@ -1436,6 +1462,7 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
     replay(cmd, s, g.p, g.end);
     end_pass(cmd);
     full_barrier(cmd);
+    par_stats_segment(false);
     rmode = Mode::Serial;
     ub_limit = SIZE_MAX;
 }
@@ -1546,7 +1573,18 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     }
     if (!par_pool.started) {
         par_pool.started = true;
-        for (int i = 0; i < threads; i++) std::thread(par_worker_main).detach();
+        // (TICK-052) RX_VK_PARLOCK_SPIN=<n> (default 0; 4000 tried): ParLock spins that many times before it sleeps. It is held ~0.1-0.6 us a
+        // taking, but a taker that found it held slept in the kernel and woke ~9 us later (castle-move: 70 such waits a command buffer,
+        // 0.6 ms of the recording threads'). 0: no spin, as before
+        {
+            static const int spin = getenv("RX_VK_PARLOCK_SPIN") ? std::max(0, atoi(getenv("RX_VK_PARLOCK_SPIN"))) : 0;   // (off by default: TICK-052 not adopted)
+#ifdef _WIN32   // (libc++'s recursive_mutex is a CRITICAL_SECTION there)
+            static_assert(sizeof(std::recursive_mutex) >= sizeof(CRITICAL_SECTION));
+            if (spin) SetCriticalSectionSpinCount(reinterpret_cast<CRITICAL_SECTION*>(par_mu.native_handle()), (DWORD)spin);
+#endif
+            logf("vk: parallel replay: ParLock spins %d times before it waits (RX_VK_PARLOCK_SPIN)", spin);
+        }
+        for (int i = 0; i < threads; i++) std::thread(par_worker_main, i).detach();
         logf("vk: parallel replay: big command buffers recorded on %d threads in segments of ~%lld draws and dispatches%s%s",
              threads, (long long)per, one_round ? ", in one round (RX_VK_PARALLEL_ROUNDS)" : "",
              self_rec ? (self_help ? ", the replay thread recording the first and helping (RX_VK_PARALLEL_SELF=2)"
@@ -1616,7 +1654,8 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     }
     texture_segments_begin(inits.data(), inits.size());
     const auto t_seg0 = std::chrono::steady_clock::now();
-    const int64_t wait0 = par_lock_wait_ns.load(), locks0 = par_locks.load();
+    int64_t locks0, wait0;
+    par_counts_sum(&locks0, &wait0);
     par_active = true;
     std::condition_variable seg_cv;
     std::mutex seg_mu;
@@ -1631,13 +1670,16 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         texture_begin_recording(j->r->upload, j->r->value);
         draw_begin_recording(j->r->slot, j->r->cmd, j->r->value);
         VkCommandBuffer c = j->r->cmd;
+        const int64_t ta = par_stats_on ? now_ns() : 0;
         record_segment(c, j->g);
+        const int64_t tc = par_stats_on ? now_ns() : 0;
         j->uploads = texture_uploads_recorded();
         j->inits = texture_segment_end(j->index);   // (after its last new image)
         texture_segment_worker(-1);
         vkEndCommandBuffer(j->r->upload);
         vkEndCommandBuffer(j->r->cmd);
         j->t1 = now_ns();
+        par_stats_segment_parts(j->t0, ta, tc, j->t1);
         {
             std::lock_guard l(seg_mu);
             j->done = true;
@@ -1645,11 +1687,17 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         seg_cv.notify_all();
     };
     const size_t first_pooled = self_rec ? 1 : 0;   // (the replay thread's own: jobs[0])
+    // (TICK-052) RX_VK_PARALLEL_AFFINITY=1: a segment's place goes to the same worker in every command buffer (place k to worker
+    // k mod workers, after the replay thread's own), so a worker records about the same draws frame after frame: its own caches
+    // (views by handle, the programs' texture slots, picks, pipelines, buffer binds) and its core's hold them. Off: the first idle
+    // worker takes the next segment, and a segment's first draws cost ~2x its later ones (castle-move: 7 against 3.8 us)
+    static const bool affinity = getenv("RX_VK_PARALLEL_AFFINITY") && atoi(getenv("RX_VK_PARALLEL_AFFINITY")) != 0;
     {
         std::lock_guard lk(par_pool.mu);
         for (size_t k = first_pooled; k < jobs.size(); k++) {
             Job* j = jobs[k].get();
-            par_pool.jobs.push_back([j, &record_job] { record_job(j); });
+            (affinity ? par_pool.own[(k - first_pooled) % (size_t)std::min(threads, 8)] : par_pool.jobs)
+                .push_back([j, &record_job] { record_job(j); });
             par_pool.pending++;
         }
     }
@@ -1708,7 +1756,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();
     segs_n += (double)seg.size();
     static double wait_ms, locks_n;
-    wait_ms += (par_lock_wait_ns.load() - wait0) / 1e6, locks_n += (double)(par_locks.load() - locks0);
+    {
+        int64_t locks1, wait1;
+        par_counts_sum(&locks1, &wait1);
+        wait_ms += (wait1 - wait0) / 1e6, locks_n += (double)(locks1 - locks0);
+    }
     // (TICK-050) the slowest and fastest segment's recording, the rounds, the replay thread's wait for its segments and its own
     // segment's recording (RX_VK_PARALLEL_SELF), and the slowest's worst over the window (a tail)
     static double slow_ms, fast_ms, rounds_n, ptwait_ms, self_ms, slow_max;
@@ -1750,6 +1802,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
             n += snprintf(pl + n, sizeof pl - n, "%s %d: %.2f ms (%.0f draws and dispatches, %.0f%% of them)", k ? "," : "", k,
                           place_ms[k] / place_n[k], place_work[k] / place_n[k], 100.0 * place_n[k] / 240);
         logf("vk: parallel replay, a segment by its place:%s", pl);
+        par_stats_log();
         for (int k = 0; k < kMaxBatch; k++) place_ms[k] = place_work[k] = place_n[k] = 0;
     }
     // what follows, after them all (the uniform updates are written to guest memory at the submission's end)
@@ -1819,7 +1872,7 @@ void bench_frame(int64_t presents) {
     std::vector<double> ms;
     int64_t prof0[PROF_COUNT];
     prof_full++;   // (every phase timed, not one draw in eight: the A/B differences are small)
-    std::memcpy(prof0, prof_ns, sizeof prof0);
+    for (int i = 0; i < PROF_COUNT; i++) prof0[i] = prof_ns[i];
     const size_t ub_before = ub_updates.size();
     queue_flush();
     for (int i = 0; i < times; i++) {
@@ -1858,7 +1911,7 @@ struct SlowWatch {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     int64_t prof0[PROF_COUNT];
     const char* what;
-    explicit SlowWatch(const char* w) : what(w) { std::memcpy(prof0, prof_ns, sizeof prof0); }
+    explicit SlowWatch(const char* w) : what(w) { for (int i = 0; i < PROF_COUNT; i++) prof0[i] = prof_ns[i]; }
     ~SlowWatch() {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         static int logged;
@@ -3127,7 +3180,7 @@ void status_tick() {
         l_gone = gone;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;
-        std::memcpy(l_prof, prof_ns, sizeof l_prof);
+        for (int i = 0; i < PROF_COUNT; i++) l_prof[i] = prof_ns[i];
     }
     last_ns = now_ns;
     if (++frames % sl::kCheckEvery) return;
@@ -4487,7 +4540,167 @@ void fill_replay_table(MkwVkRenderer& t) {
 }
 
 std::atomic<bool> par_active{false};
-std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
+namespace {
+struct alignas(64) ParCounts {   // (TICK-052: one cache line a thread)
+    std::atomic<int64_t> locks{0}, wait_ns{0};
+};
+constexpr int kParCountSlots = 32;
+ParCounts par_counts[kParCountSlots];
+std::atomic<int> par_count_next{0};
+int par_count_slot() {
+    static thread_local int slot = par_count_next.fetch_add(1, std::memory_order_relaxed) % kParCountSlots;
+    return slot;
+}
+} // namespace
+void par_counts_add(int64_t locks, int64_t wait_ns) {
+    ParCounts& c = par_counts[par_count_slot()];
+    // (only this thread writes its slot, so a load and a store: no locked add. Two threads sharing a slot past 32 lose a count)
+    c.locks.store(c.locks.load(std::memory_order_relaxed) + locks, std::memory_order_relaxed);
+    if (wait_ns) c.wait_ns.store(c.wait_ns.load(std::memory_order_relaxed) + wait_ns, std::memory_order_relaxed);
+}
+void par_counts_sum(int64_t* locks, int64_t* wait_ns) {
+    int64_t l = 0, w = 0;
+    for (const ParCounts& c : par_counts) l += c.locks.load(std::memory_order_relaxed), w += c.wait_ns.load(std::memory_order_relaxed);
+    *locks = l, *wait_ns = w;
+}
+
+// ---- (TICK-052) RX_VK_PARLOCK_STATS=1: where the recording threads take ParLock, how long they wait for it and hold it, and
+// what a segment's draws cost by their place in it (blocks of 32), logged every 240 parallel command buffers. A diagnostic: it
+// adds two clock reads to every taking ----
+bool par_stats_on = [] { const char* e = getenv("RX_VK_PARLOCK_STATS"); return e && atoi(e) != 0; }();
+namespace {
+constexpr int kParSites = 128, kParBlocks = 10;
+struct ParSite {
+    std::atomic<uint64_t> key{0};
+    const char* file = nullptr;
+    unsigned line = 0;
+    std::atomic<int64_t> n{0}, wait_ns{0}, waited{0}, hold_ns{0};
+};
+ParSite par_sites[kParSites];
+struct ParBlock {
+    std::atomic<int64_t> draws{0}, ns{0}, locks{0};
+};
+ParBlock par_blocks[kParBlocks];
+thread_local int par_seg_draw = -1;     // (draws begun in the thread's segment; -1: not in one)
+thread_local int64_t par_block_t0 = 0, par_block_locks = 0;
+thread_local int64_t par_first_draw = 0, par_last_draw = 0;
+std::atomic<int64_t> par_parts[6];   // (setup, lead, draws, tail, finish ns; segments)
+void par_block_close(int draws) {
+    if (par_seg_draw <= 0 || draws <= 0) return;
+    const int b = std::min((par_seg_draw - 1) / 32, kParBlocks - 1);
+    par_blocks[b].draws.fetch_add(draws, std::memory_order_relaxed);
+    par_blocks[b].ns.fetch_add(par_now_ns() - par_block_t0, std::memory_order_relaxed);
+    par_blocks[b].locks.fetch_add(par_block_locks, std::memory_order_relaxed);
+}
+} // namespace
+int par_stats_site(const char* file, unsigned line) {
+    par_block_locks++;
+    const uint64_t key = ((uint64_t)(uintptr_t)file ^ (uint64_t)line << 48) | 1;
+    for (uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 57), n = 0; n < (uint32_t)kParSites; n++, i = (i + 1) % kParSites) {
+        uint64_t k = par_sites[i].key.load(std::memory_order_acquire);
+        if (k == key) return (int)i;
+        if (!k) {
+            static std::mutex mu;
+            std::lock_guard lk(mu);
+            k = par_sites[i].key.load(std::memory_order_acquire);
+            if (k && k != key) continue;
+            if (!k) {
+                par_sites[i].file = file, par_sites[i].line = line;
+                par_sites[i].key.store(key, std::memory_order_release);
+            }
+            return (int)i;
+        }
+    }
+    return -1;
+}
+void par_stats_note(int site, int64_t wait_ns, int64_t hold_ns, bool released) {
+    if (site < 0) return;
+    ParSite& s = par_sites[site];
+    if (released) s.n.fetch_add(1, std::memory_order_relaxed), s.hold_ns.fetch_add(hold_ns, std::memory_order_relaxed);
+    if (wait_ns) s.waited.fetch_add(1, std::memory_order_relaxed), s.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+}
+void par_stats_segment(bool begin) {
+    if (!par_stats_on) return;
+    if (!begin) {
+        if (par_seg_draw > 0) par_block_close((par_seg_draw - 1) % 32 + 1);
+        par_seg_draw = -1;
+        return;
+    }
+    par_seg_draw = 0;
+    par_block_t0 = par_now_ns(), par_block_locks = 0;
+}
+void par_stats_segment_parts(int64_t t0, int64_t ta, int64_t tc, int64_t t1) {
+    if (!par_stats_on) return;
+    const int64_t fd = par_first_draw ? par_first_draw : tc, ld = par_last_draw ? par_last_draw : tc;
+    par_parts[0].fetch_add(ta - t0), par_parts[1].fetch_add(fd - ta), par_parts[2].fetch_add(ld - fd);
+    par_parts[3].fetch_add(tc - ld), par_parts[4].fetch_add(t1 - tc), par_parts[5].fetch_add(1);
+    par_first_draw = par_last_draw = 0;
+}
+void par_stats_draw() {
+    if (!par_stats_on || par_seg_draw < 0) return;
+    par_last_draw = par_now_ns();
+    if (!par_first_draw) par_first_draw = par_last_draw;
+    if (par_seg_draw > 0 && par_seg_draw % 32 == 0) {
+        par_block_close(32);
+        par_block_t0 = par_now_ns(), par_block_locks = 0;
+    }
+    par_seg_draw++;
+}
+namespace {
+std::atomic<int64_t> par_why_n[PW_COUNT];
+}
+void par_why(int kind) {
+    if (kind >= 0 && kind < PW_COUNT && par_stats_on && par_active.load(std::memory_order_relaxed)) par_why_n[kind].fetch_add(1, std::memory_order_relaxed);
+}
+void par_stats_log() {
+    if (!par_stats_on) return;
+    {
+        static const char* names[PW_COUNT] = {"bind written", "bind no page", "bind page stale", "bind page range", "bind mirror state",
+                                              "bind sync epoch", "bind sync segment", "bind past the pool's end", "view new", "view version", "view destroyed",
+                                              "touch by view", "touch by slot", "slot new", "slot other handle", "slot version",
+                                              "slot destroyed", "touch: not uploaded", "touch: a later segment's upload",
+                                              "touch: not checked this submission"};
+        char w[1400];
+        int n = 0;
+        for (int k = 0; k < PW_COUNT; k++)
+            n += snprintf(w + n, sizeof w - n, "%s %s %.1f", k ? "," : "", names[k], par_why_n[k].exchange(0) / 240.0);
+        logf("vk: parallel replay, why the lookups went to the lock, a command buffer:%s", w);
+    }
+    struct Row { int64_t n, waited, wait, hold; const char* file; unsigned line; };
+    std::vector<Row> rows;
+    for (ParSite& s : par_sites)
+        if (s.key.load(std::memory_order_acquire)) {
+            Row r{s.n.exchange(0), s.waited.exchange(0), s.wait_ns.exchange(0), s.hold_ns.exchange(0), s.file, s.line};
+            if (r.n) rows.push_back(r);
+        }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.wait + a.hold > b.wait + b.hold; });
+    char line[1600];
+    int n = 0;
+    for (size_t i = 0; i < rows.size() && i < 14 && n < (int)sizeof line - 140; i++) {
+        const char* f = rows[i].file;
+        for (const char* q = f; *q; q++)
+            if (*q == '/' || *q == 92) f = q + 1;
+        n += snprintf(line + n, sizeof line - n, "%s %s:%u %.1f (waited %.1f, %.3f ms; held %.3f ms)", i ? "," : "", f, rows[i].line,
+                      rows[i].n / 240.0, rows[i].waited / 240.0, rows[i].wait / 240e6, rows[i].hold / 240e6);
+    }
+    logf("vk: parallel replay, the lock by place, a command buffer: taken (waited, waiting ms; held ms):%s", n ? line : " none");
+    n = 0;
+    for (int b = 0; b < kParBlocks && n < (int)sizeof line - 80; b++) {
+        const int64_t d = par_blocks[b].draws.exchange(0), ns = par_blocks[b].ns.exchange(0), lk = par_blocks[b].locks.exchange(0);
+        if (d)
+            n += snprintf(line + n, sizeof line - n, "%s %d-%d: %.2f us (%.2f locks)", n ? "," : "", b * 32,
+                          b == kParBlocks - 1 ? 9999 : b * 32 + 31, ns / 1e3 / (double)d, (double)lk / (double)d);
+    }
+    logf("vk: parallel replay, a draw by its place in its segment:%s", n ? line : " none");
+    {
+        int64_t v[6];
+        for (int k = 0; k < 6; k++) v[k] = par_parts[k].exchange(0);
+        const double segs = v[5] ? (double)v[5] : 1.0;
+        logf("vk: parallel replay, a segment in parts (ms): set up %.3f, before its first draw %.3f, its draws %.3f, from its last "
+             "draw on %.3f, ended %.3f (%.0f segments)", v[0] / segs / 1e6, v[1] / segs / 1e6, v[2] / segs / 1e6, v[3] / segs / 1e6,
+             v[4] / segs / 1e6, (double)v[5]);
+    }
+}
 std::recursive_mutex& par_mutex() {
     return par_mu;
 }

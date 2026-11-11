@@ -38,6 +38,7 @@
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
+#include "gone_ring.h"   // (TICK-052)
 
 #include <span>
 
@@ -2116,10 +2117,14 @@ bool texture_dirty(Texture& tex, uint32_t gen, Ranges& out) {
     return !out.empty();
 }
 
-uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to them goes stale)
+// (bumped when textures go: what was resolved to them goes stale. TICK-052: with which texture each bump was for, gone_ring.h: the
+// recording threads' caches were all stale after any eviction (the Market walking evicts some texture nearly every frame), and each
+// of their next lookups went to ParLock)
+gone_ring::Ring<Texture> destroy_gens(1);
+void destroy_gen_bump(const Texture* tex) { destroy_gens.bump(tex); }
 
 void destroy_later(Texture& tex) {
-    destroy_gen++;
+    destroy_gen_bump(&tex);
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     if (tex.pool_key && tex.allocation && tex.sparse_chunks.empty() && pool_cap()) {   // (a render target's: to the pool, its views too)
         d.pool_key = tex.pool_key, d.view_map = std::move(tex.views), d.bytes = tex.bytes + tex.pad;
@@ -2727,7 +2732,14 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling) {
 }
 
 uint64_t texture_destroy_generation() {
-    return destroy_gen;
+    return destroy_gens.generation();
+}
+bool texture_gone_ring_on() {
+    static const bool on = getenv("RX_VK_GONE_RING") && atoi(getenv("RX_VK_GONE_RING")) != 0;   // (off by default: TICK-052 not adopted)
+    return on;
+}
+bool texture_kept_since(const Texture* tex, uint64_t from, uint64_t to) {
+    return destroy_gens.kept(tex, from, to);
 }
 
 uint32_t texture_epoch() {
@@ -3501,11 +3513,14 @@ void texture_written(Texture* tex) {
 
 
 bool texture_touch_quick(Texture* tex, bool for_sampling) {
-    tex->last_frame = frame_no;   // (the same values whichever thread stores them)
-    tex->last_value = rec_value;
+    // (the same values whichever thread stores them. TICK-052: stored only when they differ, so that the recording threads touching
+    // one texture in a submission do not take its line from each other's caches for the same values)
+    if (tex->last_frame != frame_no) tex->last_frame = frame_no;
+    if (tex->last_value != rec_value) tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
-    if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) return false;
+    if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) return par_why(PW_QUICK_LATER_SEG), false;
+    if (par_stats_on && !(tex->uploaded && tex->checked_epoch == epoch)) par_why(!tex->uploaded ? PW_QUICK_NOT_UPLOADED : PW_QUICK_EPOCH);
     return tex->uploaded && tex->checked_epoch == epoch;
 }
 void texture_gpu_wrote(uint64_t gpu, uint64_t size) {
@@ -3825,7 +3840,7 @@ void texture_frame(uint64_t completed) {
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
         // (the views and descriptor sets resolved to the placeholder this frame go stale, as when textures go: the next frame
         // looks those textures up again, and uploads them)
-        destroy_gen++;
+        destroy_gen_bump(nullptr);
         static int told;
         if (told++ < 40 || st_deferred.load(std::memory_order_relaxed) % 2000 < d)
             logf("vk: %lld new ASTC textures left for a later frame (this frame's uploads took their budget; %lld so far)", (long long)d,

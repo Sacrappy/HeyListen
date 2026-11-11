@@ -68,7 +68,7 @@ namespace mkwvk {
 
 std::vector<std::string> gpu_device_names;
 const MkwVkHost* host;
-int64_t prof_ns[PROF_COUNT];
+SplitCount prof_ns[PROF_COUNT];
 Device dev;
 PFN_vkGetInstanceProcAddr instance_proc() { return vkx::instance_proc_addr(); }
 

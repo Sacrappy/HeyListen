@@ -737,7 +737,9 @@ struct PipeEntry {
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};   // (a fast-linked one first, the worker's full build over it)
 };
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
-int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
+// (TICK-052: st_draws to st_mesh are bumped at every draw by every recording thread: a cache line a thread, split_count.h)
+SplitCount st_draws, st_skipped, st_dispatches, st_passes, st_mesh;
+int64_t st_pending_skips, st_waits;
 // (hookshot) skips by the line that made them, reported with the frame statistics (draw_skip_report)
 namespace {
 struct SkipSite { std::atomic<int> line{0}; std::atomic<int64_t> n{0}; int64_t last = 0; };
@@ -2087,9 +2089,17 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
         else if (it->second.destroy_gen != dgen) st_gen++;
         else st_hit++;
     }
+    // (TICK-052) a texture gone since the view was resolved that was not its own: the view stands (texture_kept_since)
+    if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen != dgen && texture_gone_ring_on() &&
+        texture_kept_since(it->second.tex, it->second.destroy_gen, dgen))
+        it->second.destroy_gen = dgen;
+    if (par_stats_on)
+        par_why(it == handle_hits().end() ? PW_VIEW_NEW : it->second.version != version ? PW_VIEW_VERSION
+                : it->second.destroy_gen != dgen ? PW_VIEW_DGEN : PW_COUNT);
     if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen) {
         if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
             if (!texture_touch_quick(it->second.tex, it->second.sampling)) {
+                if (par_stats_on) par_why(PW_TOUCH_VIEW);
                 ParLock lk;
                 texture_touch(it->second.tex, it->second.sampling);
             }
@@ -2816,10 +2826,18 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 const uint32_t version = sl ? texture_slot_version((int)(handle & 0xFFFFF)) : 0;
                 const uint32_t samp_version = sl ? sampler_slot_version((int)(handle >> 20)) : 0;
                 if (sl && sl->valid && sl->handle == handle && sl->version == version && sl->samp_version == samp_version &&
+                    sl->destroy_gen != dgen_now && texture_gone_ring_on() && texture_kept_since(sl->tex, sl->destroy_gen, dgen_now))
+                    sl->destroy_gen = dgen_now;   // (TICK-052: as texture_view_of's)
+                if (par_stats_on && sl)
+                    par_why(!sl->valid ? PW_SLOT_NEW : sl->handle != handle ? PW_SLOT_HANDLE
+                            : sl->version != version || sl->samp_version != samp_version ? PW_SLOT_VERSION
+                            : sl->destroy_gen != dgen_now ? PW_SLOT_DGEN : PW_COUNT);
+                if (sl && sl->valid && sl->handle == handle && sl->version == version && sl->samp_version == samp_version &&
                     sl->destroy_gen == dgen_now) {
                     view = sl->view, tex = sl->tex, sampler = sl->sampler;
                     if (tex && sl->tex_epoch != texture_epoch()) {   // (as texture_view_of's hit: once a submission)
                         if (!texture_touch_quick(tex, true)) {
+                            if (par_stats_on) par_why(PW_TOUCH_SLOT);
                             ParLock lk;
                             texture_touch(tex, true);
                         }
@@ -3354,7 +3372,7 @@ struct IndexBind {
     bool on = false;
 };
 thread_local IndexBind last_ib;
-int64_t st_desc_reused;
+SplitCount st_desc_reused;   // (TICK-052: split_count.h)
 
 thread_local uint64_t targets_serial = ~0ull;   // (the state's render targets resolved once per NOP_SET_RT)
 thread_local Targets cached_targets;
@@ -5808,6 +5826,7 @@ static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs&
 }
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    if (par_stats_on) par_stats_draw();
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
     stats_tick();
@@ -7528,6 +7547,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
 }
 
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
+    if (par_stats_on) par_stats_draw();
     PROF(PROF_DISPATCH);
     DispatchClock dclock;
     s.grid[0] = indirect ? 1 : x, s.grid[1] = indirect ? 1 : y, s.grid[2] = indirect ? 1 : z;
