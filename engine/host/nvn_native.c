@@ -1052,23 +1052,80 @@ static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: f
    flashed as walls for a frame, we thought; measured, holding made them far more frequent (61 vs 0-9 in a 60 s drive):
    MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then. Off by
    default; HOS_NVN_HOLD=1: held. */
-typedef struct { int n; uint64_t h[64]; } held_submit;
+typedef struct { int n; uint64_t h[64]; uint64_t queue; uint32_t *pages; int64_t npages; uint8_t *copy; int64_t t; } held_submit;
 static held_submit held[256];
 static volatile LONG nheld;
-static CRITICAL_SECTION held_cs;
+static CRITICAL_SECTION held_cs, flush_cs;   /* (held_cs: the list; flush_cs: a flush and the presenting thread's submit, in order) */
 static int held_ready, hold_on = -1;
+/* (HeyListen, TICK-054) HOS_NVN_HOLD=2: only the submits of threads other than the presenting one (the main thread's two
+   a frame in OoT) are held, and the presenting thread replays them before its own next submit, its present, or whoever waits
+   for them first (a fence wait, a finish, a flush, an event poll). The submit-time capture, the replay of those command
+   buffers and their queue submits leave the main thread's critical path (~1.5 ms a frame of the Market's ~14: TICK-054's
+   frame timeline), for the Presentation Thread, which idles ~5 ms a frame. The capture is taken at the flush, ~0.5-1.5 ms
+   after the game's submit: HOS_NVN_HOLD_CHECK=1 measures what that changes (the pages the game wrote again between the
+   two, and those whose bytes differ: host/rx_backend.c hos_hold_*), logged every 600 flushes. */
+static HosThread *present_thread;
+static int hold_check = -1;
+static int64_t st_hold_flushes, st_hold_submits, st_hold_pages, st_hold_again, st_hold_differ, st_hold_max_differ, st_hold_wait_ns,
+    st_hold_by[8];
+int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy);   /* (rx_backend.c, HOS_NVN_HOLD_CHECK) */
+void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ);
 static void held_init(void) {
-    if (!held_ready) { InitializeCriticalSection(&held_cs); held_ready = 1; }
-    if (hold_on < 0) { const char *e = getenv("HOS_NVN_HOLD"); hold_on = e && atoi(e) != 0; }   /* (off: see below) */
+    if (!held_ready) { InitializeCriticalSection(&held_cs); InitializeCriticalSection(&flush_cs); held_ready = 1; }
+    if (hold_on < 0) {   /* (off: see below; 2: TICK-054) */
+        const char *e = getenv("HOS_NVN_HOLD");
+        hold_on = e ? atoi(e) : 0;
+        hold_check = getenv("HOS_NVN_HOLD_CHECK") && atoi(getenv("HOS_NVN_HOLD_CHECK")) != 0;
+        if (hold_on) hos_log("nvn: submits held (HOS_NVN_HOLD=%d%s)", hold_on, hold_check ? ", checked" : "");
+    }
 }
-static void held_flush(void) {
+enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_OTHER, HF_N };
+/* the held submits replayed now, on this thread, in their order: under flush_cs, so that no submit of the presenting
+   thread comes between them (held_cs is let go before the replay: the replay reads the recordings under copy_lock) */
+static void held_flush_why(int why) {
     held_init();
     if (!nheld) return;
+    EnterCriticalSection(&flush_cs);
+    static held_submit local[256];
+    LONG n;
     EnterCriticalSection(&held_cs);
-    for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
+    n = nheld;
+    memcpy(local, held, sizeof *held * (size_t)n);
     nheld = 0;
     LeaveCriticalSection(&held_cs);
+    if (n) {
+        const int64_t t0 = hos_now_ns();
+        const int away = hos_vcore_away();
+        for (LONG i = 0; i < n; i++) {
+            if (local[i].pages || local[i].copy) {   /* (HOS_NVN_HOLD_CHECK: what changed since the submit) */
+                int64_t again = 0, differ = 0;
+                hos_hold_check(local[i].pages, local[i].npages, local[i].copy, &again, &differ);
+                st_hold_pages += local[i].npages, st_hold_again += again, st_hold_differ += differ;
+                if (differ > st_hold_max_differ) st_hold_max_differ = differ;
+                local[i].pages = NULL, local[i].copy = NULL;
+            }
+            if (hold_on == 2) rx_nvn_submit_q(local[i].h, local[i].n, local[i].queue);
+            else rx_nvn_submit(local[i].h, local[i].n);
+            st_hold_wait_ns += t0 - local[i].t;
+        }
+        if (away) hos_vcore_back();
+        st_hold_submits += n, st_hold_by[why < HF_N ? why : HF_OTHER]++;
+        if (++st_hold_flushes % 600 == 0) {
+            hos_log("nvn: held submits: %lld flushes (by: queue flush %lld, finish %lld, present %lld, sync wait %lld, event poll %lld, "
+                    "the presenting thread's submit %lld, other %lld), %lld submits, held %.2f ms each; this flush by %s%s",
+                    (long long)st_hold_flushes, (long long)st_hold_by[0], (long long)st_hold_by[1], (long long)st_hold_by[2],
+                    (long long)st_hold_by[3], (long long)st_hold_by[4], (long long)st_hold_by[5], (long long)st_hold_by[6],
+                    (long long)st_hold_submits, st_hold_wait_ns / 1e6 / (double)st_hold_submits,
+                    hos_self() ? hos_thread_name(hos_self()) : "a host thread", hos_self() == present_thread ? " (the presenting thread)" : "");
+            if (hold_check)
+                hos_log("nvn: held submits checked: %lld pages captured at the submit, %lld written again before the flush, %lld of "
+                        "them with other bytes at the flush (at most %lld in one submit)", (long long)st_hold_pages,
+                        (long long)st_hold_again, (long long)st_hold_differ, (long long)st_hold_max_differ);
+        }
+    }
+    LeaveCriticalSection(&flush_cs);
 }
+static void held_flush(void) { held_flush_why(HF_OTHER); }
 static uint64_t held_count(void) { return (uint64_t)nheld; }
 
 NV(nvnQueueFenceSync) {
@@ -1102,7 +1159,7 @@ NV(nvnSyncWait) {
                             (unsigned long long)s->fence, (unsigned long long)U64(1), (unsigned long long)c->x[30],
                             (unsigned long long)rx_nvn_fence(), (unsigned long long)rx_nvn_replayed());
     if (!s->fenced) { RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
-    if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush();   /* (a wait flushes what it waits for) */
+    if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush_why(HF_SYNC);   /* (a wait flushes what it waits for) */
     if (rx_nvn_wait(s->fence, 0)) { RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */
     if (block < 0) block = getenv("HOS_NVN_SYNC_BLOCK") != NULL;
@@ -1140,6 +1197,7 @@ NV(nvnEventGetValue) {
         if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
         if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
     }
+    if (hold_on == 2 && nheld) held_flush_why(HF_EVENT);   /* (TICK-054: a held submit may be what signals it) */
     uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);
 }
@@ -1180,9 +1238,9 @@ NV(nvnQueueBuilderSetQueueMemory) { QB(P(0))->mem = U64(1); QB(P(0))->mem_sz = U
 NV(nvnQueueInitialize) { nvn_queue *q = (nvn_queue *)P(0); q->magic = NVN_MAGIC('Q', 'U', 'E', 'U'); q->submits = 0; RET(1); }
 NV(nvnQueueFinalize) { ((nvn_queue *)P(0))->magic = 0; }
 NV(nvnQueueGetError) { if (P(1)) memset(P(1), 0, sizeof(NVNqueueErrorInfo)); RET(NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR); }
-NV(nvnQueueFlush) { held_flush(); }
+NV(nvnQueueFlush) { held_flush_why(HF_FLUSH); }
 NV(nvnQueueFinish) {
-    held_flush();
+    held_flush_why(HF_FINISH);
     const int away = hos_vcore_away();
     const int64_t t0 = hos_now_ns();
     rx_nvn_finish();
@@ -2372,24 +2430,33 @@ NV(nvnQueueSubmitCommands) {
         resolve_deferred((uint8_t *)(uintptr_t)h[i]);
     }
     held_init();
-    if (!hold_on) {
+    const int mine = hold_on == 2 && (!present_thread || hos_self() == present_thread);   /* (TICK-054: the presenting thread's own) */
+    if (!hold_on || mine) {
         /* (the replay runs here, on this thread, for ~9 ms a frame (vk_replay.cpp submit_q, RX_VK_ASYNC off): the virtual
            core is given up for it, as Present and AcquireTexture do, so the game's other threads run on it meanwhile.
            Nothing in the replay runs guest code or needs the core) */
+        if (mine) EnterCriticalSection(&flush_cs);   /* (the held ones first, and nothing between them and this one) */
+        if (mine && nheld) held_flush_why(HF_SUBMIT);
         const int away = hos_vcore_away();
+        HOS_JT(JT_MARK, 1, q->submits);   /* (TICK-054: the submit's capture and replay, on this thread; tools/bench/frameline.py) */
         rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
+        HOS_JT(JT_MARK, 2, q->submits);
         if (away) hos_vcore_back();
+        if (mine) LeaveCriticalSection(&flush_cs);
         return;
     }
+    if (nheld >= (LONG)(sizeof held / sizeof *held) - 1) held_flush_why(HF_OTHER);   /* (full: what is held goes now) */
     EnterCriticalSection(&held_cs);
-    if (nheld == (LONG)(sizeof held / sizeof *held)) {   /* (full: what is held goes now) */
-        for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
-        nheld = 0;
-    }
-    held[nheld].n = n;
-    memcpy(held[nheld].h, h, 8 * (size_t)n);
+    held_submit *hs = &held[nheld];
+    hs->n = n;
+    memcpy(hs->h, h, 8 * (size_t)n);
+    hs->queue = (uint64_t)(uintptr_t)q;
+    hs->pages = NULL, hs->copy = NULL, hs->npages = 0;
+    hs->t = hos_now_ns();
+    if (hold_check) hs->npages = hos_hold_snapshot(&hs->pages, &hs->copy);
     nheld++;
     LeaveCriticalSection(&held_cs);
+    HOS_JT(JT_MARK, 3, q->submits);   /* (the submit held) */
 }
 
 /* ---- window ---- */
@@ -2488,10 +2555,14 @@ NV(nvnQueuePresentTexture) {
     nvn_win *o = (nvn_win *)P(1);
     const int i = I(2);
     if (i < 0 || i >= o->ntex) die("present of window texture %d", i);
-    held_flush();   /* (a present flushes the queue) */
+    held_init();
+    present_thread = hos_self();   /* (TICK-054, HOS_NVN_HOLD=2: the presenting thread, whose submits are not held) */
+    held_flush_why(HF_PRESENT);   /* (a present flushes the queue) */
     {
         const int away = hos_vcore_away();
+        HOS_JT(JT_MARK, 5, o->presents);   /* (TICK-054: the present, on this thread) */
         rx_nvn_present(win_tex(o, i), o->crop);
+        HOS_JT(JT_MARK, 6, o->presents);
         if (away) hos_vcore_back();
     }
     o->presents++;

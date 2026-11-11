@@ -117,6 +117,38 @@ static int64_t host_collect(uint32_t **pages) {
     if (!ranges) ranges = malloc(sizeof *ranges * 4096);
     return collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
 }
+/* (HeyListen, TICK-054) HOS_NVN_HOLD_CHECK=1 (nvn_native.c): what a held submit's capture would have held, taken at the submit:
+   the marks over the GPU ranges read and cleared, and the pages' bytes copied (at most 16 K pages, 64 MB). At the flush,
+   hos_hold_check counts the pages marked again since (the game wrote them between the submit and the flush) and those whose
+   bytes differ from the copy, then marks them all again so that the flush's capture takes them, as it would have. */
+int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy) {
+    static uint64_t (*ranges)[2];
+    if (!ranges) ranges = malloc(sizeof *ranges * 4096);
+    const int64_t n = collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
+    *copy = NULL;
+    if (n > 0 && n <= 16384) {
+        *copy = malloc((size_t)n * 4096);
+        if (*copy) {
+            const uint8_t *base = hos_guest_base();
+            for (int64_t i = 0; i < n; i++) memcpy(*copy + i * 4096, base + ((uint64_t)(*pages)[i] << 12), 4096);
+        }
+    }
+    return n;
+}
+void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ) {
+    const uint8_t *base = hos_guest_base();
+    *again = *differ = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const uint32_t p = pages[i];
+        if (__atomic_load_n(&a64_dirty[p], __ATOMIC_ACQUIRE)) {
+            (*again)++;
+            if (copy && memcmp(copy + i * 4096, base + ((uint64_t)p << 12), 4096)) (*differ)++;
+        }
+    }
+    for (int64_t i = 0; i < n; i++) __atomic_store_n(&a64_dirty[pages[i]], 1, __ATOMIC_RELEASE);
+    free(pages);
+    free(copy);
+}
 /* (only within the given guest ranges: the submit-time capture of the mirrored pools, a small part of the 20 ms the
    whole collection takes) */
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { return collect_in(ranges, n, pages); }
