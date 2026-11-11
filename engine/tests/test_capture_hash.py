@@ -1,7 +1,8 @@
 """(HeyListen TICK-060) RX_VK_CAPTURE_HASH: the capture's copy makes the mirror syncs' chunk hashes, read from the source.
 (msync_diff::copy_hash_page itself is checked against memcpy + page_hash by tests/test_msync_diff.cpp, with and without AVX2.)
 
-- off by default, and only with the chunk diff on and an AVX2 build;
+- on by default since the PC 3050 confirm (=0: off), and only with the chunk diff on and an AVX2 build; RX_VK_MSYNC_FAST
+  (TICK-056) on by default where the diff is on;
 - copy_part copies and hashes page by page in one pass, a slot's hashes valid (hok) only when its copy succeeded;
 - the slots copied again after the copy (a late page after the take's wait, a deferred late page at its fix) lose their hashes;
 - the kept capture carries them (CapBuf::hash), retired ones give their arrays back;
@@ -30,8 +31,11 @@ def main():
 
     mem = (VK / "vk_memory.cpp").read_text(encoding="utf-8")
     on = body(mem, "bool capture_hash_on() {")
-    need('getenv("RX_VK_CAPTURE_HASH") && atoi(getenv("RX_VK_CAPTURE_HASH")) != 0 && diff_mode() != 0' in on and
-         "#if defined(__AVX2__)" in on and "return false;" in on, "capture_hash_on: off by default, with the diff and AVX2 only")
+    need('(!getenv("RX_VK_CAPTURE_HASH") || atoi(getenv("RX_VK_CAPTURE_HASH")) != 0) && diff_mode() != 0' in on and
+         "#if defined(__AVX2__)" in on and "return false;" in on, "capture_hash_on: on by default with the diff and AVX2 only, =0 off")
+    fast = body(mem, "bool msync_fast_on() {")
+    need('getenv("RX_VK_MSYNC_FAST") ? atoi(getenv("RX_VK_MSYNC_FAST")) != 0 : diff_mode() != 0' in fast,
+         "msync_fast_on: on by default where the diff is on, the switch either way")
     cp = body(mem, "void copy_part(const CopyPart& w) {")
     hp = cp[cp.index("if (w.hash) {"):cp.index("for (int64_t i = w.i0; i < w.i1;) {")]
     need("guarded_copy_hash(w.out + (uint64_t)i * 4096, base + ga, w.hash + (uint64_t)i * msync_diff::kChunks, stream)" in hp and

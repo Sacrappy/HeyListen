@@ -1444,12 +1444,13 @@ struct CopyPart {
 // off it (RX_VK_MSYNC_DIFF=0 there: 1.5 ms, with 30 MB more over the x4 link). The sync takes a slot's hashes when the copy made
 // them (hok) and hashes it as before otherwise: a page the copy could not read whole, the pre-copy's (RX_VK_CAPTURE_PRECOPY), a
 // late page copied again after the take (its slot's hashes dropped). Same hashes, same copies, same mirror. Only with the diff on
-// (RX_VK_MSYNC_DIFF, by default on links of 8 GB/s or less) and AVX2 builds. Off by default (=1: on). tests/test_msync_diff.cpp
+// (RX_VK_MSYNC_DIFF, by default on links of 8 GB/s or less) and AVX2 builds. On by default since the PC 3050 confirm (TICK-060; =0: off). tests/test_msync_diff.cpp
 namespace { int diff_mode(); }   // (below, in this file's anonymous namespace)
 bool capture_hash_on() {
 #if defined(__AVX2__)
     static const bool v = [] {
-        const bool on = getenv("RX_VK_CAPTURE_HASH") && atoi(getenv("RX_VK_CAPTURE_HASH")) != 0 && diff_mode() != 0;
+        // (TICK-060: on by default after the PC 3050 confirm, wherever the diff is on; =0 off)
+        const bool on = (!getenv("RX_VK_CAPTURE_HASH") || atoi(getenv("RX_VK_CAPTURE_HASH")) != 0) && diff_mode() != 0;
         if (on) logf("vk: the capture's copy makes the mirror syncs' chunk hashes (RX_VK_CAPTURE_HASH)");
         return on;
     }();
@@ -2258,11 +2259,11 @@ int late_diff_runs(const uint8_t* now, const uint8_t* shadow, uint32_t* off, uin
 // bytes, copied at the same moment (the value's end), by another thread. Not deferred, as before: a late value not yet sent
 // (held recordings, a queue stopped at an event), RX_VK_LATE_MERGE, a late page in a live texture's storage (uploads read it as
 // submitted from the shadow the take copies: the take waits as before); a deferred late page in a pool with textures gets no
-// shadow copy (an upload over it would read guest memory). At most kLateFixMax pending. Off by default (=1: on).
+// shadow copy (an upload over it would read guest memory). At most kLateFixMax pending. On by default since the PC 3050 confirm (=0: off).
 // tests/test_late_defer.py
-bool late_defer_on() {
+bool late_defer_on() {   // (TICK-060: on by default after the PC 3050 confirm; =0 off)
     static const bool v = [] {
-        const bool on = getenv("RX_VK_LATE_DEFER") && atoi(getenv("RX_VK_LATE_DEFER")) != 0;
+        const bool on = !getenv("RX_VK_LATE_DEFER") || atoi(getenv("RX_VK_LATE_DEFER")) != 0;
         if (on) logf("vk: late pages' wait deferred to the queue (RX_VK_LATE_DEFER)");
         return on;
     }();
@@ -3593,7 +3594,9 @@ bool presync_stats_on() {
 /// lookups): ~0.13 us a page, ~1 ms for the frame's big pre-sync (castle-move). Now the dirty pages go to lazy_cpu_pages once, in
 /// order, and the last capture buffer and run list found are kept while the next pages have the same ones
 bool msync_fast_on() {
-    static const bool v = getenv("RX_VK_MSYNC_FAST") && atoi(getenv("RX_VK_MSYNC_FAST")) != 0;
+    // (TICK-060) on by default where the chunk diff is on (links of 8 GB/s or less: PC 3050's confirm, with RX_VK_LATE_DEFER and
+    // RX_VK_CAPTURE_HASH); elsewhere off as TICK-056 left it. RX_VK_MSYNC_FAST=0 / 1: off / on anywhere
+    static const bool v = getenv("RX_VK_MSYNC_FAST") ? atoi(getenv("RX_VK_MSYNC_FAST")) != 0 : diff_mode() != 0;
     return v;
 }
 

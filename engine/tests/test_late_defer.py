@@ -1,6 +1,6 @@
 """(HeyListen TICK-060) RX_VK_LATE_DEFER: the late pages' wait moved from the capture's take to the queue, read from the source.
 
-- vk_memory.cpp take_capture: off by default; a take does not wait only when the switch is on, LATE_MERGE is off, the late value is
+- vk_memory.cpp take_capture: on by default since the PC 3050 confirm (=0: off); a take does not wait only when the switch is on, LATE_MERGE is off, the late value is
   already sent to the queue (vk_timeline_signal_sent), no late page is a live texture's storage and fewer than kLateFixMax fixes are
   pending; otherwise the wait and the copies as before. A deferred take registers a LateFix (value, generation, buffer, slots) only
   for a kept buffer, and gives no texture shadow copy of a late slot.
@@ -42,7 +42,7 @@ def main():
 
     mem = read("vk_memory.cpp")
     on = body(mem, "bool late_defer_on() {")
-    need('getenv("RX_VK_LATE_DEFER") && atoi(getenv("RX_VK_LATE_DEFER")) != 0' in on, "vk_memory.cpp: RX_VK_LATE_DEFER off by default")
+    need('!getenv("RX_VK_LATE_DEFER") || atoi(getenv("RX_VK_LATE_DEFER")) != 0' in on, "vk_memory.cpp: RX_VK_LATE_DEFER on by default, =0 off")
 
     take = body(mem, "bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {")
     a = take.index("// (TICK-060) RX_VK_LATE_DEFER: no wait here")
