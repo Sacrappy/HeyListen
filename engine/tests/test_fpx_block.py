@@ -40,7 +40,7 @@ import test_fpx_sticky as sticky  # noqa: E402  (its compiler search, flags and 
 
 CASES, SEED = 2000000, 20261112
 SWITCH = "A64_FPX_BLOCK"
-# (name, assembly, whether the switch must change its text)
+# (name, assembly, whether the switch must change its text: 1 yes, 0 no, 2 either (A64_FPX_BLOCK_ST's cases))
 GUEST = (
     ("vadd/vsub/vmul .4s chain", "fsub v1.4s, v21.4s, v20.4s\nfmul v2.4s, v7.4s, v1.4s\nfadd v3.4s, v2.4s, v1.4s\nfsub v4.4s, v3.4s, v2.4s", 1),
     ("vadd/vsub .2s", "fadd v1.2s, v2.2s, v3.2s\nfsub v4.2s, v1.2s, v2.2s\nfmul v5.2s, v4.2s, v1.2s", 1),
@@ -90,9 +90,26 @@ GUEST = (
                            "fsub v6.4s, v5.4s, v0.4s\nldr s7, [x0, #12]\nfmul s8, s7, s6\nlsl w13, w11, #2\ncsel x14, x12, x13, eq\nfadd s9, s8, s7", 1),
     ("gpr loads the FP ops read", "ldr x8, [x0]\nand x8, x8, #0xff0\nfmul v0.4s, v1.4s, v2.4s\nadd x9, x0, x8\nldr q3, [x9]\nfadd v4.4s, v3.4s, v0.4s\n"
                                   "ldr x9, [x0, #8]\nand x9, x9, #0xff0\nadd x9, x0, x9\nldr q5, [x9, #16]\nfmul v6.4s, v5.4s, v4.4s\nstr x9, [x1]", 1),
+    # (A64_FPX_BLOCK_ST) stores inside runs: S / D / Q, STP S / D, through SP, register offsets that may overlap, a register
+    # stored then overwritten, a base register moved between stores, a load after a store (a new run), a gpr load after one
+    ("stores inside a run", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x1]\nfadd v3.4s, v0.4s, v1.4s\nstr s3, [x1, #16]\nstp s3, s0, [x2, #8]\n"
+                            "fmul v4.4s, v3.4s, v3.4s\nstp d0, d4, [sp, #16]\nstr d4, [sp, #40]\nfadd s5, s4, s3\nstr s5, [sp, #4]\nfmul s6, s5, s5", 2),
+    ("stores that overlap", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x0, x8, lsl #4]\nfadd v3.4s, v0.4s, v1.4s\nstr q3, [x0, x9, lsl #4]\n"
+                            "str s3, [x0, #4]\nfmul v4.4s, v3.4s, v0.4s\nstr d4, [x0]\nfsub v5.4s, v4.4s, v3.4s", 2),
+    ("stored then overwritten", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x1]\nfadd v0.4s, v0.4s, v1.4s\nstr q0, [x1, #16]\nfmul s0, s0, s2\n"
+                                "str s0, [x1, #32]\nfsub v0.4s, v0.4s, v3.4s\nstp s0, s0, [x1, #36]", 2),
+    ("base moved between stores", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x1]\nadd x1, x1, #32\nfadd v3.4s, v0.4s, v1.4s\nstr q3, [x1]\n"
+                                  "mov x2, x1\nfmul v4.4s, v3.4s, v3.4s\nstr s4, [x2, #20]\nfadd v5.4s, v4.4s, v0.4s", 2),
+    ("load after a store", "fmul v0.4s, v1.4s, v2.4s\nfadd v3.4s, v0.4s, v1.4s\nstr q3, [x0]\nfmul v6.4s, v3.4s, v3.4s\nldr s4, [x0, #8]\n"
+                           "fmul s5, s4, s3\nfadd s7, s5, s6\nstr s7, [x0, #4]\nldp s8, s9, [x0]\nfmul s10, s8, s9\nfadd s11, s10, s8", 2),
+    ("gpr load after a store", "fmul v0.4s, v1.4s, v2.4s\nfadd v3.4s, v0.4s, v1.4s\nstr q3, [x0]\nfsub v6.4s, v3.4s, v0.4s\nldr x8, [x0]\n"
+                               "and x8, x8, #0x70\nfmul v4.4s, v6.4s, v3.4s\nldr q5, [x0, x8]\nfadd v7.4s, v5.4s, v4.4s\nfmul v8.4s, v7.4s, v7.4s", 2),
     ("one op alone", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x0]\nfadd s3, s1, s2\nstr s3, [x1]", 0),
     ("moves alone", "dup v0.4s, v1.s[2]\nins v0.s[1], v3.s[0]\next v4.16b, v0.16b, v3.16b, #4", 0),
 )
+# (A64_FPX_BLOCK_ST=1 must change these, against the switch alone)
+ST_CHANGES = {"store between runs", "stores inside a run", "stores that overlap", "stored then overwritten", "base moved between stores",
+              "load after a store", "gpr load after a store", "read back through memory", "one op alone"}
 NEEDS = {("add32", "add32", 2, 2), ("sub32", "sub32", 2, 2), ("mul32", "fma32", 2, 3), ("fma32", "fma32", 3, 3),
          ("div32", "div32", 2, 2), ("sqrt32", "sqrt32", 1, 1)}
 
@@ -143,27 +160,36 @@ def generate(cc, cxx, tmp, flags):
         olds = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for w in words]
         os.environ[SWITCH] = "1"
         news = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for w in words]
+        os.environ["A64_FPX_BLOCK_ST"] = "1"   # (the stores inside blocks: every case again)
+        sts = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for w in words]
         import a64_block
         print(a64_block.report())
     finally:
         os.environ[SWITCH] = "0"
+        os.environ.pop("A64_FPX_BLOCK_ST", None)
         if a64emit._lib is not None:
             import _ctypes
             (_ctypes.FreeLibrary if os.name == "nt" else _ctypes.dlclose)(a64emit._lib._handle)
             a64emit._lib = None
     for (name, _, change), o, n in zip(GUEST, olds, news):
-        if change and n == o:
+        if change == 1 and n == o:
             raise SystemExit("fpx block: the switch did not change %s:\n%s" % (name, o))
-        if not change and n != o:
+        if change == 0 and n != o:
             raise SystemExit("fpx block: the switch changed %s" % name)
-    for i, (o, n) in enumerate(zip(olds, news)):
+    for (name, _, _), n, t in zip(GUEST, news, sts):
+        if (name in ST_CHANGES) != (t != n):
+            raise SystemExit("fpx block: A64_FPX_BLOCK_ST=1 %s %s" % ("did not change" if name in ST_CHANGES else "changed", name))
+    n_g = len(GUEST)
+    for i, (o, n, t) in enumerate(zip(olds, news, sts)):
         out.append("static void g_old%d(Ctx *__restrict c) {\n%s\n}" % (i, o))
         out.append("static void g_new%d(Ctx *__restrict c) {\n%s\n}" % (i, n))
+        out.append("static void g_st%d(Ctx *__restrict c) {\n%s\n}" % (i, t))
     out.append("typedef void (*GuestFn)(Ctx *);")
-    out.append("const GuestFn fn_old[] = {%s};" % ", ".join("g_old%d" % i for i in range(len(GUEST))))
-    out.append("const GuestFn fn_new[] = {%s};" % ", ".join("g_new%d" % i for i in range(len(GUEST))))
-    out.append("const char *const fn_names[] = {%s};" % ", ".join('"%s"' % g[0] for g in GUEST))
-    out.append("const int fn_count = %d;" % len(GUEST))
+    # (the cases twice: the switch alone, then with A64_FPX_BLOCK_ST=1, both against the default lowering)
+    out.append("const GuestFn fn_old[] = {%s};" % ", ".join(["g_old%d" % i for i in range(n_g)] * 2))
+    out.append("const GuestFn fn_new[] = {%s};" % ", ".join(["g_new%d" % i for i in range(n_g)] + ["g_st%d" % i for i in range(n_g)]))
+    out.append("const char *const fn_names[] = {%s};" % ", ".join(['"%s"' % g[0] for g in GUEST] + ['"%s [st]"' % g[0] for g in GUEST]))
+    out.append("const int fn_count = %d;" % (2 * n_g))
     with open(os.path.join(tmp, "block_cases.c"), "w", newline="\n") as f:
         f.write("\n".join(out) + "\n")
     used |= NEEDS

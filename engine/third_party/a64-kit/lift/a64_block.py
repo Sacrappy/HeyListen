@@ -20,6 +20,13 @@ context and the guest memory with the default lowering on random registers, memo
 A run ends at anything else: a store, a compare, a flag or general-register write, a call, a label, a branch. Blocks
 need at least BLOCK_MIN_ARITH arithmetic ops.
 
+A64_FPX_BLOCK_ST=1 (off by default; TICK-063's second lever): the vector stores (STR S / D / Q, STP S / D, through SP or
+not) join the runs instead of ending them. A store's address and value are taken where it stands in the run and the store
+itself is made at the commit, after the keep test, in program order, through the same recomp_store* helper: the fallback
+still starts from a run that stored nothing. A load after a store (a vector load or a general-register statement that
+reads guest memory) ends the run before it, so no load in a block can need a value the block has not stored yet; the
+stores move later only past register arithmetic, which no other thread can see.
+
     text = block_text(text)         # a hot function's text (after hot_text's other passes)
     header = block_header()         # appended to a64_fpx.h
 """
@@ -32,6 +39,11 @@ BARRIERS = Counter()
 BLOCK_MIN_ARITH = int(os.environ.get("A64_FPX_BLOCK_MIN", "2"))
 GPR_IN_BLOCKS = os.environ.get("A64_FPX_BLOCK_GPR", "1") != "0"
 
+
+def stores_on():
+    """A64_FPX_BLOCK_ST=1: vector stores inside blocks (read at each call: the test turns it on and off)"""
+    return os.environ.get("A64_FPX_BLOCK_ST", "0") == "1"
+
 V = r"c->vreg\[(\d+)\]"
 # an address made of general registers and constants (no vector register, no assignment, one statement)
 ADDR = r"((?:(?!vreg)[^;=])+?)"
@@ -39,12 +51,13 @@ L4, L2, L1 = "A64_BK_L4", "A64_BK_L2", "A64_BK_L1"
 
 
 class Op:
-    __slots__ = ("kind", "dst", "srcs", "code", "arith", "text", "ends_run", "gpr_reads", "gpr_writes")
+    __slots__ = ("kind", "dst", "srcs", "code", "arith", "text", "ends_run", "gpr_reads", "gpr_writes", "store")
 
     def __init__(self, kind, dst, srcs, code, arith=False, text="", ends_run=False):
         self.kind, self.dst, self.srcs, self.code, self.arith, self.text = kind, dst, srcs, code, arith, text
         self.ends_run = ends_run
         self.gpr_reads, self.gpr_writes = [], []
+        self.store = None   # (a store: (helper, address expression, [(register, part)]); made at the commit)
 
 
 def bv(r):
@@ -437,6 +450,47 @@ class _G:
 
 SHAPES = [(rx, (zip_builder if fn is None else fn)) for rx, fn in SHAPES]
 
+
+# ---- stores (A64_FPX_BLOCK_ST=1): the value's part of a register: lo32 / lo64 / hi64 ------------------------------------
+def st_op(fn, addr, parts):
+    op = Op("st", None, sorted({r for r, _ in parts}, key=int), "")
+    op.store = (fn, addr, parts)
+    return op
+
+
+def sh_st1(m):
+    r, n, bits, sp, addr = m.groups()
+    if (n == "4") != (bits == "32"):
+        return None
+    return st_op("recomp_store%s%s" % (bits, sp or ""), addr, [(r, "lo" + bits)])
+
+
+def sh_stq(m):
+    sp, addr, r, r2 = m.groups()
+    if r != r2:
+        return None
+    return st_op("recomp_stp64%s" % (sp or ""), addr, [(r, "lo64"), (r, "hi64")])
+
+
+def sh_stp(m):
+    xb, off, r1, n, r2, bits, sp = m.groups()
+    if (n == "4") != (bits == "32"):
+        return None
+    return st_op("recomp_stp%s%s" % (bits, sp or ""), "c->x[%s]+(%s)" % (xb, off), [(r1, "lo" + bits), (r2, "lo" + bits)])
+
+
+STORE_SHAPES = [
+    (re.compile(r"\{ \{ uint64_t _v=0; memcpy\(&_v,&" + V + r"\[0\],(4|8)\); recomp_store(32|64)(_sp)?\(c,\(" + ADDR + r"\),_v\); \} \}"), sh_st1),
+    (re.compile(r"\{ recomp_stp64(_sp)?\(c,\(" + ADDR + r"\)," + V + r"\[0\]," + V + r"\[1\]\); \}"), sh_stq),
+    (re.compile(r"\{ uint64_t _b=c->x\[(\d+)\]; int64_t _o=(-?\d+); \{ uint64_t _p0=0,_p1=0; memcpy\(&_p0,&" + V + r"\[0\],(4|8)\); "
+                r"memcpy\(&_p1,&" + V + r"\[0\],\4\); recomp_stp(32|64)(_sp)?\(c,\(_b\+_o\),_p0,_p1\); \}\}"), sh_stp),
+]
+LOAD_KINDS = {"ldq", "ld32", "ld64", "ldp32", "ldp64", "ldpq"}
+
+
+def reads_memory(op):
+    return op.kind in LOAD_KINDS or (op.kind == "gpr" and ("recomp_load" in op.code or "recomp_ldp" in op.code))
+
 # (general-register statements between FP ops: address arithmetic, pointer loads, immediates. Kept inside a block when they are
 # pure: only c->x[N] written, read from c->x / the flags / guest memory (recomp_load*), no call, no brace nesting)
 GPR_STMT = re.compile(r"(?:\{[^{}\n]*\}|[^{};\n]*;)")
@@ -501,7 +555,7 @@ def find_gpr(text, ops):
 def find_ops(text):
     """[(start, end, Op)] of every statement one of the shapes matches, in text order (non-overlapping)"""
     found = []
-    for rx, build in SHAPES:
+    for rx, build in SHAPES + (STORE_SHAPES if stores_on() else []):
         for m in rx.finditer(text):
             op = build(m)
             if op is not None:
@@ -519,6 +573,16 @@ def find_ops(text):
 
 
 def emit_block(ops):
+    # (stores, A64_FPX_BLOCK_ST: the address and the value taken where the store stands, the store made at the commit)
+    stores = []
+    for op in ops:
+        if op.store is not None:
+            k = len(stores)
+            fn, addr, parts = op.store
+            regs = sorted({r for r, _ in parts}, key=int)
+            op.code = "const uint64_t _sa%d = (uint64_t)(%s); %s" % (k, addr, " ".join(
+                "const __m128i _sv%d_%s = %s;" % (k, r, bv(r)) for r in regs))
+            stores.append("%s(c, _sa%d, %s);" % (fn, k, ", ".join("a64_bk_%s(_sv%d_%s)" % (part, k, r) for r, part in parts)))
     gpr_used, gpr_written = [], []
     for op in ops:
         for r in op.gpr_reads + op.gpr_writes + [int(x) for x in GPR_X.findall(op.code)]:
@@ -557,6 +621,8 @@ def emit_block(ops):
     commit += "".join(" c->x[%d] = _bx%d;" % (r, r) for r in gpr_written)
     if any(op.kind == "fcmp" for op in ops):
         commit += " a64_bk_fcmp_commit(c, _bfl);"
+    if stores:   # (A64_FPX_BLOCK_ST: in program order, after the keep test)
+        commit += " " + " ".join(stores)
     out.append("if (RECOMP_LIKELY(!_mm_movemask_epi8(_bad))) { %s _bk = 1; A64_BK_PROBE(1); } else A64_BK_PROBE(0);" % commit)
     out.append("}")
     out.append("if (__builtin_expect(!_bk, 0)) {")   # (the fallback out of line, cold without a profile too)
@@ -580,7 +646,7 @@ def block_text(text):
             return
         # (general-register statements at a run's ends stay outside the block: nothing to carry them for)
         lo, hi = 0, len(run)
-        while lo < hi and run[lo][2].kind == "gpr":
+        while lo < hi and run[lo][2].kind in ("gpr", "st"):   # (a leading store: nothing to carry it for either)
             lo += 1
         while hi > lo and run[hi - 1][2].kind == "gpr":
             hi -= 1
@@ -605,6 +671,8 @@ def block_text(text):
 
     for s, e, op in ops:
         between = text[pos:s]
+        if run and not between.strip() and reads_memory(op) and any(o.kind == "st" for _, _, o in run):
+            flush()   # (A64_FPX_BLOCK_ST: a load after a store starts a new run: no load in a block reads past a delayed store)
         if run and between.strip():
             # a statement no shape knows ends the run: count its kind (what to add next)
             BARRIERS[re.sub(r"\d+", "N", between.strip().splitlines()[0])[:90]] += 1
@@ -728,6 +796,9 @@ static inline __attribute__((always_inline)) __m128i a64_bk_bcast(__m128i x, int
 static inline __attribute__((always_inline)) __m128i a64_bk_ldq(uint64_t a) { return _mm_loadu_si128((const __m128i *)A64_PTR(a)); }
 static inline __attribute__((always_inline)) __m128i a64_bk_ld64(uint64_t a) { return _mm_loadl_epi64((const __m128i *)A64_PTR(a)); }
 static inline __attribute__((always_inline)) __m128i a64_bk_ld32(uint64_t a) { uint32_t v; memcpy(&v, A64_PTR(a), 4); return _mm_cvtsi32_si128((int)v); }
+static inline __attribute__((always_inline)) uint64_t a64_bk_lo32(__m128i x) { return (uint64_t)(uint32_t)_mm_cvtsi128_si32(x); }
+static inline __attribute__((always_inline)) uint64_t a64_bk_lo64(__m128i x) { return (uint64_t)_mm_cvtsi128_si64(x); }
+static inline __attribute__((always_inline)) uint64_t a64_bk_hi64(__m128i x) { return (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(x, x)); }
 static inline __attribute__((always_inline)) __m128i a64_bk_fromx4(uint64_t x) { return _mm_cvtsi32_si128((int)(uint32_t)x); }
 static inline __attribute__((always_inline)) __m128i a64_bk_fromx8(uint64_t x) { return _mm_cvtsi64_si128((long long)x); }
 static inline __attribute__((always_inline)) __m128i a64_bk_set1_1(uint64_t x) { return _mm_set1_epi8((char)x); }
