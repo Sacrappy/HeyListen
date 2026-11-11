@@ -27,6 +27,12 @@ still starts from a run that stored nothing. A load after a store (a vector load
 reads guest memory) ends the run before it, so no load in a block can need a value the block has not stored yet; the
 stores move later only past register arithmetic, which no other thread can see.
 
+A64_FPX_BLOCK_CVT=1 (off by default): the binary32 <-> 32-bit integer conversions join the runs: SCVTF / UCVTF (vector,
+lane and from a W register) and FCVTZS / FCVTZU (vector, lane and to a W register). In the gate the rounding is to nearest
+and IXC is already set, so the host conversion gives the Arm result and no new flag; the lanes the host cannot do the same
+way (UCVTF of a value >= 2^31; FCVTZ* of |x| >= 2^31, a NaN or an infinity, FCVTZU of a negative value <= -1; under FZ a
+subnormal operand: IDC) are "bad" and the run takes the fallback.
+
     text = block_text(text)         # a hot function's text (after hot_text's other passes)
     header = block_header()         # appended to a64_fpx.h
 """
@@ -38,6 +44,11 @@ STATS = Counter()
 BARRIERS = Counter()
 BLOCK_MIN_ARITH = int(os.environ.get("A64_FPX_BLOCK_MIN", "2"))
 GPR_IN_BLOCKS = os.environ.get("A64_FPX_BLOCK_GPR", "1") != "0"
+
+
+def cvt_on():
+    """A64_FPX_BLOCK_CVT=1: the binary32 / int32 conversions inside blocks"""
+    return os.environ.get("A64_FPX_BLOCK_CVT", "0") == "1"
 
 
 def stores_on():
@@ -499,6 +510,52 @@ STORE_SHAPES = [
     (re.compile(r"\{ uint64_t _b=c->x\[(\d+)\]; int64_t _o=(-?\d+); recomp_stp64(_sp)?\(c,\(_b\+_o\)," + V + r"\[0\]," + V + r"\[1\]\);"
                 r"(?: recomp_stp64(_sp)?\(c,\(_b\+_o\)\+16," + V + r"\[0\]," + V + r"\[1\]\);)? \}"), sh_stpq),
 ]
+# ---- conversions (A64_FPX_BLOCK_CVT=1) ----------------------------------------------------------------------------------
+LANES_N = {"1": L1, "2": L2, "4": L4}
+
+
+def whole_line(m):
+    """the match is a statement of its own line (not the body of an if or part of a bigger statement)"""
+    t = m.string
+    return not t[t.rfind("\n", 0, m.start()) + 1:m.start()].strip() and not t[m.end():(t.find("\n", m.end()) + 1 or len(t))].strip()
+
+
+def sh_scvtv(m):
+    s_, n, sg, d = m.groups()
+    return Op("scvtf", d, [s_], "%s = a64_bk_scvtf(&_bad, %s, %s, %s);" % (bv(d), bv(s_), sg, LANES_N[n]), True)
+
+
+def sh_fcvtzv(m):
+    s_, n, sg, d = m.groups()
+    return Op("fcvtz", d, [s_], "%s = a64_bk_fcvtz(&_bad, _fzm, %s, %s, %s);" % (bv(d), bv(s_), sg, LANES_N[n]), True)
+
+
+def sh_scvtg(m):
+    x, sg, d, d2 = m.groups()
+    if d != d2 or not whole_line(m):
+        return None
+    return Op("scvtfg", d, [], "%s = a64_bk_scvtf(&_bad, _mm_cvtsi32_si128((int)(uint32_t)c->x[%s]), %s, %s);" % (bv(d), x, sg, L1), True)
+
+
+def sh_fcvtzg(m):
+    x, s_, sg = m.groups()
+    if not whole_line(m):
+        return None
+    op = Op("fcvtzg", None, [s_], "c->x[%s] = (uint64_t)(uint32_t)_mm_cvtsi128_si32(a64_bk_fcvtz(&_bad, _fzm, %s, %s, %s));" % (
+        x, bv(s_), sg, L1), True)
+    op.gpr_writes = [int(x)]
+    return op
+
+
+CVT_SHAPES = [
+    (re.compile(r"\{ uint32_t _a\[4\],_r\[4\]=\{0\}; memcpy\(_a," + V + r",16\); for\(int _i=0;_i<([124]);_i\+\+\) "
+                r"_r\[_i\]=\(uint32_t\)recomp_fixed_to_fp\(_a\[_i\],32,32,0,([01]),c->fpcr,&c->fpsr\); a64_vst16\(" + V + r",_r\); \}"), sh_scvtv),
+    (re.compile(r"\{ uint32_t _a\[4\],_r\[4\]=\{0\}; memcpy\(_a," + V + r",16\); for\(int _i=0;_i<([124]);_i\+\+\) "
+                r"_r\[_i\]=\(uint32_t\)recomp_fp_to_int\(_a\[_i\],32,32,([01]),3,c->fpcr,&c->fpsr\); a64_vst16\(" + V + r",_r\); \}"), sh_fcvtzv),
+    (re.compile(r"\{ uint64_t _r=recomp_fixed_to_fp\(c->x\[(\d+)\],32,32,0,([01]),c->fpcr,&c->fpsr\); a64_vset64\(" + V + r",0\); "
+                + V + r"\[0\]=_r; \}"), sh_scvtg),
+    (re.compile(r"c->x\[(\d+)\]=recomp_fp_to_int\(" + V + r"\[0\]&UINT64_C\(0xffffffff\),32,32,([01]),3,c->fpcr,&c->fpsr\);"), sh_fcvtzg),
+]
 LOAD_KINDS = {"ldq", "ld32", "ld64", "ldp32", "ldp64", "ldpq"}
 
 
@@ -569,7 +626,7 @@ def find_gpr(text, ops):
 def find_ops(text):
     """[(start, end, Op)] of every statement one of the shapes matches, in text order (non-overlapping)"""
     found = []
-    for rx, build in SHAPES + (STORE_SHAPES if stores_on() else []):
+    for rx, build in SHAPES + (STORE_SHAPES if stores_on() else []) + (CVT_SHAPES if cvt_on() else []):
         for m in rx.finditer(text):
             op = build(m)
             if op is not None:
@@ -799,6 +856,18 @@ static inline __attribute__((always_inline)) uint32_t a64_bk_fcmp(__m128i *bad, 
 static inline __attribute__((always_inline)) void a64_bk_fcmp_commit(Ctx *c, uint32_t fl) {
     c->n = (uint8_t)(fl & 1u); c->z = (uint8_t)(fl >> 1 & 1u); c->c = (uint8_t)!(fl & 1u); c->v = 0;
 }
+/* SCVTF / UCVTF (recomp_fixed_to_fp, binary32 from 32-bit integers, no fraction bits): in the gate rounded to nearest with
+   IXC set, as the host's conversion; UCVTF of a lane >= 2^31 is left to the fallback */
+static inline __attribute__((always_inline)) __m128i a64_bk_scvtf(__m128i *bad, __m128i a, int is_signed, __m128i lanes) {
+    if (!is_signed) *bad = _mm_or_si128(*bad, _mm_and_si128(_mm_srai_epi32(a, 31), lanes));
+    return _mm_and_si128(A64_BK_I(_mm_cvtepi32_ps(a)), lanes); }
+/* FCVTZS / FCVTZU (recomp_fp_to_int, toward zero, binary32 to 32-bit): kept when |x| < 2^31 (so not a NaN or an infinity),
+   FCVTZU also x >= +0 or |x| < 1 (a magnitude of zero), under FZ no subnormal (IDC); the truncation's IXC is already set */
+static inline __attribute__((always_inline)) __m128i a64_bk_fcvtz(__m128i *bad, __m128i fzm, __m128i a, int is_signed, __m128i lanes) {
+    __m128i keep = a64_bk_ult(a64_bk_abs(a), 0x4f000000u);
+    if (!is_signed) keep = _mm_and_si128(keep, _mm_or_si128(_mm_cmpgt_epi32(a, _mm_set1_epi32(-1)), a64_bk_ult(a64_bk_abs(a), 0x3f800000u)));
+    *bad = _mm_or_si128(*bad, _mm_and_si128(_mm_or_si128(a64_bk_not(keep), _mm_and_si128(fzm, a64_bk_subn(a))), lanes));
+    return _mm_and_si128(_mm_cvttps_epi32(A64_BK_F(a)), lanes); }
 static inline __attribute__((always_inline)) __m128i a64_bk_negs(__m128i x) { return _mm_xor_si128(x, _mm_setr_epi32((int)0x80000000u, 0, 0, 0)); }
 static inline __attribute__((always_inline)) __m128i a64_bk_negv(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi32((int)0x80000000u)); }
 static inline __attribute__((always_inline)) __m128i a64_bk_neg4(__m128i x) { return a64_bk_negs(x); }

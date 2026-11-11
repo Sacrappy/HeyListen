@@ -106,12 +106,23 @@ GUEST = (
                                "and x8, x8, #0x70\nfmul v4.4s, v6.4s, v3.4s\nldr q5, [x0, x8]\nfadd v7.4s, v5.4s, v4.4s\nfmul v8.4s, v7.4s, v7.4s", 2),
     ("stp q, stur q", "fmul v0.4s, v1.4s, v2.4s\nstp q0, q1, [sp, #32]\nfadd v3.4s, v0.4s, v1.4s\nstp q3, q0, [x1, #32]\nfmul v4.4s, v3.4s, v0.4s\n"
                       "stur q4, [x1, #17]\nfsub v5.4s, v4.4s, v3.4s\nstr q5, [x2, #48]\nfmul v6.4s, v5.4s, v5.4s", 2),
+    # (A64_FPX_BLOCK_CVT) conversions inside runs: vector, lane, from and to a W register, signed and unsigned
+    ("cvt vector", "fmul v0.4s, v1.4s, v2.4s\nfcvtzs v3.4s, v0.4s\nscvtf v4.4s, v3.4s\nfadd v5.4s, v4.4s, v0.4s\nucvtf v6.2s, v3.2s\n"
+                   "fcvtzu v7.4s, v5.4s\nfmul v8.4s, v6.4s, v6.4s\nucvtf v9.4s, v7.4s\nfcvtzs v10.2s, v8.2s", 2),
+    ("cvt lane", "fmul s0, s1, s2\nfcvtzs s3, s0\nscvtf s4, s3\nucvtf s5, s3\nfcvtzu s6, s0\nfadd s7, s4, s5\nscvtf s8, s6", 2),
+    ("cvt general registers", "fmul s0, s1, s2\nfcvtzs w8, s0\nscvtf s3, w8\nfcvtzu w9, s1\nucvtf s4, w9\nfadd s5, s3, s4\n"
+                              "scvtf s6, w4\nucvtf s7, w5\nfmul s10, s6, s7\nfcvtzs w11, s10\nadd x10, x8, x9", 2),
+    ("cvt in range", "fcvtzu s3, s1\nfadd s4, s1, s2\nfcvtzs s5, s2\nfmul s6, s4, s1\nfcvtzu w8, s2\nfcvtzs w9, s1\nucvtf s7, w8\n"
+                     "scvtf s8, w9\nfadd s10, s7, s8", 2),
+    ("cvt subnormal", "fcvtzs s3, s1\nfcvtzu s4, s1\nfcvtzs w8, s1", 2),
     ("one op alone", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x0]\nfadd s3, s1, s2\nstr s3, [x1]", 0),
     ("moves alone", "dup v0.4s, v1.s[2]\nins v0.s[1], v3.s[0]\next v4.16b, v0.16b, v3.16b, #4", 0),
 )
 # (A64_FPX_BLOCK_ST=1 must change these, against the switch alone)
 ST_CHANGES = {"store between runs", "stores inside a run", "stores that overlap", "stored then overwritten", "base moved between stores",
               "load after a store", "gpr load after a store", "read back through memory", "one op alone", "stp q, stur q"}
+# (A64_FPX_BLOCK_CVT=1 must change these, against _ST=1)
+CVT_CHANGES = {"cvt vector", "cvt lane", "cvt general registers", "cvt in range", "cvt subnormal"}
 NEEDS = {("add32", "add32", 2, 2), ("sub32", "sub32", 2, 2), ("mul32", "fma32", 2, 3), ("fma32", "fma32", 3, 3),
          ("div32", "div32", 2, 2), ("sqrt32", "sqrt32", 1, 1)}
 
@@ -164,11 +175,14 @@ def generate(cc, cxx, tmp, flags):
         news = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for w in words]
         os.environ["A64_FPX_BLOCK_ST"] = "1"   # (the stores inside blocks: every case again)
         sts = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for w in words]
+        os.environ["A64_FPX_BLOCK_CVT"] = "1"   # (and the conversions: every case a third time)
+        cvts = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for w in words]
         import a64_block
         print(a64_block.report())
     finally:
         os.environ[SWITCH] = "0"
         os.environ.pop("A64_FPX_BLOCK_ST", None)
+        os.environ.pop("A64_FPX_BLOCK_CVT", None)
         if a64emit._lib is not None:
             import _ctypes
             (_ctypes.FreeLibrary if os.name == "nt" else _ctypes.dlclose)(a64emit._lib._handle)
@@ -181,17 +195,23 @@ def generate(cc, cxx, tmp, flags):
     for (name, _, _), n, t in zip(GUEST, news, sts):
         if (name in ST_CHANGES) != (t != n):
             raise SystemExit("fpx block: A64_FPX_BLOCK_ST=1 %s %s" % ("did not change" if name in ST_CHANGES else "changed", name))
+    for (name, _, _), t, v in zip(GUEST, sts, cvts):
+        if (name in CVT_CHANGES) != (v != t):
+            raise SystemExit("fpx block: A64_FPX_BLOCK_CVT=1 %s %s" % ("did not change" if name in CVT_CHANGES else "changed", name))
     n_g = len(GUEST)
-    for i, (o, n, t) in enumerate(zip(olds, news, sts)):
+    for i, (o, n, t, v) in enumerate(zip(olds, news, sts, cvts)):
         out.append("static void g_old%d(Ctx *__restrict c) {\n%s\n}" % (i, o))
         out.append("static void g_new%d(Ctx *__restrict c) {\n%s\n}" % (i, n))
         out.append("static void g_st%d(Ctx *__restrict c) {\n%s\n}" % (i, t))
+        out.append("static void g_cvt%d(Ctx *__restrict c) {\n%s\n}" % (i, v))
     out.append("typedef void (*GuestFn)(Ctx *);")
-    # (the cases twice: the switch alone, then with A64_FPX_BLOCK_ST=1, both against the default lowering)
-    out.append("const GuestFn fn_old[] = {%s};" % ", ".join(["g_old%d" % i for i in range(n_g)] * 2))
-    out.append("const GuestFn fn_new[] = {%s};" % ", ".join(["g_new%d" % i for i in range(n_g)] + ["g_st%d" % i for i in range(n_g)]))
-    out.append("const char *const fn_names[] = {%s};" % ", ".join(['"%s"' % g[0] for g in GUEST] + ['"%s [st]"' % g[0] for g in GUEST]))
-    out.append("const int fn_count = %d;" % (2 * n_g))
+    # (the cases three times: the switch alone, with A64_FPX_BLOCK_ST=1, with _ST=1 and _CVT=1; each against the default lowering)
+    out.append("const GuestFn fn_old[] = {%s};" % ", ".join(["g_old%d" % i for i in range(n_g)] * 3))
+    out.append("const GuestFn fn_new[] = {%s};" % ", ".join(["g_new%d" % i for i in range(n_g)] + ["g_st%d" % i for i in range(n_g)]
+                                                            + ["g_cvt%d" % i for i in range(n_g)]))
+    out.append("const char *const fn_names[] = {%s};" % ", ".join(['"%s"' % g[0] for g in GUEST] + ['"%s [st]"' % g[0] for g in GUEST]
+                                                                 + ['"%s [st+cvt]"' % g[0] for g in GUEST]))
+    out.append("const int fn_count = %d;" % (3 * n_g))
     with open(os.path.join(tmp, "block_cases.c"), "w", newline="\n") as f:
         f.write("\n".join(out) + "\n")
     used |= NEEDS
