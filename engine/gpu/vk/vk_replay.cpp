@@ -415,6 +415,7 @@ void gpu_time_begin(Recording& r) {
         if (vkCreateQueryPool(dev.device, &qi, nullptr, &ts_pool) != VK_SUCCESS) ts_pool = VK_NULL_HANDLE;
         if (!ts_pool) return;
     }
+    ts_sig[r.slot] = r.value;   // (TICK-057: a segment's, which signals nothing; submit_recording sets the value signalled)
     vkCmdResetQueryPool(r.upload, ts_pool, 4 * r.slot, 2);   // (each command buffer resets its own: the upload one is not always sent)
     vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot);
     vkCmdResetQueryPool(r.cmd, ts_pool, 4 * r.slot + 2, 2);
@@ -1740,6 +1741,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandPool(dev.device, j->r->upload_pool, 0);
         vkBeginCommandBuffer(j->r->upload, &bi);
+        gpu_time_begin(*j->r);   // (TICK-057: the segments' GPU time too, in the trace's gpu_ms and gaps and the late waits' tail)
         j->g = seg[k];
         j->order = base + k;
         j->index = (int)k;
@@ -1798,6 +1800,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         j->uploads = texture_uploads_recorded();
         j->inits = texture_segment_end(j->index);   // (after its last new image)
         texture_segment_worker(-1);
+        gpu_time_end(*j->r, j->uploads);   // (TICK-057)
         vkEndCommandBuffer(j->r->upload);
         vkEndCommandBuffer(j->r->cmd);
         j->t1 = now_ns();
