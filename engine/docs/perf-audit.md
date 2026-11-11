@@ -2894,3 +2894,15 @@ In the base build chain B ends ~1 ms before chain A needs it. HOLD=2 takes 1.6 m
 chain B (the serialized flush ahead of the Presentation Thread's first submit). A gain needs both chains cut: the replay's
 7.3 ms (TICK-049/050/052: the per-draw cost and the waits for segments) is the lever on chain B, and it could not show
 while chain B had slack.
+
+### Screen 2: both chains cut (castle-move, 3 interleaved rounds, one binary; fps / 1% low / p99 ms, frame prep)
+
+| variant | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| base | 68.5 | 68.0 | 66.6 | **67.7 / 33.2 / 24.0**, 8.84 |
+| HOLD=2 + `RX_VK_PARALLEL_ROUNDS=1 SELF=1 BALANCE=1 POINT=32` + `RX_VK_GONE_RING=1 TL_POOLS_WIDE=1 PARLOCK_SPIN=4000` | 69.8 | 70.8 | 71.6 | **70.8 / 34.9 / 21.5**, 8.41 |
+
++3.1 fps, every combo run above every base run, p99 -2.5 ms: TICK-050's and TICK-052's switches (inside the spread on
+their own, with chain B slack) show once HOLD=2 makes chain B critical. The main thread's two captures copy ~30 MB a frame
+(the frame's writes; 0.6 ms mean, 1.2 ms p90 each by the trace marks: the capture log's 0.27 ms is the mean over the
+Presentation Thread's small ones too) and that copy is on both chains whichever thread does it.
