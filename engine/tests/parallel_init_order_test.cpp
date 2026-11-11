@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 struct Op {
@@ -177,13 +179,15 @@ VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
 thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;
 bool is_bc(VkFormat) { return false; }
 bool is_astc(VkFormat) { return false; }
+struct Texture {   // (the fields texture.cpp's astc_trace_note reads (TICK-051 frame trace) are never set here: it returns at once)
+    VkImage image;
+    uint32_t levels = 1, layers = 1, width = 0, height = 0, nvn_format = 0;
+    uint64_t gpu = 0;
+};
 #include "init_upload.inc"
 #include "init_hooks.inc"
 
 // ---- create()'s initialization of a new image ----
-struct Texture {
-    VkImage image;
-};
 std::vector<std::unique_ptr<Texture>> textures;
 std::mutex par_lock;   // (texture_get's ParLock: an image is made once, by whichever worker gets there first)
 Texture* create(VkImage image) {
@@ -276,7 +280,8 @@ struct RunJobs {
 };
 struct {
     std::mutex mu;
-    std::vector<std::function<void()>> jobs;
+    std::deque<std::function<void()>> jobs;
+    std::deque<std::function<void()>> own[8];   // (TICK-052, RX_VK_PARALLEL_AFFINITY: off by default, never filled here)
     int pending = 0;
     RunJobs cv;
     std::condition_variable done;
@@ -286,7 +291,8 @@ void RunJobs::notify_all() {
     std::vector<std::function<void()>> jobs;
     {
         std::lock_guard lk(par_pool.mu);
-        jobs.swap(par_pool.jobs);
+        jobs.assign(par_pool.jobs.begin(), par_pool.jobs.end());
+        par_pool.jobs.clear();
     }
     if (run_order.empty()) {   // (at once, as par_worker_main runs them; the replay thread submits meanwhile)
         for (auto& job : jobs) {
@@ -349,11 +355,15 @@ void submit_post() {
     vkQueueSubmit2(VK_NULL_HANDLE, 1, &si, VK_NULL_HANDLE);
 }
 /// replay_handle from its segments on (the dry pass, the part before and the slots' order are the caller's)
+const uint8_t* occ_go_on(VkCommandBuffer&, const uint8_t*, bool, Recording*) { return nullptr; }   // (only after occ_stop)
 void submit_segments(std::vector<Segment> seg, std::vector<int> order) {
     run_order = order;
     cur_segs = &seg;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     const uint8_t* const stop = kStop;
+    const uint8_t* const occ_stop = nullptr;   // (TICK-033: a dry pass stopped for a report's count: not in these cases)
+    const bool may_stop = false;
+    const bool self_rec = false, self_help = false;   // (TICK-050, RX_VK_PARALLEL_SELF: off by default)
     uint64_t seq = 10;
     const uint64_t base = 1;
     [&]() -> const uint8_t* {
