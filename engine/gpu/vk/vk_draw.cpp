@@ -5876,9 +5876,13 @@ bool occ_proxy_skip_on() {
     }();
     return on;
 }
+// (the answer kept by the program's key and variant, each thread its own: not in Program, whose size is part of the program
+// cache's stamp (vk_shader.cpp disk_stamp: sizeof(Program)); a field there made every program cache on disk start again.
+// A key and variant name one translation, so the same stages and the same answer)
 bool program_inert(const Program& p) {
-    const int known = p.inert.load(std::memory_order_relaxed);
-    if (known >= 0) return known != 0;
+    thread_local std::unordered_map<uint64_t, bool> known;
+    const uint64_t id = p.key ^ (p.variant * 0x9E3779B97F4A7C15ull) ^ (p.compute ? 1 : 0);
+    if (const auto it = known.find(id); it != known.end()) return it->second;
     bool inert = !p.compute && !p.mesh && !p.fallback && !p.stages.empty();
     for (const Stage& st : p.stages) {
         const Shader::Info& i = st.info;
@@ -5887,7 +5891,8 @@ bool program_inert(const Program& p) {
             i.uses_atomic_image_u32 || i.num_global_tables)
             inert = false;
     }
-    p.inert.store(inert ? 1 : 0, std::memory_order_relaxed);   // (threads may ask at once: the same answer)
+    if (known.size() > 65536) known.clear();
+    known.emplace(id, inert);
     return inert;
 }
 bool draw_writes_nothing(const Program& p, const NvnState& s, const Targets& at) {
