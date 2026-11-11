@@ -71,6 +71,7 @@ ARGS = {
     "tests/test_fg_scale_sharpen.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],
+    "tests/test_segment_plan.py": ["--cxx", "g++"],
     "tests/test_mirror_inherit.py": ["--cxx", "{cxx}"],
     "tests/test_menu_hit.py": ["--cxx", "g++"],
     "tests/test_ui_record.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],

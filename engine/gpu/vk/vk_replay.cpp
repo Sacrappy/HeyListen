@@ -41,6 +41,7 @@
 #include "vk_framegen.h"
 #include "vk_menu.h"
 #include "vk_perf.h"
+#include "segment_plan.h"   // (TICK-050: the parallel replay's segment count)
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_state.h"
@@ -1293,7 +1294,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (dry) {
                 const bool compute = h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT;
                 if (s.render_enabled && (compute || !s.raster_discard)) dry_mark_written(s, compute, dry_work == 0);
-                if (++dry_work % 64 == 0) par_points.push_back({p + h.size, s, ub_updates.size(), par_conds.size(), dry_work});
+                // (TICK-050, RX_VK_PARALLEL_POINT=<n>: a point every n instead of 64, for finer boundaries)
+                static const int64_t point_every = getenv("RX_VK_PARALLEL_POINT") ? std::clamp(atoi(getenv("RX_VK_PARALLEL_POINT")), 8, 256) : 64;
+                if (++dry_work % point_every == 0) par_points.push_back({p + h.size, s, ub_updates.size(), par_conds.size(), dry_work});
             } else if (!worker) {
                 maybe_split(cmd);
             }
@@ -1486,7 +1489,27 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // (segments of ~RX_VK_PARALLEL_SEG draws and dispatches (default 160), taken in order by the threads and submitted
     // as each is done with those before it: the GPU starts on the first while the rest are recorded)
     static const int64_t per = getenv("RX_VK_PARALLEL_SEG") ? std::max(32, atoi(getenv("RX_VK_PARALLEL_SEG"))) : 160;
-    const int nseg = (int)std::clamp<int64_t>(total / per, 1, kMaxBatch);
+    // (TICK-050) RX_VK_PARALLEL_ROUNDS=1: no more segments than recorders, so that they are all recorded in one round (TICK-049:
+    // ~830 draws gave 5 segments on 4 workers, the fifth recorded alone after the others). RX_VK_PARALLEL_SELF=1 (with it): the
+    // replay thread records the first segment itself instead of only waiting, one recorder more; =2: it also takes segments
+    // no worker has started yet before it waits for one (the pool's queue, in order). All off by default
+    static const bool one_round = getenv("RX_VK_PARALLEL_ROUNDS") && atoi(getenv("RX_VK_PARALLEL_ROUNDS")) != 0;
+    static const int self_mode = getenv("RX_VK_PARALLEL_SELF") ? std::clamp(atoi(getenv("RX_VK_PARALLEL_SELF")), 0, 2) : 0;
+    static const bool self_rec = self_mode >= 1, self_help = self_mode >= 2;
+    const int recorders = mkwvk::segment_plan::recorders(threads, self_rec);
+    const int nseg = mkwvk::segment_plan::segment_count(total, per, recorders, kMaxBatch, one_round);
+    // (TICK-050, RX_VK_PARALLEL_BALANCE=1) the boundaries placed by recording time, not by count: the first draws of a command
+    // buffer cost ~2-3 times the last ones a draw (castle-move: 5.9 against 1.8 us), so equal counts left the first segment the
+    // slowest. Each large command buffer of a frame (by its order in the frame) keeps the time its segments took over its length
+    // (segment_plan::Profile, an average over frames); the boundaries cut that into equal parts, at the nearest point
+    static const bool balance = getenv("RX_VK_PARALLEL_BALANCE") && atoi(getenv("RX_VK_PARALLEL_BALANCE")) != 0;
+    static mkwvk::segment_plan::Profile profiles[4];
+    static uint64_t prof_frame = ~0ull;
+    static int prof_ord = 0;
+    if (texture_frame_no() != prof_frame) prof_frame = texture_frame_no(), prof_ord = 0;
+    mkwvk::segment_plan::Profile& profile = profiles[std::min(prof_ord++, 3)];
+    int64_t wants[kMaxBatch] = {};
+    if (balance) mkwvk::segment_plan::balanced_targets(profile, nseg, total, wants);
     std::vector<Segment> seg;
     seg.push_back({h, nullptr, &start, ub0, 0, serial0});
     // (RX_VK_PARALLEL_BOUNDARY=<k>, diagnosis: only the k-th boundary of each command buffer splits it, and its program's code keys are logged,
@@ -1494,10 +1517,16 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     static const int only_boundary = getenv("RX_VK_PARALLEL_BOUNDARY") ? atoi(getenv("RX_VK_PARALLEL_BOUNDARY")) : 0;
     for (int k = 1; k < nseg; k++) {
         if (only_boundary && k != only_boundary) continue;
-        const int64_t want = total * k / nseg;
+        const int64_t want = balance ? wants[k - 1] : total * k / nseg;
         const ParPoint* at = nullptr;
-        for (const ParPoint& q : par_points)
-            if (q.work >= want) { at = &q; break; }
+        if (balance) {   // (the nearest point: the first at or after it leaned every segment long)
+            for (const ParPoint& q : par_points)
+                if (!at || std::llabs(q.work - want) < std::llabs(at->work - want)) at = &q;
+            if (at && (at->work <= (int64_t)(seg.back().serial - serial0) || at->work >= total)) at = nullptr;
+        } else {
+            for (const ParPoint& q : par_points)
+                if (q.work >= want) { at = &q; break; }
+        }
         if (!at || at->p == seg.back().p) continue;
         // (RX_VK_PARALLEL_MINWORK=<n>, diagnosis: no boundary before that many draws and dispatches of the command buffer)
         static const int64_t min_work = getenv("RX_VK_PARALLEL_MINWORK") ? atoll(getenv("RX_VK_PARALLEL_MINWORK")) : 0;
@@ -1518,8 +1547,10 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     if (!par_pool.started) {
         par_pool.started = true;
         for (int i = 0; i < threads; i++) std::thread(par_worker_main).detach();
-        logf("vk: parallel replay: big command buffers recorded on %d threads in segments of ~%lld draws and dispatches",
-             threads, (long long)per);
+        logf("vk: parallel replay: big command buffers recorded on %d threads in segments of ~%lld draws and dispatches%s%s",
+             threads, (long long)per, one_round ? ", in one round (RX_VK_PARALLEL_ROUNDS)" : "",
+             self_rec ? (self_help ? ", the replay thread recording the first and helping (RX_VK_PARALLEL_SELF=2)"
+                                   : ", the replay thread recording the first (RX_VK_PARALLEL_SELF)") : "");
     }
     // what came before, to the GPU now (its uploads included); then each segment into a recording of its own (its
     // command buffer and uploads), recorded in order by the threads and submitted in order as they are done
@@ -1540,6 +1571,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         std::atomic<bool> done{false};
         bool uploads = false;
         int inits = 0;   // (texture_segment_end's)
+        int64_t t0 = 0, t1 = 0;   // (TICK-050: its recording's start and end, steady clock ns)
     };
     std::vector<std::unique_ptr<Job>> jobs;
     for (size_t k = 0; k < seg.size(); k++) {
@@ -1588,38 +1620,63 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     par_active = true;
     std::condition_variable seg_cv;
     std::mutex seg_mu;
+    const auto now_ns = [] { return (int64_t)std::chrono::steady_clock::now().time_since_epoch().count(); };
+    // (one segment recorded into its own recording, on any recording thread: a worker, or with RX_VK_PARALLEL_SELF the replay
+    // thread for the first. The thread's per-recording state (draw_begin_recording, texture_begin_recording) is set for it here;
+    // the replay thread's is set again by begin_recording for what follows the segments, below)
+    const auto record_job = [&seg_cv, &seg_mu, &now_ns](Job* j) {
+        j->t0 = now_ns();
+        texture_set_segment(j->order);
+        texture_segment_worker(j->index);
+        texture_begin_recording(j->r->upload, j->r->value);
+        draw_begin_recording(j->r->slot, j->r->cmd, j->r->value);
+        VkCommandBuffer c = j->r->cmd;
+        record_segment(c, j->g);
+        j->uploads = texture_uploads_recorded();
+        j->inits = texture_segment_end(j->index);   // (after its last new image)
+        texture_segment_worker(-1);
+        vkEndCommandBuffer(j->r->upload);
+        vkEndCommandBuffer(j->r->cmd);
+        j->t1 = now_ns();
+        {
+            std::lock_guard l(seg_mu);
+            j->done = true;
+        }
+        seg_cv.notify_all();
+    };
+    const size_t first_pooled = self_rec ? 1 : 0;   // (the replay thread's own: jobs[0])
     {
         std::lock_guard lk(par_pool.mu);
-        for (auto& jp : jobs) {
-            Job* j = jp.get();
-            par_pool.jobs.push_back([j, &seg_cv, &seg_mu] {
-                texture_set_segment(j->order);
-                texture_segment_worker(j->index);
-                texture_begin_recording(j->r->upload, j->r->value);
-                draw_begin_recording(j->r->slot, j->r->cmd, j->r->value);
-                VkCommandBuffer c = j->r->cmd;
-                record_segment(c, j->g);
-                j->uploads = texture_uploads_recorded();
-                j->inits = texture_segment_end(j->index);   // (after its last new image)
-                texture_segment_worker(-1);
-                vkEndCommandBuffer(j->r->upload);
-                vkEndCommandBuffer(j->r->cmd);
-                {
-                    std::lock_guard l(seg_mu);
-                    j->done = true;
-                }
-                seg_cv.notify_all();
-            });
+        for (size_t k = first_pooled; k < jobs.size(); k++) {
+            Job* j = jobs[k].get();
+            par_pool.jobs.push_back([j, &record_job] { record_job(j); });
             par_pool.pending++;
         }
     }
     par_pool.cv.notify_all();
+    if (self_rec) record_job(jobs[0].get());
     bool init_lost = false;
+    int64_t pt_wait_ns = 0;   // (TICK-050: the replay thread waiting for segments, in seg_cv)
     for (auto& jp : jobs) {   // (in order, each as soon as it is done)
         Job* j = jp.get();
+        // (RX_VK_PARALLEL_SELF=2) before waiting: a segment no worker has taken yet, recorded here as a worker would
+        while (self_help && !j->done.load()) {
+            std::function<void()> fn;
+            {
+                std::lock_guard lk(par_pool.mu);
+                if (par_pool.jobs.empty()) break;
+                fn = std::move(par_pool.jobs.front());
+                par_pool.jobs.pop_front();
+            }
+            fn();
+            std::lock_guard lk(par_pool.mu);
+            if (--par_pool.pending == 0) par_pool.done.notify_all();
+        }
         {
+            const int64_t w0 = now_ns();
             std::unique_lock l(seg_mu);
             seg_cv.wait(l, [j] { return j->done.load(); });
+            pt_wait_ns += now_ns() - w0;
         }
         if (j->inits < 0) init_lost = true;   // (its init command buffer could not be ended: the replay stops, below)
         if (init_lost) continue;              // (nothing from it on is submitted)
@@ -1652,10 +1709,48 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     segs_n += (double)seg.size();
     static double wait_ms, locks_n;
     wait_ms += (par_lock_wait_ns.load() - wait0) / 1e6, locks_n += (double)(par_locks.load() - locks0);
+    // (TICK-050) the slowest and fastest segment's recording, the rounds, the replay thread's wait for its segments and its own
+    // segment's recording (RX_VK_PARALLEL_SELF), and the slowest's worst over the window (a tail)
+    static double slow_ms, fast_ms, rounds_n, ptwait_ms, self_ms, slow_max;
+    {
+        int64_t lo = INT64_MAX, hi = 0;
+        for (auto& jp : jobs) lo = std::min(lo, jp->t1 - jp->t0), hi = std::max(hi, jp->t1 - jp->t0);
+        slow_ms += hi / 1e6, fast_ms += lo / 1e6, slow_max = std::max(slow_max, hi / 1e6);
+        rounds_n += mkwvk::segment_plan::rounds((int)jobs.size(), recorders);
+        ptwait_ms += pt_wait_ns / 1e6;
+        if (self_rec) self_ms += (jobs[0]->t1 - jobs[0]->t0) / 1e6;
+    }
+    if (balance) {   // (what each segment took, over its part of the command buffer)
+        double from[kMaxBatch], to[kMaxBatch], ms[kMaxBatch];
+        size_t m = 0;
+        for (size_t k = 0; k < jobs.size() && k < (size_t)kMaxBatch && total > 0; k++, m++) {
+            const uint64_t end = k + 1 < jobs.size() ? jobs[k + 1]->g.serial : serial0 + (uint64_t)total;
+            from[m] = (double)(jobs[k]->g.serial - serial0) / (double)total, to[m] = (double)(end - serial0) / (double)total;
+            ms[m] = (jobs[k]->t1 - jobs[k]->t0) / 1e6;
+        }
+        mkwvk::segment_plan::profile_add(profile, from, to, ms, m, 0.25);
+    }
+    // (TICK-050) each place's recording time and its draws and dispatches: whether some places are always the slow ones
+    static double place_ms[kMaxBatch], place_work[kMaxBatch], place_n[kMaxBatch];
+    for (size_t k = 0; k < jobs.size() && k < (size_t)kMaxBatch; k++) {
+        const uint64_t end = k + 1 < jobs.size() ? jobs[k + 1]->g.serial : serial0 + (uint64_t)total;
+        place_ms[k] += (jobs[k]->t1 - jobs[k]->t0) / 1e6, place_work[k] += (double)(end - jobs[k]->g.serial), place_n[k]++;
+    }
     if (++timed % 240 == 0) {
         logf("vk: parallel replay, a command buffer: dry pass %.2f ms, segments %.2f ms (%.1f of them), lock taken %.0f "
-             "times, waited for %.2f ms (all threads)", dry_ms / 240, seg_ms / 240, segs_n / 240, locks_n / 240, wait_ms / 240);
+             "times, waited for %.2f ms (all threads); slowest segment %.2f ms (worst %.2f), fastest %.2f ms, %.2f rounds, the "
+             "replay thread waited %.2f ms and recorded %.2f ms",
+             dry_ms / 240, seg_ms / 240, segs_n / 240, locks_n / 240, wait_ms / 240, slow_ms / 240, slow_max, fast_ms / 240,
+             rounds_n / 240, ptwait_ms / 240, self_ms / 240);
         dry_ms = seg_ms = segs_n = wait_ms = locks_n = 0;
+        slow_ms = fast_ms = rounds_n = ptwait_ms = self_ms = slow_max = 0;
+        char pl[400];
+        int n = 0;
+        for (int k = 0; k < kMaxBatch && place_n[k] > 0; k++)
+            n += snprintf(pl + n, sizeof pl - n, "%s %d: %.2f ms (%.0f draws and dispatches, %.0f%% of them)", k ? "," : "", k,
+                          place_ms[k] / place_n[k], place_work[k] / place_n[k], 100.0 * place_n[k] / 240);
+        logf("vk: parallel replay, a segment by its place:%s", pl);
+        for (int k = 0; k < kMaxBatch; k++) place_ms[k] = place_work[k] = place_n[k] = 0;
     }
     // what follows, after them all (the uniform updates are written to guest memory at the submission's end)
     texture_set_segment(++seq);
