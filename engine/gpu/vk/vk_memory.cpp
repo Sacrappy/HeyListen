@@ -2248,11 +2248,6 @@ void memory_late_fix_apply(uint64_t done) {
     }
     late_fix_top.store(late_fixes.empty() ? 0 : late_fixes.back().value, std::memory_order_release);
 }
-/// A wait for a pending fix's value on a thread that needed the queue (not the fix thread's): in the frame trace's late waits
-void memory_late_wait_note(int64_t ns) {
-    st_tr_late_ns.fetch_add(ns, std::memory_order_relaxed);
-    st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
-}
 bool memory_is_rb_page_locked(uint32_t page);
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();

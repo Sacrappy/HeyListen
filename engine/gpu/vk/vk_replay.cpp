@@ -219,6 +219,7 @@ void note_signal_sent(uint64_t v) {
 }
 int64_t st_lf_thread, st_lf_blocked, st_lf_held_cbs;   // (dev.present_mu: fixes applied by the fix thread, by a flush that waited)
 double st_lf_blocked_ms;
+std::atomic<int64_t> st_lf_wait_ns{0};   // (the frame trace's late_fix_ms: any thread's waits for a pending fix, the fix thread's not)
 /// (TICK-060) The pending late fixes applied before anything goes to the queue: a wait for their value (sent already: no flush
 /// needed, and none may be made here), then their copies. dev.present_mu held
 void late_fix_flush_locked() {
@@ -236,7 +237,7 @@ void late_fix_flush_locked() {
         }
         const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
         st_lf_blocked++, st_lf_blocked_ms += ns / 1e6;
-        memory_late_wait_note(ns);
+        st_lf_wait_ns.fetch_add(ns, std::memory_order_relaxed);
     }
     memory_late_fix_apply(std::max(completed(), v));   // (v: past the timeouts, as the take's wait went on after 250 ms)
 }
@@ -259,7 +260,8 @@ bool late_fix_wait_unlocked() {
         if (tl_poll) return false;   // (a poll: what is held is not done anyway; the fix thread sends it)
         const auto t0 = std::chrono::steady_clock::now();
         vk_timeline_wait_sent(lv);
-        memory_late_wait_note(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        st_lf_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                                std::memory_order_relaxed);
     }
     return true;
 }
@@ -3944,7 +3946,7 @@ void status_tick() {
                           "t_s,gpu_ms,late_wait_ms,late_waits,submit_ms,present_ms,qsubmit_ms,dispatch_ms,astc,tex_made,scatter_mb,"
                           "vram_mb,astc_again,astc_mtexels,"
                           // (TICK-053: the upload command buffers' GPU time, the gaps between recordings on the queue)
-                          "gpu_up_ms,gpu_gap_ms\n");
+                          "gpu_up_ms,gpu_gap_ms,late_fix_ms\n");
         return f;
     }();
     // (TICK-051) seconds since the process started, for the bench's 66 s cut: the steady clock's offset from the creation time
@@ -3967,7 +3969,7 @@ void status_tick() {
         const auto dp = [](int i) { return (prof_ns[i] - l_prof[i]) / 1e6; };
         static uint64_t l_gone;
         const uint64_t gone = texture_destroy_generation();
-        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc, l_gpu_up, l_gpu_gap;
+        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc, l_gpu_up, l_gpu_gap, l_lf_wait;
         static uint64_t l_made_t;
         int64_t late_ns = 0, late_n = 0, sc = 0;
         memory_trace_counts(&late_ns, &late_n, &sc);
@@ -3978,7 +3980,7 @@ void status_tick() {
         uint64_t vused = 0, vallowed = 0;
         vram_usage_now(&vused, &vallowed);
         fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
-                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f,%.2f,%.2f\n",
+                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f,%.2f,%.2f,%.2f\n",
                 (unsigned long long)frames, (now_ns - last_ns) / 1e6, (long long)(pw - l_pw), pwms - l_pwms, (long long)(ps - l_ps),
                 tr - l_tr, (long long)(up - l_up), (upb - l_upb) / 1048576.0, texture_count(), dp(PROF_MEMSYNC), dp(PROF_PIPE),
                 dp(PROF_UPLOAD), dp(PROF_PROGRAM), dp(PROF_SLOTWAIT), (st_wait_ns - l_wait) / 1e6, dp(PROF_DRAW), dp(PROF_DESC),
@@ -3986,9 +3988,10 @@ void status_tick() {
                 (now_ns + launch_offset_ns) / 1e9, (st_gpu_ns - l_gpu_t) / 1e6, (late_ns - l_late_ns) / 1e6, (long long)(late_n - l_late_n),
                 dp(PROF_SUBMIT), dp(PROF_PRESENT), dp(PROF_QSUBMIT), dp(PROF_DISPATCH), (long long)(astc - l_astc),
                 (unsigned long long)(made - l_made_t), (sc - l_sc) / 1048576.0, (unsigned long long)(vused >> 20),
-                (long long)(again - l_again), (texels - l_texels) / 1e6, (st_gpu_up_ns - l_gpu_up) / 1e6, (st_gpu_gap_ns - l_gpu_gap) / 1e6);
+                (long long)(again - l_again), (texels - l_texels) / 1e6, (st_gpu_up_ns - l_gpu_up) / 1e6, (st_gpu_gap_ns - l_gpu_gap) / 1e6,
+                (st_lf_wait_ns.load(std::memory_order_relaxed) - l_lf_wait) / 1e6);
         l_gpu_t = st_gpu_ns, l_late_ns = late_ns, l_late_n = late_n, l_sc = sc, l_astc = astc, l_made_t = made; l_again = again, l_texels = texels;
-        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns;
+        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns, l_lf_wait = st_lf_wait_ns.load(std::memory_order_relaxed);
         l_gone = gone;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;
