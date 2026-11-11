@@ -20,7 +20,12 @@ present = replay[present_at:replay.index('\n}\n', present_at) + 3]   # (the whol
 signal = re.search(r'    signal\.semaphore = [^;]+;', present)[0]
 wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', present)[0]
 acquire_wait = re.search(r'    waits\[0\]\.semaphore = [^;]+;', present)[0]
-assert 'acquire_timeout, f.acquired, VK_NULL_HANDLE, &index)' in present
+# (TICK-053: RX_VK_ACQUIRE_FENCE, off by default: the acquire signals f.acquired, the semaphore the blit waits on, and no fence;
+# on, it signals the fence f.acq instead and the submit has no wait)
+assert 'const bool acq_fence = acquire_fence_on() && f.acq;' in present
+assert 'acquire_timeout, acq_fence ? VK_NULL_HANDLE : f.acquired,' in present
+assert 'acq_fence ? f.acq : VK_NULL_HANDLE, &index)' in present
+assert 'si.waitSemaphoreInfoCount = acq_fence ? 0 : 1;' in present
 # Include the actual creation attempt: passing oldSwapchain retires it even on failure.
 start = main.index('    ci.oldSwapchain = dev.swapchain;')
 end = main.index('    logf("vk: swapchain', start)
