@@ -8,6 +8,8 @@
 - vk_memory.cpp mirrors_give_back: RX_VK_MIRROR_VRAM_FREE (off by default) judges the 80% VRAM rule by what the process holds less
   the free space in VMA's blocks (as the textures' budget does). RX_VK_MIRROR_STICKY (off by default) keeps a mirror made again soon after it went, against the
   VRAM rule only (not past kLongIdle, not when the mirrors' own budget is short); mirror_make counts such mirrors.
+- RX_VK_BARRIER_TRUST / RX_VK_GAME_BARRIER_NARROW (off by default): the engine's pass-start and dispatch barriers trust the game's
+  barriers since the trust point; the game's ORDER_FRAGMENTS (+ INVALIDATE_TEXTURE) barriers wait in the fragment stages only.
 - vk_replay.cpp / vk_gprof.cpp: the GPU's busy tail before a late-page wait (diagnostic, always on; by label with
   RX_VK_PASS_TIMING).
 
@@ -64,6 +66,28 @@ def main():
     after = fb[fb.index("vkCmdPipelineBarrier2(cmd, &d);"):]
     need(after.index("last_barrier_cmd_work = all_work_slot(cmd).load") > 0, "vk_texture.cpp: the count taken after the barrier is recorded")
     need("thread_local uint64_t last_barrier_cmd_work" in tex, "vk_texture.cpp: the count is the recording thread's")
+
+    # (RX_VK_BARRIER_TRUST, RX_VK_GAME_BARRIER_NARROW: off by default; the trust point set by every barrier, reset per recording)
+    for name in ("barrier_trust_on", "game_barrier_narrow_on"):
+        b = body(tex, f"bool {name}() {{")
+        need("env_on(" in b, f"vk_texture.cpp: {name} off by default")
+    need(body(tex, "bool env_on(const char* name) {").count("e && atoi(e) != 0") == 1, "vk_texture.cpp: env_on")
+    need("note_trust_point(cmd);   // (TICK-057)" in fb, "vk_texture.cpp: a full barrier is a trust point")
+    gfb = body(tex, "void game_fragment_barrier(VkCommandBuffer cmd) {")
+    need("b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;" in gfb and "VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT" in gfb and
+         "VK_PIPELINE_STAGE_2_VERTEX" not in gfb and "note_trust_point(cmd);" in gfb and "last_barrier_cmd" not in gfb.split("note_trust_point")[0],
+         "vk_texture.cpp: the game's fragment barrier waits for everything, in the fragment stages only")
+    db = body(tex, "void dispatch_barrier(VkCommandBuffer cmd, const char* why) {")
+    need("barrier_trust_on() && cmd == trust_cmd && xfer_slot(cmd).load(std::memory_order_relaxed) == trust_xfer" in db,
+         "vk_texture.cpp: a dispatch trusted only with no transfer since the trust point")
+    ps = body(tex, "void pass_start_barrier(VkCommandBuffer cmd) {")
+    need("other_work_slot(cmd).load(std::memory_order_relaxed) == trust_other" in ps and "VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT" in ps,
+         "vk_texture.cpp: a pass start trusted only after draws, with an attachment barrier")
+    tb = body(tex, "void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {")
+    need("trust_cmd = VK_NULL_HANDLE;" in tb, "vk_texture.cpp: a new recording trusts nothing")
+    rp = read("vk_replay.cpp")
+    need("if (game_barrier_narrow_on() && (bits & 0x6) && !(bits & ~0x16)) game_fragment_barrier(cmd);" in rp,
+         "vk_replay.cpp: only ORDER_FRAGMENTS(_TILED) + INVALIDATE_TEXTURE barriers narrowed")
 
     mem = read("vk_memory.cpp")
     st = body(mem, "bool mirror_sticky_on() {")

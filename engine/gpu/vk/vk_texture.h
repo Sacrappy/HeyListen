@@ -198,6 +198,9 @@ void note_pass_end(VkCommandBuffer cmd);
 void pass_start_barrier(VkCommandBuffer cmd);
 /// Pass starts with the fragment-stage barrier, since the start
 int64_t pass_barriers_relaxed();
+bool game_barrier_narrow_on();   // (TICK-057: RX_VK_GAME_BARRIER_NARROW)
+void game_fragment_barrier(VkCommandBuffer cmd);   // (TICK-057: the game's ORDER_FRAGMENTS barrier, fragment stages only)
+void trust_stats(int64_t* pass_left, int64_t* pass_attach, int64_t* dispatch_left, int64_t* game_narrow);   // (TICK-057)
 int64_t barriers_left_out_par();   // (TICK-057: of the left out, inside a parallel replay: RX_VK_BARRIER_DEDUPE_PAR)
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// (TICK-051, RX_VK_FRAME_TRACE=1) ASTC transcodes of storage transcoded before, and the texels transcoded (running totals)
