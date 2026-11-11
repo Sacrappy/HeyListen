@@ -1136,6 +1136,8 @@ struct SubmittedPage {
     uint8_t bytes[4096]{};
 };
 thread_local SubmittedPage submitted_page;
+bool late_fix_slot_pending(uint32_t gen, uint32_t slot, uint64_t* value);   // (TICK-060, below)
+std::atomic<int64_t> st_late_def_full{0}, st_late_reads{0}, st_late_syncs{0};   // (TICK-060)
 
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. The next words are
@@ -1166,16 +1168,27 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     int64_t from = 0;
     {
         std::lock_guard lk(pools_mu);
+        bool late_read = false;
         for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
             const CapEntry e = cap_entry(page);
             if (!e.gen || e.gen != page_gen(page)) continue;
             auto b = cap_bufs.find(e.gen);
             if (b == cap_bufs.end() || !b->second.map) continue;
             const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
+            // (TICK-060, RX_VK_LATE_DEFER) a late slot whose fix is pending: the bytes the fix will copy there, read where it will
+            // read them (guest memory once the write-back is done), as the take that waited gave them; not kept for the next reads
+            if (uint64_t lv = 0; late_fix_slot_pending(e.gen, e.slot, &lv)) {
+                vk_timeline_wait_sent(lv);
+                guarded_copy((uint8_t*)dst + (a - guest), (const uint8_t*)host->guest_base() + a, z - a);
+                late_read = true;
+                st_late_reads.fetch_add(1, std::memory_order_relaxed);
+                from++;
+                continue;
+            }
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
         }
-        if (page0 == page1) {
+        if (page0 == page1 && !late_read) {
             submitted_page.page = page0;
             submitted_page.pgen = page_gen(page0);
             submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
@@ -2151,12 +2164,98 @@ int late_diff_runs(const uint8_t* now, const uint8_t* shadow, uint32_t* off, uin
     return n;
 }
 
+// ---- (HeyListen TICK-060) RX_VK_LATE_DEFER: the late pages' wait moved from the capture's take to the queue ----
+// On PC 3050 (RTX 3050 on PCIe 3.0 x4, i5-10400F) the late-page wait above is ~8 ms of every ~36 ms frame: the held submits'
+// thread waits there for the previous frame's last write-back while holding the replay, the Presentation Thread waits behind
+// it, and the GPU, done with that frame's tail, then idles until the next recording arrives. With the switch on, a capture
+// whose late value the queue already has (a signal of it or of a later value went out: the GPU reaches it with nothing more
+// submitted) is taken without the wait: its late slots are noted (a LateFix: the capture buffer, the slots and their pages)
+// and the replay goes on recording. Nothing that reads the capture buffer reaches the GPU before the fix: until it is applied
+// every recording is held back (vk_replay.cpp submit_recording, the batched path), and every submit and flush applies the
+// pending fixes first (queue_flush_locked: a wait for the value, then the same copies the take made after its wait: the late
+// pages from guest memory into their slots). A thread of its own (vk_replay.cpp late_fix_main) waits for the value and applies
+// the fix and sends the held recordings as soon as it is reached, so the GPU gets the new frame when the old one ends, as it
+// did, with the CPU's recording done meanwhile. What the GPU reads is what the take's copies after the wait gave: the same
+// bytes, copied at the same moment (the value's end), by another thread. Not deferred, as before: a late value not yet sent
+// (held recordings, a queue stopped at an event), RX_VK_LATE_MERGE, a late page in the texture storage (the shadow copies
+// the capture buffer at the take: the take waits as before). Off by default (=1: on). tests/test_late_defer.py
+bool late_defer_on() {
+    static const bool v = [] {
+        const bool on = getenv("RX_VK_LATE_DEFER") && atoi(getenv("RX_VK_LATE_DEFER")) != 0;
+        if (on) logf("vk: late pages' wait deferred to the queue (RX_VK_LATE_DEFER)");
+        return on;
+    }();
+    return v;
+}
+struct LateFix {
+    uint64_t value = 0;                                  // (the late pages' write-back: their slots copied again once it is done)
+    uint32_t gen = 0;                                    // (the capture's generation: its slots in the capture table)
+    uint8_t* map = nullptr;                              // (the capture's buffer, kept in cap_bufs until its submission is done)
+    VmaAllocation alloc = nullptr;
+    size_t nbytes = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> slots;    // (slot, guest page)
+};
+std::mutex late_fix_mu;
+std::deque<LateFix> late_fixes;          // (late_fix_mu; in take order, values rising)
+std::atomic<uint64_t> late_fix_top{0};   // (the highest value a pending fix waits for; 0: none pending)
+constexpr int kLateFixMax = 4;           // (pending at once; a take past it waits as before)
+std::atomic<uint32_t> late_fix_gens[kLateFixMax];   // (the pending fixes' generations, 0: free: the readers' quick test)
+/// Whether a capture's slot is a late one whose fix is pending (its bytes not yet the write-back's): *value, the value to wait for.
+/// The CPU's readers of the capture buffers ask it: a replay read as submitted (memory_read_as_submitted) and the mirror sync's
+/// chunk hashes (msync_diff), which must not take the slot's bytes before the fix
+bool late_fix_slot_pending(uint32_t gen, uint32_t slot, uint64_t* value) {
+    if (!gen || !late_fix_top.load(std::memory_order_acquire)) return false;
+    bool any = false;
+    for (int k = 0; k < kLateFixMax; k++) any |= late_fix_gens[k].load(std::memory_order_acquire) == gen;
+    if (!any) return false;
+    std::lock_guard lk(late_fix_mu);
+    for (const LateFix& f : late_fixes) {
+        if (f.gen != gen) continue;
+        const auto it = std::lower_bound(f.slots.begin(), f.slots.end(), std::make_pair(slot, 0u));
+        if (it != f.slots.end() && it->first == slot) {
+            if (value) *value = f.value;
+            return true;
+        }
+    }
+    return false;
+}
+std::atomic<int64_t> st_late_deferred{0}, st_late_def_pages{0}, st_late_def_tex{0}, st_late_def_unsent{0};
+uint64_t memory_late_fix_pending() { return late_fix_top.load(std::memory_order_acquire); }
+size_t late_fix_count() {
+    std::lock_guard lk(late_fix_mu);
+    return late_fixes.size();
+}
+/// The pending fixes whose value done has reached: their late pages copied again from guest memory into their slots (as the
+/// take did after its wait). Called with the queue's lock held (vk_replay.cpp), before anything goes to the queue
+void memory_late_fix_apply(uint64_t done) {
+    std::lock_guard lk(late_fix_mu);
+    if (late_fixes.empty()) return;
+    uint8_t* const base = (uint8_t*)host->guest_base();
+    while (!late_fixes.empty() && late_fixes.front().value <= done) {
+        LateFix& f = late_fixes.front();
+        for (const auto& [slot, page] : f.slots)
+            guarded_copy(f.map + (uint64_t)slot * 4096, base + ((uint64_t)page << kPageShift), 4096);
+        flush_mapped(f.alloc, f.nbytes);
+        for (int k = 0; k < kLateFixMax; k++)
+            if (late_fix_gens[k].load(std::memory_order_relaxed) == f.gen) {
+                late_fix_gens[k].store(0, std::memory_order_release);
+                break;
+            }
+        late_fixes.pop_front();
+    }
+    late_fix_top.store(late_fixes.empty() ? 0 : late_fixes.back().value, std::memory_order_release);
+}
+/// A wait for a pending fix's value on a thread that needed the queue (not the fix thread's): in the frame trace's late waits
+void memory_late_wait_note(int64_t ns) {
+    st_tr_late_ns.fetch_add(ns, std::memory_order_relaxed);
+    st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
+}
 bool memory_is_rb_page_locked(uint32_t page);
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
     // (TICK-053) the late pages merged at their syncs instead (RX_VK_LATE_MERGE): no wait when every one of them has a shadow
     // of what its mirror holds; else the wait below, and a shadow wanted for each, made at its sync from this fresh copy
-    bool late_merge = false;
+    bool late_merge = false, late_defer = false;
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
         if (late_merge_on()) {
             std::lock_guard sl(pools_mu);
@@ -2172,7 +2271,21 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 for (uint32_t i : c->late) late_shadow_want(c->pages[i]);
             }
         }
-        if (!late_merge) {
+        // (TICK-060) RX_VK_LATE_DEFER: no wait here when the queue has the late value already and no late page is texture storage
+        if (!late_merge_on() && late_defer_on() && c->late_value > vk_timeline_completed()) {
+            bool tex = false;
+            if (tex_capture_on()) {
+                std::lock_guard sk(shadow_mu);
+                if (!tex_merged.empty())
+                    for (uint32_t i : c->late)
+                        if (in_tex_merged((uint64_t)c->pages[i] << 12)) { tex = true; break; }
+            }
+            if (tex) st_late_def_tex.fetch_add(1, std::memory_order_relaxed);
+            else if (c->late_value > vk_timeline_signal_sent()) st_late_def_unsent.fetch_add(1, std::memory_order_relaxed);
+            else if (late_fix_count() >= kLateFixMax) st_late_def_full.fetch_add(1, std::memory_order_relaxed);
+            else late_defer = true, gpu_tail_note_late(c->late_value);   // (TICK-057's tail: the value the queue now waits for)
+        }
+        if (!late_merge && !late_defer) {
             st_late_waited.fetch_add(1, std::memory_order_relaxed);
             // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
             // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
@@ -2286,6 +2399,33 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             for (uint32_t i : c->late) late_mark[i] = 1;
         for (size_t i = 0; i < c->copied.size(); i++)
             cap_entry_set(c->copied[i], CapEntry{g, c->slots[i] | (late_mark[c->slots[i]] ? kCapLateBit : 0u)});
+        if (late_defer) {   // (TICK-060: the late slots copied again once their write-back is done, before anything reads them)
+            LateFix f;
+            f.value = c->late_value, f.gen = g, f.map = (uint8_t*)b.map, f.alloc = b.alloc, f.nbytes = c->nbytes;
+            for (uint32_t i : c->late) f.slots.push_back({i, c->pages[i]});
+            static int logged;
+            for (uint32_t i : c->late)
+                if (logged < 24) {
+                    logged++;
+                    const uint64_t ga = (uint64_t)c->pages[i] << kPageShift;
+                    auto pit = imported.upper_bound(ga);
+                    const Pool* pool = pit != imported.begin() && ga < std::prev(pit)->second.hi ? &std::prev(pit)->second : nullptr;
+                    logf("vk: late page deferred: %#llx (pool %#llx+%#llx, readback page %d), write-back %llu, submission %llu",
+                         (unsigned long long)ga, (unsigned long long)(pool ? pool->lo : 0), (unsigned long long)(pool ? ga - pool->lo : 0),
+                         memory_is_rb_page_locked(c->pages[i]) ? 1 : 0, (unsigned long long)c->late_value, (unsigned long long)value);
+                }
+            st_late_deferred.fetch_add(1, std::memory_order_relaxed);
+            st_late_def_pages.fetch_add((int64_t)c->late.size(), std::memory_order_relaxed);
+            std::lock_guard fl(late_fix_mu);
+            for (int k = 0; k < kLateFixMax; k++)
+                if (!late_fix_gens[k].load(std::memory_order_relaxed)) {
+                    late_fix_gens[k].store(g, std::memory_order_release);
+                    break;
+                }
+            late_fixes.push_back(std::move(f));
+            late_fix_top.store(late_fixes.back().value, std::memory_order_release);
+            late_fix_wake(late_fixes.back().value);
+        }
     }
     cap_view_bump();
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
@@ -2305,6 +2445,17 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                  cap_bufs.size(), (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
                  (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
             st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_lock = 0, st_tk_late_n = 0;
+            if (late_defer_on()) {   // (TICK-060)
+                static int64_t l_d, l_p, l_t, l_u, l_f, l_r, l_s;
+                const int64_t d = st_late_deferred.load(), pg = st_late_def_pages.load(), t = st_late_def_tex.load(), u = st_late_def_unsent.load();
+                logf("vk: late pages deferred (RX_VK_LATE_DEFER): %lld takes not waited (%.1f late pages each), waited as before: %lld "
+                     "(a late page in texture storage), %lld (the value not sent yet), %lld (%d fixes pending); before their fix, %lld replay "
+                     "reads of a late slot (waited), %lld syncs of one (copied whole)", (long long)(d - l_d),
+                     d - l_d ? (double)(pg - l_p) / (double)(d - l_d) : 0.0, (long long)(t - l_t), (long long)(u - l_u),
+                     (long long)(st_late_def_full.load() - l_f), kLateFixMax, (long long)(st_late_reads.load() - l_r),
+                     (long long)(st_late_syncs.load() - l_s));
+                l_d = d, l_p = pg, l_t = t, l_u = u, l_f = st_late_def_full.load(), l_r = st_late_reads.load(), l_s = st_late_syncs.load();
+            }
             if (late_merge_on()) {   // (TICK-053)
                 static int64_t l_m, l_w, l_ns, l_b, l_seg;
                 const int64_t m = st_late_merged.load(), w = st_late_waited.load(), ns = st_late_no_shadow.load();
@@ -3474,7 +3625,10 @@ int64_t mirror_sync(Pool& p) {
                     }
                     uint32_t mask = 0xffff;   // (TICK-048: the chunks to copy)
                     if (dmode) {
-                        if (d_ok && gb - ga == 4096 && b->second.map) {
+                        // (TICK-060) a late slot whose fix is pending: its bytes are not yet the ones the GPU will copy: whole, no hash
+                        const bool late_pending = late_fix_slot_pending(e.gen, e.slot, nullptr);
+                        if (late_pending) st_late_syncs.fetch_add(1, std::memory_order_relaxed);
+                        if (!late_pending && d_ok && gb - ga == 4096 && b->second.map) {
                             DiffPage* d = diff_page(page, true);
                             uint64_t h[msync_diff::kChunks];
                             msync_diff::page_hash((const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, h);
