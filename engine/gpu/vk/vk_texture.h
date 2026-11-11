@@ -198,6 +198,7 @@ void note_pass_end(VkCommandBuffer cmd);
 void pass_start_barrier(VkCommandBuffer cmd);
 /// Pass starts with the fragment-stage barrier, since the start
 int64_t pass_barriers_relaxed();
+int64_t barriers_left_out_par();   // (TICK-057: of the left out, inside a parallel replay: RX_VK_BARRIER_DEDUPE_PAR)
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// (TICK-051, RX_VK_FRAME_TRACE=1) ASTC transcodes of storage transcoded before, and the texels transcoded (running totals)
 void texture_trace_counts(int64_t* astc_again, int64_t* astc_texels);

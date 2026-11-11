@@ -22,29 +22,46 @@ inline void note_xfer_work(VkCommandBuffer c) {
     const uintptr_t v = (uintptr_t)c;
     xfer_work_by_cmd[((v >> 4) ^ (v >> 10) ^ (v >> 16)) & 63].fetch_add(1, std::memory_order_relaxed);
 }
+// (TICK-057) Every command that does or orders GPU work, and every begin of a command buffer, by the command buffer it went into
+// (a slot of 64 by its handle, as above: two command buffers in one slot count each other's, a barrier kept, never one left out).
+// full_barrier's dedupe inside a parallel replay (RX_VK_BARRIER_DEDUPE_PAR) compares this count, not work_epoch, which the
+// other recording threads move all the time
+extern std::atomic<uint64_t> all_work_by_cmd[64];
+inline std::atomic<uint64_t>& all_work_slot(VkCommandBuffer c) {
+    const uintptr_t v = (uintptr_t)c;
+    return all_work_by_cmd[((v >> 4) ^ (v >> 10) ^ (v >> 16)) & 63];
+}
 inline void note_other_work(VkCommandBuffer c) {
     other_work_slot(c).fetch_add(1, std::memory_order_relaxed);
+    all_work_slot(c).fetch_add(1, std::memory_order_relaxed);
     work_epoch.fetch_add(1, std::memory_order_relaxed);
 }
+inline void note_work_cmd(VkCommandBuffer c) {
+    all_work_slot(c).fetch_add(1, std::memory_order_relaxed);
+    work_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+extern std::atomic<uint64_t> foreign_work;   // (TICK-057: note_work's calls with no command buffer, NGX's: the dedupe by command buffer keeps the next barrier)
 inline void note_work() {
+    foreign_work.fetch_add(1, std::memory_order_relaxed);
     // (an add, not a load and a store: a thread preempted between the two would store a stale count over another thread's, which could
     // make the count equal the one a barrier was recorded at with work recorded since, and the next barrier is left out for it)
     work_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 } // namespace mkwvk
 
-#define vkCmdPipelineBarrier2(...) (::mkwvk::note_work(), ::vkx::vkCmdPipelineBarrier2(__VA_ARGS__))
-#define vkCmdBeginRendering(...) (::mkwvk::note_work(), ::vkx::vkCmdBeginRendering(__VA_ARGS__))
-#define vkCmdEndRendering(...) (::mkwvk::note_work(), ::vkx::vkCmdEndRendering(__VA_ARGS__))
-#define vkCmdDraw(...) (::mkwvk::note_work(), ::vkx::vkCmdDraw(__VA_ARGS__))
-#define vkCmdDrawIndexed(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawIndexed(__VA_ARGS__))
-#define vkCmdDrawIndirect(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawIndirect(__VA_ARGS__))
-#define vkCmdDrawIndexedIndirect(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawIndexedIndirect(__VA_ARGS__))
-#define vkCmdDrawIndirectCount(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawIndirectCount(__VA_ARGS__))
-#define vkCmdDrawIndexedIndirectCount(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawIndexedIndirectCount(__VA_ARGS__))
-#define vkCmdDrawMeshTasksEXT(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawMeshTasksEXT(__VA_ARGS__))
-#define vkCmdDrawMeshTasksIndirectEXT(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawMeshTasksIndirectEXT(__VA_ARGS__))
-#define vkCmdDrawMeshTasksIndirectCountEXT(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawMeshTasksIndirectCountEXT(__VA_ARGS__))
+#define vkBeginCommandBuffer(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkBeginCommandBuffer(c_, __VA_ARGS__))
+#define vkCmdPipelineBarrier2(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdPipelineBarrier2(c_, __VA_ARGS__))
+#define vkCmdBeginRendering(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdBeginRendering(c_, __VA_ARGS__))
+#define vkCmdEndRendering(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdEndRendering(c_ __VA_OPT__(,) __VA_ARGS__))
+#define vkCmdDraw(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDraw(c_, __VA_ARGS__))
+#define vkCmdDrawIndexed(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawIndexed(c_, __VA_ARGS__))
+#define vkCmdDrawIndirect(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawIndirect(c_, __VA_ARGS__))
+#define vkCmdDrawIndexedIndirect(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawIndexedIndirect(c_, __VA_ARGS__))
+#define vkCmdDrawIndirectCount(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawIndirectCount(c_, __VA_ARGS__))
+#define vkCmdDrawIndexedIndirectCount(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawIndexedIndirectCount(c_, __VA_ARGS__))
+#define vkCmdDrawMeshTasksEXT(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawMeshTasksEXT(c_, __VA_ARGS__))
+#define vkCmdDrawMeshTasksIndirectEXT(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawMeshTasksIndirectEXT(c_, __VA_ARGS__))
+#define vkCmdDrawMeshTasksIndirectCountEXT(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdDrawMeshTasksIndirectCountEXT(c_, __VA_ARGS__))
 #define vkCmdDispatch(c_, ...) (::mkwvk::note_other_work(c_), ::vkx::vkCmdDispatch(c_, __VA_ARGS__))
 #define vkCmdDispatchIndirect(c_, ...) (::mkwvk::note_other_work(c_), ::vkx::vkCmdDispatchIndirect(c_, __VA_ARGS__))
 #define vkCmdCopyBuffer(c_, ...) (::mkwvk::note_xfer_work(c_), ::mkwvk::note_other_work(c_), ::vkx::vkCmdCopyBuffer(c_, __VA_ARGS__))

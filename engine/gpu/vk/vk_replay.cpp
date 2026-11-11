@@ -3207,9 +3207,12 @@ void log_frame_stats() {
             barrier_stats(&made, &left);
             static int64_t l_relaxed;
             const int64_t relaxed = pass_barriers_relaxed();
-            logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before), %.1f pass starts "
-                 "ordered in their fragment stages only (RX_VK_PASS_BARRIER=game)", (made - l_made) / 120.0, (left - l_left) / 120.0,
-                 (relaxed - l_relaxed) / 120.0);
+            static int64_t l_lpar;
+            const int64_t lpar = barriers_left_out_par();
+            logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before; %.1f of them inside a "
+                 "parallel replay), %.1f pass starts ordered in their fragment stages only (RX_VK_PASS_BARRIER=game)",
+                 (made - l_made) / 120.0, (left - l_left) / 120.0, (lpar - l_lpar) / 120.0, (relaxed - l_relaxed) / 120.0);
+            l_lpar = lpar;
             l_made = made, l_left = left, l_relaxed = relaxed;
             std::string fl;   // (NVN's barrier bits: ORDER_PRIMITIVES 1, ORDER_FRAGMENTS 2, ORDER_FRAGMENTS_TILED 4, ORDER_INDIRECT_DATA 8, INVALIDATE_TEXTURE 0x10, _SHADER 0x20, _TEXTURE_DESCRIPTOR 0x40, _ZCULL 0x80)
             std::lock_guard lk(st_barrier_flags_mu);

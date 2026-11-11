@@ -2544,7 +2544,11 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 std::atomic<uint64_t> work_epoch{0};
 std::atomic<uint64_t> other_work_by_cmd[64]{};
 std::atomic<uint64_t> xfer_work_by_cmd[64]{};
+std::atomic<uint64_t> all_work_by_cmd[64]{};   // (TICK-057, vk_work.h)
+std::atomic<uint64_t> foreign_work{0};
 namespace {
+thread_local uint64_t last_barrier_cmd_work = 0, last_barrier_foreign = 0;   // (TICK-057: the command buffer's count at this thread's last full barrier)
+std::atomic<int64_t> st_barriers_left_out_par{0};
 // (each thread's own: the display thread's present records barriers too)
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)
 thread_local uint64_t last_barrier_epoch = 0;
@@ -2558,11 +2562,34 @@ void barrier_stats(int64_t* made, int64_t* left_out) {
 // (hookshot) A full barrier right after another one on the same command buffer, no command that does or orders GPU work in between
 // (vk_work.h counts them), orders nothing the first did not: left out. The game's own barrier (end of a pass), then the next pass's
 // start barrier, then a dispatch's, were two or three in a row. RX_VK_BARRIER_DEDUPE_OFF=1: all recorded, as before.
+// (TICK-057) Inside a parallel replay work_epoch moves with every thread's work, so the dedupe was off there. RX_VK_BARRIER_DEDUPE_PAR=1:
+// there the count of the command buffer's own work (vk_work.h all_work_slot: each draw, pass edge, copy, dispatch, barrier and begin
+// recorded into it) decides instead. One command buffer is recorded by one thread at a time (Vulkan's rule), and any work another
+// thread records into it, or into one sharing its slot, moves the count: the barrier is kept
+bool barrier_dedupe_par_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_BARRIER_DEDUPE_PAR");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: full barriers inside a parallel replay: %s (RX_VK_BARRIER_DEDUPE_PAR)",
+             v ? "one right after another on the same command buffer left out" : "all recorded, as before");
+        return v;
+    }();
+    return on;
+}
+int64_t barriers_left_out_par() { return st_barriers_left_out_par.load(std::memory_order_relaxed); }
 void full_barrier(VkCommandBuffer cmd, const char* why) {
     static const bool off = getenv("RX_VK_BARRIER_DEDUPE_OFF") != nullptr;
-    const bool dedupe = !off && !par_active.load(std::memory_order_relaxed);   // (a parallel replay's threads share command buffers and the count)
+    const bool par = par_active.load(std::memory_order_relaxed);
+    const bool dedupe = !off && !par;   // (a parallel replay's threads share command buffers and the count)
     if (dedupe && cmd == last_barrier_cmd && work_epoch.load(std::memory_order_relaxed) == last_barrier_epoch) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!off && par && barrier_dedupe_par_on() && cmd == last_barrier_cmd &&
+        all_work_slot(cmd).load(std::memory_order_relaxed) == last_barrier_cmd_work &&
+        foreign_work.load(std::memory_order_relaxed) == last_barrier_foreign) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        st_barriers_left_out_par.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     st_barriers_made.fetch_add(1, std::memory_order_relaxed);
@@ -2576,6 +2603,8 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
     last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    last_barrier_cmd_work = all_work_slot(cmd).load(std::memory_order_relaxed);   // (TICK-057: with this barrier's own count)
+    last_barrier_foreign = foreign_work.load(std::memory_order_relaxed);
     last_barrier_other = other_work_slot(cmd).load(std::memory_order_relaxed);
     {
         const uintptr_t v = (uintptr_t)cmd;
