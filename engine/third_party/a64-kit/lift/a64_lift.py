@@ -1190,7 +1190,12 @@ def lift_opt(name):
 def hot_text(text):
     """a hot function's text: its FPX helper calls go through the copies with the fast path inline"""
     text = HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
-    return xmm_text(text) if lift_opt("A64_FPX_XMM") else text
+    if lift_opt("A64_FPX_XMM"):
+        text = xmm_text(text)
+    if lift_opt("A64_FPX_BLOCK"):   # (HeyListen TICK-063; off by default: the text as before)
+        import a64_block
+        text = a64_block.block_text(text)
+    return text
 
 
 # (HeyListen TICK-055) A64_FPX_XMM=1 at lift time (off by default): the hot functions' scalar binary32 FP ops, the S / D / Q
@@ -1438,6 +1443,9 @@ def fpx_header(used):
         out.append(xmm_header(used))
     if lift_opt("A64_LR_SCALAR"):   # (TICK-055; off by default)
         out.append(LR_HEADER)
+    if lift_opt("A64_FPX_BLOCK"):   # (TICK-063; off by default: a64_fpx.h as before)
+        import a64_block
+        out.append(a64_block.block_header())
     return "\n".join(out) + "\n"
 
 
@@ -2313,6 +2321,9 @@ class Lifter:
                                                                          ", in code_hot.c" if hot_chunk else ""))
         if lift_opt("A64_FPX_XMM"):
             print("A64_FPX_XMM: %s" % ", ".join("%s %d" % kv for kv in sorted(XMM_STATS.items())))
+        if lift_opt("A64_FPX_BLOCK"):
+            import a64_block
+            print(a64_block.report())
         self._write_table(out_dir)
         with open(os.path.join(out_dir, "functions.txt"), "w") as f:
             for e in sorted(self.funcs):
