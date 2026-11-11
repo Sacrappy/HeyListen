@@ -16,6 +16,7 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <immintrin.h>
 
 volatile int hos_jt_on;
 
@@ -60,6 +61,9 @@ void hos_jt_rec(int type, uint64_t a, uint64_t b) {
 void hos_jt_job(uint64_t obj, uint64_t target, uint64_t site, int begin) {
     HOS_JT(begin ? JT_JOB_B : JT_JOB_E, obj, (target & 0xffffffffu) | site << 32);
 }
+/* (TICK-054) the renderer's marks (gpu/vk/vk_replay.cpp jt_mark: it looks this up in the exe, as it includes no host header):
+   a JT_MARK record of that kind, only while the window is open */
+__declspec(dllexport) void hos_jt_mark_ext(int kind, uint64_t v) { HOS_JT(JT_MARK, kind, v); }
 uint64_t hos_jt_lr(void) {
     Ctx *c = hos_ctx();
     return c ? c->x[30] : 0;
@@ -72,7 +76,17 @@ static DWORD WINAPI jt_thread(void *p) {
     Sleep((DWORD)(at * 1000));
     const int64_t t0 = hos_now_ns();
     hos_jt_on = 1;
-    Sleep((DWORD)(secs * 1000));
+    {   /* (TICK-054) the GPU's progress while the window is open: a JT_MARK 7 record each time the renderer's timeline
+           moves (rx_nvn_replayed: the submissions the GPU has finished), looked at every ~2 us on this thread */
+        uint64_t rx_nvn_replayed(void);
+        const int64_t until = hos_now_ns() + (int64_t)(secs * 1e9);
+        uint64_t last = 0;
+        while (hos_now_ns() < until) {
+            const uint64_t v = rx_nvn_replayed();
+            if (v != last) { HOS_JT(JT_MARK, 7, v); last = v; }
+            for (int i = 0; i < 100; i++) _mm_pause();
+        }
+    }
     hos_jt_on = 0;
     const int64_t t1 = hos_now_ns();
     Sleep(100);   /* (records already begun) */

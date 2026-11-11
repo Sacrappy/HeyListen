@@ -54,6 +54,21 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+// (HeyListen, TICK-054) the host's frame-timeline marks (HOS_JOBTRACE, tools/bench/frameline.py): hos_jt_mark_ext, exported by
+// the game's exe and looked up there (the host's headers are not included here; vk_api.h is a shader-stamp input). A call that
+// returns at once while the trace window is closed. Kinds: 9/10 the replay thread waiting for its segments, 11/12 a submit's
+// capture made, 13/14 a parallel replay's dry pass, 15/16 a submission's memory work (its capture taken), 17 the segments handed
+// out to the workers, 18 the replay thread's own segment recorded (RX_VK_PARALLEL_SELF);
+// 19, 20, 21 (points, diagnosis): the mirrors synced before the segments, what came before submitted, their recordings begun
+void jt_mark(int kind, uint64_t v) {
+#ifdef _WIN32
+    static void (*const fn)(int, uint64_t) =
+        reinterpret_cast<void (*)(int, uint64_t)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(nullptr), "hos_jt_mark_ext")));
+    if (fn) fn(kind, v);
+#else
+    (void)kind, (void)v;
+#endif
+}
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
 int64_t presents_now;   // (the presents so far, for SlowWatch)
 // (TICK-033, vk_draw.cpp: real occlusion counts, RX_VK_OCC_REAL) each draw and dispatch of the stream numbered in stream order: on
@@ -1349,8 +1364,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (dry) {
                 const bool compute = h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT;
                 if (s.render_enabled && (compute || !s.raster_discard)) dry_mark_written(s, compute, dry_work == 0);
-                // (TICK-050, RX_VK_PARALLEL_POINT=<n>: a point every n instead of 64, for finer boundaries)
-                static const int64_t point_every = getenv("RX_VK_PARALLEL_POINT") ? std::clamp(atoi(getenv("RX_VK_PARALLEL_POINT")), 8, 256) : 64;
+                // (TICK-050, RX_VK_PARALLEL_POINT=<n>: a point every n instead of 64, for finer boundaries; TICK-054: 32 by default, =0: 64)
+                static const int64_t point_every = getenv("RX_VK_PARALLEL_POINT")
+                    ? (atoi(getenv("RX_VK_PARALLEL_POINT")) <= 0 ? 64 : std::clamp(atoi(getenv("RX_VK_PARALLEL_POINT")), 8, 256)) : 32;
                 if (++dry_work % point_every == 0) par_points.push_back({p + h.size, s, ub_updates.size(), par_conds.size(), dry_work});
             } else if (!worker) {
                 maybe_split(cmd);
@@ -1427,7 +1443,10 @@ bool occ_sync(VkCommandBuffer& cmd) {
 int par_threads() {
     // (HeyListen, TICK-006) on by default since the fix: 4 threads with 8+ hardware threads (Kokiri 54->65 fps, Hyrule Field 49->62,
     // p99 26->20 and 66->19 ms, same picture). RX_VK_PARALLEL=0 turns it off
-    static const int dflt = std::thread::hardware_concurrency() >= 8 ? 4 : 0;
+    // (TICK-054) 5 with 16+ hardware threads: with the Presentation Thread recording too (RX_VK_PARALLEL_SELF), six segments a
+    // command buffer (kMaxBatch) instead of five; 4 below 16 (a 6-core PC's cores are the game's job threads')
+    static const unsigned hc = std::thread::hardware_concurrency();
+    static const int dflt = hc >= 16 ? 5 : hc >= 8 ? 4 : 0;
     static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : dflt, 0, 8);
     return n;
 }
@@ -1559,7 +1578,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     rmode = Mode::Dry;
     VkCommandBuffer none = cmd;
     suspend_ok = may_stop;
+    jt_mark(13, 0);
     replay(none, state, h);
+    jt_mark(14, 0);
     suspend_ok = false;
     rmode = Mode::Serial;
     const uint8_t* const occ_stop = suspend_at ? nullptr : occ_stop_at;   // (TICK-033: stopped for a report's count)
@@ -1574,9 +1595,10 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // (TICK-050) RX_VK_PARALLEL_ROUNDS=1: no more segments than recorders, so that they are all recorded in one round (TICK-049:
     // ~830 draws gave 5 segments on 4 workers, the fifth recorded alone after the others). RX_VK_PARALLEL_SELF=1 (with it): the
     // replay thread records the first segment itself instead of only waiting, one recorder more; =2: it also takes segments
-    // no worker has started yet before it waits for one (the pool's queue, in order). All off by default
-    static const bool one_round = getenv("RX_VK_PARALLEL_ROUNDS") && atoi(getenv("RX_VK_PARALLEL_ROUNDS")) != 0;
-    static const int self_mode = getenv("RX_VK_PARALLEL_SELF") ? std::clamp(atoi(getenv("RX_VK_PARALLEL_SELF")), 0, 2) : 0;
+    // no worker has started yet before it waits for one (the pool's queue, in order). (TICK-054) ROUNDS on and SELF=2 by default
+    // (=0: off): the frame is one serial loop through the Presentation Thread's replay, and its own segment was the slowest
+    static const bool one_round = !getenv("RX_VK_PARALLEL_ROUNDS") || atoi(getenv("RX_VK_PARALLEL_ROUNDS")) != 0;
+    static const int self_mode = getenv("RX_VK_PARALLEL_SELF") ? std::clamp(atoi(getenv("RX_VK_PARALLEL_SELF")), 0, 2) : 2;
     static const bool self_rec = self_mode >= 1, self_help = self_mode >= 2;
     const int recorders = mkwvk::segment_plan::recorders(threads, self_rec);
     const int nseg = mkwvk::segment_plan::segment_count(total, per, recorders, kMaxBatch, one_round);
@@ -1584,7 +1606,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // buffer cost ~2-3 times the last ones a draw (castle-move: 5.9 against 1.8 us), so equal counts left the first segment the
     // slowest. Each large command buffer of a frame (by its order in the frame) keeps the time its segments took over its length
     // (segment_plan::Profile, an average over frames); the boundaries cut that into equal parts, at the nearest point
-    static const bool balance = getenv("RX_VK_PARALLEL_BALANCE") && atoi(getenv("RX_VK_PARALLEL_BALANCE")) != 0;
+    static const bool balance = !getenv("RX_VK_PARALLEL_BALANCE") || atoi(getenv("RX_VK_PARALLEL_BALANCE")) != 0;   // (TICK-054: on by default)
     static mkwvk::segment_plan::Profile profiles[4];
     static uint64_t prof_frame = ~0ull;
     static int prof_ord = 0;
@@ -1628,16 +1650,19 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     }
     if (!par_pool.started) {
         par_pool.started = true;
-        // (TICK-052) RX_VK_PARLOCK_SPIN=<n> (default 0; 4000 tried): ParLock spins that many times before it sleeps. It is held ~0.1-0.6 us a
+        // (TICK-052) RX_VK_PARLOCK_SPIN=<n> (TICK-054: default 4000; 0: no spin): ParLock spins that many times before it sleeps. It is held ~0.1-0.6 us a
         // taking, but a taker that found it held slept in the kernel and woke ~9 us later (castle-move: 70 such waits a command buffer,
         // 0.6 ms of the recording threads'). 0: no spin, as before
         {
-            static const int spin = getenv("RX_VK_PARLOCK_SPIN") ? std::max(0, atoi(getenv("RX_VK_PARLOCK_SPIN"))) : 0;   // (off by default: TICK-052 not adopted)
+            static const int spin = getenv("RX_VK_PARLOCK_SPIN") ? std::max(0, atoi(getenv("RX_VK_PARLOCK_SPIN"))) : 4000;   // (TICK-054: 4000 by default)
 #ifdef _WIN32   // (libc++'s recursive_mutex is a CRITICAL_SECTION there)
             static_assert(sizeof(std::recursive_mutex) >= sizeof(CRITICAL_SECTION));
             if (spin) SetCriticalSectionSpinCount(reinterpret_cast<CRITICAL_SECTION*>(par_mu.native_handle()), (DWORD)spin);
 #endif
-            logf("vk: parallel replay: ParLock spins %d times before it waits (RX_VK_PARLOCK_SPIN)", spin);
+            logf("vk: parallel replay: ParLock spins %d times before it waits (RX_VK_PARLOCK_SPIN); destroyed textures in a ring "
+                 "(RX_VK_GONE_RING) %s; wide pool table (RX_VK_TL_POOLS_WIDE) %s; a point every %d draws (RX_VK_PARALLEL_POINT)", spin,
+                 texture_gone_ring_on() ? "on" : "off", getenv("RX_VK_TL_POOLS_WIDE") && atoi(getenv("RX_VK_TL_POOLS_WIDE")) == 0 ? "off" : "on",
+                 getenv("RX_VK_PARALLEL_POINT") ? (atoi(getenv("RX_VK_PARALLEL_POINT")) <= 0 ? 64 : std::clamp(atoi(getenv("RX_VK_PARALLEL_POINT")), 8, 256)) : 32);
         }
         for (int i = 0; i < threads; i++) std::thread(par_worker_main, i).detach();
         logf("vk: parallel replay: big command buffers recorded on %d threads in segments of ~%lld draws and dispatches%s%s",
@@ -1651,7 +1676,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     end_pass(r.cmd);
     full_barrier(r.cmd);
     memory_sync_mirrors_before_segments();   // (in r's uploads, ahead of every segment)
+    jt_mark(19, 0);
     submit_recording(r, false);
+    jt_mark(20, 0);
     static uint64_t seq = 0;   // (the segments' order, across submissions: a recording's uploads precede it)
     const uint64_t base = ++seq;
     seq += seg.size();
@@ -1679,6 +1706,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         j->index = (int)k;
         jobs.push_back(std::move(j));
     }
+    jt_mark(21, 0);
     std::vector<VkCommandBuffer> inits;   // (each one's init command buffer, begun)
     {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1757,7 +1785,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
     }
     par_pool.cv.notify_all();
+    jt_mark(17, jobs.size());   // (TICK-054: the segments handed out: the setup since the dry pass's end)
     if (self_rec) record_job(jobs[0].get());
+    jt_mark(18, 0);
     bool init_lost = false;
     int64_t pt_wait_ns = 0;   // (TICK-050: the replay thread waiting for segments, in seg_cv)
     for (auto& jp : jobs) {   // (in order, each as soon as it is done)
@@ -1777,9 +1807,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
         {
             const int64_t w0 = now_ns();
+            jt_mark(9, (uint64_t)j->index);
             std::unique_lock l(seg_mu);
             seg_cv.wait(l, [j] { return j->done.load(); });
             pt_wait_ns += now_ns() - w0;
+            jt_mark(10, (uint64_t)j->index);
         }
         if (j->inits < 0) init_lost = true;   // (its init command buffer could not be ended: the replay stops, below)
         if (init_lost) continue;              // (nothing from it on is submitted)
@@ -1989,6 +2021,8 @@ struct SlowWatch {
 /// (replay_mu held). In the order of the submits: one behind its queue's stopped one (submit_job) has it done as it comes.
 void submit_memory_work(uint64_t value) {
     PROF(PROF_MEMSYNC);
+    jt_mark(15, value);
+    struct JtEnd { ~JtEnd() { jt_mark(16, 0); } } jt_end;
     const auto m0 = std::chrono::steady_clock::now();
     memory_sync();
     // (the capture takes only the mirrored pools' pages, the collection the rest: skipping it whenever a capture was
@@ -4404,7 +4438,9 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         // counted into the other set, and the foliage, grass, characters and particles of that frame were never drawn.
         // With it the syncs take the submits' captures, as the console's GPU sees its memory. RX_VK_SYNC_CAPTURE=0: off.
         static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
+        jt_mark(11, 0);
         if (capture) memory_capture_submit();
+        jt_mark(12, 0);
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
         // arrive just after it, from the game's other threads?)
         static const int delay_us = getenv("RX_VK_SUBMIT_DELAY_US") ? atoi(getenv("RX_VK_SUBMIT_DELAY_US")) : 0;

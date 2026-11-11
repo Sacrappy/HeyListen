@@ -273,6 +273,7 @@ std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
 const bool par_stats_on = false;   // (TICK-052, RX_VK_PARLOCK_STATS: off by default)
 void par_counts_sum(int64_t* locks, int64_t* wait_ns) { *locks = par_locks.load(), *wait_ns = par_lock_wait_ns.load(); }
 void par_stats_segment_parts(int64_t, int64_t, int64_t, int64_t) {}
+void jt_mark(int, uint64_t) {}   // (TICK-054: the frame-timeline marks)
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
 std::vector<std::thread> workers;

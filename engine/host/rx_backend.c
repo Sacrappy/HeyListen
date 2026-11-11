@@ -117,6 +117,38 @@ static int64_t host_collect(uint32_t **pages) {
     if (!ranges) ranges = malloc(sizeof *ranges * 4096);
     return collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
 }
+/* (HeyListen, TICK-054) HOS_NVN_HOLD_CHECK=1 (nvn_native.c): what a held submit's capture would have held, taken at the submit:
+   the marks over the GPU ranges read and cleared, and the pages' bytes copied (at most 16 K pages, 64 MB). At the flush,
+   hos_hold_check counts the pages marked again since (the game wrote them between the submit and the flush) and those whose
+   bytes differ from the copy, then marks them all again so that the flush's capture takes them, as it would have. */
+int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy) {
+    static uint64_t (*ranges)[2];
+    if (!ranges) ranges = malloc(sizeof *ranges * 4096);
+    const int64_t n = collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
+    *copy = NULL;
+    if (n > 0 && n <= 16384) {
+        *copy = malloc((size_t)n * 4096);
+        if (*copy) {
+            const uint8_t *base = hos_guest_base();
+            for (int64_t i = 0; i < n; i++) memcpy(*copy + i * 4096, base + ((uint64_t)(*pages)[i] << 12), 4096);
+        }
+    }
+    return n;
+}
+void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ) {
+    const uint8_t *base = hos_guest_base();
+    *again = *differ = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const uint32_t p = pages[i];
+        if (__atomic_load_n(&a64_dirty[p], __ATOMIC_ACQUIRE)) {
+            (*again)++;
+            if (copy && memcmp(copy + i * 4096, base + ((uint64_t)p << 12), 4096)) (*differ)++;
+        }
+    }
+    for (int64_t i = 0; i < n; i++) __atomic_store_n(&a64_dirty[pages[i]], 1, __ATOMIC_RELEASE);
+    free(pages);
+    free(copy);
+}
 /* (only within the given guest ranges: the submit-time capture of the mirrored pools, a small part of the 20 ms the
    whole collection takes) */
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { return collect_in(ranges, n, pages); }
@@ -178,6 +210,9 @@ static const MkwVkHost vk_host = {
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
+static void (*vk_precopy_kick)(void);   /* (TICK-054) the renderer's pre-copy thread kicked (RX_VK_PRECOPY_KICK=1) */
+/* (TICK-054) HOS_PRECOPY_KICK=1 (host/nn_os_sync.c): the capture's pre-copy thread starts a round now */
+void rx_precopy_kick(void) { if (vk_precopy_kick) vk_precopy_kick(); }
 static HMODULE vk_module;   /* (the last back end loaded: rx_close_asked) */
 
 /* The game registers its first textures and samplers before the window's thread starts the renderer (NVN is up
@@ -253,6 +288,10 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
     char *slash = n ? (strrchr(path, '\\') ? strrchr(path, '\\') : strrchr(path, '/')) : NULL;   /* (linux: '/') */
     if (!slash) return NULL;
     strcpy(slash + 1, dll);
+    /* (TICK-054) RX_VK_GONE_RING on by default (=0: off): its switch is read in gpu/vk/vk_texture.cpp, which TICK-053 works on;
+       set for the back end here, before it loads, when the user has not set it (the back end and this exe share the UCRT's
+       environment: the renderer logs it at its first parallel replay) */
+    if (!getenv("RX_VK_GONE_RING")) _putenv("RX_VK_GONE_RING=1");
     HMODULE m = LoadLibraryA(path);
     if (!m) {
         hos_log("rx: RX_BACKEND=vulkan, but %s did not load (%lu): WebGPU", path, GetLastError());
@@ -261,6 +300,7 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
     vk_module = m;
     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
     vk_pool_flags = (void (*)(uint64_t, uint64_t, uint32_t))(void *)GetProcAddress(m, "mkwvk_pool_flags");   /* (TICK-015; optional) */
+    vk_precopy_kick = (void (*)(void))(void *)GetProcAddress(m, "mkwvk_precopy_kick");   /* (TICK-054; optional) */
     const MkwVkRenderer *r = init ? init(&vk_host) : NULL;
     if (!r || r->version != MKWVK_API_VERSION) {
         hos_log("rx: the Vulkan back end did not start: WebGPU");
