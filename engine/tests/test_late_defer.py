@@ -100,8 +100,10 @@ def main():
     wi = body(rep, "int wait_inner(uint64_t f, uint64_t timeout_ns) {")
     need("poll_flag(timeout_ns == 0);" in wi and wi.index("poll_flag(") < wi.index("queue_flush_for(FR_WAIT);"), "wait_inner: polls flagged")
     lm = body(rep, "void late_fix_main() {")
-    need("memory_late_fix_apply(completed());" in lm and "if (!memory_late_fix_pending() && !pend.cbs.empty())" in lm,
+    need("memory_late_fix_apply(completed())" in lm and "if (!memory_late_fix_pending() && !pend.cbs.empty())" in lm,
          "late_fix_main: applies and sends the held recordings")
+    need(lm.index("memory_late_fix_apply(completed())") < lm.index("std::lock_guard lk(dev.present_mu);"),
+         "late_fix_main: the copies made before the queue's lock (TICK-060m)")
 
     # every vkQueueSubmit2 on dev.queue in the replay and the textures: a flush (which applies the fixes) under dev.present_mu first,
     # with the fix waited for outside the lock where the submit is not the batched flush itself

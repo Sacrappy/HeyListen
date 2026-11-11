@@ -270,6 +270,7 @@ bool late_fix_wait_unlocked() {
         vk_timeline_wait_sent(lv);
         st_lf_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
                                 std::memory_order_relaxed);
+        memory_late_fix_apply(completed());   // (TICK-060m: at once, as the fix thread: whichever wakes first copies)
     }
     return true;
 }
@@ -332,12 +333,15 @@ void late_fix_main() {
         wi.pValues = &v;
         vkWaitSemaphores(dev.device, &wi, 250000000ull);   // (a flush elsewhere may have applied it meanwhile)
         jt_mark(38, v);
+        // (TICK-060m) the copies as soon as the value is reached, before the queue's lock (another thread's submit may hold it):
+        // the take's wait made them at once, and the game's CPU may write such a page again soon after the write-back (OoT's
+        // exposure page). Every fix reached, whatever the others' values; late_fix_mu orders this with any other apply
+        bool applied = false;
+        if (memory_late_fix_pending()) memory_late_fix_apply(completed()), applied = !memory_late_fix_pending();
         {
             std::lock_guard lk(dev.present_mu);
-            if (memory_late_fix_pending()) {   // (TICK-060m: every fix reached, whatever the others' values)
-                memory_late_fix_apply(completed());
-                if (!memory_late_fix_pending()) st_lf_thread++;
-            }
+            if (memory_late_fix_pending()) memory_late_fix_apply(completed()), applied |= !memory_late_fix_pending();
+            if (applied) st_lf_thread++;
             if (!memory_late_fix_pending() && !pend.cbs.empty()) flush_reason = FR_VALUE, queue_flush_locked();
             static int64_t n;
             if (++n % 600 == 0) {

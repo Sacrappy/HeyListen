@@ -51,8 +51,10 @@ def main():
     lm = function(rp, "void late_fix_main() {")
     need("if (!memory_late_fix_pending()) lf_want = 0;" in lm and "lf_want <= v &&" not in lm,
          "late_fix_main: idle only when nothing is pending")
-    need("if (memory_late_fix_pending()) {" in lm and "memory_late_fix_apply(completed());" in lm,
-         "late_fix_main: applies whatever is reached")
+    need("if (memory_late_fix_pending()) memory_late_fix_apply(completed())" in lm, "late_fix_main: applies whatever is reached")
+    wu = function(rp, "bool late_fix_wait_unlocked() {")
+    need(wu.index("vk_timeline_wait_sent(lv);") < wu.index("memory_late_fix_apply(completed());"),
+         "late_fix_wait_unlocked: the fixes made once the value is reached")
     sr = function(rp, "void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0) {")
     need("if (memory_late_fix_pending()) {\n        memory_late_fix_apply(completed());" in sr,
          "submit_recording: applies whatever is reached")
