@@ -166,6 +166,7 @@ int recording_index = 0;
 void recording_wait(Recording& r) {
     if (!r.submitted) return;
     if (r.batch) {
+        if (batch_flushed < r.batch) late_fix_wait_unlocked();   // (TICK-060; a stale read only waits or not for a fix)
         {
             std::lock_guard lk(dev.present_mu);
             if (batch_flushed < r.batch) flush_reason = FR_SLOT, queue_flush_locked();
@@ -248,6 +249,19 @@ void vk_timeline_wait_sent(uint64_t v) {
     wi.pSemaphores = &timeline;
     wi.pValues = &v;
     for (int i = 0; i < 8 && vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT; i++) {}
+}
+// (TICK-060) Before taking the queue's lock to send something: a pending late fix's value waited for here, outside the lock, so the
+// flush under it does not wait there and hold up the threads that only hold their recordings back meanwhile (the Presentation
+// Thread's submits; a poll of the main thread's waited 7.5 ms under it in the first try). A poll does not wait at all
+thread_local bool tl_poll = false;
+bool late_fix_wait_unlocked() {
+    for (uint64_t lv; (lv = memory_late_fix_pending()) && completed() < lv;) {
+        if (tl_poll) return false;   // (a poll: what is held is not done anyway; the fix thread sends it)
+        const auto t0 = std::chrono::steady_clock::now();
+        vk_timeline_wait_sent(lv);
+        memory_late_wait_note(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+    return true;
 }
 void queue_flush_locked() {   // (dev.present_mu held)
     late_fix_flush_locked();   // (TICK-060: before anything that may read a capture's late slots)
@@ -346,6 +360,7 @@ void device_wait_idle_locked() {   // (dev.present_mu held)
 }
 namespace {
 void queue_flush_for(int why) {
+    if (!late_fix_wait_unlocked()) return;   // (TICK-060: a poll while a fix waits: nothing to send yet)
     if (why == FR_WAIT) jt_mark(34, 0);   // (TICK-058: 34/35 a wait taking dev.present_mu)
     std::lock_guard lk(dev.present_mu);
     if (why == FR_WAIT) jt_mark(35, 0);
@@ -1849,6 +1864,7 @@ void presync_early_finish(bool segments) {
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = 1;
         si.pCommandBufferInfos = &cb;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
@@ -2081,6 +2097,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = n;
         si.pCommandBufferInfos = cb;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
@@ -2442,6 +2459,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = n;
         si.pCommandBufferInfos = cb;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
@@ -3123,6 +3141,11 @@ int wait(uint64_t f, uint64_t timeout_ns) {
 }
 int wait_inner(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
+    struct PollFlag {   // (TICK-060: a poll does not wait for a pending late fix in its flushes)
+        bool prev;
+        explicit PollFlag(bool poll) : prev(tl_poll) { tl_poll = poll; }
+        ~PollFlag() { tl_poll = prev; }
+    } poll_flag(timeout_ns == 0);
     queue_flush_for(FR_WAIT);
     // (HeyListen, TICK-058) RX_VK_FENCE_POLL_FAST=1: a poll (timeout 0) of a fence whose submission was finished whole on its
     // queue skips sync_order_mu below, held by submit_q / present for whole replays (1.4 ms a frame on the main thread). The
@@ -4768,6 +4791,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     si.pCommandBufferInfos = &cb;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
+    late_fix_wait_unlocked();   // (TICK-060)
     std::unique_lock qk(dev.present_mu);
     if (!pend.cbs.empty()) flush_reason = FR_PRESENT;
     queue_flush_locked();

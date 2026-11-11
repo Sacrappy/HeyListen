@@ -261,6 +261,7 @@ void memory_late_fix_apply(uint64_t done);
 void memory_late_wait_note(int64_t ns);
 uint64_t vk_timeline_signal_sent();
 void vk_timeline_wait_sent(uint64_t v);   // (TICK-060: a wait for a value already sent: no flush, safe under any lock)
+bool late_fix_wait_unlocked();   // (TICK-060, vk_replay.cpp: a pending late fix's value waited for before the queue's lock; false: a poll)
 void late_fix_wake(uint64_t v);
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
