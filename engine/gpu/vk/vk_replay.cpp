@@ -1743,7 +1743,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     Recording& r = *rec_cur;
     end_pass(r.cmd);
     full_barrier(r.cmd);
-    memory_sync_mirrors_before_segments();   // (in r's uploads, ahead of every segment)
+    memory_sync_mirrors_before_segments();   // (rec_cur's uploads, before the dry pass: ahead of every segment)
     texture_rb_refresh_now();                // (the part's readback refresh, in r: before any segment's)
     jt_mark(19, 0);
     const uint64_t base = ++par_seq;
