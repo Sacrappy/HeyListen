@@ -137,3 +137,13 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Chain: Link's calc #13-17 -> #5, alone 0.71-0.74 -> 0.25-0.29 ms.
 - A/B, 6 runs each: 76.3 -> 77.4 standing, 71.6 -> 71.8 walking, 74.4 -> 73.4 on the street: inside the spread.
 - Decision: not adopted; the default lift is as before; the game folder keeps the TICK-045 build. Next: shorter jobs (80166100, 800b73d0) or the main thread's serial part.
+
+## TICK-050 (2026-11-11): replay segments in one round, the Presentation Thread recording one
+- Instrument added (on): the parallel replay line now gives the slowest and fastest segment, the rounds, and the Presentation Thread's wait and own recording; a new per-place line. Fine profile (kokiri-idle): descriptors 4.23 ms a frame, textures 2.08 of it.
+- Found: the slowest segment is ~1.25 ms whatever the count; the second round was not the wait. A parallel draw costs ~5 us against ~3.6 alone, and a command buffer's first draws cost ~3x its last ones.
+- Built, behind switches (off): `RX_VK_PARALLEL_ROUNDS`, `RX_VK_PARALLEL_SELF` (=1, =2), `RX_VK_PARALLEL_BALANCE`, `RX_VK_PARALLEL_POINT`; `segment_plan.h` + `tests/test_segment_plan.py`.
+- Screen (castle-move, 3 runs each):
+  - frame prep falls 7.76 -> 7.62 (ROUNDS+SELF) and -> 7.35 (+BALANCE); ROUNDS alone 8.43 (no gain);
+  - fps inside the spread.
+- Decision: not adopted (~0.4 ms, not the 1.5 ms needed; acceptance <= 5.5 ms not reached). The game folder keeps the TICK-045 build.
+- Next: the sampler on the workers (why concurrency costs), then design 2 (textures first), then the dry pass overlapped with segment 0.

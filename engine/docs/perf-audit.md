@@ -2504,3 +2504,81 @@ or the main thread's serial part.
 
 Not verified: the J6 room check in a 6-run A/B (only the check differs from J5; how often it held a job back was not
 counted); other CPUs; more than 6 runs a variant; a job-marked trace of J6.
+
+## TICK-050: a command buffer's replay segments in one round, the Presentation Thread recording one (2026-11-11)
+
+Design 1 of `docs/research/replay-cost.md` (TICK-049). Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame
+generation off, 110 s runs cut at 66 s, one binary with env switches (`build/tick050/ab.py` in the worktree).
+
+### New instruments (always on, logged every 240 parallel command buffers)
+
+- `vk: parallel replay, a command buffer: ...` now ends with: the slowest segment (and its worst in the window), the
+  fastest, the rounds (`ceil(n / recorders)`), the Presentation Thread's wait in `seg_cv` and the time it recorded itself.
+- `vk: parallel replay, a segment by its place: k: ms (draws and dispatches, share of command buffers that had it)`.
+
+### The fine profile (kokiri-idle, base, `RX_VK_PROF_FINE=1 RX_VK_FRAME_TRACE=1`, one run, 3,000 draws)
+
+| phase | ms a frame | | fine part | ms a frame |
+|---|---:|---|---|---:|
+| submit (GPU frame prep) | 7.83 | | descriptors: textures | 2.08 |
+| draw (all threads) | 11.36 | | descriptors: user uniform buffers | 0.70 |
+| descriptors | 4.23 | | descriptors: storage buffers | 0.44 |
+| commands | 4.32 | | descriptors: banks / c1 | 0.17 / 0.10 |
+| programs | 1.81 | | commands: bind descriptors (push call 0.66) | 1.02 |
+| pipelines | 0.40 | | commands: vertex + index binds | 0.91 |
+| memory sync | 0.78 | | commands: bind pipeline | 0.70 |
+| | | | commands: hazards + pass / push constants / dynamic state / draw call | 0.40 / 0.35 / 0.31 / 0.16 |
+
+A draw: 0.88 descriptor builds, 12.6 descriptor writes (5.95 pushed), 4.8 user uniform buffer calls, 1.9 storage buffer
+descriptors built, 0.97 index buffer binds, 0.37 pipeline binds. Program picks with other textures: 30.8%. For design 2:
+**textures are half of the descriptor build** (2.08 of 4.23 ms), more than the uniform and storage buffers together.
+
+The parallel line, base: dry pass 0.33 ms, segments 1.51 ms (4.65), slowest 1.25 ms, fastest 0.60 ms, 1.67 rounds, the
+Presentation Thread waits 1.42 ms a command buffer.
+
+### What the new lines show: the segment time is not set by the rounds
+
+- Per place (castle-move, base): 1.15-1.23 ms (209 draws), 1.0, 0.9-0.97, 0.7-0.9, 0.3-0.5, 0.3-0.4 ms (150-170 draws).
+  The first draws of a command buffer cost ~5.5-6 us each while recorded in parallel, the last ~1.8-2.5 us. Boundaries are
+  also rounded up to the 64-draw points, so the first segment is the longest in count too.
+- The slowest segment stays ~1.25 ms whatever the count: 4 segments (ROUNDS) 1.52 ms, 5 with the Presentation Thread
+  1.24-1.28 ms, 5 balanced by time 1.27 ms, 6 recorders 1.24 ms. With 5 recorders the segments sum to ~5 ms a command
+  buffer against ~3 ms serial (3.6 us x 830): a draw costs more the more threads record at once.
+- So TICK-049's "second round" was not the cause of the wait. The second round's segment is short (0.3-0.5 ms) and runs
+  while the first segment is still being recorded.
+
+### Variants (castle-move screen, 3 interleaved runs each; GPU frame prep = `submit`, ms a frame)
+
+| variant | switches | submit | segments / slowest (ms) | PT wait (ms) | fps |
+|---|---|---:|---|---:|---:|
+| base (screen 3) | - | 7.76 | 1.46 / 1.26 | 1.37 | 73.7 |
+| ROUNDS+SELF | `RX_VK_PARALLEL_ROUNDS=1 RX_VK_PARALLEL_SELF=1` | 7.62 | 1.31 / 1.24 | 0.15 | 72.7 |
+| + BALANCE | `+ RX_VK_PARALLEL_BALANCE=1 RX_VK_PARALLEL_POINT=32` | 7.35 | 1.33 / 1.27 | 0.30 | 74.6 |
+| + 5 workers | `+ RX_VK_PARALLEL=5` | 7.42 | 1.30 / 1.24 | 0.30 | 73.2 |
+| base (screen 2) | - | 8.43 (8.05 without a stutter run) | 1.50 / 1.28 | 1.40 | 68.7 (72.7 without) |
+| ROUNDS | `RX_VK_PARALLEL_ROUNDS=1` | 8.43 | 1.60 / 1.52 | 1.52 | 70.7 |
+| ROUNDS+SELF | as above | 7.52 | 1.35 / 1.28 | 0.15 | 72.9 |
+| SELF=2 (helps, cap 6) | `RX_VK_PARALLEL_SELF=2` | 7.66 | 1.37 / 1.21 | 0.22 | 72.4 |
+
+- ROUNDS alone loses (fewer, longer segments: +0.1 ms a command buffer).
+- SELF moves the wait into the Presentation Thread's own recording (1.07 ms): the segment phase falls 1.46 -> 1.31 ms a
+  command buffer, ~0.4 ms a frame of frame prep. Balancing adds ~0.2 ms. Run-to-run spread of `submit` is 0.5-0.9 ms.
+- fps inside the 2-4 fps spread for all.
+- Not adopted: frame prep falls 0.1-0.5 ms, not the plan's 1.5 ms, and not clearly beyond the run-to-run spread. The
+  acceptance (<= 5.5 ms standing) is out of reach for design 1. The switches stay off; the confirm A/B was not run (the
+  user's short policy).
+
+### Correctness (switches on)
+
+- Shots every 1200 presents, castle-move, base against ROUNDS+SELF+BALANCE+POINT=32: the Market drawn alike (fog,
+  shadows, exposure, text bubbles, the HUD); the positions differ by the moment of each shot.
+- HOS_SPEED_LOG, last 40 lines: base 59.99, balanced 60.02.
+- Saves identical after every run; no game process left after any run. New `tests/test_segment_plan.py`. run_all: 226 pass, only the 4 nup tests fail, 33 skip.
+
+### What is next
+
+The replay's wall is per-draw cost under concurrency, not the segment plan. Next, in this order:
+1. Why a draw costs ~5 us on 5 threads against ~3.6 us alone: the all-thread sampler (`HOS_SAMPLE_ALL`) on the workers
+   (driver locks in `nvoglv64.dll`, `pools_mu`, `ParLock`, the heap).
+2. Design 2, starting with the textures' share of the descriptor build (2.08 ms a frame).
+3. Overlap the dry pass with segment 0 (0.33-0.47 ms a command buffer, ~1.2 ms a frame), which needs a progress counter.
