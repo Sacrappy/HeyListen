@@ -25,6 +25,9 @@ bool gprof_begin(VkCommandBuffer cmd);
 void gprof_end(VkCommandBuffer cmd, const std::string& label, int items = 1, uint64_t bytes = 0);
 /// A draw of program key into the open pass (RX_VK_PASS_TIMING=2): the run of draws of one program is timed
 void gprof_run(VkCommandBuffer cmd, uint64_t key);
+/// (TICK-057) The GPU's busy tail before a late-page wait ended, in GPU ticks: the spans collected inside it are counted apart
+/// (the report's 'tail' lines: the GPU work a late wait waited for)
+void gprof_tail(uint64_t lo, uint64_t hi);
 /// The slot's work completed: its spans are added to the totals
 void gprof_collect(int slot);
 /// Every 120 presents (frames of them): every 600, the report

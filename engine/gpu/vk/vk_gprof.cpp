@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +47,17 @@ std::unordered_map<std::string, Agg> totals[2];   // label -> what its spans too
 double active_ns[2], sum_ns[2];                   // (the command buffers' first timestamp to last, and what their spans took)
 int64_t recs[2], dropped;
 int acc_frames = 0;
+// (TICK-057) the spans collected lately with their GPU times, for gprof_tail: what a late-page wait waited for
+struct Recent {
+    std::string label;
+    int k;
+    uint64_t t0, t1;
+    bool counted;
+};
+std::deque<Recent> recent;
+std::unordered_map<std::string, Agg> tail_totals[2];
+double tail_ns = 0;
+int64_t tails = 0;
 
 Stream* find(VkCommandBuffer cmd) {
     if (!pool || cur < 0 || !cmd) return nullptr;
@@ -172,6 +184,7 @@ void gprof_collect(int slot) {
             Agg& a = totals[k][sp.label];
             a.ns += ns, a.n++, a.items += sp.items, a.bytes += sp.bytes;
             if (sp.nested) continue;
+            recent.push_back({sp.label, k, t[sp.qb], t[sp.qe], false});
             sum += ns;
             first = std::min(first, t[sp.qb]), last = std::max(last, t[sp.qe]);
         }
@@ -181,6 +194,19 @@ void gprof_collect(int slot) {
             recs[k]++;
         }
         st.spans.clear();
+    }
+    while (recent.size() > 12000) recent.pop_front();
+}
+
+void gprof_tail(uint64_t lo, uint64_t hi) {
+    if (!pool) return;
+    const double period = dev.props.limits.timestampPeriod;
+    tail_ns += (double)(hi - lo) * period, tails++;
+    for (Recent& r : recent) {
+        if (r.counted || r.t0 < lo || r.t1 > hi) continue;
+        r.counted = true;
+        Agg& a = tail_totals[r.k][r.label];
+        a.ns += (double)(r.t1 - r.t0) * period, a.n++;
     }
 }
 
@@ -243,6 +269,30 @@ void gprof_report(int frames) {
                  r.name.c_str());
         }
     }
+    if (tails) {   // (TICK-057)
+        logf("vk:   the late waits' GPU tail (busy with no gap up to the value a capture waited for): %.2f ms a wait, %.2f waits a "
+             "frame; what ran in it, ms a frame:", tail_ns / tails / 1e6, tails / f);
+        std::vector<Row> trows;
+        std::map<std::string, Agg> tcat[2];
+        for (int k = 0; k < 2; k++)
+            for (const auto& [label, a] : tail_totals[k]) {
+                trows.push_back({label, k, a});
+                Agg& c = tcat[k][label.substr(0, label.find(' '))];
+                c.ns += a.ns, c.n += a.n;
+            }
+        std::vector<Row> tc;
+        for (int k = 0; k < 2; k++)
+            for (const auto& [name, a] : tcat[k]) tc.push_back({name, k, a});
+        std::sort(tc.begin(), tc.end(), by_ns);
+        std::sort(trows.begin(), trows.end(), by_ns);
+        for (const Row& c : tc)
+            logf("vk:     tail %c %-9s %7.3f ms  %7.1f spans", c.k ? 'u' : 'm', c.name.c_str(), c.a.ns / f / 1e6, c.a.n / f);
+        for (size_t i = 0; i < trows.size() && i < 20; i++)
+            logf("vk:     tail %c %7.3f ms  %6.1f x  %s", trows[i].k ? 'u' : 'm', trows[i].a.ns / f / 1e6, trows[i].a.n / f,
+                 trows[i].name.c_str());
+    }
+    for (auto& t : tail_totals) t.clear();
+    tail_ns = 0, tails = 0;
     for (auto& t : totals) t.clear();
     active_ns[0] = active_ns[1] = sum_ns[0] = sum_ns[1] = 0;
     recs[0] = recs[1] = dropped = 0;
