@@ -334,10 +334,9 @@ void late_fix_main() {
         jt_mark(38, v);
         {
             std::lock_guard lk(dev.present_mu);
-            const uint64_t lv = memory_late_fix_pending();
-            if (lv && completed() >= lv) {
+            if (memory_late_fix_pending()) {   // (TICK-060m: every fix reached, whatever the others' values)
                 memory_late_fix_apply(completed());
-                st_lf_thread++;
+                if (!memory_late_fix_pending()) st_lf_thread++;
             }
             if (!memory_late_fix_pending() && !pend.cbs.empty()) flush_reason = FR_VALUE, queue_flush_locked();
             static int64_t n;
@@ -349,8 +348,11 @@ void late_fix_main() {
             }
         }
         jt_mark(39, v);
+        // (TICK-060m: idle only when nothing is pending. Every registration wakes with its value after it is pending, so lf_want is at
+        // least every pending value; a fix registered while this pass applied (its value reached) was lost before: lf_want reset
+        // under it, its held recordings left to the next submit or flush)
         std::lock_guard l(lf_mu);
-        if (lf_want <= v && (completed() >= lf_want || !memory_late_fix_pending())) lf_want = 0;
+        if (!memory_late_fix_pending()) lf_want = 0;
     }
 }
 } // namespace
@@ -647,8 +649,8 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     // (TICK-060, RX_VK_LATE_DEFER) a late fix pending: held with the batched ones until its value is reached (the fix thread
     // sends them then); one already reached is applied here
     bool late_hold = false;
-    if (const uint64_t lv = memory_late_fix_pending()) {
-        if (completed() >= lv) memory_late_fix_apply(completed());
+    if (memory_late_fix_pending()) {
+        memory_late_fix_apply(completed());   // (TICK-060m: the ones reached, whatever the others' values)
         late_hold = memory_late_fix_pending() && batch_tl != VK_NULL_HANDLE;
         if (late_hold) st_lf_held_cbs += n;
     }

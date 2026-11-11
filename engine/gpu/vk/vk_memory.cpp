@@ -249,6 +249,7 @@ bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t piece, Pool& p) {
             vkCreateFence(dev.device, &fi, nullptr, &fence);
         }
         {   // (on the queue, as the sparse textures' binds: nothing uses the new buffer yet, so no wait for earlier work)
+            late_fix_wait_unlocked();   // (TICK-060m: a pending late fix waited for outside the queue's lock, as the other senders)
             std::lock_guard qk(dev.present_mu);
             queue_flush_locked();
             res = vkQueueBindSparse(dev.queue, 1, &si, fence);
@@ -1184,15 +1185,19 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             auto b = cap_bufs.find(e.gen);
             if (b == cap_bufs.end() || !b->second.map) continue;
             const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
-            // (TICK-060, RX_VK_LATE_DEFER) a late slot whose fix is pending: the bytes the fix will copy there, read where it will
-            // read them (guest memory once the write-back is done), as the take that waited gave them; not kept for the next reads
+            // (TICK-060, RX_VK_LATE_DEFER) a late slot whose fix is pending: its value waited for and the fixes reached made here
+            // (TICK-060m), so this read and the GPU take the same bytes, the slot's, as with the take's wait. Only past the wait's
+            // timeouts (the value not reached in 2 s) guest memory as it is, not kept for the next reads
             if (uint64_t lv = 0; late_fix_slot_pending(e.gen, e.slot, &lv)) {
                 vk_timeline_wait_sent(lv);
-                guarded_copy((uint8_t*)dst + (a - guest), (const uint8_t*)host->guest_base() + a, z - a);
-                late_read = true;
+                memory_late_fix_apply(vk_timeline_completed());
                 st_late_reads.fetch_add(1, std::memory_order_relaxed);
-                from++;
-                continue;
+                if (late_fix_slot_pending(e.gen, e.slot, nullptr)) {
+                    guarded_copy((uint8_t*)dst + (a - guest), (const uint8_t*)host->guest_base() + a, z - a);
+                    late_read = true;
+                    from++;
+                    continue;
+                }
             }
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
@@ -2278,7 +2283,7 @@ struct LateFix {
     std::vector<std::pair<uint32_t, uint32_t>> slots;    // (slot, guest page)
 };
 std::mutex late_fix_mu;
-std::deque<LateFix> late_fixes;          // (late_fix_mu; in take order, values rising)
+std::deque<LateFix> late_fixes;          // (late_fix_mu; in take order, values NOT always rising: see memory_late_fix_apply)
 std::atomic<uint64_t> late_fix_top{0};   // (the highest value a pending fix waits for; 0: none pending)
 constexpr int kLateFixMax = 4;           // (pending at once; a take past it waits as before)
 std::atomic<uint32_t> late_fix_gens[kLateFixMax];   // (the pending fixes' generations, 0: free: the readers' quick test)
@@ -2308,13 +2313,25 @@ size_t late_fix_count() {
     return late_fixes.size();
 }
 /// The pending fixes whose value done has reached: their late pages copied again from guest memory into their slots (as the
-/// take did after its wait). Called with the queue's lock held (vk_replay.cpp), before anything goes to the queue
+/// take did after its wait). Called before anything goes to the queue (vk_replay.cpp, the queue's lock held), and by the CPU's
+/// readers of a pending slot once its value is reached (late_fix_mu alone orders them: late_fix_top drops only after the copies).
+/// (TICK-060m) Any fix whose value is reached, not only the front ones, and late_fix_top the highest pending value: the values are
+/// not rising in take order (a capture's late value is the newest write-back of its own late pages: the next capture's late pages
+/// can be older submissions' write-backs). With the front-only loop and the back's value as the top, a fix behind a lower one
+/// left the top below its own value: a flush waited for the lower value and sent the recordings reading the unfixed slots, and
+/// its buffer could be retired and reused before its fix
 void memory_late_fix_apply(uint64_t done) {
     std::lock_guard lk(late_fix_mu);
     if (late_fixes.empty()) return;
     uint8_t* const base = (uint8_t*)host->guest_base();
-    while (!late_fixes.empty() && late_fixes.front().value <= done) {
-        LateFix& f = late_fixes.front();
+    uint64_t top = 0;
+    for (auto it = late_fixes.begin(); it != late_fixes.end();) {
+        LateFix& f = *it;
+        if (f.value > done) {
+            top = std::max(top, f.value);
+            ++it;
+            continue;
+        }
         for (const auto& [slot, page] : f.slots)
             guarded_copy(f.map + (uint64_t)slot * 4096, base + ((uint64_t)page << kPageShift), 4096);
         flush_mapped(f.alloc, f.nbytes);
@@ -2323,9 +2340,54 @@ void memory_late_fix_apply(uint64_t done) {
                 late_fix_gens[k].store(0, std::memory_order_release);
                 break;
             }
-        late_fixes.pop_front();
+        it = late_fixes.erase(it);
     }
-    late_fix_top.store(late_fixes.empty() ? 0 : late_fixes.back().value, std::memory_order_release);
+    late_fix_top.store(top, std::memory_order_release);
+}
+std::atomic<int64_t> st_late_def_lower{0};   // (TICK-060m: fixes registered with a value below a pending one's)
+/// (TICK-060m) A deferred take's fix registered: its generation for the readers' quick test, late_fix_top raised to its value
+/// if higher (never lowered: see memory_late_fix_apply), the fix thread woken. late_fix_count() < kLateFixMax (one taker)
+void late_fix_push(LateFix&& f) {
+    const uint64_t v = f.value;
+    {
+        std::lock_guard fl(late_fix_mu);
+        for (int k = 0; k < kLateFixMax; k++)
+            if (!late_fix_gens[k].load(std::memory_order_relaxed)) {
+                late_fix_gens[k].store(f.gen, std::memory_order_release);
+                break;
+            }
+        const uint64_t top = late_fix_top.load(std::memory_order_relaxed);
+        if (top > v) st_late_def_lower.fetch_add(1, std::memory_order_relaxed);
+        late_fixes.push_back(std::move(f));
+        late_fix_top.store(std::max(top, v), std::memory_order_release);
+    }
+    late_fix_wake(v);
+}
+/// (TICK-060m) The highest value of the pending fixes with a late page in [guest, guest + n) (0: none): a reader of guest memory
+/// as submitted that has no capture slot to read (a texture's storage the CPU uploads from) waits for it
+uint64_t late_fix_range_value(uint64_t guest, uint64_t n) {
+    if (!n || !late_fix_top.load(std::memory_order_acquire)) return 0;
+    const uint64_t p0 = guest >> kPageShift, p1 = (guest + n - 1) >> kPageShift;
+    uint64_t v = 0;
+    std::lock_guard lk(late_fix_mu);
+    for (const LateFix& f : late_fixes)
+        for (const auto& sp : f.slots)
+            if (sp.second >= p0 && sp.second <= p1) {
+                v = std::max(v, f.value);
+                break;
+            }
+    return v;
+}
+std::atomic<int64_t> st_late_tex_waits{0};   // (TICK-060m: texture storage reads that waited for a pending late page's value)
+/// (TICK-060m) Before the CPU reads [guest, guest + n) of guest memory for an upload (vk_texture.cpp guest_bytes): a late page
+/// there whose fix is pending is not the write-back's yet in guest memory (the take did not wait, and gave it no shadow): its
+/// value waited for (it is sent: no flush needed) and the fixes reached applied, as the take's wait had it before the upload
+void memory_late_fix_wait_range(uint64_t guest, uint64_t n) {
+    const uint64_t v = late_fix_range_value(guest, n);
+    if (!v) return;
+    st_late_tex_waits.fetch_add(1, std::memory_order_relaxed);
+    vk_timeline_wait_sent(v);
+    memory_late_fix_apply(vk_timeline_completed());
 }
 bool memory_is_rb_page_locked(uint32_t page);
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
@@ -2505,15 +2567,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 }
             st_late_deferred.fetch_add(1, std::memory_order_relaxed);
             st_late_def_pages.fetch_add((int64_t)c->late.size(), std::memory_order_relaxed);
-            std::lock_guard fl(late_fix_mu);
-            for (int k = 0; k < kLateFixMax; k++)
-                if (!late_fix_gens[k].load(std::memory_order_relaxed)) {
-                    late_fix_gens[k].store(g, std::memory_order_release);
-                    break;
-                }
-            late_fixes.push_back(std::move(f));
-            late_fix_top.store(late_fixes.back().value, std::memory_order_release);
-            late_fix_wake(late_fixes.back().value);
+            late_fix_push(std::move(f));   // (slots in rising order: late_fix_slot_pending's lower_bound)
         }
     }
     cap_view_bump();
@@ -2542,15 +2596,18 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 l_m = m, l_u = u, l_a = a;
             }
             if (late_defer_on()) {   // (TICK-060)
-                static int64_t l_d, l_p, l_t, l_u, l_f, l_r, l_s;
+                static int64_t l_d, l_p, l_t, l_u, l_f, l_r, l_s, l_x, l_lo;
                 const int64_t d = st_late_deferred.load(), pg = st_late_def_pages.load(), t = st_late_def_tex.load(), u = st_late_def_unsent.load();
                 logf("vk: late pages deferred (RX_VK_LATE_DEFER): %lld takes not waited (%.1f late pages each), waited as before: %lld "
                      "(a late page in a live texture's storage), %lld (the value not sent yet), %lld (%d fixes pending); before their fix, %lld replay "
-                     "reads of a late slot (waited), %lld syncs of one (copied whole)", (long long)(d - l_d),
+                     "reads of a late slot (waited), %lld syncs of one (copied whole), %lld texture storage reads (waited); %lld fixes below a "
+                     "pending one's value", (long long)(d - l_d),
                      d - l_d ? (double)(pg - l_p) / (double)(d - l_d) : 0.0, (long long)(t - l_t), (long long)(u - l_u),
                      (long long)(st_late_def_full.load() - l_f), kLateFixMax, (long long)(st_late_reads.load() - l_r),
-                     (long long)(st_late_syncs.load() - l_s));
+                     (long long)(st_late_syncs.load() - l_s), (long long)(st_late_tex_waits.load() - l_x),
+                     (long long)(st_late_def_lower.load() - l_lo));
                 l_d = d, l_p = pg, l_t = t, l_u = u, l_f = st_late_def_full.load(), l_r = st_late_reads.load(), l_s = st_late_syncs.load();
+                l_x = st_late_tex_waits.load(), l_lo = st_late_def_lower.load();
             }
             if (late_merge_on()) {   // (TICK-053)
                 static int64_t l_m, l_w, l_ns, l_b, l_seg;

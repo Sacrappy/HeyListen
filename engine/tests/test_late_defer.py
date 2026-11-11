@@ -58,22 +58,27 @@ def main():
          "take_capture: the wait and the copies as before otherwise")
     kept = take[take.index("if (!c->copied.empty() && g && c->map) {"):]
     reg = kept[kept.index("if (late_defer) {"):]
-    need("f.value = c->late_value, f.gen = g, f.map = (uint8_t*)b.map" in reg and "late_fixes.push_back(std::move(f));" in reg
-         and "late_fix_wake(" in reg, "take_capture: a kept buffer's fix registered and the fix thread woken")
+    need("f.value = c->late_value, f.gen = g, f.map = (uint8_t*)b.map" in reg and "late_fix_push(std::move(f));" in reg,
+         "take_capture: a kept buffer's fix registered")
+    push = body(mem, "void late_fix_push(LateFix&& f) {")
+    need("late_fixes.push_back(std::move(f));" in push and "late_fix_top.store(std::max(top, v)" in push and
+         push.index("late_fix_wake(v);") > push.index("late_fixes.push_back"), "late_fix_push: registered, the top raised only, then woken")
     need("if (late_defer && std::find(c->late.begin(), c->late.end(), c->slots[i]) != c->late.end()) continue;" in take,
          "take_capture: no texture shadow copy of a deferred late slot")
 
     ap = body(mem, "void memory_late_fix_apply(uint64_t done) {")
-    need("late_fixes.front().value <= done" in ap and
+    need("if (f.value > done) {" in ap and "top = std::max(top, f.value);" in ap and "late_fixes.front()" not in ap and
          "guarded_copy(f.map + (uint64_t)slot * 4096, base + ((uint64_t)page << kPageShift), 4096);" in ap and
          "flush_mapped(f.alloc, f.nbytes);" in ap and "late_fix_gens[k].store(0" in ap and
-         "late_fix_top.store(late_fixes.empty() ? 0 : late_fixes.back().value" in ap, "memory_late_fix_apply: copies, flush, top")
+         "late_fix_top.store(top, std::memory_order_release);" in ap,
+         "memory_late_fix_apply: every reached fix (any position) copied and flushed, top the highest pending (TICK-060m)")
     pend = body(mem, "bool late_fix_slot_pending(uint32_t gen, uint32_t slot, uint64_t* value) {")
     need("if (!gen || !late_fix_top.load(std::memory_order_acquire)) return false;" in pend and "std::lower_bound" in pend,
          "late_fix_slot_pending: quick test, then the slots")
     rd = body(mem, "bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {")
     need("late_fix_slot_pending(e.gen, e.slot, &lv)" in rd and "vk_timeline_wait_sent(lv);" in rd and
-         "if (page0 == page1 && !late_read) {" in rd, "memory_read_as_submitted: a pending late slot read after its value, not cached")
+         "memory_late_fix_apply(vk_timeline_completed());" in rd and
+         "if (page0 == page1 && !late_read) {" in rd, "memory_read_as_submitted: a pending late slot read after its value and fix")
     need("const bool late_pending = late_fix_slot_pending(e.gen, e.slot, nullptr);" in mem and
          "if (!late_pending && d_ok && gb - ga == 4096 && b->second.map) {" in mem, "mirror sync: no hash of a pending late slot")
 
@@ -100,16 +105,16 @@ def main():
 
     # every vkQueueSubmit2 on dev.queue in the replay and the textures: a flush (which applies the fixes) under dev.present_mu first,
     # with the fix waited for outside the lock where the submit is not the batched flush itself
-    for name in ("vk_replay.cpp", "vk_texture.cpp"):
+    for name in ("vk_replay.cpp", "vk_texture.cpp", "vk_memory.cpp"):
         src = read(name)
-        for m in re.finditer(r"vkQueueSubmit2\(dev\.queue", src):
+        for m in re.finditer(r"vkQueue(?:Submit2|BindSparse)\(dev\.queue", src):
             before = src[src.rfind("\n}\n", 0, m.start()):m.start()]   # (from the enclosing function's start)
             if "void queue_flush_locked() {" in before:
                 need("late_fix_flush_locked();" in before, f"{name}: the batched flush applies the fixes")
                 continue
             line = src.count("\n", 0, m.start()) + 1
-            need("queue_flush_locked();" in before, f"{name}:{line}: a vkQueueSubmit2 without a flush before it")
-            need("late_fix_wait_unlocked();" in before, f"{name}:{line}: a vkQueueSubmit2 without the fix waited for outside the lock")
+            need("queue_flush_locked();" in before, f"{name}:{line}: a queue submit without a flush before it")
+            need("late_fix_wait_unlocked();" in before, f"{name}:{line}: a queue submit without the fix waited for outside the lock")
 
     if fails:
         for f in fails:

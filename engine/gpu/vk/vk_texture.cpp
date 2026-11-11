@@ -1006,6 +1006,8 @@ LevelGeo level_geo(const Texture& tex, uint32_t level) {   // (level: the image'
 const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scratch) {
     uint64_t avail = 0;
     const uint8_t* p = host->gpu_ptr(gpu, &avail);
+    // (TICK-060m, RX_VK_LATE_DEFER) a late page here whose fix is pending: guest memory has the write-back only once its value is done
+    if (gpu < (1ull << 40)) memory_late_fix_wait_range(gpu, n);
     // (below 1 TB the GPU address is the guest's: the storage as it was at the submit being replayed, where the game has
     // rewritten it since (vk_memory.cpp, "texture storage in the capture"))
     if (p && avail >= n) return gpu < (1ull << 40) ? memory_as_submitted(gpu, p, n, scratch) : p;
