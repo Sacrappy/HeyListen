@@ -13,6 +13,11 @@ import subprocess
 import sys
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cc", "gcc"]
+
 ROOT = Path(__file__).resolve().parents[1]
 FLOAT = "_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_22TBiquadFilterParameterIfEE"
 LEGACY = "_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadFilterParameterE"
@@ -61,7 +66,7 @@ static void release_wb(Voice *voice, uint64_t buffer) { (void)voice; (void)buffe
         folder = Path(temporary)
         (folder / "actual_audio_biquad.inc").write_text("\n\n".join(actual), encoding="utf-8")
         executable = folder / "fixture.exe"
-        command = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-I" + str(folder),
+        command = [args.cc, "-std=c11", "-include", ENV_ON_H, "-O2", "-Wall", "-Wextra", "-Werror", "-I" + str(folder),
                    str(ROOT / "tests/audio_voice_biquad_test.c"), "-lm", "-o", str(executable)]
         for command in (command, [str(executable)]):
             result = subprocess.run(command, creationflags=flags, capture_output=True, text=True,

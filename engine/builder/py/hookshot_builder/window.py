@@ -553,6 +553,9 @@ class Window(QWidget):
         self.chosen_nup = self.romfs = self.exefs = None
         self.folders_note = None
         self.updating = self.checking = self.source_picked = False
+        # (the first page has its game files and saved choices: a start with --update or --launch goes past that. back)
+        self.files_ready = False
+        self.kept_folder = ""
         self.compiled = 0.0
         self.files_done = self.files_of = 0
         self.files_changed, self.files_compiled = -1, 0
@@ -912,7 +915,10 @@ class Window(QWidget):
 
     def found_go(self):
         self.apply_settings()
+        if self.kept_folder:   # (back from an update that stopped: its folder, the saved one is the last build's)
+            self.out_path.setText(self.kept_folder)
         self.fill_dumps()
+        self.files_ready = True
         self.show_main()
         if os.environ.get("HOOKSHOT_UI_PREVIEW"):
             self.preview(os.environ["HOOKSHOT_UI_PREVIEW"])
@@ -1367,7 +1373,23 @@ class Window(QWidget):
         if update:
             self.rows["read"].small_text("Your game files are kept: the .nup isn't needed")
 
+    def hard_drive_warning(self):
+        """The game folder or the build files folder on a hard drive: the build works, but much more slowly than on an SSD.
+        None when both are on an SSD (or their drive cannot be told, as on a network share)"""
+        for what, folder in (("game folder", self.out_path.text()), ("build files folder", core.work())):
+            if core.spinning(folder) is not True:
+                continue
+            root = os.path.splitdrive(os.path.abspath(folder))[0] or folder
+            return ("The %s is on a hard drive (%s). An SSD builds the game much faster: build there if you can.\n\n"
+                    "Choose OK to build here anyway, or Cancel to choose another folder." % (what, root))
+        return None
+
     def run(self, tools, args, keep_rows=False, dlss=False):
+        # (a warning, not a stop: the player may have no other folder with the room. An update keeps its own flow)
+        slow = None if keep_rows else self.hard_drive_warning()
+        if slow and QMessageBox.question(self, "Hookshot", slow, QMessageBox.StandardButton.Ok |
+                                         QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+            return
         sel = self.worker_box.currentText()
         workers = None if sel == core.AUTOMATIC else int(sel)
         if not keep_rows:
@@ -1510,8 +1532,7 @@ class Window(QWidget):
             self.show_ready()
             return
         if failure == "cancelled":
-            self.set_step(0)
-            self.show_page(self.files_page)
+            self.back()
             return
         if self.current in self.rows:
             self.rows[self.current].stopped()
@@ -1663,8 +1684,22 @@ class Window(QWidget):
         self.copy_report.setText("Copied")
 
     def back(self):
+        """The first page again, from a build or an update that stopped or was cancelled. refresh_mode leaves the button alone
+        while an update runs, and one that stopped left it so for good: the page kept the button it had before. After a start
+        with --update that was a grey "Build the game" over a page with no game files and no saved choices, and the Update
+        button only came back when the app was closed and opened again (#2129). The update is over here: the page is set up if
+        it never was, for the update's folder, and its button says what that needs"""
         self.set_step(0)
         self.show_page(self.files_page)
+        if not self.updating:
+            return
+        self.updating = False
+        if self.files_ready:
+            self.refresh()
+        else:
+            self.files_ready = True
+            self.kept_folder = self.out_path.text()
+            self.find_files()
 
     def repair(self):
         """The build tools checked against their checksums and downloaded again, after this window closes"""

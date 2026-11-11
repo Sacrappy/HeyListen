@@ -19,6 +19,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cc", "gcc"]
+
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("foreground", "script-background", "headless", "noactivate", "live-background",
          "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off",
@@ -62,6 +67,7 @@ def main():
     constants = block(hid, "enum { B_A") + ";\n" + block(api, "enum { HOS_SW_A") + ";\n"
     constants += block(api, "enum { HOS_KEY_MOVE_UP") + ";\n"   # (the keys-only controls)
     constants += block(api, "enum { HOS_OPT_CHEAT_HEARTS") + ";\n"
+    constants += block(api, "enum { HOS_BIND_PAD") + ";\n"   # (the live input's !bind)
     for name in ("STATE_SIZE", "NPAD_NO1", "ATTR_CONNECTED"):
         matches = re.findall(r"^#define " + name + r"\s+[^\n]+", hid, re.M)
         assert len(matches) == 1, name
@@ -69,13 +75,22 @@ def main():
     start = hid.index("typedef struct { int64_t start_ms, end_ms;")
     script = block(hid, "static void scripted_input(")
     end = hid.index(script) + len(script)
-    cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;", hid, re.M).group(0)
+    cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;\n"
+                            r"static int move_stick_held;", hid, re.M).group(0)
     cheat_spies = """
 volatile int hos_oot_live_action;
 int hos_oot_flight_shortcut_ready(void) { CHECK(!"unexpected cheat readiness query"); return 0; }
 void rx_option_set(int id, int value) { (void)id; (void)value; CHECK(!"unexpected cheat option change"); }
 """
-    actual = "\n".join((cheat_state, cheat_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
+    # (the host's own presses and stick, for the game's menus' mouse (host/oot_menu.c): none here; the player's input
+    # time it hides the mouse by: not looked at)
+    host_spies = """
+static void host_taps(void) {}
+static void host_stick_read(int32_t stick[4]) { (void)stick; }
+static void host_drag_read(int32_t stick[4]) { (void)stick; }
+static void player_used(void) {}
+"""
+    actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
         block(hid, "static int pads_in_background("),
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
@@ -103,7 +118,7 @@ void rx_option_set(int id, int value) { (void)id; (void)value; CHECK(!"unexpecte
         (folder / "input_actual.inc").write_text(actual, encoding="utf-8")
         exe = folder / "fixture.exe"
         # Production's button table deliberately leaves its unused axis fields zero-initialized.
-        run([a.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
+        run([a.cc, "-std=c11", "-include", ENV_ON_H, "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
              "-D_CRT_SECURE_NO_WARNINGS",
              "-I" + str(folder), str(ROOT / "tests/input_background_test.c"), "-o", str(exe)])
         for case in ((a.case,) if a.case else CASES):

@@ -12,6 +12,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cc", "gcc", "--cxx", "g++"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 HOS_H = r'''
@@ -391,7 +396,7 @@ def main():
                            ('fixture.c', FIXTURE)):
             (folder / name).write_text(text, encoding='utf-8')
         exe = folder / 'fixture'
-        subprocess.run([a.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(folder), str(folder / 'fixture.c'),
+        subprocess.run([a.cc, '-std=gnu11', '-include', ENV_ON_H, '-Wall', '-Wextra', '-Werror', '-I', str(folder), str(folder / 'fixture.c'),
                         '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
         # (the menu's side: the row's choice by name, gpu/vk/vk_menu.cpp)
@@ -400,7 +405,7 @@ def main():
         fixture = fixture.replace('@REFRESH@', block(menu, 'void mic_tell_host()', 'void save()'))
         (folder / 'menu.cpp').write_text(fixture, encoding='utf-8')
         menu_exe = folder / 'menu'
-        subprocess.run([a.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', str(folder / 'menu.cpp'), '-o', str(menu_exe)],
+        subprocess.run([a.cxx, '-std=c++17', '-include', ENV_ON_H, '-Wall', '-Wextra', '-Werror', str(folder / 'menu.cpp'), '-o', str(menu_exe)],
                        check=True)
         subprocess.run([str(menu_exe)], check=True)
 

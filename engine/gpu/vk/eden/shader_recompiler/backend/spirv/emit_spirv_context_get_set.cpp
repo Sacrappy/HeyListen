@@ -431,13 +431,6 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, [[maybe_un
         value = ctx.OpBitcast(output->type, value);
     }
 
-    static constexpr IR::Attribute cd0 = IR::Attribute::ClipDistance0;
-    static constexpr IR::Attribute cd7 = IR::Attribute::ClipDistance7;
-
-    if (attr >= cd0 && attr <= cd7) {
-        const u32 idx = (u32) attr - (u32) cd0;
-        clip_distance_written.set(idx);
-    }
     ctx.OpStore(output->pointer, value);
 }
 
@@ -567,7 +560,16 @@ void EmitSetOFlag(EmitContext&) {
 }
 
 Id EmitWorkgroupId(EmitContext& ctx) {
-    return ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+    const Id id{ctx.OpLoad(ctx.U32[3], ctx.workgroup_id)};
+    if (ctx.mesh_fallback && ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_fallback_task) {
+        // (hookshot) a fallback mesh workgroup is a slot (its task's map gives it, EmitMeshPrologue): its id is its index in its
+        // task, as a task launches them from 0
+        const Id slot{Sirit::ValidId(ctx.mesh_fallback_slot) ? ctx.mesh_fallback_slot
+                                                             : ctx.OpCompositeExtract(ctx.U32[1], id, 0U)};
+        const Id x{ctx.OpUMod(ctx.U32[1], slot, ctx.Const(ctx.runtime_info.mesh_fallback_task_threads))};
+        return ctx.OpCompositeConstruct(ctx.U32[3], x, ctx.u32_zero_value, ctx.u32_zero_value);
+    }
+    return id;
 }
 
 Id EmitLocalInvocationId(EmitContext& ctx) {

@@ -16,6 +16,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cc", "gcc", "--cxx", "g++"]
+
 ROOT = Path(__file__).resolve().parents[1]
 THRESHOLDS = [7849, 1638, 3277, 4915, 6553, 9830]   # (Default, then 5% ... 30% of 32767)
 
@@ -125,8 +130,8 @@ int main(void) {
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
 enum MenuTab { TAB_CONTROLS };
-struct Options { int output_res = 0, resolution = 0, upscale = 0, dlss = 0, stick_dead_zone = 0; } opts;
-static int output_choice(int v) { return v; }
+struct Options { int output_res = 0, vsync = 0, resolution = 0, fps_cap = 0, upscale = 0, dlss = 0, handheld = 0, mesh_mode = 0, stick_dead_zone = 0; } opts;
+static int parse_output(const char* text) { return atoi(text); }   // (the Output row's own parse: not what this checks)
 ''' + block(menu, "struct Row {") + ";\n" + block(menu, "const char* tx_stick_dead_zone(") + "\n" + \
         "Row rows[] = {" + row.group(0) + "};\n" + block(menu, "const char* ini_key(") + r'''
 static int parse(const char* text) {
@@ -147,14 +152,14 @@ int main() {
     static const char* want[] = {"Default (24%)", "5%", "10%", "15%", "20%", "30%"};
     for (int v = 0; v < 6; v++) CHECK(!strcmp(rows[0].text(v), want[v]));
     CHECK(!strcmp(rows[0].text(-1), want[0]) && !strcmp(rows[0].text(6), want[0]));
-    (void)output_choice(0);
+    (void)parse_output("0");
     printf("menu: stick_dead_zone parses and clamps to 0..5; labels Default (24%%) ... 30%%\n");
     return 0;
 }
 '''
     with tempfile.TemporaryDirectory(prefix="stick-dead-zone-") as tmp:
-        run(a.cc, c, "stick.c", tmp, ["-std=c11", "-O1"])
-        run(a.cxx, cxx, "menu.cpp", tmp, ["-std=c++17"])
+        run(a.cc, c, "stick.c", tmp, ["-std=c11", "-include", ENV_ON_H, "-O1"])
+        run(a.cxx, cxx, "menu.cpp", tmp, ["-std=c++17", "-include", ENV_ON_H])
     print("ok")
 
 

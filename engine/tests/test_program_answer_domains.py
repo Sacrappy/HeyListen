@@ -12,6 +12,11 @@ import os
 import subprocess
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cxx", "clang++", "--headers", "{vulkan_headers}"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -37,6 +42,7 @@ namespace mkwvk {
 static uint32_t handles[3]{};
 static uint8_t answers[4]{0,2,2,2};
 uint32_t driver_bank_word(const NvnState&, int, int, uint32_t offset) { return handles[offset/8]; }
+uint32_t stage_cbuf_word(const NvnState&, const Stage&, uint32_t, uint32_t offset) { return handles[offset/8]; }
 uint32_t stage_handle(const NvnState&, const Stage&, uint32_t) { std::abort(); }
 uint8_t texture_answer(uint32_t h) { return h ? answers[h] : 0xff; }
 uint32_t texture_slot_version(int id) { return 10+id; }
@@ -66,6 +72,8 @@ int main(int argc, char** argv){using namespace mkwvk;auto s=std::make_unique<Nv
   check(!still_valid(*s,*d),"strict depth compare remains raw");record_answers(*d,*s);
   check(d->answers[0].type==131&&d->variant!=hash,"strict depth record/hash remains raw");
   answers[1]=3;check(!still_valid(*s,*d),"strict depth changed raw bit still rejects");
+  unbind();auto f=sampled(false);f->stages[0].info.texture_descriptors[0].type_fixed=true;record_answers(*f,*s);bind();
+  answers[1]=2;check(!still_valid(*s,*f),"strict instruction-typed compare remains raw");
   printf("strict checks=%u failures=%u\n",checked,failed);return failed?1:0;
  }
 
@@ -87,7 +95,17 @@ int main(int argc, char** argv){using namespace mkwvk;auto s=std::make_unique<Nv
  for(auto fmt:{Shader::ImageFormat::Typeless,Shader::ImageFormat::R8_SINT,Shader::ImageFormat::R16_SINT}){
   for(bool integer:{false,true}){unbind();auto p=image(fmt,integer);record_answers(*p,*s);auto old=p->variant;bind();answers[3]=integer?2:130;check(!still_valid(*s,*p),"Typeless/signed actual integer-bit changes preserved");record_answers(*p,*s);check(p->variant!=old,"Typeless/signed hashes still distinguish integer bit");}
  }
- unbind();auto ordinary=sampled(false);record_answers(*ordinary,*s);bind();answers[1]=131;check(!still_valid(*s,*ordinary),"ordinary sampled integer change retained");answers[1]=2;check(!still_valid(*s,*ordinary),"ordinary sampled dimension change retained");handles[0]=0;check(still_valid(*s,*ordinary),"unbound handling preserved");
+ unbind();auto ordinary=sampled(false);record_answers(*ordinary,*s);bind();answers[1]=131;check(!still_valid(*s,*ordinary),"ordinary sampled integer change retained");answers[1]=2;check(!still_valid(*s,*ordinary),"dimension change retained where an answer set the type");handles[0]=0;check(still_valid(*s,*ordinary),"unbound handling preserved");
+ // The instruction's own type (TextureDescriptor::type_fixed): the module and the view are the same whatever is bound.
+ unbind();auto fixed=sampled(false);fixed->stages[0].info.texture_descriptors[0].type_fixed=true;record_answers(*fixed,*s);auto fixed_hash=fixed->variant;bind();
+ answers[1]=2;check(still_valid(*s,*fixed),"instruction-typed slot accepts another dimension");record_answers(*fixed,*s);
+ check(fixed->answers[0].type==3&&fixed->variant==fixed_hash,"instruction-typed record/hash canonical across dimension");
+ answers[1]=131;check(!still_valid(*s,*fixed),"instruction-typed slot keeps the integer bit");
+ answers[1]=130;check(!still_valid(*s,*fixed),"instruction-typed slot keeps the integer bit across dimension");
+ answers[1]=8;check(!still_valid(*s,*fixed),"a rectangle is still another module");
+ answers[1]=7;check(!still_valid(*s,*fixed),"a buffer is still another module");
+ unbind();auto fixed_depth=sampled(true);fixed_depth->stages[0].info.texture_descriptors[0].type_fixed=true;record_answers(*fixed_depth,*s);bind();
+ answers[1]=130;check(still_valid(*s,*fixed_depth),"instruction-typed float depth accepts dimension and integer-bit change");
  unbind();auto counted=image(Shader::ImageFormat::R32_UINT);for(auto& d:counted->stages[0].info.texture_descriptors)d.count=2;counted->stages[0].info.image_descriptors[0].count=2;record_answers(*counted,*s);check(counted->answers.empty()&&counted->variant==0,"count!=1 descriptors still omitted");
  // Hash-only callers (seed/census cache readers) have no stage metadata; do not change their contract.
  Program hash_only;hash_only.answers={{0,0,2,false},{0,1,2,false},{0,0,128,true}};check(answers_hash(hash_only)!=0,"answers_hash remains usable without module Info");
@@ -117,14 +135,19 @@ def main():
         markers.append('uint8_t canonical_answer(')
     if 'bool answers_fit(' in source:   # (the answers from files checked against the stages and their slots)
         markers.append('bool answers_fit(')
-    markers += ['uint64_t answers_hash(', 'void record_answers(', 'bool still_valid(',
+    markers += ['uint64_t answers_hash(', 'size_t generated_stage(', 'std::vector<Program::Answer> answers_here(', 'void record_answers(', 'bool still_valid(',
                 'void answer_handles(', 'uint32_t answer_stage_mask(']
     functions = '\n\n'.join(block(source, marker) for marker in markers)
+    if 'd.type_fixed' in functions:   # (the baseline has no such rule: nothing to hold the pass to)
+        texture_pass = (vk / 'eden/shader_recompiler/ir_opt/texture_pass.cpp').read_text(encoding='utf-8')
+        for needed in ('.type_fixed = !type_asked,', '].type_fixed &= desc.type_fixed;'):
+            if needed not in texture_pass:
+                raise SystemExit('texture_pass.cpp no longer sets or merges TextureDescriptor::type_fixed: ' + needed)
     if 'if (answers_in' in functions:
         start = source.rfind('\n', 0, source.index(' answers_in =')) + 1
         functions = source[start:source.index(';', start) + 1] + '\n\n' + functions
     fixture = FIXTURE.replace('#include MATCHER_FUNCTIONS', functions)
-    flags = ['-std=c++20', '-O1', '-w', '-DNDEBUG', '-DVK_NO_PROTOTYPES', '-DMKWVK_INCLUDES=2']
+    flags = ['-std=c++20', '-include', ENV_ON_H, '-O1', '-w', '-DNDEBUG', '-DVK_NO_PROTOTYPES', '-DMKWVK_INCLUDES=2']
     for header in ('algorithm', 'cstdio', 'cstdlib', 'cstring', 'functional', 'string', 'vector'):
         flags += ['-include', header]
     includes = [vk, vk / 'compat', args.source / 'gpu/compat', vk / 'eden',
@@ -142,8 +165,10 @@ def main():
         # Each child reads the existing settings once, just like canonical_answer's static gate.
         for name, overrides, strict in (
             ('default', {}, False),
-            ('handles-live-presence-zero', {'RX_VK_HANDLES_LIVE': '0'}, True),
-            ('register-at-once-presence-zero', {'RX_VK_REGISTER_AT_ONCE': '0'}, True),
+            ('handles-live-zero', {'RX_VK_HANDLES_LIVE': '0'}, False),   # (an on/off switch too: env_on)
+            ('handles-live-one', {'RX_VK_HANDLES_LIVE': '1'}, True),
+            ('register-at-once-zero', {'RX_VK_REGISTER_AT_ONCE': '0'}, False),   # (an on/off switch: 0 is off, env_on)
+            ('register-at-once-one', {'RX_VK_REGISTER_AT_ONCE': '1'}, True),
             ('capture-zero', {'RX_VK_CAPTURE': '0'}, True),
             ('capture-one', {'RX_VK_CAPTURE': '1'}, False),
         ):

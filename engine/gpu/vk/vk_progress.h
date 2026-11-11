@@ -95,6 +95,14 @@ inline std::string percent_text(size_t done, size_t total) {
     return std::to_string(p) + "%";
 }
 
+/// "32%" of a fraction: rounded down, and 99% until it is 1
+inline std::string percent_of(double f) {
+    if (f < 0) return "";
+    int p = f >= 1 ? 100 : (int)(f * 100);
+    if (p > 99 && f < 1) p = 99;
+    return std::to_string(p) + "%";
+}
+
 /// What the start-up screen shows (vk_menu.cpp draw_startup draws it)
 struct StartupView {
     std::string version;            // ("v2.0.5"; empty: the build's)
@@ -113,6 +121,62 @@ struct StartupState {
     size_t done = 0, total = 0;
     double left = -1, secs = 0;
     bool prepared = false, finished = false, stopping = false;
+    double whole = -1;   // (the bar over every part, PrepareBar::fraction; negative: the bar is this part's done of total)
+};
+
+/// (hookshot) The whole preparation on one bar: its parts, 0 the shader programs, 1 the pipelines the notes predict, 2 the noted
+/// pipelines, each counted in what one of it costs (kCost, in shader programs' time) and each in the total from the start. The
+/// predicted pipelines were a step of their own after a full bar: the bar sat at 100% while thousands of them were built. A part
+/// not counted yet stands in the total at its guess (prepare_guess: from the files on disk), and at its count once it reports one;
+/// a part that does not run (a start with nothing to prepare) is skipped, out of the total. The bar never goes back, and reaches
+/// 1 only when every part has
+struct PrepareBar {
+    // (an RTX 3090, 24 threads, a cold driver cache: 38,809 programs translated, their compute pipelines warmed, in 131 s, ~295 a
+    // second; 43,414 predicted pipelines built in 306 s, ~142 a second: a pipeline costs about two programs. Only the shares
+    // matter: the time left is taken from the bar's own rate)
+    static constexpr double kCost[3] = {1.0, 2.0, 2.0};
+    size_t done[3]{}, total[3]{};
+    bool counted[3]{}, skipped[3]{};
+    double shown = 0;
+
+    /// A part's guess, until it is counted
+    void guess(int part, size_t n) {
+        if (!counted[part] && !skipped[part]) total[part] = n;
+    }
+    /// A part that does not run
+    void skip(int part) { skipped[part] = true, done[part] = total[part] = 0; }
+    /// A part's progress (done of total, its count now); the parts before it are over
+    void at(int part, size_t d, size_t t) {
+        for (int k = 0; k < part; k++)
+            if (!skipped[k]) counted[k] = true, done[k] = total[k];
+        counted[part] = true, total[part] = t, done[part] = std::min(d, t);
+    }
+    /// The parts before this one over (it is not counted yet)
+    void reach(int part) {
+        for (int k = 0; k < part; k++)
+            if (!skipped[k]) counted[k] = true, done[k] = total[k];
+    }
+    /// Every part over
+    void finish() {
+        for (int k = 0; k < 3; k++)
+            if (!skipped[k]) counted[k] = true, done[k] = total[k];
+    }
+    double units_done() const { return done[0] * kCost[0] + done[1] * kCost[1] + done[2] * kCost[2]; }
+    double units_total() const { return total[0] * kCost[0] + total[1] * kCost[1] + total[2] * kCost[2]; }
+    bool over() const {
+        for (int k = 0; k < 3; k++)
+            if (!skipped[k] && (!counted[k] || done[k] < total[k])) return false;
+        return true;
+    }
+    /// 0 to 1: never back, and under 1 while any part is not over
+    double fraction() {
+        const double all = units_total();
+        double f = all > 0 ? units_done() / all : 0;
+        if (!over()) f = std::min(f, 0.999);
+        else f = 1;
+        shown = std::max(shown, f);
+        return shown;
+    }
 };
 
 /// The screen for a state. The first second shows the wordmark alone: a start with next to nothing to prepare is over by then
@@ -134,10 +198,11 @@ inline StartupView startup_view(const StartupState& s) {
     if (s.prepared) v.hint = "This happens once after an update. Closing the window keeps what is done.";
     if (!s.total) {
         v.left = !pipelines ? "Reading the game's shaders" : s.stage == 1 ? "Reading the pipeline notes" : "Loading the shader cache";
+        if (s.whole >= 0) v.fraction = s.whole, v.pct = percent_of(s.whole), v.right = left_text(s.left);
         return v;
     }
-    v.fraction = (double)std::min(s.done, s.total) / (double)s.total;
-    v.pct = percent_text(s.done, s.total);
+    v.fraction = s.whole >= 0 ? s.whole : (double)std::min(s.done, s.total) / (double)s.total;
+    v.pct = s.whole >= 0 ? percent_of(s.whole) : percent_text(s.done, s.total);
     v.left = with_commas(s.done) + " / " + with_commas(s.total) + (pipelines ? " pipelines" : " shaders");
     v.right = left_text(s.left);
     return v;

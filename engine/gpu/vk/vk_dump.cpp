@@ -11,6 +11,9 @@
 #include <direct.h>
 
 #include "vk_dump.h"
+#ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
+#include "hookshot_env.h"
+#endif
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -77,6 +80,19 @@ void barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
     VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     d.imageMemoryBarrierCount = 1;
     d.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
+// Completion alone does not make the staging copy available to host reads.
+void host_read_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
 }
 
@@ -211,7 +227,7 @@ void write_item(Item& it) {
         }
     }
     logf("%s", line);
-    static const bool no_png = getenv("RX_VK_DUMP_NOPNG") != nullptr;   // (statistics only)
+    static const bool no_png = env_on("RX_VK_DUMP_NOPNG");   // (statistics only)
     if (no_png) return;
     // (RX_VK_DUMP_RAW: float pictures also as raw RGBA32F)
     char path[1024];
@@ -219,7 +235,7 @@ void write_item(Item& it) {
     for (char* c = path + dir.size() + 1; *c; c++)
         if (*c == ' ' || *c == ':' || *c == '/' || *c == '\\') *c = '_';
     write_png(path, rgba.data(), it.w, it.h);
-    static const bool raw = getenv("RX_VK_DUMP_RAW") != nullptr;
+    static const bool raw = env_on("RX_VK_DUMP_RAW");
     if (raw && it.kind == KIND_FLOAT) {
         std::string rp(path);
         rp.replace(rp.size() - 4, 4, ".f32");
@@ -302,7 +318,7 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
     if (!armed || !tex || !tex->image || tex->samples != VK_SAMPLE_COUNT_1_BIT) return;
     if (!step_wanted(seq, what)) return void(seq++);
     // (RX_VK_DUMP_DEPTH_ONLY=1: the passes' colour targets left out, depth only (per-draw dumps of big targets fit))
-    static const bool depth_only = getenv("RX_VK_DUMP_DEPTH_ONLY") != nullptr;
+    static const bool depth_only = env_on("RX_VK_DUMP_DEPTH_ONLY");
     if (depth_only && (tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && std::strncmp(what, "pass", 4) == 0) return void(seq++);
     // (RX_VK_DUMP_ONLY_W=<width>[,<width>...]: only targets that wide (the minimap's 468: its per-draw dumps alone,
     // small; the scene's and the output's: 2048,3840)
@@ -319,7 +335,7 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
     if (!only_w.empty() && std::find(only_w.begin(), only_w.end(), std::max(1u, tex->width >> std::min(level, tex->levels - 1))) ==
                                only_w.end())
         return void(seq++);
-    static const bool as_9e5 = getenv("RX_VK_DUMP_9E5") != nullptr;
+    static const bool as_9e5 = env_on("RX_VK_DUMP_9E5");
     const bool raw_9e5 = as_9e5 && tex->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     if (!(tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || raw_9e5) {
         if (!(tex->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !raw_9e5) return;
@@ -337,10 +353,11 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
                            it.buffer_alloc, &it.map))
             return;
         full_barrier(cmd);
-        const VkBufferImageCopy c{0, 0, 0, {raw_9e5 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, level,
+        const VkBufferImageCopy c{0, 0, 0, {(VkImageAspectFlags)(raw_9e5 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT), level,
                                             std::min(layer, tex->layers - 1), 1}, {0, 0, 0},
                                   {it.w, it.h, 1}};
         vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, it.buffer, 1, &c);
+        host_read_barrier(cmd);
         full_barrier(cmd);
         items.push_back(std::move(it));
         return;
@@ -389,6 +406,7 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
     barrier(cmd, it.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {it.w, it.h, 1}};
     vkCmdCopyImageToBuffer(cmd, it.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
+    host_read_barrier(cmd);
     full_barrier(cmd);
     items.push_back(std::move(it));
 }
@@ -422,6 +440,7 @@ void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSi
     vkCmdPipelineBarrier2(cmd, &d);
     const VkBufferCopy c{off, 0, n};
     vkCmdCopyBuffer(cmd, src, it.buffer, 1, &c);
+    host_read_barrier(cmd);
     vkCmdPipelineBarrier2(cmd, &d);
     buf_items.push_back(std::move(it));
 }
@@ -432,12 +451,15 @@ bool dump_pending() {
 
 void dump_write() {
     for (Item& it : items) {
+        // Before write_item converts depth and changes its dimensions/map.
+        invalidate_mapped(it.buffer_alloc, (uint64_t)it.w * it.h * (it.depth_bytes ? it.depth_bytes : 16));
         write_item(it);
         destroy_buffer(it.buffer, it.buffer_alloc);
         if (it.image) destroy_image(it.image, it.image_alloc);
     }
     items.clear();
     for (BufItem& it : buf_items) {
+        invalidate_mapped(it.alloc, it.n);
         const uint32_t* w = (const uint32_t*)it.map;
         const size_t nw = it.n / 4;
         size_t nz = 0;

@@ -15,6 +15,9 @@ import subprocess
 import sys
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
 ROOT = Path(__file__).resolve().parents[1]
 APPEND = "_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE"
 RELEASED = "_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE"
@@ -60,7 +63,7 @@ static int16_t adpcm_sample(Voice *v, const WB *w, int64_t s) { (void)v; (void)w
         folder = Path(temporary)
         (folder / "actual_audio_wave_buffers.inc").write_text("\n\n".join(actual), encoding="utf-8")
         executable = folder / "fixture.exe"
-        command = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-I" + str(folder),
+        command = [args.cc, "-std=c11", "-include", ENV_ON_H, "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-I" + str(folder),
                    str(ROOT / "tests/audio_wave_buffer_release_test.c"), "-lm", "-o", str(executable)]
         for command in (command, [str(executable)]):
             result = subprocess.run(command, creationflags=flags, capture_output=True, text=True,

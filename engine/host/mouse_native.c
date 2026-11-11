@@ -28,6 +28,9 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 int hos_mouse_take(int32_t *dx, int32_t *dy);                                   /* display.c */
 void hos_mouse_give_back(int32_t dx, int32_t dy);                               /* display.c */
@@ -55,7 +58,7 @@ static int native_on(void) {
 
 static int invert_y(void) {
     static int env = -1;
-    if (env < 0) env = getenv("HOS_MOUSE_INVERT_Y") != NULL;
+    if (env < 0) env = env_on("HOS_MOUSE_INVERT_Y");
     return env || rx_option(8, 0);   /* (the menu's Invert mouse vertical) */
 }
 
@@ -65,6 +68,10 @@ static int looks_like_camera(uint64_t cam) {
     return isfinite(lo) && isfinite(hi) && lo < hi && lo >= -90.0f && hi <= 90.0f && isfinite(p) && isfinite(y) &&
            fabsf(y) <= 360.0f;
 }
+
+/* The Controls row "Disable camera centering" (option 45), independent of the mouse mode. The game's state-3 yaw-follow
+   branch asks before it runs (nx2/oot_patches.py); 0 keeps the stock behavior, including without a renderer. */
+int hos_disable_camera_centering(void) { return rx_option(45, 0); }
 
 /* f_80644c80's first line (nx2/oot_patches.py): cam is the player camera, the game's thread */
 void hos_mouse_camera(uint64_t cam) {

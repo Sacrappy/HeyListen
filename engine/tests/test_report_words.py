@@ -8,6 +8,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -42,8 +45,6 @@ struct Pool { uint64_t lo; };
 struct VkBufferCopy { uint64_t srcOffset, dstOffset, size; };
 std::mutex cpu_words_mu;
 std::vector<uint64_t> cpu_words, cpu_words_recent, cpu_words_new;   // (the big and the recent sorted sets, and noted since: vk_memory.cpp)
-constexpr int kPageShift = 12;
-void shadow_written(const uint32_t*, int64_t) {}   // (memory_cpu_owned tells the write-back diff its pages: not checked here)
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d\n", __LINE__); std::exit(1); } } while (0)
 ''' + helper + r'''
 // after a merge: both sets sorted with no repeats, no word in both, nothing left noted, and together exactly the words in want
@@ -198,7 +199,7 @@ int main() {
         cpp = Path(tmp) / 'fixture.cpp'
         exe = Path(tmp) / 'fixture.exe'
         cpp.write_text(fixture, encoding='utf-8')
-        subprocess.run([args.cxx, '-std=c++20', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(exe)], check=True)
+        subprocess.run([args.cxx, '-std=c++20', '-include', ENV_ON_H, '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(exe)], check=True)
         # (memory_cpu_owned does nothing with RX_VK_WB_REPORTS set: not from the caller's environment)
         env = {k: v for k, v in os.environ.items() if k != 'RX_VK_WB_REPORTS'}
         subprocess.run([str(exe)], check=True, env=env)

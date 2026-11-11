@@ -23,12 +23,15 @@
 #include "hd_rumble.h"
 #include "hos_motion.h"
 #include "../gpu/vk/vk_api.h"   /* (HOS_PAD_*) */
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 void hos_host_thread_register_self(const char *name);   /* hos_prof.c */
 
 /* (BTN_A ... BTN_RIGHT are HOS_PAD_SOUTH ... HOS_PAD_RIGHT) */
 enum { BTN_A, BTN_B, BTN_X, BTN_Y, BTN_BACK, BTN_GUIDE, BTN_START, BTN_LSTICK, BTN_RSTICK, BTN_LSHOULDER, BTN_RSHOULDER,
-       BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_MISC1, BTN_N = 21 };
+       BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_MISC1, BTN_TOUCHPAD = 20, BTN_N = 21 };
 enum { AX_LX, AX_LY, AX_RX, AX_RY, AX_LT, AX_RT };
 
 #define MAX_PADS 8
@@ -46,6 +49,8 @@ static struct {
     int motion, motion_on;
     int64_t motion_retry_ns, used_ns;
     uint64_t input_sig;
+    unsigned rested;   /* (hookshot) the sticks' axes seen at rest since it was opened, a bit each: only those steer */
+    signed char held[4];   /* (the way each axis was last held, -1, 0 or 1: one held the other way has passed its rest) */
     uint32_t serial;
     float bias[3], bias_t;
     int has_bias;
@@ -92,7 +97,7 @@ static int pads_start(void) {
     hos_sdl_hint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
     /* (with no window nothing reads SDL's quit event: SDL's own SIGINT/SIGTERM handlers turned a timeout's or a service
        manager's SIGTERM into that event, and the run went on until SIGKILL. Without them the signals end it as usual) */
-    if (getenv("HOS_HEADLESS")) hos_sdl_hint("SDL_NO_SIGNAL_HANDLERS", "1");
+    if (env_on("HOS_HEADLESS")) hos_sdl_hint("SDL_NO_SIGNAL_HANDLERS", "1");
     if (!hos_sdl_init(HOS_SDL_GAMEPAD)) {
         hos_log("hid: SDL could not start its controller support: %s", hos_sdl_error());
         return 0;
@@ -177,7 +182,7 @@ static int hd_poll(int i, const uint8_t side[3][4], long long now) {
 static void motion_poll(int64_t now, int count) {
     int rx_option(int id, int otherwise);
     static int debug = -1;   /* (HOS_MOTION_DEBUG, read once) */
-    if (debug < 0) debug = getenv("HOS_MOTION_DEBUG") != NULL;
+    if (debug < 0) debug = env_on("HOS_MOTION_DEBUG");
     const int want = rx_option(HOS_OPT_GYRO, 1) != 0;
     int pick = -1, any = 0;
     for (int i = 0; i < MAX_PADS; i++) {
@@ -206,6 +211,27 @@ static void motion_poll(int64_t now, int count) {
     float a[3], g[3];
     const int read = pick >= 0 && hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, a, 3) &&
                      hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_GYRO, g, 3);
+    /* (a gyroscope reading the very same values for over a second has stopped: a real one always moves a little. Seen with a
+       Steam Controller under Steam after Alt+Tab, when Steam's layout switch left its sensors off while SDL still had them on.
+       Off and on again, as the menu's Motion controls row does, brings it back) */
+    {
+        static float last_g[3];
+        static int64_t same_since, rearm_ns;
+        if (read && !memcmp(g, last_g, sizeof g)) {
+            if (!same_since) same_since = now;
+            else if (now - same_since > 1200000000LL && now >= rearm_ns) {
+                hos_sdl_pad_sensor_enable(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, 0);
+                hos_sdl_pad_sensor_enable(pads[pick].gc, HOS_SDL_SENSOR_GYRO, 0);
+                pads[pick].motion_on = 0;   /* (turned on again by the loop above on the next poll) */
+                hos_log("hid: \"%s\": its gyroscope stopped changing: motion sensors turned off and on again",
+                        hos_sdl_pad_name(pads[pick].gc));
+                same_since = 0, rearm_ns = now + 3000000000LL;
+            }
+        } else {
+            if (read) memcpy(last_g, g, sizeof g);
+            same_since = 0;
+        }
+    }
     /* (the pad that had motion keeps what its filter learned of its gyroscope's bias, for when it has motion again) */
     if (motion_pad >= 0 && (!read || pick != motion_pad) && pads[motion_pad].gc && pads[motion_pad].serial == motion_serial &&
         motion.learned_t > 0) {
@@ -310,6 +336,8 @@ static void pads_poll(void) {
                 pads[slot].motion_on = 0;
                 pads[slot].motion_retry_ns = 0;
                 pads[slot].used_ns = now, pads[slot].input_sig = 0;   /* (just connected: the one about to be used) */
+                pads[slot].rested = 0;
+                memset(pads[slot].held, 0, sizeof pads[slot].held);
                 pads[slot].serial = ++pads_opened;
                 pads[slot].has_bias = 0;
                 hos_log("hid: controller \"%s\" connected (SDL)%s", hos_sdl_pad_name(gc),
@@ -343,15 +371,33 @@ static void pads_poll(void) {
             count++;
             for (int k = BTN_A; k <= BTN_RIGHT; k++)   /* (SDL3's gamepad buttons are in SDL2's order) */
                 if (hos_sdl_pad_button(gc, k)) b |= 1ULL << k;
+            /* (hookshot) a DualShock 4's or DualSense's touchpad click: it opens the Insert menu as F1 does (vk_menu.cpp).
+               SDL numbers it 20, past the buttons above; an SDL without it answers 0 */
+            if (hos_sdl_pad_button(gc, BTN_TOUCHPAD)) b |= 1ULL << HOS_PAD_TOUCHPAD;
             if (hos_sdl_pad_axis(gc, AX_LT) > 8000) b |= 1ULL << HOS_PAD_LTRIGGER;
             if (hos_sdl_pad_axis(gc, AX_RT) > 8000) b |= 1ULL << HOS_PAD_RTRIGGER;
             const int inv_x = rx_option(16, 0);
             const int inv_y = rx_option(17, 0);
             const int z = rx_option(11, 0);   /* (the menu's Stick dead zone: nn_hid.c's hos_stick_axis) */
-            const int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1, z)};
+            int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_RX), 0, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_RY), 1, z)};
+            /* (hookshot) An axis steers once it has been seen at rest (inside the dead zone) since the pad was opened. The sticks are
+               the strongest of all the pads', so a device whose axis reads held for good (a mapping that puts a trigger or an
+               unused axis on a stick, a second virtual pad) turned the camera or walked Link in circles on its own, with the
+               player's pad at rest (#1673: Xbox 360 pad, CachyOS; #1661: GameSir 2 Lite, wired). A real stick rests at the start. */
+            /* (a worn stick resting just past a small dead zone counts once it is pushed the other way: it went past its rest) */
+            for (int k = 0; k < 4; k++) {
+                const signed char way = (signed char)(v[k] > 0 ? 1 : v[k] < 0 ? -1 : 0);
+                if (!way || (pads[i].held[k] && way != pads[i].held[k])) pads[i].rested |= 1u << k;
+                pads[i].held[k] = way;
+                if (!(pads[i].rested >> k & 1)) v[k] = 0;
+            }
+            /* Camera inversion changes output, not whether the physical stick crossed its rest position. Otherwise
+               toggling the setting admits a held phantom axis, which stays admitted after the setting is restored (#2273). */
+            if (inv_x) v[2] = -v[2];
+            if (inv_y) v[3] = -v[3];
             for (int k = 0; k < 4; k++)
                 if ((v[k] < 0 ? -v[k] : v[k]) > (s[k] < 0 ? -s[k] : s[k])) s[k] = v[k];
             {   /* (motion: the pad last used; a stick counts by which way it is pushed, not by how far) */
@@ -411,7 +457,7 @@ void hos_sdl_pads_pump(void) {
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
     static volatile LONG started;
     if (!started && !InterlockedExchange(&started, 1)) {
-        if (getenv("HOS_NO_SDL")) return 0;
+        if (env_on("HOS_NO_SDL")) return 0;
         if (!hos_sdl_load()) {
             hos_log("hid: no SDL beside the exe or on the system: only XInput controllers (Xbox pads) work");
             return 0;

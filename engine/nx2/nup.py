@@ -20,6 +20,7 @@ A file that is itself zstd in the game (the romfs .zs files) is not one of those
 """
 import argparse
 from contextlib import suppress
+import errno
 import hashlib
 import os
 import re
@@ -27,6 +28,7 @@ import shutil
 import stat
 import struct
 import sys
+from time import monotonic
 
 
 ZSTD = b"\x28\xb5\x2f\xfd"
@@ -379,14 +381,64 @@ def pick_title(nup, want):
     raise SystemExit("no title %s" % want)
 
 
-def extraction_path(out, part, rel, temporary_suffix=".part"):
-    """A package path stays under its part, without following existing output links."""
+def long_path(p):
+    """(Windows) p as an extended-length path (\\\\?\\...), so a game folder whose deepest file passes 260 characters (MAX_PATH)
+    still unpacks, links and is read (#1468: a 262-character path in Event\\EventSetting stopped the build with
+    FileNotFoundError). Python takes these everywhere, without Windows' long-paths setting. Elsewhere, or one already: as is."""
+    if os.name != "nt" or not p:
+        return p
+    p = os.path.abspath(p)
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):   # (a share: \\server\share -> \\?\UNC\server\share)
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def package_parts(rel):
     parts = rel.split("/")
     if (not rel or "\\" in rel or any(not p or p in (".", "..") or p[-1] in " ." or
             any(c in '<>:"|?*' or ord(c) < 32 for c in p) or p.split(".")[0].rstrip(" ").upper() in WINDOWS_DEVICES
             for p in parts)):
         raise SystemExit("unsafe path in the package: %r" % rel)
-    root = os.path.realpath(os.path.abspath(out))
+    return parts
+
+
+def is_link(info):
+    return stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+
+
+class Destination:
+    """extraction_path over a whole extraction: the output resolved once, each folder checked or made once"""
+    def __init__(self, out):
+        self.root = long_path(os.path.realpath(os.path.abspath(out)))
+        self.folders = set()
+
+    def folder(self, path):
+        if path not in self.folders:
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                os.makedirs(path, exist_ok=True)
+            else:
+                if is_link(info):
+                    raise SystemExit("extraction path is a link or reparse point: %s" % path)
+            self.folders.add(path)
+
+    def path(self, part, rel):
+        parts = package_parts(rel)
+        at = self.root
+        self.folder(at)
+        for name in (part, *parts[:-1]):
+            at = os.path.join(at, name)
+            self.folder(at)
+        return os.path.join(at, parts[-1])
+
+
+def extraction_path(out, part, rel, temporary_suffix=".part"):
+    """A package path stays under its part, without following existing output links."""
+    parts = package_parts(rel)
+    root = long_path(os.path.realpath(os.path.abspath(out)))
     base = os.path.join(root, part)
     dst = os.path.join(base, *parts)
     if os.path.commonpath((os.path.normcase(base), os.path.normcase(os.path.abspath(dst)))) != os.path.normcase(base):
@@ -403,39 +455,172 @@ def extraction_path(out, part, rel, temporary_suffix=".part"):
             info = os.lstat(path)
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        if is_link(info):
             raise SystemExit("extraction path is a link or reparse point: %s" % path)
         if path == temporary and info.st_nlink > 1:
             raise SystemExit("extraction temporary file has other hard links: %s" % path)
     return dst
 
 
+class ProgressSink:
+    """Report successful writes without changing the package reader's copy interface."""
+    def __init__(self, output, report):
+        self.output = output
+        self.report = report
+
+    def write(self, data):
+        count = self.output.write(data)
+        self.report(count)
+        return count
+
+
+class HeadSink:
+    """Check the Zstd prefix and available member digest during extraction, without reopening the file."""
+    def __init__(self, output, expected):
+        self.output = output
+        self.expected = expected
+        self.digest = hashlib.sha256() if expected is not None else None
+        self.head = b""
+
+    def write(self, data):
+        if len(self.head) < 4:
+            self.head += bytes(data[:4 - len(self.head)])
+        if self.digest is not None:
+            self.digest.update(data)
+        return self.output.write(data)
+
+    def damaged(self):
+        return not zstd_start(self.head) or (self.digest is not None and self.digest.digest() != self.expected)
+
+# Damaged romfs .zs files found while extracting, beside
+# the extracted romfs: its first line HEADS_MAGIC, then one path under romfs a line, with "/"
+HEADS_NAME = "romfs_zstd_heads.txt"
+HEADS_MAGIC = "hookshot romfs zstd heads 1"
+
+
+def file_system(path):
+    """The file system of the volume path is on (NTFS, exFAT, FAT32, ReFS): Windows only, None elsewhere"""
+    if os.name != "nt":
+        return None
+    import ctypes
+    k = ctypes.WinDLL("kernel32")
+    root, name = ctypes.create_unicode_buffer(261), ctypes.create_unicode_buffer(261)
+    if not k.GetVolumePathNameW(path, root, 261) or not k.GetVolumeInformationW(root, None, 0, None, None, None, name, 261):
+        return None
+    return name.value
+
+
+def out_of_space(error, dst, part, rel, size):
+    """A full drive said with the member being written and what its drive reports, to tell a full disk from a write the drive
+    refused with room to spare (issue 1388: 196 GB free on NTFS, stopped at 12 GB). None for any other error"""
+    if not isinstance(error, OSError) or error.errno != errno.ENOSPC:
+        return None
+    folder = os.path.dirname(dst)
+    try:
+        free = "%.1f GB free there" % (shutil.disk_usage(folder).free / 1e9)
+    except OSError:
+        free = "free space unknown"
+    kind = file_system(folder)
+    return OSError(errno.ENOSPC, "No space left on device writing %s/%s (%d bytes): %s%s" % (
+        part, rel, size, free, ", " + kind if kind else ""))
+
+
 def extract(nup, t, out, only=None, quiet=False):
-    total = n = 0
+    total = n = written = 0
+    digests = {}
+    details = getattr(nup, "file_details", ())
+    if only != "exefs" and details:
+        digests = {id(record): expected for record, (expected, _, _) in zip(nup.files, details)
+                   if expected != bytes(32)}
+    interval = 2
+    next_report = 0 if quiet else monotonic() + interval
+
+    def progress(size):
+        nonlocal written, next_report
+        written += size
+        now = monotonic()
+        if now >= next_report:
+            print("  %.1f MiB written (%d files completed)" % (written / (1 << 20), n), flush=True)
+            next_report = now + interval
+
+    where = Destination(out)
+    stale = True
     for part in ("exefs", "romfs"):
         if only and part != only:
             continue
+        damaged = [] if part == "romfs" else None
         for rel, r in nup.walk(t[part]):
-            dst = extraction_path(out, part, rel)
-            if os.path.exists(dst) and os.path.getsize(dst) == r[2]:
-                continue          # (re-runs pick up where they stopped)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            temporary = dst + ".part"
-            g = open(temporary, "wb")
+            dst = where.path(part, rel)
+            checked = damaged is not None and rel.endswith(".zs")
+            expected = digests.get(id(r)) if checked else None
+            try:
+                info = os.lstat(dst)
+            except FileNotFoundError:
+                info = None
+            if info is not None and is_link(info):
+                raise SystemExit("extraction path is a link or reparse point: %s" % dst)
+            # (an interrupted member is shorter than its size: written again)
+            if info is not None and stat.S_ISREG(info.st_mode) and info.st_size == r[2]:
+                if checked:
+                    with open(dst, "rb") as f:
+                        prefix = f.read(4)
+                        if not zstd_start(prefix):
+                            damaged.append(rel)
+                        elif expected is not None:
+                            digest = hashlib.sha256(prefix)
+                            for block in iter(lambda: f.read(1 << 20), b""):
+                                digest.update(block)
+                            if digest.digest() != expected:
+                                damaged.append(rel)
+                continue
+            # Written in place: a temporary and a rename per member took most of an extraction's time on Windows.
+            # A stale file is unlinked, not truncated, so another hard link to it keeps its data.
+            if info is not None:
+                os.unlink(dst)
+            if stale:   # (an interrupted builder that wrote through a temporary left it beside the first member still to write)
+                stale = False
+                with suppress(OSError):
+                    os.unlink(dst + ".part")
+            g = open(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)), "wb")
             try:
                 with g:
-                    nup.copy_to(r, g, rel)
-                os.replace(temporary, dst)
-            except BaseException:
+                    sink = HeadSink(g, expected) if checked else g
+                    nup.copy_to(r, sink if quiet else ProgressSink(sink, progress), rel)
+                if checked and sink.damaged():
+                    damaged.append(rel)
+            except BaseException as error:
+                full = out_of_space(error, dst, part, rel, r[2])   # (measured before the member's space is freed)
                 # Free the failed member's space without hiding the extraction error.
                 with suppress(OSError):
-                    os.unlink(temporary)
+                    os.unlink(dst)
+                if full:
+                    raise full from error
                 raise
             total += r[2]
             n += 1
-            if not quiet and n % 5000 == 0:
-                print("  %d files, %.1f GB" % (n, total / 1e9), flush=True)
+        if damaged is not None:   # (the whole romfs was walked: its answer is complete)
+            heads = os.path.join(out, HEADS_NAME)
+            with open(heads + ".part", "w", encoding="utf-8", newline="\n") as f:
+                f.write(HEADS_MAGIC + "\n" + "".join(rel + "\n" for rel in damaged))
+            os.replace(heads + ".part", heads)
     return n, total
+
+
+def read_heads(path):
+    """HEADS_NAME's list (paths under romfs, "/"), or None when the file is missing or not one of these"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return None
+    if not lines or lines[0] != HEADS_MAGIC:
+        return None
+    return read_heads_text("\n".join(lines[1:]))
+
+
+def read_heads_text(text):
+    """The paths of HEADS_NAME's list after its first line"""
+    return [line for line in text.split("\n") if line]
 
 
 def heal(nup, t, out, names):
@@ -471,19 +656,42 @@ def zstd_start(head):
     return head == ZSTD or (len(head) == 4 and head[1:] == b"\x2a\x4d\x18" and head[0] & 0xf0 == 0x50)
 
 
-def damaged_game_files(romfs):
+def still_in_nup_frame(f, head):
+    """Whether a .zs file that starts as zstd (head: its first 18 bytes) is the .nup's own frame round a damaged file, as
+    builders before #456 wrote them (#2361): a frame whose content is as large as the file, and that starts with zeros or
+    does not decompress. Only those are decompressed, and only their start: a game .zs file's content is larger than the
+    file, and most of them need the game's dictionary to decompress at all"""
+    if frame_content_size(head) != os.fstat(f.fileno()).st_size:
+        return False
+    import zstandard
+    f.seek(0)
+    try:
+        return not any(zstandard.ZstdDecompressor().stream_reader(f, read_size=1 << 14).read(16))
+    except zstandard.ZstdError:
+        return True
+
+
+def damaged_game_files(romfs, progress=None):
     """The romfs .zs files that do not start as zstd: in the 23.3 GB dumps three of them begin with zeros (the complete
     dump is about 23.8 GB), and the game then leaves out every model that uses one: the Water Temple's walls and floors,
-    the Great Fairy Fountain's floor (#1002, #718, #1259)"""
-    found = []
-    for folder, dirs, files in os.walk(romfs):
+    the Great Fairy Fountain's floor (#1002, #718, #1259). Also those still in the .nup's zstd frame (still_in_nup_frame).
+    progress(done, total), when given, after each file: the files are listed first, then opened one by one (about
+    100,000, minutes where a virus scanner looks at each one)"""
+    root = long_path(romfs)   # (walked and read as long paths; the paths returned are under romfs as given)
+    paths = []   # (the long path read, the path under romfs as given)
+    for folder, dirs, files in os.walk(root):
         dirs.sort()
-        for name in sorted(files):
-            if name.endswith(".zs"):
-                path = os.path.join(folder, name)
-                with open(path, "rb") as f:
-                    if not zstd_start(f.read(4)):
-                        found.append(path)
+        rel = os.path.relpath(folder, root)
+        paths += [(os.path.join(folder, name), os.path.normpath(os.path.join(romfs, rel, name)))
+                  for name in sorted(files) if name.endswith(".zs")]
+    found = []
+    for i, (path, given) in enumerate(paths):
+        with open(path, "rb") as f:
+            head = f.read(18)
+            if not zstd_start(head[:4]) or still_in_nup_frame(f, head):
+                found.append(given)
+        if progress:
+            progress(i + 1, len(paths))
     return found
 
 
@@ -493,33 +701,36 @@ def stand_in_for(path, damaged=()):
     one of the damaged files, even one already given a stand-in"""
     folder, name = os.path.split(path)
     suffix = re.search(r"(_[A-Za-z]+\d*)?(\.[^_]*)$", name).group(0)
-    size = os.path.getsize(path)
+    size = os.path.getsize(long_path(path))
     best = None
-    for other in os.listdir(folder):
+    for other in os.listdir(long_path(folder)):
         if other == name or not other.endswith(suffix):
             continue
         candidate = os.path.join(folder, other)
         if candidate in damaged:
             continue
-        with open(candidate, "rb") as f:
+        with open(long_path(candidate), "rb") as f:
             if not zstd_start(f.read(4)):
                 continue
-        score = (len(os.path.commonprefix((name, other))), -abs(os.path.getsize(candidate) - size))
+        score = (len(os.path.commonprefix((name, other))), -abs(os.path.getsize(long_path(candidate)) - size))
         if best is None or score > best[0]:
             best = (score, candidate)
     return best and best[1]
 
 
-def stand_in_damaged(romfs):
+def stand_in_damaged(romfs, progress=None, damaged=None):
     """Each damaged .zs file in an unpacked romfs replaced by a copy of its stand-in: (damaged, stand-in or None) each.
-    Only for a romfs this tool unpacked: the player's own folder is never written to"""
+    Only for a romfs this tool unpacked: the player's own folder is never written to. progress: damaged_game_files'.
+    damaged: the paths already known (the extraction's HEADS_NAME), so no file is opened to find them"""
     done = []
-    damaged = damaged_game_files(romfs)
+    if damaged is None:
+        damaged = damaged_game_files(romfs, progress)
+    excluded = set(damaged)
     for path in damaged:
-        other = stand_in_for(path, set(damaged))
+        other = stand_in_for(path, excluded)
         if other:
-            shutil.copyfile(other, path + ".part")
-            os.replace(path + ".part", path)
+            shutil.copyfile(long_path(other), long_path(path + ".part"))
+            os.replace(long_path(path + ".part"), long_path(path))
         done.append((path, other))
     return done
 

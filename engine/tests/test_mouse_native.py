@@ -18,6 +18,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
 ROOT = Path(__file__).resolve().parents[1]
 
 HOS_H = r"""
@@ -138,7 +141,7 @@ class MouseNativeTests(unittest.TestCase):
             shutil.copy(ROOT / "host" / "mouse_native.c", tmp / "mouse_native.c")
             (tmp / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t"
-            build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-I", str(tmp), "-I", str(ROOT / "host" / "posix"),
+            build = subprocess.run([compiler, "-std=gnu11", "-include", ENV_ON_H, "-Wall", "-O1", "-g", "-I", str(tmp), "-I", str(ROOT / "host" / "posix"),
                                     str(tmp / "t.c"), str(tmp / "mouse_native.c"), "-o", str(binary), "-lm"],
                                    text=True, capture_output=True)
             self.assertEqual(build.returncode, 0, build.stderr)

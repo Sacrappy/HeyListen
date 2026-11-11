@@ -20,6 +20,9 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
+#include "hookshot_env.h"
+#endif
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -528,13 +531,11 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineCommonConstants();
     DefineInterfaces(program);
     // (RX_VK_MESH_FIRST=1, with RX_VK_MESH_ARGS=1: off, one task program with it hung or ended the game at its first draw)
-    if (stage == Stage::Task && getenv("RX_VK_MESH_FIRST") && profile.unified_descriptor_binding && profile.support_int64) {
+    if (stage == Stage::Task && !runtime_info.mesh_fallback && env_on("RX_VK_MESH_FIRST") &&
+        profile.unified_descriptor_binding && profile.support_int64) {
         // (hookshot) the draw's first task workgroup, read through a pushed address (EmitIsbeRead)
         if (!Sirit::ValidId(U64)) { AddCapability(spv::Capability::Int64); U64 = Name(TypeInt(64, false), "u64"); }
         wants_mesh_first = true;
-        if (getenv("RX_VK_FOLLOW_MESH") && !getenv("RX_VK_NO_FOLLOW") && program.info.uses_global_memory) {
-            wants_guest_pages = true;   // (the block is made once: with the page table's member if the stage will want it)
-        }
         AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
         AddExtension("SPV_KHR_physical_storage_buffer");
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
@@ -551,6 +552,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     if (runtime_info.mesh_fallback && (stage == Stage::Task || stage == Stage::Mesh)) {
         mesh_fallback = true;
         wants_mesh_fallback = true;
+        wants_mesh_first = stage == Stage::Task;
         // (the push block is made below, before DefineGlobalMemoryFunctions can ask for the page table: a fallback stage
         // that follows pointers needs its member now, or the block would be made without it)
         wants_guest_pages = program.info.uses_global_memory && profile.support_int64;
@@ -1077,17 +1079,15 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     const char* const gp_test{getenv("RX_VK_GP_TEST")};   // (1: the addressing model alone, 2: and the table's load, 3 or unset: all of it)
     const int gp_level{gp_test ? atoi(gp_test) : 3};
     // (the culling; a graphics stage with it hung the renderer at a load. RX_VK_NO_FOLLOW: none of it, as before)
-    static const bool no_follow{getenv("RX_VK_NO_FOLLOW") != nullptr};
-    // (RX_VK_FOLLOW_MESH=1: the task and mesh stages too. Tried for the foliage, which it did not bring back: off)
-    static const bool no_mesh{getenv("RX_VK_FOLLOW_MESH") == nullptr};
+    static const bool no_follow{env_on("RX_VK_NO_FOLLOW")};
+    // (not the task and mesh stages: tried for the foliage, which it did not bring back)
     // (EvilOOT: vertex and fragment stages too, as the fallback only: an access no bound buffer holds read 0 there (Kokiri's
     // pond came out grey, not green). The pointer pass leaves graphics stages as they were, so what was found before still is,
     // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block.
     // RX_VK_FOLLOW_GRAPHICS=0: off)
     static const bool graphics{!getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0};
     const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
-    const bool follow_pointers{(stage == Stage::Compute || (!no_mesh && (stage == Stage::Task || stage == Stage::Mesh)) ||
-                                (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
+    const bool follow_pointers{(stage == Stage::Compute || (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
     Id ptr_u64{};
     if (follow_pointers) {
         wants_guest_pages = true;
@@ -1126,7 +1126,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // (the page table's lookup of addr: hit(target) is called in the block where the page is mapped, its device address in target,
     // and must end that block (a return). Falls through after it)
     // (RX_VK_FOLLOW_STORES=1: writes and atomics through the table too; off by default, see the storage buffer pass)
-    static const bool follow_stores{getenv("RX_VK_FOLLOW_STORES") != nullptr};
+    static const bool follow_stores{env_on("RX_VK_FOLLOW_STORES")};
     // (hookshot) size: the access's bytes. An access that runs past its 4 KB page is left to the miss path: the table maps pages one
     // by one, the next page may be another allocation's or none, and a 16-byte read at a page's end faulted the device (the culling
     // passes 53caac5f, b6122162 at a save's load)
@@ -1588,7 +1588,7 @@ void EmitContext::DefineRescalingInputPushConstant() {
         guest_pages_member_index = member_index++;
     }
     if (wants_mesh_first) {
-        members.push_back(U64);
+        members.push_back(mesh_fallback ? U32[1] : U64);
         mesh_first_member_index = member_index++;
     }
     if (wants_mesh_fallback) {
@@ -1596,6 +1596,10 @@ void EmitContext::DefineRescalingInputPushConstant() {
         mesh_fallback_payload_member_index = member_index++;
         members.push_back(U64);
         mesh_fallback_records_member_index = member_index++;
+        if (stage == Stage::Task) {
+            members.push_back(U64);
+            mesh_fallback_indirect_input_member_index = member_index++;
+        }
     }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1624,15 +1628,16 @@ void EmitContext::DefineRescalingInputPushConstant() {
         MemberName(push_constant_struct, mesh_first_member_index, "mesh_first");
     }
     if (wants_mesh_fallback) {
-        const std::array<std::pair<u32, u32>, 2> fallback_members{{
-            {mesh_fallback_payload_member_index, MESH_FALLBACK_PAYLOAD_PUSH_OFFSET},
-            {mesh_fallback_records_member_index, MESH_FALLBACK_RECORDS_PUSH_OFFSET},
-        }};
-        for (const auto& [member, offset] : fallback_members) {
-            MemberDecorate(push_constant_struct, member, spv::Decoration::Offset, offset);
-        }
+        MemberDecorate(push_constant_struct, mesh_fallback_payload_member_index, spv::Decoration::Offset,
+                       MESH_FALLBACK_PAYLOAD_PUSH_OFFSET);
+        MemberDecorate(push_constant_struct, mesh_fallback_records_member_index, spv::Decoration::Offset,
+                       MESH_FALLBACK_RECORDS_PUSH_OFFSET);
         MemberName(push_constant_struct, mesh_fallback_payload_member_index, "mesh_fallback_payload");
         MemberName(push_constant_struct, mesh_fallback_records_member_index, "mesh_fallback_records");
+        if (stage == Stage::Task) {
+            MemberDecorate(push_constant_struct, mesh_fallback_indirect_input_member_index, spv::Decoration::Offset,
+                           MESH_FALLBACK_INDIRECT_INPUT_PUSH_OFFSET);
+        }
     }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
@@ -2249,7 +2254,11 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + mesh_info.Corners() * mesh_info.max_primitives;
+    // Whole blocks of 32 primitives, as the attributes: the program writes the index bytes of every primitive block, lanes past
+    // max_primitives too (a count of 0 wraps its min(count - 1, lane) to every lane). Sized to max_primitives, those writes were
+    // clamped onto the last byte, the last primitive's last corner: with 126 primitives (most of OoT's) a stray vertex, flashing
+    // triangles over Kokiri's foliage and ground (as nxnative found: "primitive index bytes for every primitive block")
+    mesh_map_bytes = 4 + mesh_info.Corners() * Common::DivCeil(mesh_info.max_primitives, 32U) * 32;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
@@ -2339,7 +2348,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
     // (hookshot) A component of a generic output no line writes was undefined at the fragment stage (the console's: 0, and 1 for .w,
     // as the vertex stage's defaults here). The foliage is drawn by mesh programs: neon plants. RX_VK_MESH_NO_DEFAULTS=1: as before
-    if (!std::getenv("RX_VK_MESH_NO_DEFAULTS")) {
+    if (!env_on("RX_VK_MESH_NO_DEFAULTS")) {
         std::array<u32, IR::NUM_GENERICS> written{};
         for (const u32 line : mesh_info.vertex_lines) {
             const IR::Attribute attribute{line};

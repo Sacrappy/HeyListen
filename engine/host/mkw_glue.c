@@ -2,6 +2,9 @@
    commit (TOTK commits its whole 4 GB window up front; MKW's 512 GB window is only reserved), and stand-ins for the
    hooks of files not taken into host/ (the renderer and display, the profiler, mods, TOTK's own patches). */
 #include "hos.h"
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -698,7 +701,7 @@ int hos_ab(void) { return 0; }                    /* (hos_prof.c: A/B measuremen
 /* (with the renderer's mem: lines) HOS_MEM_MAP=1: how much of the guest window is committed, and its resident part */
 void hos_memory_map_log(void) {
     static int on = -1;
-    if (on < 0) on = getenv("HOS_MEM_MAP") != NULL;
+    if (on < 0) on = env_on("HOS_MEM_MAP");
     if (!on) return;
     uint64_t committed = 0, regions = 0;
     for (uint64_t a = 0; a < HOS_GUEST_SPACE;) {

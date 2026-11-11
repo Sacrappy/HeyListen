@@ -1,6 +1,7 @@
 """Quality presets preserve the player's frame-generation choice.
 
-Compile the menu's actual preset and row handlers with small stand-ins. No game
+Compile the menu's actual preset and row handlers with small stand-ins.
+Check that the game FPS cap keeps its saved key when its label changes. No game
 or GPU is needed.
 """
 import argparse
@@ -9,6 +10,8 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+
+RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,6 +36,7 @@ def definition(text, name):
 
 FIXTURE = r"""
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 
@@ -45,24 +49,34 @@ int saves = 0;
 void save() { ++saves; }
 void apply_pad_layout(int) {}
 void sync_preset_budgets(int) {}
+void env_release(const int*) {}   // (the environment's hold on a row: none here)
+void vram_budget_sync() {}
+constexpr int kVramMinimumOnly = 1;
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
 unsigned upscalers_available() { return 1; }
 namespace ur {
 int snap(int, int value) { return value; }
+int snap_render(int, int value) { return value; }   // (the slider)
 int step(int, int value, int dir) { return value + dir; }
 int step_upscaler(int, int dir, unsigned) { return dir; }
+int step_engine(int, int dir, unsigned) { return dir; }   // (the Upscaler by engine)
+void step_render(int up, int value, int dir, int* u, int* r) { *u = up, *r = value + dir; }
 }
 namespace mr { constexpr int kMax = 8; }
 void restart_values(int*) {}
 struct { void note(const int*) {} } restart_state;
 bool can_mic() { return false; }
 void mic_chosen() {}
+void samplers_changed() {}
+void prompts_at_once(const Row&) {}
 int step_output_choice(int id, int dir) { return id + dir; }
 const char* tx_framegen(int) { return ""; }
 const char* hn_framegen(int, int) { return ""; }
 const char* tx_preset(int) { return ""; }
 const char* hn_preset(int, int) { return ""; }
+const char* tx_fps_cap(int) { return ""; }
+/* INI_KEY */
 /* STOPS */
 /* PRESET */
 /* SET_ROW */
@@ -70,6 +84,10 @@ const char* hn_preset(int, int) { return ""; }
 int main() {
     Row framegen = /* FRAMEGEN_ROW */;
     Row quality = /* QUALITY_ROW */;
+    Row fps_cap = /* FPS_CAP_ROW */;
+    CHECK(std::strcmp(fps_cap.name, "Game frame rate cap") == 0);
+    CHECK(std::strcmp(ini_key(fps_cap), "frame_rate_cap") == 0);
+    CHECK(std::strstr(fps_cap.help, "Generated frames are additional") != nullptr);
     CHECK(opts.framegen == 0);
     for (int previous = 0; previous <= 8; ++previous) {
         for (int preset = 0; preset <= 5; ++preset) {
@@ -105,11 +123,16 @@ def fixture(source):
     row = re.search(r"struct Row \{.*?\n\};", menu, re.S)
     if not options or not tabs or not row:
         raise SystemExit("the menu's options, tabs, or row definition is missing")
+    fps_cap = re.search(r'\{TAB_GRAPHICS, "[^"]+", &opts\.fps_cap,', menu)
+    if not fps_cap:
+        raise SystemExit("missing game frame rate cap row")
     replacements = {
         "/* OPTIONS */": options.group(0),
         "/* TABS */": tabs.group(0),
         "/* ROW */": row.group(0),
         "/* STOPS */": definition(menu, "bool stops_at_ends"),
+        "/* INI_KEY */": definition(menu, "const char* ini_key"),
+        "/* FPS_CAP_ROW */": block(menu, fps_cap.start()),
         "/* PRESET */": definition(menu, "void apply_preset"),
         "/* SET_ROW */": definition(menu, "void set_row"),
         "/* FRAMEGEN_ROW */": block(menu, menu.index('{TAB_GRAPHICS, "Frame generation"')),

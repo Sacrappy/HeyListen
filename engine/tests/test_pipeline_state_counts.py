@@ -8,6 +8,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+RUN_ALL_ARGS = ["--cxx", "{cxx}"]
+
 ROOT=Path(__file__).resolve().parents[1]
 
 def block(text, marker):
@@ -22,8 +24,12 @@ def main():
     parser.add_argument('--cxx',default='clang++')
     args=parser.parse_args()
     text=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
-    targets=block(text,'bool targets_ok(')
-    actual='\n'.join((block(text,'constexpr char kStateMagic[8]')+';',block(text,'struct StateRec {')+';',
+    targets=block(text,'bool targets_ok(')+'\n'+block(text,'bool formats_ok(')
+    # (version 2 records and a version 1 mesh record's numbering: tests/test_pipeline_state_portable.py. These records draw no mesh)
+    actual='\n'.join((block(text,'constexpr char kStateMagic[8]')+';',block(text,'constexpr char kStateMagic2[8]')+';',
+                       block(text,'struct StateRec {')+';',block(text,'struct StateRec2 {')+';',
+                       'static bool state_v1_portable(StateRec& r){return !r.mesh;}',
+                       'static bool state_v2_resolve(const StateRec2&,StateRec&){return false;}',
                        block(text,'std::vector<StateRec> state_list_read(')))
     fixture=r'''
 #define _CRT_SECURE_NO_WARNINGS 1
@@ -39,6 +45,16 @@ def main():
 #include <string>
 #include <vector>
 constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_PATCH_LIST = 10;   // (vulkan_core.h)
+// (a device that draws to RGBA8 (37) and has D32 (126) as depth: vkGetPhysicalDeviceFormatProperties's answer)
+enum VkFormat : uint32_t { VK_FORMAT_UNDEFINED = 0 };
+typedef uint32_t VkFormatFeatureFlags;
+constexpr uint32_t VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT = 0x80, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x200;
+struct VkFormatProperties { uint32_t linearTilingFeatures, optimalTilingFeatures, bufferFeatures; };
+struct { void* physical = (void*)1; } dev;
+static void vkGetPhysicalDeviceFormatProperties(void*, VkFormat f, VkFormatProperties* p) {
+ p->optimalTilingFeatures = f == 37 ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : f == 126 ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+}
+static bool is_depth_format(VkFormat f) { return f >= 124 && f <= 130; }
 '''+targets+'\n'+actual+r'''
 static void write(const std::filesystem::path& path,const std::vector<StateRec>& records,size_t tail=0) {
  std::ofstream out(path,std::ios::binary);
@@ -59,6 +75,10 @@ int main(int argc,char** argv) {
  // (hookshot) the targets a pipeline is made with: at most 8, a sample count and topology Vulkan has, 16 attributes
  StateRec bad_n=maximum,neg_n=maximum,bad_samples=maximum,no_samples=maximum,bad_topo=maximum,bad_vattr=maximum;
  bad_n.n=9;neg_n.n=0xFFFFFFFFu;bad_samples.samples=3;no_samples.samples=0;bad_topo.topo=99;bad_vattr.nvattr=17;
+ // (hookshot) formats the device draws to: any number reached the driver as a VkFormat
+ StateRec drawn=maximum,bad_color=maximum,bad_depth=maximum;
+ drawn.color_format[0]=37;drawn.has_depth=1;drawn.depth_format=126;
+ bad_color.color_format[7]=0x7fffffffu;bad_depth.has_depth=1;bad_depth.depth_format=37;
  bad_answers=maximum;bad_answers.nanswers=25;
  bad_questions=maximum;bad_questions.nquestions=33;
  huge=maximum;huge.nanswers=huge.nquestions=std::numeric_limits<uint32_t>::max();
@@ -78,6 +98,7 @@ int main(int argc,char** argv) {
   write(path,{huge});check(path,{},"maximum integer counts");
   write(path,{bad_n,neg_n,bad_samples,no_samples,bad_topo,bad_vattr});check(path,{},"targets a pipeline cannot have");
   write(path,{bad_n,maximum,bad_topo});check(path,{maximum},"retain a valid record between bad targets");
+  write(path,{bad_color,drawn,bad_depth});check(path,{drawn},"formats the device does not draw to");
   write(path,{maximum,bad_answers,zero,bad_questions,maximum,huge,zero});
   check(path,{maximum,zero,maximum,zero},"retain valid records around rejected records");
   write(path,{maximum},sizeof(StateRec)-1);check(path,{maximum},"ignore truncated trailing record");

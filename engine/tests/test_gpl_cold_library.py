@@ -12,6 +12,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cxx", "{cxx}"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 FIXTURE = r"""
@@ -119,7 +124,8 @@ def check_source(draw):
         raise SystemExit("a cold library is not handed to a worker, or its job carries a flag a waiting draw would run")
     # (after the pipeline is ready, not before: the draw that waits for it runs this job itself, jobs_wait, and would be held
     # for as long as anything put before that takes)
-    job = between(draw, "    jobs_push([job] {\n        pipeline_note(job->key", "}, false, &e->ready);")
+    job = between(draw, "    jobs_push([job] {
+        pipeline_note(job->key", "}, false, &e->ready,")   # (HeyListen, TICK-008: the note on the worker)
     if job.index("job->e->ready.store(true") > job.index("gpl_build_cold("):
         raise SystemExit("the cold libraries are handed to the workers before the pipeline the draw waits for is ready")
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
@@ -142,7 +148,7 @@ def main():
         tmp = Path(tmp)
         (tmp / "t.cpp").write_text(FIXTURE.replace("@CODE@", code), encoding="utf-8")
         exe = tmp / "gpl-cold"
-        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", str(tmp / "t.cpp"), "-o", str(exe)], check=True)
+        subprocess.run([args.cxx, "-std=c++20", "-include", ENV_ON_H, "-Wall", "-Wextra", str(tmp / "t.cpp"), "-o", str(exe)], check=True)
         for extra, what in (([], "with the feature"), (["off"], "without the feature")):
             r = subprocess.run([str(exe)] + extra, capture_output=True, text=True)
             if r.returncode:

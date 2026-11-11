@@ -27,9 +27,13 @@ game data, leave it out.
 
 ## Ways to help
 
+What to work on first, and the steps from claiming a problem to its release, are in the [workflow](docs/workflow.md):
+priorities by severity and by how many players run the affected hardware, and the hardware tiers a change must not
+break. Claim in Discord #dev-work before you start.
+
 | | What |
 |---|---|
-| **Test on other hardware** | NVIDIA cards are the most tested; the README's [status table](readme.md#project-status) says what works where. Reports from AMD and Intel cards, other NVIDIA drivers, other distributions and SteamOS are useful even when everything works. |
+| **Test on other hardware** | NVIDIA cards are the most tested; the README's [status table](readme.md#project-status) says what works where, and [tested configurations](docs/tested-configurations.md) lists the runs behind it (build, hardware, driver, where, fps). Reports from AMD and Intel cards, other NVIDIA drivers, other distributions and SteamOS are useful even when everything works: add a row there. |
 | **Play further** | The tested area is the start of the game. Reaching new areas, cutscenes, menus and items finds problems the developer has not seen. |
 | **Report what is broken** | Use the [issue forms](https://github.com/NotRexed/Hookshot/issues/new/choose): game problem, build problem or idea. Include the version, your hardware, where you were and `hookshot_log.txt`. |
 | **Send a fix** | Fork, fix, test, open a pull request. Small, focused changes are easiest to review and merge. |
@@ -49,7 +53,8 @@ game data, leave it out.
 
 You need your own supported dump: program `0400486024DEC000`, update v131072, build `e0f3ccfa`. Other versions do
 not work, and the build reads the dump where it lies without changing it. Builds need about 60 GB free and a run uses
-about 10 GB of RAM.
+about 10 GB of RAM. Build on an SSD if you can: a hard drive works, but takes much longer, and the builder warns you
+before it starts.
 
 ### Windows, from the command line
 
@@ -57,8 +62,7 @@ about 10 GB of RAM.
    does not see packages installed there) and the pipeline's packages:
 
    ```powershell
-   python -m pip install lz4 numpy capstone "unicorn>=2.1,<2.2" zstandard
-   python -m pip install -r nx2/prompt_requirements.txt
+   python -m pip install -r requirements.txt
    ```
 
    (the second line: the button prompts' packages. Without them the game shows the Switch's icons)
@@ -73,7 +77,7 @@ about 10 GB of RAM.
 
    | From `tools` | To | Variable |
    |---|---|---|
-   | `tools\cpm` | anywhere | `RX_CPM` points at it (Vulkan headers and FFmpeg; without it the Vulkan renderer is left out) |
+   | `tools\cpm` | anywhere | `RX_CPM` points at it (Vulkan headers and FFmpeg; without it, system headers or `HOOKSHOT_*_HEADERS`, the standalone build stops) |
    | `tools\wgpu-native` | anywhere | `WGPU_NATIVE` points at it (the WebGPU fallback renderer; without it the game is built without one) |
    | `tools\third_party` | `third_party\` | (its `.dll`, `.exe`, `.lib` and `.sha1` files, to the same places: `a64emit`, `lld-link`, `zbic` and SDL2) |
    | `tools\work` | `work\` | (hot-function list, link order, profile and icon; without it the game builds but runs slower) |
@@ -128,12 +132,20 @@ workload, or build it from a developer prompt:
 dotnet build builder/HookshotBuilder.sln
 ```
 
+For a Windows installation that keeps its own state on an external SSD, see
+[portable Builder setup and relocation](docs/windows-portable-builder.md).
+
 You only need Visual Studio for the builder itself. The game build uses llvm-mingw.
 
 The Windows app's **Build workers** choice applies to builds started from that window. **Automatic** keeps the existing
 `HOOKSHOT_JOBS` override, or the build tools' free-memory policy when no override is set. A number overrides it for that
 build's child process only; more workers need more memory and are not always faster. This choice is not saved: a new
 window, including one started to update a game, uses Automatic again.
+
+Its **Build memory** choice is saved with the build's other settings, and the updates use it too, as they show no menu.
+**Automatic** keeps the free-memory policy. A number of GB sets
+`HOOKSHOT_MEM_LIMIT_GB` for that build: the compilers may then reserve that much together, whatever is free now. The
+compilers that always run (up to 4 on Windows) still run under a smaller number.
 
 ## Building
 
@@ -164,14 +176,15 @@ python -I -B tests/run_all.py
 It runs every `tests/test_*.py` and `nx2/test_*.py` in its own process, the C++ unit tests under `gpu/vk/tests` and a
 byte-compile of every tracked Python file, goes on after a failure, and ends with a table (slowest first) and every
 failure's output. Name a check to run only the ones whose path contains it (`python -I -B tests/run_all.py ub_`). A new
-`test_*.py` file is picked up by itself: no workflow to edit.
+`test_*.py` file is picked up by itself: no workflow to edit. The slowest checks start first, by the times in
+`tests/run_all_times.json`, which also split CI's Linux and Windows runs into two parts each (`--shard 1/2`,
+`--shard 2/2`); a full run with `--write-times` refreshes this OS's times there.
 
 Some checks compile a small C or C++ fixture and need a compiler (`g++`, `gcc` or `clang++` on PATH), the SPIR-V
 validator (`spirv-val`), the SPIR-V or Vulkan headers (`HOOKSHOT_SPIRV_HEADERS` / `HOOKSHOT_VULKAN_HEADERS`, or the CPM
 cache in `RX_CPM` or `build-linux/deps/cpm`), or the `zstandard` package. A check whose tool is missing is skipped and
-says so; CI passes `--strict`, which fails it instead. The skip list at the top of `tests/run_all.py` names the checks
-that cannot run in CI (a GPU, the game, a Visual Studio prompt) and the few that run on Linux only; `--no-skip` runs
-them anyway.
+says so; CI passes `--strict`, which fails it instead. A check that cannot run in CI (a GPU, the game, a Visual Studio
+prompt), or runs on one OS only, says so in its own file with `RUN_ALL_SKIP`; `--no-skip` runs it anyway.
 
 ### Checks that need your dump or a run
 
@@ -194,9 +207,19 @@ the development guide's [reference](docs/development.md#switches-for-testing-and
 - Add a game-free test where the behavior can be tested without the dump. The existing tests are small Python files
   under `tests/` or `nx2/` that read source files and run them, or compile a tiny C++ fixture.
 - Name it `tests/test_*.py` or `nx2/test_*.py`: `tests/run_all.py` picks it up by itself and CI runs it on every pull
-  request, so there is no workflow to edit. A test that takes a compiler, headers or `spirv-val` as arguments gets an
-  entry in `ARGS` at the top of `tests/run_all.py`; one that cannot run in CI (a GPU, the game, one OS only) gets an
-  entry in `SKIP`, with the reason.
+  request, so there is no workflow to edit. What it needs from the runner it declares in its own file, after its
+  docstring and imports, as plain literals `tests/run_all.py` reads without importing the test (its docstring has
+  the details); there is no central list to add a line to:
+
+  ```python
+  RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]   # a compiler, headers, spirv-val ...
+  RUN_ALL_MODULES = ["zstandard"]                                       # packages it imports
+  RUN_ALL_SKIP = {"windows": "POSIX signals: the Linux guard"}          # cannot run in CI there (a GPU, the game,
+                                                                        # one OS only), and why
+  ```
+
+  `{name}` is a tool the runner finds (`cxx`, `vulkan_headers`, `spirv_headers`, `spirv_val`, `glslang`, `dotnet`);
+  a check whose tool is missing is skipped, or fails with `--strict`. A test that needs none of this declares nothing.
 - Keep the test fast: every check shares one CI job with a 20-minute limit. Make it pass on both Ubuntu and Windows
   where it can.
 - If the fix is in the renderer or the runtime, say what you saw before and after, on which GPU and driver, and in
@@ -231,21 +254,45 @@ the development guide's [reference](docs/development.md#switches-for-testing-and
 1. Fork the repository and branch from `main`. Name the branch for the change: `fix/...`, `linux/...`, `builder/...`,
    `docs/...`.
 2. Keep the pull request to one topic. Bug fixes do not carry refactors, and two unrelated fixes are two PRs.
-3. Write the title as a short imperative sentence, as the history does: "Stop scanning storage-buffer tables after
-   one pass", "Linux: a crash report gives the whole host stack". Start the body with why the PR is needed, in one or
-   two plain sentences a player could follow: the bug, the missing feature or the cost it removes ("The menu's text
-   is cut off at 4K", "First starts spend 20 s waiting on a few shaders"). Then say what changed, how it was tested
-   (GPU, driver, game area, fps before and after), and link the issue it fixes.
-4. Include screenshots when the change shows on screen: graphics, the menu, the start-up screen, an overlay, a
+3. Write the title as a Conventional Commit (see [Pull request titles](#pull-request-titles) below). Start the body
+   with why the PR is needed, in one or two plain sentences a player could follow: the bug, the missing feature or the
+   cost it removes ("The menu's text is cut off at 4K", "First starts spend 20 s waiting on a few shaders"). Then say
+   what changed and how it was tested (GPU, driver, game area, fps before and after).
+4. Link the issues the PR fixes, if there are any. Write `Fixes #123` in the body (one line per issue) so that merging
+   the PR closes the issue. If the PR only addresses part of an issue, or is related to one, write `Part of #123` or
+   `See #123` instead, so the issue stays open. Search the open issues before you open the PR: a report may already
+   describe the bug you fixed.
+5. Include screenshots when the change shows on screen: graphics, the menu, the start-up screen, an overlay, a
    message. Before and after for a fix, the new screen for a feature, and the sizes or settings it was checked at. A
    screenshot of the game is fine; the rule above is about game files, not pictures of the game.
-5. Run the relevant checks. CI must pass; a change that only works on your machine is not ready.
-6. Rebase or merge `main` when it has moved, and resolve conflicts in your branch rather than in the review.
-7. Do not include build output, dumps, generated files or a `.gitignore` bypass. Check `git status`.
+6. Run the relevant checks. CI must pass; a change that only works on your machine is not ready.
+7. Rebase or merge `main` when it has moved, and resolve conflicts in your branch rather than in the review.
+8. Do not include build output, dumps, generated files or a `.gitignore` bypass. Check `git status`.
 
-Commit subjects decide the next release: write them as Conventional Commits (`feat:`, `fix:`, and `!` or
-`BREAKING CHANGE:` for a break). The version rules, branches and changelog format are in
-[docs/versioning.md](docs/versioning.md).
+### Pull request titles
+
+A pull request is squash-merged, so its title becomes the commit on `main`, and that commit decides the next release
+and its changelog line. The title is a [Conventional Commit](https://www.conventionalcommits.org/): a type, an optional
+scope in parentheses, a colon, and a short description. The *PR title* check fails until it is one; edit the title
+and the check runs again.
+
+| Type | For | Example from this repository |
+|---|---|---|
+| `feat` | something new for players or modders | `feat(menu): tabbed category layout for in-game options with bumper and Q/E navigation` |
+| `fix` | a bug fix | `fix: preserve the changelog when release generation fails` |
+| `perf` | faster, or less memory | `perf(linux): hand guest memory to the GPU as udmabuf dma-bufs, not host pointers` |
+| `refactor` | a change with no effect on behaviour | `refactor(vk): ...` |
+| `docs` | documentation only | `docs: document the built game's command-line arguments` |
+| `test` | tests only | `test: cover pool-less NVN buffer mappings` |
+| `ci` | the GitHub workflows | `ci: actions pinned by commit, least privilege, realistic timeouts, Dependabot and actionlint` |
+| `build` | the build scripts, the AppImage, the builder package | `build: scope the shader cache stamp to its consumer` |
+| `chore` | anything else | `chore: remove patch backup files added by mistake` |
+| `revert` | undoing an earlier change | `revert: ...`, with the reverted PR in the body |
+
+The scope is optional and names the part of the project: `vk`, `linux`, `builder`, `menu`, `video`, `runtime` and so
+on. `feat` makes the next release a minor version, and `fix` and `perf` a patch (each first as a release candidate). A `!` after the type or scope (`feat(builder)!: ...`)
+marks a breaking change. The other types make no release on their own. The commits inside a branch can be written
+any way you like: only the title reaches `main`. The version rules are in [docs/versioning.md](docs/versioning.md).
 
 Maintainer commits record AI assistance with `Assisted-by:` and `Co-Authored-By:` trailers. If you used a tool, add
 the trailers that describe it; if you wrote the change yourself, there is nothing to add.

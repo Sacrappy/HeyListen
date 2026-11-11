@@ -1,5 +1,5 @@
 """The lift driver: image (we are rtld) -> function discovery -> C, on the vendored a64-kit plus the Switch 2
-additions (nso2: DT_RELR, insn: ARMv8.1-8.5 forms, lift_fixes: jump tables).
+additions (nso2: DT_RELR, insn: ARMv8.1-8.5 forms, lift_fixes: jump tables, suyu_rt_fixes: FPX1's binary32 FMA).
 
 Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-func N] [--layout eden|a64] [--aslr 0]
   --layout eden (default): Eglantine's addresses, rtld included, from 0x80000000 + --aslr (image.py; an emulator
@@ -29,6 +29,7 @@ import kit
 import nso2  # noqa: F401  (DT_RELR)
 import insn
 import lift_fixes
+import suyu_rt_fixes
 import chunks
 import standalone
 import adr_entries  # noqa: E402
@@ -42,6 +43,7 @@ import a64_rtgen
 
 insn.install()
 lift_fixes.install()
+suyu_rt_fixes.install()
 
 
 def module_of(img, pc):

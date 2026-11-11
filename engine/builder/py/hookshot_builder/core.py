@@ -40,8 +40,11 @@ class Tools:
             cands.append(os.path.join(cur, "HookshotBuilder", "tools"))
         for c in cands:
             if c and os.path.isfile(os.path.join(c, "nx2", "make_game.py")):
+                # (tools with a Python of their own run no other. With its python.exe gone, the first "python" Windows found
+                # ran them instead: another version, without the modules they need, or not one the player chose to trust
+                # with the game files. Its start now fails and says how to get it back: own_python_missing)
                 py = os.path.join(c, "python", "python.exe")
-                return Tools(c, py if os.path.isfile(py) else "python")
+                return Tools(c, py if os.path.isfile(py) or os.path.isdir(os.path.join(c, "python")) else "python")
         d = paths.APP_DIR
         while True:   # (a source checkout: builder/py/hookshot_builder in it)
             if os.path.isfile(os.path.join(d, "nx2", "make_game.py")):
@@ -50,6 +53,15 @@ class Tools:
             if up == d:
                 return None
             d = up
+
+
+OWN_PYTHON_MISSING = ("The builder's own Python (tools/python/python.exe) is missing. Your antivirus probably removed it: restore "
+                      "it from quarantine, then try again.")
+
+
+def own_python_missing(tools):
+    """The tools' own Python is gone: an antivirus took it, most often, after a false alarm on the download"""
+    return not os.path.isfile(tools.python) and os.path.isdir(os.path.join(tools.root, "python"))
 
 
 def build_env(tools, workers=None, ngx_sdk=None):
@@ -98,7 +110,7 @@ class Runner:
                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                  creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
         except OSError as e:
-            self.on_finished("The build tools could not start: %s" % e)
+            self.on_finished(OWN_PYTHON_MISSING if own_python_missing(self.tools) else "The build tools could not start: %s" % e)
             return
         self.process = p
 
@@ -128,9 +140,8 @@ def check(tools, args):
         p = subprocess.run(build_command(tools, args), cwd=tools.root, env=build_env(tools), capture_output=True,
                            stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
     except OSError:
-        if tools.python == "python" and os.path.isdir(os.path.join(tools.root, "python")):
-            return False, ("The builder's own Python (tools/python/python.exe) is missing. Your antivirus probably removed it: restore "
-                           "it from quarantine, then try again.")
+        if own_python_missing(tools):
+            return False, OWN_PYTHON_MISSING
         return False, "Python 3 was not found. Install it from python.org (not the Microsoft Store build)."
     result, answered = (False, "The game files could not be read."), False
     for line in p.stdout.decode("utf-8", "replace").splitlines():
@@ -294,6 +305,45 @@ def free_space(path):
         return root, shutil.disk_usage(root).free
     except OSError:
         return None, None
+
+
+def spinning(path):
+    """True on a hard drive, False on an SSD, None when the drive cannot be told (Disk.cs's IOCTL: the volume's seek penalty).
+    A build reads and writes tens of gigabytes, and an SSD makes that much faster: a warning only, never a stop."""
+    try:
+        from ctypes import wintypes
+        root = os.path.splitdrive(os.path.abspath(os.path.expanduser(path)))[0]
+        if not root:
+            return None
+
+        class Query(ctypes.Structure):
+            _fields_ = [("PropertyId", wintypes.DWORD), ("QueryType", wintypes.DWORD), ("Additional", wintypes.DWORD)]
+
+        class SeekPenalty(ctypes.Structure):
+            _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD), ("IncursSeekPenalty", ctypes.c_ubyte)]
+
+        k = ctypes.windll.kernel32
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k.DeviceIoControl.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k.CreateFileW("\\\\.\\" + root, 0, 0x1 | 0x2, None, 3, 0, None)   # (read + write share, OPEN_EXISTING)
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            query, answer, returned = Query(7, 0, 0), SeekPenalty(), wintypes.DWORD()
+            ok = k.DeviceIoControl(handle, 0x002D1400, ctypes.byref(query), ctypes.sizeof(query), ctypes.byref(answer),
+                                   ctypes.sizeof(answer), ctypes.byref(returned), None)
+            if not ok or returned.value < ctypes.sizeof(answer):
+                return None
+            return bool(answer.IncursSeekPenalty)
+        finally:
+            k.CloseHandle(handle)
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 # ---------------- the player's game files (Finder.cs) ----------------

@@ -13,7 +13,8 @@ and the play profile (addresses and counts made on the development PC).
     python -I scripts/release_parts.py package <out folder> --publish <dotnet publish folder> --setup <setup exe>
                                        [--list <setup list>] [--python-packages <requirements>] [--profile <folder>]
         the package folder make_setup_parts.py splits: the published builder, the setup, LICENSE, the tracked gpu, host, nx2
-        and scripts under tools/, tools/work (the profile) and tools/third_party: the tracked files and, from the list's
+        and scripts under tools/, the pipeline state list's sources (assets/pipeline_states/, which must be there and read),
+        tools/work (the profile) and tools/third_party: the tracked files and, from the list's
         third_party part, the prebuilt files the repository does not carry (a64emit.dll, lld-link.exe, SDL2.dll, SDL3.dll,
         zbic.dll; rebuilt on the player's PC when their sources' stamps differ). Python, emsdk, CPM and wgpu-native are not
         in it: make_setup_parts.py --reuse takes their parts from the list. --python-packages: when the list's Python part
@@ -223,7 +224,30 @@ def package(a):
         for n in names:
             copy(os.path.join(a.profile, n), os.path.join(work, n))
         print("play profile from %s: %s" % (a.profile, ", ".join(names)))
+    if state_list(tools) != 0:
+        return 1
     print("package folder: %s" % out)
+    return 0
+
+
+def state_list(tools):
+    """The sources of the pipeline state list a release ships (assets/pipeline_states/: the tour's list, the contributed ones and
+    their notes), into tools/ at the same path: nx2/make_game.py merges them beside the game. Required: without them a new
+    install's first field load is drawn white for seconds while its pipelines compile (v2.0.8 to v2.0.14 shipped none). 1, with
+    the reason, when there are none or one does not read (nx2/pipeline_states.py check)"""
+    spec = importlib.util.spec_from_file_location("pipeline_states", os.path.join(ROOT, "nx2", "pipeline_states.py"))
+    states = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(states)
+    src = states.sources_dir(ROOT)
+    try:
+        recs = states.check_sources(src)
+    except SystemExit as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    dst = states.sources_dir(tools)
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+    print("the pipeline state list: %s" % states.describe(recs))
     return 0
 
 

@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+RUN_ALL_ARGS = ["--cxx", "{cxx}"]
+
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[1])
 p.add_argument('--cxx', default='clang++')
@@ -24,6 +26,7 @@ functions = '\n'.join(function(marker) for marker in [
     'void reflex_swapchain_created(', 'void reflex_swapchain_destroyed()',
     'void reflex_present_begins()', 'void reflex_submit_ends()',
     'const void* reflex_present_id(', 'void reflex_presented()', 'void reflex_sleep()',
+    'uint64_t reflex_frame()', 'void reflex_game_submitted()',
 ])
 fixture = r'''
 #include <cstdint>
@@ -47,13 +50,13 @@ struct TestMutex {
     void lock(){auto hook=before_lock;before_lock=nullptr;if(hook)hook();native.lock();}
     void unlock(){native.unlock();}
 };
-int markers=0,sleeps=0,modes=0;bool invalid=false,fg=false;int wanted=1;
-void marker_call(int,uint64_t chain,const VkSetLatencyMarkerInfoNV*){if(!chain)invalid=true;++markers;}
+int markers=0,sleeps=0,modes=0;bool invalid=false,fg=false;int wanted=1;uint64_t marked_id=0;
+void marker_call(int,uint64_t chain,const VkSetLatencyMarkerInfoNV* i){if(!chain)invalid=true;++markers;marked_id=i->presentID;}
 int sleep_call(int,uint64_t chain,const VkLatencySleepInfoNV*){if(!chain)invalid=true;++sleeps;return VK_SUCCESS;}
 struct Reflex {
     bool ready=true,latency=true,latency_next=true,frame_marked=true;
     uint64_t swapchain=42,swapchain_generation=0,wake=100,wake_value=0,id=1;
-    int mode=1;TestMutex mu;PresentId pid;
+    int mode=1;TestMutex mu;PresentId pid;uint64_t pid_value=0,presenting=0,last_present_id=0;
     void (*marker)(int,uint64_t,const VkSetLatencyMarkerInfoNV*)=marker_call;
     int (*sleep)(int,uint64_t,const VkLatencySleepInfoNV*)=sleep_call;
 } state;
@@ -65,6 +68,7 @@ void apply_mode(){if(!state.swapchain)invalid=true;++modes;}
 void log_timings(){}
 template<class... T> void logf(const char*,T...){}
 int vkWaitSemaphores(int,const VkSemaphoreWaitInfo*,uint64_t);
+constexpr uint64_t kReflexThisFrame=~0ull;thread_local uint64_t reflex_present_frame=kReflexThisFrame;
 ''' + functions + r'''
 enum Action {Keep,Retire,Replace,ReuseHandle,LaterSleep,Disable,EnableFG};
 Action action=Keep;
@@ -83,11 +87,12 @@ int vkWaitSemaphores(int,const VkSemaphoreWaitInfo* wait,uint64_t){
 void reset(){
     state.swapchain=42;state.swapchain_generation=0;state.ready=state.latency=state.latency_next=state.frame_marked=true;
     state.wake_value=0;state.id=1;state.mode=1;markers=sleeps=modes=0;invalid=fg=false;wanted=1;before_lock=nullptr;action=Keep;
+    state.pid_value=state.presenting=state.last_present_id=0;marked_id=0;reflex_present_frame=kReflexThisFrame;
 }
 void retire_before_lock(){reflex_swapchain_destroyed();}
 int main(){
     reset();reflex_sleep();if(invalid||markers!=2||sleeps!=1||!state.frame_marked)return 1;
-    for(auto change:{Retire,Replace,ReuseHandle,LaterSleep,Disable,EnableFG}){
+    for(auto change:{Retire,Replace,ReuseHandle,LaterSleep,Disable}){
         reset();action=change;reflex_sleep();
         if(invalid||markers){std::puts("FAIL: a completed wait marked a retired/replaced/ineligible chain");return 2;}
         if((change==Retire||change==Replace||change==ReuseHandle)&&state.frame_marked)return 3;
@@ -101,7 +106,24 @@ int main(){
     reset();action=ReuseHandle;reflex_sleep();action=Keep;reflex_sleep();if(invalid||markers!=2||!state.frame_marked)return 9;
     reset();reflex_present_begins();reflex_submit_ends();reflex_present_id(nullptr);reflex_presented();
     if(invalid||markers!=5)return 10;
-    std::puts("PASS: Reflex retirement before locks and across waits, reused handles, stable wait targets and recovery");
+    // Frame generation: the game's frames are still marked and paced (a wait that turns it on marks the frame too)
+    reset();action=EnableFG;reflex_sleep();if(invalid||markers!=2||!state.frame_marked)return 11;
+    reset();fg=true;reflex_present_begins();if(markers!=2)return 12;
+    reset();fg=true;reflex_game_submitted();if(markers!=1||reflex_frame()!=1)return 13;
+    reset();state.frame_marked=false;if(reflex_frame()!=0)return 14;
+    // its display thread: a made frame gets no present id and no markers; the set's game frame its own id, going up only
+    reset();fg=true;state.id=7;reflex_present_frame=0;
+    if(reflex_present_id(&next)!=&next||markers)return 15;
+    reflex_presented();reflex_submit_ends();if(markers)return 16;   // (nor do the display thread's copies end the game's submission)
+    reflex_present_frame=5;
+    const auto* id5=static_cast<const PresentId*>(reflex_present_id(&next));
+    if(id5!=&state.pid||id5->pNext!=&next||id5->swapchainCount!=1||*id5->pPresentIds!=5||markers!=1||marked_id!=5)return 17;
+    reflex_presented();if(markers!=2||marked_id!=5)return 18;
+    if(reflex_present_id(&next)!=&next||markers!=2)return 19;   // (5 again: not going up)
+    reflex_present_frame=kReflexThisFrame;   // (then frame generation off: the frame being made, 7, goes up from 5)
+    if(reflex_present_id(&next)!=&state.pid||*state.pid.pPresentIds!=7||marked_id!=7)return 20;
+    std::puts("PASS: Reflex retirement before locks and across waits, reused handles, stable wait targets and recovery; "
+              "with frame generation the game's frames paced, made frames without present ids, the game frame's own id");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='reflex-swapchain-') as tmp:

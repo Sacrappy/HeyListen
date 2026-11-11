@@ -3,15 +3,39 @@ gpu/vk/tests and a byte-compile of every tracked Python file. All of them run ev
 printed whole at the end, with a table of every check (slowest first), also to $GITHUB_STEP_SUMMARY when it is set.
 Exits 1 when anything failed.
 
-    python -I -B tests/run_all.py [--jobs N] [--timeout SECONDS] [--strict] [--no-skip] [name ...]
+    python -I -B tests/run_all.py [--jobs N] [--timeout SECONDS] [--strict] [--no-skip] [--shard K/N] [name ...]
 
 A name picks the checks whose path contains it. --strict: a check that needs a tool this PC lacks (a compiler, the
-SPIR-V or Vulkan headers, spirv-val) fails instead of being skipped (CI installs them all). --no-skip runs the checks on
-the skip list below too. Standard library only: no package is installed for the runner itself.
+SPIR-V or Vulkan headers, spirv-val) fails instead of being skipped (CI installs them all). --no-skip runs the checks a
+test skips on this OS too. Standard library only: no package is installed for the runner itself.
+
+A test says what it needs in its own file, with up to three top-level assignments of plain literals (after its
+docstring and imports). The runner reads them with ast and never imports the test; a test that declares none runs with
+no arguments and its own defaults.
+
+    RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]   # its command-line arguments
+    RUN_ALL_MODULES = ["zstandard"]                                       # Python packages it imports
+    RUN_ALL_SKIP = {"windows": "needs spirv-val: checked on Linux"}       # OS ("linux", "windows") -> why it is skipped
+
+{name} in an argument is a tool or folder find_tools looks for (cxx, vulkan_headers, spirv_headers, spirv_val, glslang,
+dotnet); a check whose tool, compiler (the word after --cc or --cxx) or module is missing here is skipped, or fails
+with --strict. A check skipped on both OSes (a GPU, the game) names both. A declaration that is not a plain literal of
+that shape, names an unknown placeholder or OS, or any other RUN_ALL_ name, stops the run with the file and line; so
+does one set or changed anywhere but its own top-level line (inside an if or a try, .append(...), +=, a subscript).
+Only the tests a run picks (by name) are read: a bad declaration elsewhere does not stop it. A test that does not parse
+fails, on every OS, without running.
+
+The slowest checks start first, so a long one does not begin last and run on alone: tests/run_all_times.json has each
+OS's checks of 2 s or more, as CI last measured them (a check not in it counts as 1 s). --shard K/N runs the K-th of N
+parts, which split the checks by those times so the parts take about as long (CI runs Windows in parts); every check is
+in exactly one part, whatever the times say, so stale times only make the parts uneven. After a full run on one OS,
+--write-times puts that run's times in the file, for that OS.
 """
 import argparse
+import ast
 import concurrent.futures
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -23,142 +47,24 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WINDOWS = os.name == "nt"
 OS = "windows" if WINDOWS else "linux"
 
-# Arguments some tests need. {name} is a tool or folder found below (find_tools); a check whose tools are missing is
-# skipped, or fails with --strict. Tests not listed run with no arguments and their own defaults.
-ARGS = {
-    "tests/test_png_publication.py": ["--cxx", "{cxx}"],
-    "tests/test_framelog_sink.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_capture_slot_ownership.py": ["--cxx", "{cxx}"],
-    "tests/test_setup_tar_diagnostics.py": ["--cc", "gcc"],
-    "tests/test_display_startup_failure.py": ["--cxx", "{cxx}"],
-    "tests/test_frame_wait_bounds.py": ["--cxx", "{cxx}"],
-    "tests/test_fallback_buffer_cleanup.py": ["--cxx", "{cxx}"],
-    "tests/test_capture_resources.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_mesh_args_cleanup.py": ["--cxx", "{cxx}"],
-    "tests/test_present_aspect.py": ["--cxx", "{cxx}"],
-    "tests/test_present_aspect_vulkan.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
-    "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
-    "tests/test_msync_fast.py": ["--cxx", "{cxx}"],
-    "tests/test_readback_ticket.py": ["--cxx", "{cxx}"],
-    "tests/test_capture_stream_copy.py": ["--cxx", "{cxx}"],
-    "tests/test_capture_merge.py": ["--cxx", "{cxx}"],
-    "tests/test_flash_sampling.py": ["--cxx", "{cxx}"],
-    "tests/test_capture_dimensions.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_ui_texture_upload.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_multiwait_wake.py": ["--cxx", "{cxx}"],
-    "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
-    "tests/test_prof_sampling.py": ["--cxx", "{cxx}"],
-    "tests/test_present_geometry_trace.py": ["--cxx", "{cxx}"],
-    "tests/test_screensaver.py": ["--cc", "gcc"],
-    "tests/test_windows_display_startup.py": ["--cc", "gcc"],
-    "tests/test_system_header_cache.py": ["--cc", "clang"],
-    "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
-    "tests/test_vulkan_clear_mip.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_vulkan_copy_span.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_vulkan_copy_span_gpu_compile.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_input_background.py": ["--cc", "gcc"],
-    "tests/test_framegen_resources.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_framegen_preset.py": ["--cxx", "{cxx}"],
-    "tests/test_oot_wide_save_picture.py": ["--cc", "gcc"],
-    "nx2/test_import_windows.py": ["--cxx", "g++"],
-    "tests/test_import_write_watch.py": ["--cxx", "{cxx}"],
-    "tests/test_lower_depbar.py": ["--cxx", "clang++"],
-    "tests/test_lower_register_markers.py": ["--cxx", "clang++"],
-    "tests/test_text_speed.py": ["--cc", "gcc"],
-    "tests/test_audio_in.py": ["--cc", "gcc", "--cxx", "g++"],
-    "tests/test_upscale_fallback.py": ["--cxx", "g++"],
-    "tests/test_reserved_core.py": ["--cxx", "g++"],
-    "tests/test_fsr3_shaders.py": ["--glslang", "{glslang}", "--spirv-val", "{spirv_val}"],
-    "tests/test_fg_scale_sharpen.py": ["--cxx", "g++"],
-    "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
-    "tests/test_target_overlap.py": ["--cxx", "g++"],
-    "tests/test_segment_plan.py": ["--cxx", "g++"],
-    "tests/test_gone_ring.py": ["--cxx", "g++"],
-    "tests/test_split_count.py": ["--cxx", "g++"],
-    "tests/test_mirror_inherit.py": ["--cxx", "{cxx}"],
-    "tests/test_menu_hit.py": ["--cxx", "g++"],
-    "tests/test_ui_record.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_game_font.py": ["--cxx", "{cxx}"],
-    "tests/test_menu_utf8.py": ["--cxx", "{cxx}"],
-    "tests/test_menu_keys.py": ["--cxx", "{cxx}"],
-    "tests/test_prompt_font_bind.py": ["--cc", "gcc"],
-    "tests/test_stick_dead_zone.py": ["--cc", "gcc", "--cxx", "g++"],
-    "tests/test_menu_restart.py": ["--cxx", "g++", "--cc", "gcc"],
-    "tests/test_output_resolution.py": ["--cxx", "{cxx}"],
-    "tests/test_widescreen_shapes.py": ["--cc", "gcc"],
-    "tests/test_nvn_buffer_map.py": ["--cc", "gcc"],
-    "tests/test_nvn_host_tables.py": ["--cc", "gcc"],
-    "tests/test_startup_progress.py": ["--cxx", "g++"],
-    "tests/test_audio_voice_biquad.py": ["--cc", "gcc"],
-    "tests/test_audio_output_menu.py": ["--cxx", "g++"],
-    "tests/test_motion.py": ["--cc", "gcc"],
-    "tests/test_low_memory_notice.py": ["--cc", "gcc"],
-    "tests/test_cpp_preflight.py": ["--cxx", "g++"],
-    "tests/test_invalidate_vcore.py": ["--cxx", "g++"],
-    "tests/test_linux_driver_fault_guard.py": ["--cxx", "{cxx}"],
-    "tests/test_gpl_cold_library.py": ["--cxx", "{cxx}"],
-    "tests/test_seed_cs_pointers.py": ["--cxx", "g++"],
-    "tests/test_program_record_head.py": ["--cxx", "g++"],
-    "tests/test_seed_kept_loaded.py": ["--cxx", "g++"],
-    "tests/test_prepare_seed_stamp.py": ["--cxx", "g++"],
-    "tests/test_lower_atomg_cas.py": ["--cxx", "g++"],
-    "tests/test_lower_lea_hi_constant.py": ["--cxx", "g++"],
-    "tests/test_wb_diff_split.py": ["--cxx", "g++"],
-    "tests/test_native_suatom.py": ["--cxx", "clang++"],
-    "nx2/test_cbuf_table_extent.py": ["--cxx", "g++"],
-    "nx2/test_dump_ssbo_read.py": ["--cxx", "g++"],
-    "nx2/test_mesh_dynamic_state.py": ["--cxx", "g++"],
-    "nx2/test_timeline_modes.py": ["--cxx", "g++"],
-    "tests/test_keep_rendered.py": ["--cxx", "g++"],
-    "tests/test_program_answer_domains.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
-    "nx2/test_texture_phi_dominance.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_bc_storage_views.py": ["--headers", "{vulkan_headers}"],
-    "nx2/test_mesh_first_types.py": ["--headers", "{spirv_headers}"],
-    "nx2/test_texture_init_barrier.py": ["--headers", "{vulkan_headers}"],
-    "tests/test_parallel_init_order.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
-    "tests/test_device_lost_exit.py": ["--cxx", "{cxx}"],
-    "tests/test_mesh_unreachable_outputs.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_default_point_size.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_unsigned_image_types.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_depth_sample_types.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_draw_parameters.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_coop_spirv.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "nx2/test_spirv_struct_identity.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
-    "tests/test_astc_bc_policy.py": ["--cxx", "g++"],
-}
+# What a check needs is declared in the test file itself, as top-level literals the runner reads with ast (the test is
+# never imported): see the docstring above and read_declarations below.
+DECLARATIONS = ("RUN_ALL_ARGS", "RUN_ALL_MODULES", "RUN_ALL_SKIP")
+# (a list's or a dict's methods that change it in place: a declaration changed that way is not what the runner reads)
+MUTATORS = {"append", "extend", "insert", "remove", "pop", "clear", "update", "setdefault", "popitem", "sort",
+            "reverse", "__setitem__", "__delitem__", "__iadd__", "__ior__"}
+OSES = ("linux", "windows")
 
-# Python packages some tests import (CI installs them; the runner itself needs none)
-MODULES = {
-    "nx2/test_nup_codec.py": ["zstandard"],
-    "nx2/test_nup_verify.py": ["zstandard"],
-}
+# (each OS's measured seconds per check, for the order and the --shard split: see the docstring)
+TIMES = os.path.join(ROOT, "tests", "run_all_times.json")
+DEFAULT_SECS = 1.0   # (a check not in TIMES: most take about that or less)
+TIMES_MIN = 2.0      # (--write-times keeps only the checks that took this long or longer)
 
-# Checks that cannot run in CI, with why, by OS. Each still runs with --no-skip (or by name).
-SKIP = {
-    "tests/test_precompile_compute_guard.py": ({"linux"}, "Windows structured exceptions"),
-    # (the game: these run the lifted code of a real dump against Unicorn)
-    "nx2/test_insn.py": ({"linux", "windows"}, "needs the game's modules (work/dump) and Unicorn"),
-    "nx2/test_leaf.py": ({"linux", "windows"}, "needs the game's modules (work/dump) and Unicorn"),
-    "nx2/test_dll.py": ({"linux", "windows"}, "needs a full game build (work/build/hookshot_game.dll) and Unicorn"),
-    # (a GPU)
-    "tests/test_present_aspect_vulkan.py": ({"linux", "windows"}, "needs a Vulkan 1.3 device for offscreen transfer/readback"),
-    "nx2/test_bc_storage_views.py": ({"linux", "windows"}, "needs a Windows Vulkan device"),
-    # (Linux only)
-    "tests/test_appimage_source_headers.py": ({"windows"}, "the AppImage source-copy block uses POSIX Bash and cp"),
-    "tests/test_appimage_package_retry.py": ({"windows"}, "the AppImage package bootstrap is POSIX shell; exercised on Linux"),
-    "tests/test_hookshot_launch.py": ({"windows"}, "the Linux launcher, a POSIX shell script"),
-    "tests/test_linux_update.py": ({"windows"}, "the Linux builder's update and folder launcher, POSIX files and shell scripts"),
-    "tests/test_oot_saves.py": ({"windows"}, "the save script's folder discovery is the Linux one (on Windows Hookshot's saves are in the game folder: --hookshot)"),
-    "tests/test_linux_driver_fault_guard.py": ({"windows"}, "POSIX signals: the Linux guard"),
-}
-# (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
-for _name in ("nx2/test_texture_phi_dominance.py", "nx2/test_unsigned_image_types.py", "nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
-              "nx2/test_spirv_struct_identity.py", "tests/test_mesh_unreachable_outputs.py"):
-    SKIP[_name] = ({"windows"}, "needs spirv-val: checked on Linux")
-# (glslang: likewise a Linux runner package. The headers it checks are SPIR-V, the same on every platform)
-SKIP["tests/test_fsr3_shaders.py"] = ({"windows"}, "needs glslang: checked on Linux")
-
+# Retired: the central tables these declarations replaced. They stay, empty, so that an entry a branch from before the
+# move adds here stops the run and says where it belongs, instead of being dropped without a word. Do not add to them.
+ARGS = {}
+MODULES = {}
+SKIP = {}
 
 def which(*names):
     for n in names:
@@ -187,6 +93,7 @@ def find_tools():
         "vulkan_headers": header_dir("HOOKSHOT_VULKAN_HEADERS", "vulkanheaders", os.path.join("vulkan", "vulkan.h")),
         "spirv_val": which("spirv-val"),
         "glslang": which("glslangValidator", "glslang"),
+        "dotnet": which("dotnet"),
         "cxx": which(os.environ.get("CXX", ""), "clang++", "g++", "c++"),
     }
 
@@ -197,9 +104,114 @@ class Check:
         self.status, self.secs, self.output = "skip", 0.0, ""
 
 
-def python_check(rel, tools, timeout):
+class DeclarationError(Exception):
+    pass
+
+
+def read_declarations(path, rel, tools):
+    """A test's RUN_ALL_ARGS, RUN_ALL_MODULES and RUN_ALL_SKIP (see the docstring), from its top-level assignments,
+    checked against the placeholders in tools and the OSes in OSES. {"args": [...], "modules": [...], "skip": {os:
+    why}}, empty where the test declares nothing. A file that does not parse declares nothing and says why in
+    "unparsed" (its check fails with that, on every OS, without running); a bad declaration raises DeclarationError naming
+    the file and line."""
+    found = {"args": [], "modules": [], "skip": {}, "unparsed": None}
+    with open(path, "rb") as f:
+        source = f.read()
+    try:
+        tree = ast.parse(source, rel)
+    except (SyntaxError, ValueError) as e:
+        found["unparsed"] = "%s: does not parse (%s), so its RUN_ALL_ declarations cannot be read" % (rel, e)
+        return found
+    seen = set()
+
+    def bad(node, what):
+        return DeclarationError("%s:%d: %s" % (rel, node.lineno, what))
+
+    def declared(node):
+        return isinstance(node, ast.Name) and node.id.startswith("RUN_ALL_")
+    # (at module level but not a top-level NAME = literal: inside an if or a try, a RUN_ALL_ARGS.append(...), a del. The
+    # runner reads only the top level, so these would be ignored without a word. The top level's own forms are checked
+    # below; a function's or a class's own names are not declarations and are left alone)
+    top_targets = {id(n) for top in tree.body if isinstance(top, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                   for t in (top.targets if isinstance(top, ast.Assign) else [top.target]) for n in ast.walk(t)}
+
+    def module_level(node):
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                yield from module_level(child)
+    for node in module_level(tree):
+        if id(node) in top_targets:
+            continue
+        if declared(node) and not isinstance(node.ctx, ast.Load):
+            raise bad(node, "%s must be assigned at the top level of the file, as NAME = literal" % node.id)
+        elif isinstance(node, (ast.Subscript, ast.Attribute)) and declared(node.value) \
+                and not isinstance(node.ctx, ast.Load):
+            raise bad(node, "%s must be assigned once, alone, as NAME = literal" % node.value.id)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and declared(node.func.value) \
+                and node.func.attr in MUTATORS:
+            raise bad(node, "%s is changed after it is set (.%s): write the whole literal in one assignment"
+                      % (node.func.value.id, node.func.attr))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        names = [n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name) and n.id.startswith("RUN_ALL_")]
+        if not names:
+            continue
+        name = names[0]
+        if name not in DECLARATIONS:
+            raise bad(node, "%s is not a run_all.py declaration (%s)" % (name, ", ".join(DECLARATIONS)))
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or value is None or len(targets) != 1 \
+                or not isinstance(targets[0], ast.Name):
+            raise bad(node, "%s must be assigned once, alone, as NAME = literal" % name)
+        if name in seen:
+            raise bad(node, "%s is assigned twice" % name)
+        seen.add(name)
+        try:
+            v = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            raise bad(node, "%s must be a plain literal (no names, calls or expressions)" % name) from None
+        if name == "RUN_ALL_SKIP":
+            if not isinstance(v, dict) or not all(isinstance(k, str) and isinstance(w, str) and w.strip()
+                                                  for k, w in v.items()):
+                raise bad(node, 'RUN_ALL_SKIP must be a dict of OS -> reason, e.g. {"windows": "why"}')
+            unknown = sorted(k for k in v if k not in OSES)
+            if unknown:
+                raise bad(node, "RUN_ALL_SKIP names an unknown OS %s (known: %s)" % (", ".join(map(repr, unknown)),
+                                                                                    ", ".join(OSES)))
+            found["skip"] = dict(v)
+            continue
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise bad(node, "%s must be a list of strings" % name)
+        if name == "RUN_ALL_ARGS":
+            unknown = sorted({x.strip("{}") for x in v if x.startswith("{")} - set(tools))
+            if unknown:
+                raise bad(node, "RUN_ALL_ARGS names an unknown placeholder %s (known: %s)"
+                          % (", ".join("{%s}" % u for u in unknown), ", ".join(sorted(tools))))
+            found["args"] = list(v)
+        else:
+            found["modules"] = list(v)
+    return found
+
+
+def stale_tables():
+    """Entries a branch from before the move still adds to the retired ARGS, MODULES or SKIP: what to declare instead"""
+    out = []
+    for table, decl in ((ARGS, "RUN_ALL_ARGS"), (MODULES, "RUN_ALL_MODULES"), (SKIP, "RUN_ALL_SKIP")):
+        for rel, v in table.items():
+            if decl == "RUN_ALL_SKIP" and isinstance(v, tuple) and len(v) == 2:
+                v = {o: v[1] for o in sorted(v[0])}
+            out.append("%s: declare it in the test: %s = %r" % (rel, decl, v))
+    return out
+
+
+def python_check(rel, decl, tools, timeout):
     args, missing = [], []
-    for a in ARGS.get(rel, []):
+    for a in decl["args"]:
         if a.startswith("{"):
             v = tools.get(a.strip("{}"))
             if not v:
@@ -211,7 +223,7 @@ def python_check(rel, tools, timeout):
     for i, a in enumerate(args[:-1]):
         if a in ("--cc", "--cxx") and not which(args[i + 1]):
             missing.append(args[i + 1])
-    missing += [m for m in MODULES.get(rel, []) if importlib.util.find_spec(m) is None]
+    missing += [m for m in decl["modules"] if importlib.util.find_spec(m) is None]
 
     def run():
         return subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, rel)] + args, cwd=ROOT, timeout=timeout,
@@ -221,8 +233,8 @@ def python_check(rel, tools, timeout):
 
 def cpp_checks(tools, timeout):
     """gpu/vk/tests: the presentation rectangle (all of it), the lowering harness built and run over no programs
-    (the programs it reads are dumped from the game, so here it only shows the lowering still compiles), and the
-    lowering's register-marker regression"""
+    (the programs it reads are dumped from the game, so here it only shows the lowering still compiles), the
+    lowering's register-marker regression and LDSM's address copy"""
     cxx = tools["cxx"]
     out = []
 
@@ -244,7 +256,59 @@ def cpp_checks(tools, timeout):
     out.append((lower, build_and_run(lower, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], ["{tmp}"])))
     regmap = "gpu/vk/tests/regmap_marker_test.cpp"   # (the lowering's renamed-register markers: no number mapped twice)
     out.append((regmap, build_and_run(regmap, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
+    ldsm = "gpu/vk/tests/ldsm_address_test.cpp"   # (LDSM's row addresses kept apart from its shuffles' registers)
+    out.append((ldsm, build_and_run(ldsm, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     return out, ([] if cxx else ["a C++ compiler"])
+
+
+def load_times(path=TIMES):
+    """{check: seconds} for this OS from tests/run_all_times.json; {} when it is missing or unreadable (the order is
+    then by name, and the parts of --shard are still whole)"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    mine = data.get(OS) if isinstance(data, dict) else None
+    return {k: float(v) for k, v in (mine or {}).items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def by_time(names, times):
+    """The names slowest first (ties by name): the order checks start in"""
+    return sorted(names, key=lambda n: (-times.get(n, DEFAULT_SECS), n))
+
+
+def shard_of(names, times, count):
+    """{name: part index} for count parts: each name, slowest first, to the part with the fewest seconds so far (the
+    lowest index on a tie). Depends only on the names and the times, so every part's run makes the same split"""
+    load, part = [0.0] * count, {}
+    for n in by_time(names, times):
+        i = min(range(count), key=lambda j: (load[j], j))
+        part[n] = i
+        load[i] += times.get(n, DEFAULT_SECS)
+    return part
+
+
+def write_times(ran, path=TIMES):
+    """This OS's entry in tests/run_all_times.json, replaced by the checks of this run that took TIMES_MIN or longer"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data[OS] = {c.name: round(c.secs, 1) for c in sorted(ran, key=lambda c: c.name) if c.secs >= TIMES_MIN}
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({k: data[k] for k in sorted(data)}, indent=1) + "\n")
+
+
+def shard_arg(text):
+    try:
+        k, n = (int(x) for x in text.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("--shard is K/N, e.g. 1/2") from None
+    if not 1 <= k <= n:
+        raise argparse.ArgumentTypeError("--shard K/N needs 1 <= K <= N")
+    return k, n
 
 
 class Result:
@@ -276,17 +340,46 @@ def main():
     p.add_argument("--timeout", type=int, default=600, help="seconds per check (default 600)")
     p.add_argument("--strict", action="store_true", help="a missing tool fails the check instead of skipping it")
     p.add_argument("--no-skip", action="store_true", help="also run the checks on the skip list")
+    p.add_argument("--shard", type=shard_arg, metavar="K/N", help="run only the K-th of N parts (split by the times)")
+    p.add_argument("--write-times", action="store_true",
+                   help="write this run's times to tests/run_all_times.json for this OS (a full run only)")
     a = p.parse_args()
+    if a.write_times and (a.names or a.shard):
+        p.error("--write-times needs a full run: no names, no --shard")
+    times = load_times()
     tools = find_tools()
 
     checks = []
     tests = sorted(d + "/" + f for d in ("tests", "nx2") for f in os.listdir(os.path.join(ROOT, d))
                    if f.startswith("test_") and f.endswith(".py"))
+    stale = stale_tables()
+    if stale:
+        print("tests/run_all.py: ARGS, MODULES and SKIP are retired: each test declares what it needs in its own file"
+              " (see the docstring at the top of tests/run_all.py)", file=sys.stderr)
+        for line in stale:
+            print("  " + line, file=sys.stderr)
+        return 2
+    # (only the tests asked for: a bad declaration elsewhere does not stop a run of one named test)
+    if a.names:
+        tests = [rel for rel in tests if any(n in rel for n in a.names)]
+    decls, errors = {}, []
     for rel in tests:
-        oses, reason = SKIP.get(rel, (set(), ""))
-        run, missing = python_check(rel, tools, a.timeout)
+        try:
+            decls[rel] = read_declarations(os.path.join(ROOT, rel), rel, tools)
+        except DeclarationError as e:
+            errors.append(str(e))
+    if errors:
+        print("tests/run_all.py: bad declarations, nothing run:", file=sys.stderr)
+        for e in errors:
+            print("  " + e, file=sys.stderr)
+        return 2
+    for rel in tests:
+        reason = decls[rel]["skip"].get(OS)
+        run, missing = python_check(rel, decls[rel], tools, a.timeout)
         c = Check(rel, run)
-        if OS in oses and not a.no_skip and not any(n in rel for n in a.names):
+        if decls[rel]["unparsed"]:   # (no skip to read: the same failure on every OS, not run)
+            c.run = lambda why=decls[rel]["unparsed"]: Result(1, (why + "\n").encode())
+        elif reason and not a.no_skip and not any(n in rel for n in a.names):
             c.why_skip = reason
         elif missing and not a.strict:
             c.why_skip = "not found here: " + ", ".join(missing)
@@ -305,6 +398,13 @@ def main():
     checks.append(Check("(byte-compile every tracked .py)", compile_all))
     if a.names:
         checks = [c for c in checks if any(n in c.name for n in a.names)]
+    part = ""
+    if a.shard:
+        k, n = a.shard
+        mine = shard_of([c.name for c in checks], times, n)
+        checks = [c for c in checks if mine[c.name] == k - 1]
+        part = ", part %d/%d" % (k, n) if n > 1 else ""
+    rank = {name: i for i, name in enumerate(by_time([c.name for c in checks], times))}
 
     def one(c):
         t = time.time()
@@ -321,9 +421,11 @@ def main():
         c.secs = time.time() - t
         return c
 
-    to_run = [c for c in checks if not c.why_skip]
+    # (slowest first: see the docstring)
+    to_run = sorted((c for c in checks if not c.why_skip), key=lambda c: rank[c.name])
     t0 = time.time()
-    print("%d checks, %d skipped, %d at once (%s)" % (len(to_run), len(checks) - len(to_run), a.jobs, OS), flush=True)
+    print("%d checks, %d skipped, %d at once (%s%s)" % (len(to_run), len(checks) - len(to_run), a.jobs, OS, part),
+          flush=True)
     with concurrent.futures.ThreadPoolExecutor(max(1, a.jobs)) as ex:
         for c in concurrent.futures.as_completed([ex.submit(one, c) for c in to_run]):
             c = c.result()
@@ -341,8 +443,8 @@ def main():
 
     order = sorted(to_run, key=lambda c: -c.secs) + sorted((c for c in checks if c.why_skip), key=lambda c: c.name)
     passed = sum(c.status == "pass" for c in to_run)
-    head = "%d passed, %d failed, %d skipped in %.0f s (%s, %d at once)" % (passed, len(failed), len(checks) - len(to_run),
-                                                                         wall, OS, a.jobs)
+    head = "%d passed, %d failed, %d skipped in %.0f s (%s%s, %d at once)" % (
+        passed, len(failed), len(checks) - len(to_run), wall, OS, part, a.jobs)
     print("\n%-8s %8s  %s" % ("result", "time", "check"))
     for c in order:
         print("%-8s %8s  %s%s" % (c.status, "" if c.why_skip else "%.1fs" % c.secs, c.name,
@@ -361,6 +463,9 @@ def main():
             lines.append("| %s | %s | `%s` | %s |" % (mark[c.status], "" if c.why_skip else "%.1f s" % c.secs, c.name, note))
         with open(summary, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n\n")
+    if a.write_times:
+        write_times(to_run)
+        print("times for %s written to %s" % (OS, os.path.relpath(TIMES, ROOT)))
     return 1 if failed else 0
 
 

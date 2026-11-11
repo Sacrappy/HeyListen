@@ -43,9 +43,13 @@ struct VkShaderModuleCreateInfo {
 };
 namespace Shader {
 namespace IR { enum class Attribute : uint64_t {}; }
+struct Descriptor {   // (a descriptor's array size, which get_info checks)
+    uint32_t count;
+    Descriptor(uint32_t c = 1) : count(c) {}
+};
 struct Info {
     uint32_t marker = 0;
-    std::vector<uint32_t> constant_buffer_descriptors, storage_buffers_descriptors,
+    std::vector<Descriptor> constant_buffer_descriptors, storage_buffers_descriptors,
         texture_buffer_descriptors, image_buffer_descriptors, texture_descriptors, image_descriptors;
     std::map<IR::Attribute, IR::Attribute> legacy_stores_mapping;
     std::vector<std::vector<uint32_t>> handle_programs;
@@ -82,6 +86,7 @@ FILE* disk_out = nullptr;
 FILE* disk_idx = nullptr;
 std::mutex disk_mu;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
+std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_taken;   // (vk_shader.cpp: the records read in, for the prediction)
 std::atomic<int64_t> st_cache_hits{0};
 #define PROF_EXACT()   // (vk_prof.h's exact-timing scope, since #989: nothing to time here)
 #include "cache_functions.inc"

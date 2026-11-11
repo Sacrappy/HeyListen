@@ -26,12 +26,22 @@ class WriteAttempt(AssertionError):
 @contextmanager
 def guard_io(root):
     """Keep unsafe probes inside this fixture, without faking successful metadata reads."""
-    roots = {os.path.normcase(os.path.abspath(root)), os.path.normcase(os.path.realpath(root))}
+    def normalized(path):
+        path = os.path.normcase(os.path.abspath(path))
+        # Compare equivalent filesystem paths; keep the original spelling for the real metadata call.
+        if os.name == "nt":
+            if path.startswith("\\\\?\\unc\\"):
+                return "\\\\" + path[8:]
+            if path.startswith("\\\\?\\") and path[5:7] == ":\\":
+                return path[4:]
+        return path
+
+    roots = {normalized(root), normalized(os.path.realpath(root))}
     attempts = []
 
     def metadata(function):
         def checked(path, *args, **kwargs):
-            candidate = os.path.normcase(os.path.abspath(path))
+            candidate = normalized(path)
             for owned in roots:
                 try:
                     common = os.path.commonpath((candidate, owned))
@@ -222,6 +232,17 @@ class ExtractionPaths(unittest.TestCase):
             self.assertEqual(attempts, [name for name, _ in operations])
         self.assertEqual(before, snapshot(self.root))
 
+    def test_metadata_guards_accept_owned_paths_and_reject_siblings(self):
+        outside = self.root.with_name(self.root.name + "-sibling") / "outside.bin"
+        with guard_io(self.root) as attempts:
+            for path in dict.fromkeys((str(self.sentinel), nup.long_path(str(self.sentinel)))):
+                with self.subTest(owned=path):
+                    self.assertEqual(os.lstat(path).st_size, len(b"keep outside data"))
+            for path in dict.fromkeys((str(outside), nup.long_path(str(outside)))):
+                with self.subTest(outside=path), self.assertRaisesRegex(AssertionError, "^metadata access outside fixture:"):
+                    os.lstat(path)
+            self.assertEqual(attempts, [])
+
     def test_parent_path_cannot_overwrite_a_sibling(self):
         # This also safely demonstrates the original failure: both files belong to this fixture.
         self.reject(["../../outside.bin"], "unsafe path in the package: '../../outside.bin'")
@@ -234,33 +255,61 @@ class ExtractionPaths(unittest.TestCase):
         self.assertEqual((self.out / "romfs" / "file.bin").read_bytes(), b"authored fixture")
         self.assertFalse(partial.exists())
 
-    def test_failed_member_keeps_previous_file_and_can_be_retried(self):
+    def test_failed_member_is_removed_and_can_be_retried(self):
         target = self.out / "romfs" / "file.bin"
         target.parent.mkdir()
-        partial = target.with_name("file.bin.part")
         package = Package(["file.bin"])
         title = {"romfs": 0}
 
-        def out_of_space(record, output, name):
-            output.write(b"some bytes")
-            raise OSError(errno.ENOSPC, "authored disk-full failure")
+        def failing(error):
+            def copy_to(record, output, name):
+                output.write(b"some bytes")
+                raise error
+            return copy_to
 
-        failures = (
-            (patch.object(package, "copy_to", side_effect=out_of_space), errno.ENOSPC),
-            (patch.object(nup.os, "replace", side_effect=PermissionError(errno.EACCES, "authored replacement failure")),
-             errno.EACCES),
-        )
-        for failure, code in failures:
-            with self.subTest(error=code):
+        for error in (OSError(errno.ENOSPC, "authored disk-full failure"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
                 target.write_bytes(b"previous file")
-                with failure, self.assertRaises(OSError) as error:
+                with patch.object(package, "copy_to", side_effect=failing(error)), self.assertRaises(type(error)):
                     nup.extract(package, title, str(self.out), only="romfs", quiet=True)
-                self.assertEqual(error.exception.errno, code)
-                self.assertEqual(target.read_bytes(), b"previous file")
-                self.assertFalse(partial.exists())
+                self.assertFalse(target.exists())
                 self.assertEqual(nup.extract(package, title, str(self.out), only="romfs", quiet=True),
                                  (1, len(package.data)))
                 self.assertEqual(target.read_bytes(), package.data)
+
+    def test_member_cut_short_is_written_again(self):
+        # A killed extraction leaves its last member shorter than the package says.
+        names = ["a/first.bin", "a/second.bin", "b/third.bin"]
+        self.extract(names)
+        cut = self.out / "romfs" / "a" / "second.bin"
+        cut.write_bytes(b"authored")
+        partial = cut.with_name("second.bin.part")   # (as builders that wrote a temporary left it)
+        partial.write_bytes(b"authored")
+        (self.out / "romfs" / "b" / "third.bin").unlink()
+        self.assertEqual(self.extract(names), (2, 2 * len(b"authored fixture")))
+        self.assertFalse(partial.exists())
+        for name in names:
+            self.assertEqual((self.out / "romfs" / name).read_bytes(), b"authored fixture")
+
+    def test_members_are_written_in_place_and_folders_checked_once(self):
+        names = ["Map/%d/file%d.bin" % (i % 3, i) for i in range(30)]
+        with patch.object(nup.os, "replace", wraps=os.replace) as replace,                 patch.object(nup.os, "lstat", wraps=os.lstat) as lstat:
+            self.assertEqual(self.extract(names)[0], len(names))
+        self.assertEqual([os.path.basename(call.args[1]) for call in replace.call_args_list], [nup.HEADS_NAME])
+        romfs = os.path.normcase(nup.long_path(os.path.realpath(self.out / "romfs")))
+        under = [call for call in lstat.call_args_list
+                 if os.path.normcase(nup.long_path(str(call.args[0]))).startswith(romfs)]
+        self.assertEqual(len(under), 1 + 1 + 3 + len(names))   # romfs, Map, Map/0..2, then each member once
+        self.assertEqual(sorted(p.name for p in (self.out / "romfs").rglob("*") if p.is_file()),
+                         sorted(name.split("/")[-1] for name in names))
+
+    def test_destination_hard_link_is_replaced_without_truncation(self):
+        (self.out / "romfs").mkdir()
+        member = self.out / "romfs" / "file.bin"
+        os.link(self.sentinel, member)
+        self.extract(["file.bin"])
+        self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
+        self.assertEqual(member.read_bytes(), b"authored fixture")
 
     def test_part_directory_link_cannot_redirect_extraction(self):
         outside = self.root / "outside"
@@ -296,18 +345,24 @@ class ExtractionPaths(unittest.TestCase):
             self.fail("Cannot create the file-link fixture: %s" % error)
         self.reject(["file.bin"], "extraction path is a link or reparse point: ")
 
-    def test_temporary_link_cannot_truncate_an_outside_file(self):
+    def test_stale_temporary_link_cannot_truncate_an_outside_file(self):
         (self.out / "romfs").mkdir()
         try:
             os.symlink(self.sentinel, self.out / "romfs" / "file.bin.part")
         except OSError as error:
             self.fail("Cannot create the file-link fixture: %s" % error)
-        self.reject(["file.bin"], "extraction path is a link or reparse point: ")
+        self.extract(["file.bin"])
+        self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
+        self.assertFalse(os.path.lexists(self.out / "romfs" / "file.bin.part"))
+        self.assertEqual((self.out / "romfs" / "file.bin").read_bytes(), b"authored fixture")
 
-    def test_temporary_hard_link_cannot_truncate_an_outside_file(self):
+    def test_stale_temporary_hard_link_cannot_truncate_an_outside_file(self):
         (self.out / "romfs").mkdir()
         os.link(self.sentinel, self.out / "romfs" / "file.bin.part")
-        self.reject(["file.bin"], "extraction temporary file has other hard links: ")
+        self.extract(["file.bin"])
+        self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
+        self.assertFalse((self.out / "romfs" / "file.bin.part").exists())
+        self.assertEqual((self.out / "romfs" / "file.bin").read_bytes(), b"authored fixture")
 
     def test_heal_missing_module_and_resume(self):
         (self.out / "exefs").mkdir()

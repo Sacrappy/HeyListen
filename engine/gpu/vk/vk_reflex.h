@@ -35,4 +35,17 @@ void reflex_presented();
 /// After the present: the driver's sleep until the next frame should start, then that frame's start markers
 void reflex_sleep();
 
+// With frame generation the game's frames are still marked and paced (the sleep, the simulation and submission markers, at
+// the game's present), and the display thread shows them later, between made frames: each set keeps the game frame it was
+// made at (reflex_frame), and only the set's game frame is presented with that present id and the present markers.
+constexpr uint64_t kReflexThisFrame = ~0ull;
+/// The Reflex frame the calling thread's next present shows: kReflexThisFrame (the default) the frame being made, as without
+/// frame generation; frame generation's display thread sets a set's game frame for its game frame and 0 for a made frame
+/// (no present id, no present markers)
+extern thread_local uint64_t reflex_present_frame;
+/// The game frame Reflex is marking now (its present id), 0 when Reflex is not on: frame generation keeps it with the set
+uint64_t reflex_frame();
+/// Frame generation: the game frame's rendering submitted (do_present, the set queued): its submission's end
+void reflex_game_submitted();
+
 } // namespace mkwvk

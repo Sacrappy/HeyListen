@@ -73,6 +73,25 @@ class HostMarch(unittest.TestCase):
         appimage = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
         self.assertIn("RX_MARCH=x86-64-v3 RX_VK_ONLY=1", appimage)   # (its prebuilt renderer: not the CI runner's CPU)
 
+    def test_build_message_names_the_cause(self):
+        """'this CPU has no AVX2' only when the CPU chose the level: an RX_MARCH of znver2 (AVX2 and more) said it too"""
+        build = (ROOT / "nx2" / "build.py").read_text(encoding="utf-8")
+        start = build.index('MARCH = os.environ.get("RX_MARCH") or host_march()')
+        block = build[start:build.index("CPU = [", start)]
+        for env, host, want in (({"RX_MARCH": "znver2"}, "x86-64-v3", "built for znver2 (RX_MARCH)"),
+                                ({"RX_MARCH": "x86-64-v3"}, "x86-64", ""),
+                                ({}, "x86-64-v2", "this CPU has no AVX2"),
+                                ({}, "x86-64-v3", "")):
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out):
+                exec(block, {"os": os, "host_march": lambda h=host: h})
+            if want:
+                self.assertIn(want, out.getvalue(), env)
+            else:
+                self.assertEqual(out.getvalue(), "", env)
+            if env:
+                self.assertNotIn("no AVX2", out.getvalue(), env)
+
 
 class AppImageCheck(unittest.TestCase):
     """make_game.py stops before reading the game when the AppImage's x86-64-v3 renderer meets a CPU without AVX2"""

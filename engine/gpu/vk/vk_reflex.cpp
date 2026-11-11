@@ -12,7 +12,12 @@
 //
 // What the markers stand for is approximate: OoT simulates on its main thread and renders on its presentation thread, and the
 // replay records the GPU work as the game submits it; the sleep holds the presentation thread, which the main thread waits for.
-// With frame generation on, presents come from the display thread: Reflex is not used then.
+// With frame generation on, the game's frames are marked and paced the same way (the sleep and the simulation and submission
+// markers belong to the game's frame, at do_present), and its display thread shows each set later, made frames first: a set
+// keeps the game frame it was made at (reflex_frame), and its game frame alone is presented with that present id and the
+// present markers (reflex_present_frame); made frames get neither. Present ids only go up: one that would not is left off.
+// Without Reflex under frame generation its held-back frame added its whole delay (an RTX 5080 at 4x: +12 to +18 ms from
+// input to the screen against frame generation off with Reflex on, PR 2118's review).
 //
 // RX_VK_REFLEX_LOG=1: every 300 frames with Reflex on, the driver's own timings (vkGetLatencyTimingsNV) averaged in the log:
 // simulation start to present end, and to the GPU's end of rendering.
@@ -24,8 +29,8 @@
 #include <cstring>
 #include <mutex>
 
-#include "vk_framegen.h"
 #include "vk_menu.h"
+#include "vk_work.h"   // (last: RX_VK_RECORDER=defer drains before the latency-sleep wait; =thread does not need to, the driver signals it)
 
 namespace mkwvk {
 
@@ -49,6 +54,9 @@ struct Reflex {
     int mode = -1;                       // (as set on the swapchain)
     bool frame_marked = false;           // (this frame's start markers given: its other markers count)
     VkPresentIdKHR pid{VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+    uint64_t pid_value = 0;              // (the present id the present carries: the frame it shows)
+    uint64_t presenting = 0;             // (the frame of the present in progress: its end marker)
+    uint64_t last_present_id = 0;        // (present ids only go up)
     std::mutex mu;
 };
 Reflex& rx() {
@@ -61,17 +69,18 @@ int wanted_mode() {
     return std::clamp(e && *e ? atoi(e) : opts.reflex, 0, 2);
 }
 
-/// With r.mu held: the row on, the extension and its feature, a swapchain made with latency mode, and no frame generation (its
-/// own display thread)
+/// With r.mu held: the row on, the extension and its feature, and a swapchain made with latency mode. With frame generation
+/// too: its presents are told apart by reflex_present_frame
 bool on() {
     Reflex& r = rx();
-    return r.ready && r.swapchain && r.latency && wanted_mode() > 0 && !framegen_on();
+    return r.ready && r.swapchain && r.latency && wanted_mode() > 0;
 }
 
-void mark(VkLatencyMarkerNV m) {
+/// A marker for a frame: the one being made (id 0), or the one a present shows
+void mark(VkLatencyMarkerNV m, uint64_t id = 0) {
     Reflex& r = rx();
     VkSetLatencyMarkerInfoNV i{VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV};
-    i.presentID = r.id, i.marker = m;
+    i.presentID = id ? id : r.id, i.marker = m;
     r.marker(dev.device, r.swapchain, &i);
 }
 
@@ -181,6 +190,7 @@ void reflex_swapchain_created(VkSwapchainKHR swapchain) {
     const bool was = r.latency;
     ++r.swapchain_generation;
     r.swapchain = swapchain, r.mode = -1, r.frame_marked = false, r.latency = r.latency_next;
+    r.last_present_id = r.presenting = 0;   // (a new swapchain's present ids start again)
     if (r.latency) apply_mode();
     else if (was) logf("vk: NVIDIA Reflex: off");
 }
@@ -203,7 +213,22 @@ void reflex_present_begins() {
     mark(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
 }
 
+thread_local uint64_t reflex_present_frame = kReflexThisFrame;
+
 void reflex_submit_ends() {
+    Reflex& r = rx();
+    std::lock_guard lk(r.mu);
+    if (!on() || reflex_present_frame != kReflexThisFrame) return;   // (frame generation's copies: not the game's rendering)
+    if (r.frame_marked) mark(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+}
+
+uint64_t reflex_frame() {
+    Reflex& r = rx();
+    std::lock_guard lk(r.mu);
+    return on() && r.frame_marked ? r.id : 0;
+}
+
+void reflex_game_submitted() {
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
     if (!on()) return;
@@ -213,9 +238,17 @@ void reflex_submit_ends() {
 const void* reflex_present_id(const void* next) {
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
-    if (!on() || !r.frame_marked) return next;
-    mark(VK_LATENCY_MARKER_PRESENT_START_NV);
-    r.pid.pNext = next, r.pid.swapchainCount = 1, r.pid.pPresentIds = &r.id;
+    r.presenting = 0;
+    if (!on()) return next;
+    uint64_t id = reflex_present_frame;
+    if (id == kReflexThisFrame) {   // (the frame being made, presented as it is: no frame generation)
+        if (!r.frame_marked) return next;
+        id = r.id;
+    }
+    if (!id || id <= r.last_present_id) return next;   // (a made frame; or an id that would not go up: frame generation turned on or off)
+    mark(VK_LATENCY_MARKER_PRESENT_START_NV, id);
+    r.presenting = r.last_present_id = r.pid_value = id;
+    r.pid.pNext = next, r.pid.swapchainCount = 1, r.pid.pPresentIds = &r.pid_value;
     return &r.pid;
 }
 
@@ -223,7 +256,8 @@ void reflex_presented() {
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
     if (!on()) return;
-    if (r.frame_marked) mark(VK_LATENCY_MARKER_PRESENT_END_NV);
+    if (r.presenting) mark(VK_LATENCY_MARKER_PRESENT_END_NV, r.presenting);
+    r.presenting = 0;
 }
 
 void reflex_sleep() {

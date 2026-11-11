@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+RUN_ALL_ARGS = ["--cxx", "g++"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 FIXTURE = r'''#include "vk_progress.h"
@@ -112,6 +114,40 @@ int main() {
     c.reset();
     for (int i = 0; i < 40; i++) c.note(i * 0.5, 4570, 4571);
     CHECK(c.left() < 0);
+    // one bar over the three parts, each in the total from the start: the predicted pipelines are not a second bar after a full one
+    {
+        PrepareBar b;
+        b.guess(0, 38809), b.guess(1, 38809), b.guess(2, 2000);
+        b.at(0, 38809, 38809);   // (every program translated: the bar is far from full, the pipelines are still to build)
+        const double programs_done = b.fraction();
+        CHECK(programs_done > 0.1 && programs_done < 0.5);
+        b.reach(1);   // (the prediction deciding: nothing counted yet, the bar holds)
+        CHECK(b.fraction() == programs_done);
+        b.at(1, 0, 45882);   // (its count replaces the guess; the bar never goes back)
+        CHECK(b.fraction() >= programs_done);
+        b.at(1, 45881, 45882);
+        CHECK(b.fraction() < 1);
+        b.at(1, 45882, 45882);
+        CHECK(b.fraction() < 1);   // (the noted pipelines are still to come)
+        b.at(2, 1000, 2000);
+        CHECK(b.fraction() < 1);
+        b.at(2, 2000, 2000);
+        CHECK(b.fraction() == 1);
+        StartupState st;
+        st.secs = 30, st.prepared = true, st.stage = 1, st.done = 100, st.total = 45882, st.whole = 0.5;
+        StartupView v = startup_view(st);
+        CHECK(v.fraction == 0.5 && v.pct == "50%" && v.left == "100 / 45,882 pipelines");
+        st.total = 0;   // (the prediction deciding: the bar stays, with the whole's share)
+        v = startup_view(st);
+        CHECK(v.fraction == 0.5 && v.left == "Reading the pipeline notes");
+        // a start with nothing to prepare: the pipelines alone fill the bar
+        PrepareBar w;
+        w.guess(0, 38809), w.guess(1, 38809), w.guess(2, 100);
+        w.skip(0), w.skip(1);
+        w.at(2, 50, 100);
+        CHECK(std::fabs(w.fraction() - 0.5) < 1e-9);
+        CHECK(percent_of(0.999) == "99%" && percent_of(1) == "100%" && percent_of(-1).empty());
+    }
     std::printf("PASS: counts, time left and its wording\n");
 }
 '''
@@ -139,11 +175,21 @@ def main():
             raise SystemExit(why)
     if 'void mkwvk_close_asked(void)' not in main_cpp or "prepare_stop();" not in main_cpp:
         raise SystemExit("closing the window no longer stops the preparation")
-    for fn in ("bool prepare_run(", "void predict_run(", "void precompile_run("):
+    for fn in ("bool prepare_run(", "bool warm_libraries(", "void predict_run(", "void precompile_run("):
         body = draw[draw.index(fn):]
         body = body[:body.index("\n}\n")]
         if body.count("prepare_stopped()") < 2:
             raise SystemExit(fn + " does not stop its workers and its wait when the window is closed")
+    # the predicted pipelines are built in the preparation, all of them, unless RX_VK_PREDICT_S sets a budget; on every CPU
+    predict = draw[draw.index("void predict_run("):]
+    predict = predict[:predict.index("\n}\n")]
+    if 'getenv("RX_VK_PREDICT_S") ? atoi(getenv("RX_VK_PREDICT_S")) : 0;' not in predict:
+        raise SystemExit("predict_run has a time budget by default: the predicted pipelines past it are built in play")
+    if "THREAD_PRIORITY_BELOW_NORMAL" in predict or "cpus / 2" in predict:
+        raise SystemExit("predict_run builds on half the CPUs or below normal priority: nothing else runs before the game")
+    for need in ("prepare_guess(", "bar.at(", "st.whole"):
+        if need not in screen:
+            raise SystemExit("the start-up screen's bar does not count every part from the start (" + need + ")")
     prep = draw[draw.index("bool prepare_run("):]
     prep = prep[:prep.index("\n}\n")]
     stop_at = prep.index("if (prepare_stopped()) {")

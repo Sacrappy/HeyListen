@@ -9,7 +9,6 @@
    layer-faces (a multiple of 6), and linear textures are sized in pixel rows, block-compressed ones too (MacNativeGames
    3c482a7, found against the original driver under emulation: nxnative PR 11). */
 #include "../gpu/render/rx_nvn.h"
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -37,8 +36,10 @@ static fmt_t fmt_of(int f) {
 
 int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.bw; if (bh) *bh = t.bh; return t.bpb; }
 
-static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
-static uint32_t blk(uint32_t s, uint32_t b) { return (s + b - 1) / b; }
+/* (hookshot) 64-bit: a width from the game times the samples and the bytes per block wrapped in 32 bits, and a 512-byte
+   size was given for a texture the renderer then made 4 GB wide */
+static uint64_t mip(uint64_t s, unsigned l) { s = l < 64 ? s >> l : 0; return s ? s : 1; }
+static uint64_t blk(uint64_t s, uint32_t b) { return (s + b - 1) / b; }
 static unsigned pick_tile(uint32_t gobs) { return gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0; }
 static unsigned adj_tile(unsigned shift, uint32_t unit, uint32_t dim) {
     if (!shift) return 0;
@@ -71,29 +72,21 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
                              unsigned tileH, unsigned tileD, fmt_t t) {
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     uint64_t off = 0;
+    if (level > 32) level = 32;   /* (hookshot: past 32 every level is 1x1; a level count from the game looped for minutes) */
     for (unsigned i = 0; i < level; i++) {
-        uint32_t lw = blk(mip(w * sx, i), t.bw);
-        uint32_t lh = dpl >= 2 ? blk(mip(h * sy, i), t.bh) : 1;
-        uint32_t ld = dpl >= 3 ? mip(z, i) : 1;
-        uint32_t lwb = lw * t.bpb;
-        unsigned th = adj_tile(tileH, 8, lh), td = adj_tile(tileD, 1, ld);
-        uint32_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
-        uint32_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
+        uint64_t lw = blk(mip((uint64_t)w * sx, i), t.bw);
+        uint64_t lh = dpl >= 2 ? blk(mip((uint64_t)h * sy, i), t.bh) : 1;
+        uint64_t ld = dpl >= 3 ? mip(z, i) : 1;
+        uint64_t lwb = lw * t.bpb;
+        unsigned th = adj_tile(tileH, 8, lh > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)lh);
+        unsigned td = adj_tile(tileD, 1, ld > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)ld);
+        uint64_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
+        uint64_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
         off += (uint64_t)wt * ht * dt << (9 + th + td);
     }
     return off;
 }
 
-/* NVN v55 sdk+0x4429c8 compares the default footprint against one-GOB tiles
-   for MINIMAL_LAYOUT. Keep the default if equal; otherwise use tile H=D=0.
-   Packaged layouts override this choice. Layout cannot be switched on live
-   resources: the startup-only knob is a negative control for fresh sessions. */
-static int minimal_layout_on(void) {
-    static _Atomic int enabled = -1;
-    int value = atomic_load(&enabled);
-    if (value < 0) { const char *e = getenv("TOTK_MINIMAL_LAYOUT"); value = !(e && !strcmp(e, "0")); atomic_store(&enabled, value); }
-    return value;
-}
 static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered,
                             uint32_t w, uint32_t h, uint32_t z, unsigned tileH, unsigned tileD, fmt_t t) {
     uint64_t ls = level_offset(d, d->levels ? d->levels : 1, dpl, w, h, z, tileH, tileD, t);
@@ -134,10 +127,15 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
            the renderer's scratch for one level grew with 512 << (tileH + tileD) */
         if (dpl >= 2) tileH = (pl & 0xF) > 5 ? 5 : pl & 0xF;
         if (dpl == 3) tileD = (pl >> 4) > 5 ? 5 : pl >> 4;
-    } else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
+    } else if (dpl == 2) {
+        const uint64_t ah = blk((uint64_t)h * sy, t.bh), gobs = (ah + ah / 2) / 8;
+        tileH = pick_tile(gobs > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)gobs);
+    }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
-    if ((d->flags & 0x200) && !d->pkg_block_h && minimal_layout_on()) {
+    /* NVN v55 sdk+0x4429c8 compares the default footprint against one-GOB tiles for MINIMAL_LAYOUT. Keep the default if
+       equal; otherwise use tile H=D=0. Packaged layouts override this choice */
+    if ((d->flags & 0x200) && !d->pkg_block_h) {
         uint64_t minimal = layer_bytes(d, dpl, layered, w, h, z, 0, 0, t);
         if (minimal != ls) { tileH = tileD = 0; ls = minimal; }
     }
@@ -162,10 +160,10 @@ void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, 
     shape(d, &dpl, &layered, &w, &h, &z);
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     nvn_texlayout L; nvn_tex_layout(d, &L);
-    uint32_t lh = dpl >= 2 ? blk(mip(h * sy, level), t.bh) : 1;
-    uint32_t ld = dpl >= 3 ? mip(z, level) : 1;
-    *tileH = adj_tile(L.tileH, 8, lh);
-    *tileD = adj_tile(L.tileD, 1, ld);
+    const uint64_t lh = dpl >= 2 ? blk(mip((uint64_t)h * sy, level), t.bh) : 1;
+    const uint64_t ld = dpl >= 3 ? mip(z, level) : 1;
+    *tileH = adj_tile(L.tileH, 8, lh > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)lh);
+    *tileD = adj_tile(L.tileD, 1, ld > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)ld);
 }
 
 uint32_t nvn_tex_linear_stride(const nvn_texdesc *d) {
@@ -173,5 +171,7 @@ uint32_t nvn_tex_linear_stride(const nvn_texdesc *d) {
     int bw, bh;
     int bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     uint32_t align = (d->flags & 0x40) ? 128 : 32;
-    return (((d->width + bw - 1) / bw) * bpb + align - 1) & ~(align - 1);
+    /* (hookshot) 64-bit, as the layout: a width near 2^32 wrapped to a small stride */
+    const uint64_t s = (((uint64_t)d->width + bw - 1) / bw * bpb + align - 1) & ~(uint64_t)(align - 1);
+    return s > 0xFFFFFFFFu ? 0xFFFFFFFFu & ~(align - 1) : (uint32_t)s;
 }

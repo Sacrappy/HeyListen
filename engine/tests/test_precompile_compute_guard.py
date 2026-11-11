@@ -11,6 +11,9 @@ import shutil
 import subprocess
 import tempfile
 
+RUN_ALL_ARGS = ["--cxx", "clang++"]
+RUN_ALL_SKIP = {"linux": "Windows structured exceptions"}
+
 
 def block(text, marker):
     start = text.index(marker)
@@ -47,8 +50,10 @@ struct {uintptr_t device=0x1234;}dev;
 VkPipelineCache pcache=0x5678;
 struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;std::atomic<int>compute_state{1};};
 struct Pre {std::vector<Program*>computes;};
-int mode=0,calls=0,destroys=0,released=0; bool completed=false;
+int mode=0,calls=0,destroys=0,released=0,logged=0; bool completed=false;
 void cs_module_release(Program&){++released;}
+void logf(const char*,...){++logged;}
+int faults_noted=0; void note_driver_fault(){++faults_noted;}
 #define CHECK(c) do {if(!(c)){std::fprintf(stderr,"CHECK failed line %d: %s\n",__LINE__,#c);std::exit(7);}}while(0)
 const VkComputePipelineCreateInfo* expected_ci=nullptr; VkPipeline* expected_out=nullptr;
 void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&stage,unsigned x){CHECK(x==32);CHECK(stage.stage==12);}
@@ -58,12 +63,22 @@ VkResult vkCreateComputePipelines(uintptr_t device,VkPipelineCache cache,unsigne
  CHECK(ci->stage.pName&&std::string(ci->stage.pName)=="main");
  if(expected_ci)CHECK(ci==expected_ci); if(expected_out)CHECK(out==expected_out);
  ++calls;
- if(mode==1)RaiseException(EXCEPTION_ACCESS_VIOLATION,0,0,nullptr);
+ if(mode==1){*out=0xdead;RaiseException(EXCEPTION_ACCESS_VIOLATION,0,0,nullptr);}   // (a handle written, then the fault)
  if(mode==2){*out=VK_NULL_HANDLE;return -4;}
  *out=0xcafe;return VK_SUCCESS;
 }
 void vkDestroyPipeline(uintptr_t device,VkPipeline made,const void*allocator){CHECK(device==dev.device&&made==0xcafe&&allocator==nullptr);++destroys;}
 '''
+
+
+def windows_target(cxx):
+    """The target the game's own build gives this compiler (third_party/a64-kit/tools/toolchain.py native_target): an
+    llvm-mingw clang++ builds for MinGW with -fms-extensions (__try/__except), any other for the MSVC target. llvm-mingw
+    finds no Visual Studio headers, so the MSVC target alone fails there at <windows.h>."""
+    machine=subprocess.run([cxx,'-dumpmachine'],capture_output=True,text=True,timeout=30).stdout.strip()
+    if 'mingw' in machine or 'windows-gnu' in machine:
+        return ['--target=x86_64-w64-mingw32','-fms-extensions']
+    return ['--target=x86_64-pc-windows-msvc']
 
 
 def main():
@@ -83,14 +98,16 @@ def main():
     # ci/made identities are checked at the boundary as well as inside the API spy.
     armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
     assert armed != arm
-    cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){pre->computes={&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
+    # (the precompile runs before play, where cached_compute is guarded_compute with the start's cache: vk_draw.cpp create_cached)
+    stand_in='\nVkResult cached_compute(const VkComputePipelineCreateInfo*ci,VkPipeline*pl){return guarded_compute(pcache,ci,pl);}\n'
+    cpp=HEAD+wrapper+stand_in+'\nvoid actual_arm(Program&program,Pre*pre){pre->computes={&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
 int main(int argc,char**argv){
  SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX);
  CHECK(argc==2);int which=std::atoi(argv[1]);Program program;Pre pre;
  if(which==4){
   mode=1;VkComputePipelineCreateInfo ci{10};ci.stage={11,12,0x2468,"main"};ci.layout=0x1357;VkPipeline out=0;
   expected_ci=&ci;expected_out=&out;
-  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
+  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0&&logged==1&&faults_noted==1);return 0;
  }
  mode=which==1?1:which==2?2:0;
  std::thread worker([&]{actual_arm(program,&pre);});worker.join();
@@ -103,12 +120,7 @@ int main(int argc,char**argv){
 '''
     with tempfile.TemporaryDirectory(prefix='precompile-seh-') as tmp:
         path=Path(tmp); unit=path/'fixture.cpp';exe=path/'fixture.exe';unit.write_text(cpp,encoding='utf-8')
-        # (an llvm-mingw clang, as the tests are run here without Visual Studio or the Windows SDK: its GNU ABI target, with
-        # -fms-extensions for __try/__except and __declspec, as tools/toolchain.py's native_target; else the MSVC target)
-        compiler=shutil.which(args.cxx) or args.cxx
-        mingw=os.path.isfile(os.path.join(os.path.dirname(compiler),'x86_64-w64-mingw32-clang++.exe'))
-        target=['--target=x86_64-w64-mingw32','-fms-extensions'] if mingw else ['--target=x86_64-pc-windows-msvc']
-        cmd=[args.cxx]+target+['-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
+        cmd=[args.cxx,*windows_target(args.cxx),'-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
         if args.linker:cmd+=['-B'+str(args.linker.parent)]
         subprocess.run(cmd,check=True,timeout=60)
         for case in [0,1,2,4]:

@@ -128,7 +128,7 @@ class BoundKeysTests(unittest.TestCase):
             self.skipTest("no C compiler")
         hid = (ROOT / "host" / "nn_hid.c").read_text(encoding="utf-8")
         code = [block(hid, "static int kmap_down("),
-                between(hid, "static const char *const bind_names[HOS_KEY_N]", "void hos_bind("),
+                between(hid, "static const char *const bind_names[HOS_KEY_N]", "\nvoid hos_bind("),   # (its definition)
                 between(hid, "static int mouse_vk_slot(", "static int bound_down(")]
         code = "\n".join(code).replace("GetModuleFileNameA(NULL,", "GetModuleFileNameA(0,")
         read = block(hid, "static void read_input(")

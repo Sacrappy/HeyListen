@@ -17,6 +17,7 @@
    HOS_AUDIO_CHANNELS=2 or 6: stereo or 5.1 whatever the default output has and the Insert menu's Audio output say
    (see au_speakers). */
 #include "hos.h"
+#include "../gpu/vk/vk_api.h"   /* (the Audio tab's options: HOS_OPT_VOLUME, HOS_OPT_MUTE_BACKGROUND) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,9 @@
 #include "hos_sdl.h"
 #endif
 #include "hos_paths.h"   /* (the game folder: hookshot_options.ini, au_menu_output) */
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -117,7 +121,7 @@ static void put_handle(uint64_t obj, int kind, int index) {
     if (obj) G64(obj) = (uint64_t)AU_MAGIC << 32 | (uint64_t)kind << 24 | (uint32_t)index;
 }
 static int au_trace = -1;   /* HOS_AUDIO_TRACE=1: the graph setup calls */
-#define AUT(...) do { if (au_trace < 0) au_trace = getenv("HOS_AUDIO_TRACE") != NULL; if (au_trace) hos_log(__VA_ARGS__); } while (0)
+#define AUT(...) do { if (au_trace < 0) au_trace = env_on("HOS_AUDIO_TRACE"); if (au_trace) hos_log(__VA_ARGS__); } while (0)
 static int get_handle(uint64_t obj, int kind) {
     if (!obj) return -1;
     const uint64_t h = G64(obj);
@@ -302,7 +306,7 @@ static Reverb reverbs[MAX_EFFECTS];
 static float mb_gain(float mb) { return powf(10.0f, mb / 2000.0f); }
 static void reverb_frame(Reverb *rv, Mix *m) {
     static int off = -1;
-    if (off < 0) off = getenv("HOS_AUDIO_NO_REVERB") != NULL;
+    if (off < 0) off = env_on("HOS_AUDIO_NO_REVERB");
     if (off || !rv->enabled || rv->n <= 0) return;
     static const int base_len[4] = {1559, 1617, 1491, 1422};
     const float density = rv->density > 0 ? rv->density / 100.0f : 1.0f;
@@ -512,7 +516,7 @@ static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the de
     const int nch = six ? 6 : 2;
     {   /* HOS_AUDIO_STATS=1: once a second, what plays and where the signal is */
         static int stats = -1, frames;
-        if (stats < 0) stats = getenv("HOS_AUDIO_STATS") != NULL;
+        if (stats < 0) stats = env_on("HOS_AUDIO_STATS");
         if (stats && ++frames % 200 == 0) {
             int started = 0, with_buffers = 0, to_mix = 0, to_split = 0;
             for (int i = 0; i < MAX_VOICES; i++) {
@@ -601,10 +605,31 @@ static void au_device_name(unsigned device, char *out, size_t size) {
 #endif
 }
 static uint64_t au_ms(void) { return (uint64_t)GetTickCount64(); }
+/* (hookshot) Which output Windows has as its default now (the waveOut mapper's preferred device, its number and name):
+   a key that changes when the default does; 0 when unknown. A device opened as the default stays on that device when
+   Windows moves its default (a Bluetooth headset gone and back), so the output section asks every second */
+#ifndef DRVM_MAPPER_PREFERRED_GET
+#define DRVM_MAPPER_PREFERRED_GET (0x2000 + 21)   /* (mmddk.h: DRVM_MAPPER + 21) */
+#endif
+static uint32_t au_default_key(void) {
+#ifdef _WIN32
+    DWORD id = (DWORD)-1, flags = 0;
+    if (waveOutMessage((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, DRVM_MAPPER_PREFERRED_GET, (DWORD_PTR)&id, (DWORD_PTR)&flags) !=
+            MMSYSERR_NOERROR || id == (DWORD)-1)
+        return 0;
+    char name[64];
+    au_device_name(id, name, sizeof name);
+    uint32_t h = 2166136261u ^ id;
+    for (const char *p = name; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    return h ? h : 1;
+#else
+    return 0;   /* (linux: SDL follows the default device itself) */
+#endif
+}
 /* HOS_AUDIO_MUTE=1 (test runs): the device opened and fed as for a player, at volume 0 */
 static void au_opened(HWAVEOUT w) {
 #ifdef _WIN32
-    if (getenv("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
+    if (env_on("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
 #else
     (void)w;
 #endif
@@ -735,6 +760,15 @@ static void output_error(const char *operation, MMRESULT result) {
 static int out_next;           /* the next candidate: 0 = HOS_AUDIO_DEVICE, 1 = the default, 2.. = device n-2 */
 static uint64_t out_opened, out_stall_since;
 static unsigned out_played, out_peak, out_reported;
+/* (hookshot) A device gone (a Bluetooth headset off, the audio service restarted: "no driver", "invalid handle" from the
+   next call) is closed and the default opened again; none opening, the default is tried every second until one does.
+   Opened as the default, the output follows Windows': its key (au_default_key) looked at every second, a change reopens
+   there. Before, a call that failed this way was only logged, the same block tried again for good, and the game had no
+   sound for the rest of the run, on any device (RX 5500M laptop, a WH-CH720N headset) */
+static int out_retry, out_reopens;
+static uint64_t out_retry_at, out_default_seen;
+static uint32_t out_default_key;   /* (0: not opened as the default, or Windows did not say which it is) */
+static int au_device_gone(MMRESULT r) { return r == 2 || r == 5 || r == 6; }   /* BADDEVICEID, INVALHANDLE, NODRIVER */
 static int output_try(int candidate, const WAVEFORMATEX *f) {
     const char *want = getenv("HOS_AUDIO_DEVICE");
     unsigned device;
@@ -749,6 +783,8 @@ static int output_try(int candidate, const WAVEFORMATEX *f) {
         return 0;
     }
     au_opened(wout);
+    out_default_key = device == WAVE_MAPPER ? au_default_key() : 0;
+    out_default_seen = au_ms();
     char name[64];
     if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
     else au_device_name(device, name, sizeof name);
@@ -790,6 +826,7 @@ static void output_open(void) {
         channels = 2;
     }
     out_channels = channels;
+    out_retry = !wout, out_retry_at = au_ms();   /* (none opened: tried again in a second, output_frame) */
     if (!wout) return;
     for (int i = 0; i < NBLOCKS; i++) {
         memset(&hdr[i], 0, sizeof hdr[i]);
@@ -802,17 +839,29 @@ static void output_open(void) {
     out_stall_since = 0;
     out_played = out_peak = out_reported = 0;
 }
-static void output_reopen(void) {
-    static int reopens;
-    out_stall_since = 0;
-    if (++reopens > 6) return;
-    hos_log("audio: the output device took no sound for 1.5 s: trying the next one");
+static void output_close(void) {   /* (what fails here is not looked at: a device gone takes none of these calls) */
     waveOutReset(wout);
     for (int i = 0; i < NBLOCKS; i++)
         if (hdr[i].dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wout, &hdr[i], sizeof hdr[i]);
     waveOutClose(wout);
     wout = NULL;
+}
+static void output_reopen(void) {   /* (a device that takes nothing: the next candidate, 6 times; again after 30 s of sound) */
+    out_stall_since = 0;
+    if (++out_reopens > 6) return;
+    hos_log("audio: the output device took no sound for 1.5 s: trying the next one");
+    output_close();
     output_open();
+}
+static void output_open_default(void) {   /* (HOS_AUDIO_DEVICE first when it is set, as at the start) */
+    const char *want = getenv("HOS_AUDIO_DEVICE");
+    out_next = want && *want ? 0 : 1;
+    output_open();
+}
+static void output_move(const char *why) {
+    hos_log("audio: %s: the output opened again on the default device", why);
+    output_close();
+    output_open_default();
 }
 static void dump_finish(void) {
     if (!dump) return;
@@ -846,7 +895,19 @@ static void output_frame(const int16_t *pcm) {
             fseek(dump, at, SEEK_SET);
         }
     }
-    if (!wout) return;
+    if (!wout) {
+        if (!out_retry || au_ms() - out_retry_at < 1000) return;
+        output_open_default();   /* (the service back, a device plugged in) */
+        if (!wout) return;
+    }
+    if (out_default_key && au_ms() - out_default_seen >= 1000) {
+        out_default_seen = au_ms();
+        const uint32_t now = au_default_key();
+        if (now && now != out_default_key) {
+            output_move("Windows' default output changed");
+            if (!wout) return;
+        }
+    }
     for (int i = 0; i < FRAME * out_channels; i++) {
         const unsigned a = (unsigned)(pcm[i] < 0 ? -pcm[i] : pcm[i]);
         if (a > out_peak) out_peak = a;
@@ -869,6 +930,7 @@ static void output_frame(const int16_t *pcm) {
             const MMRESULT result = waveOutUnprepareHeader(wout, h, sizeof *h);
             if (result != MMSYSERR_NOERROR) {
                 output_error("waveOutUnprepareHeader", result);
+                if (au_device_gone(result)) output_move("the output device went away");
                 return;   /* the driver has not released the header: do not change its samples or flags */
             }
         }
@@ -881,10 +943,17 @@ static void output_frame(const int16_t *pcm) {
         if (result == MMSYSERR_NOERROR) {
             operation = "waveOutWrite";
             result = waveOutWrite(wout, h, sizeof *h);
-            if (result == MMSYSERR_NOERROR) out_played++;
+            if (result == MMSYSERR_NOERROR) {
+                out_played++;
+                if (out_reopens && au_ms() - out_opened > 30000) out_reopens = 0;   /* (sound again: the stall rule's 6 anew) */
+            }
         }
         if (result != MMSYSERR_NOERROR) {
             output_error(operation, result);
+            if (au_device_gone(result)) {
+                output_move("the output device went away");
+                return;
+            }
             /* A failed submission has no completion to set DONE. Reuse only a host-owned block; a prepared header
                is unprepared on its next turn. Without this, returning to this slot drops every later audio frame. */
             if (!(h->dwFlags & WHDR_INQUEUE)) h->dwFlags |= WHDR_DONE;
@@ -1004,7 +1073,7 @@ static void apply(const Cmd *k) {   /* (with the lock held) */
 }
 static void submit(const Cmd *k) {   /* (with the lock held) */
     static int immediate = -1;
-    if (immediate < 0) immediate = getenv("HOS_AUDIO_IMMEDIATE") != NULL;
+    if (immediate < 0) immediate = env_on("HOS_AUDIO_IMMEDIATE");
     if (ncmds == cmds_cap && !immediate) {
         const int cap = cmds_cap ? cmds_cap * 2 : 4096;
         Cmd *grown = (Cmd *)realloc(cmds, (size_t)cap * sizeof *grown);
@@ -1030,6 +1099,57 @@ static int64_t audio_mix_deadline(int64_t now, int64_t next, int64_t period) {
     return next;
 }
 
+/* ---- the player's volume (the Insert menu's Audio tab, gpu/vk/vk_menu.cpp) ------------------------------------- */
+/* The frame's samples (frames x channels, interleaved) scaled from `from`, the gain the last frame ended at, to `want`,
+   step by step over the frame, so a change does not click. The gains are 0 to 1: nothing clips. Returns the gain the
+   frame ended at. tests/test_audio_volume.py */
+static float audio_apply_gain(int16_t *pcm, int frames, int channels, float from, float want) {
+    if (from == 1.0f && want == 1.0f) return want;
+    for (int i = 0; i < frames; i++) {
+        const float g = from + (want - from) * (float)(i + 1) / (float)frames;
+        for (int c = 0; c < channels; c++) pcm[i * channels + c] = (int16_t)lrintf((float)pcm[i * channels + c] * g);
+    }
+    return want;
+}
+
+/* Whether the game's window counts as in front, as host/nn_hid.c's game_in_front decides it: the game's own window does,
+   another normal window does not, and an overlay (a tool or no-activate window: Steam's, Discord's, but also a toast or
+   a tray flyout) counts as the game's only while the last normal window in front was the game's. *last_normal_was_us
+   keeps that between calls. tests/test_audio_volume.py */
+static int audio_front_decide(int ours, int overlay, int *last_normal_was_us) {
+    if (ours) return *last_normal_was_us = 1;
+    if (overlay && *last_normal_was_us) return 1;
+    *last_normal_was_us = 0;
+    return 0;
+}
+static int audio_window_in_front(void) {   /* (the mixer thread's only: its own state, not game_in_front's) */
+    static int last_normal_was_us = 1;
+    DWORD pid = 0;
+    HWND w = GetForegroundWindow();
+    if (!w) return 0;
+    GetWindowThreadProcessId(w, &pid);
+    const int ours = pid == GetCurrentProcessId();
+    const int overlay = !ours && (GetWindowLongPtrA(w, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0;
+    return audio_front_decide(ours, overlay, &last_normal_was_us);
+}
+
+/* The Volume row's percent (0 to 100) as a gain (0 to 1), on a squared curve so the slider's steps sound about even: 50%
+   is a quarter, -12 dB. A straight line left the bottom half of the slider nearly all very quiet. */
+static float audio_volume_curve(int percent) {
+    const float v = (float)(percent < 0 ? 0 : percent > 100 ? 100 : percent) / 100.0f;
+    return v * v;
+}
+/* The gain the menu asks for: Volume and Mute in background. With no menu (the WebGPU renderer) the game plays at full
+   volume. */
+static float audio_player_gain(void) {
+    int rx_option(int id, int otherwise);
+    int volume = rx_option(HOS_OPT_VOLUME, 100);
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    if (volume && rx_option(HOS_OPT_MUTE_BACKGROUND, 0) && !audio_window_in_front()) volume = 0;
+    return audio_volume_curve(volume);
+}
+
 /* ---- the renderer thread --------------------------------------------------------------------------------------- */
 static uint64_t renderer_event;
 static volatile int renderer_running;
@@ -1042,6 +1162,8 @@ static DWORD WINAPI renderer_main(void *p) {
     output_open();
     int64_t period = 5000000, next = hos_now_ns() + period;   /* one audio frame: 240 samples at 48 kHz */
     static int16_t pcm[FRAME * OUT_MAX_CH];
+    float gain = 1.0f, gain_want = 1.0f;
+    int gain_frames = 0;
     for (;;) {
         hos_sleep_ns(next - hos_now_ns());
         next = audio_mix_deadline(hos_now_ns(), next, period);
@@ -1050,6 +1172,8 @@ static DWORD WINAPI renderer_main(void *p) {
         if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
         render_frame(pcm, out_channels);
         au_unlock();
+        if (gain_frames-- <= 0) gain_want = audio_player_gain(), gain_frames = 20;   /* (the menu read every 100 ms) */
+        gain = audio_apply_gain(pcm, FRAME, out_channels, gain, gain_want);
         output_frame(pcm);
         elapsed_frames++;
         if (renderer_event) hos_system_event_signal(renderer_event);

@@ -11,6 +11,9 @@
 #include "vk_loader.h"
 #include "vk_api.h"
 #include "split_count.h"   // (TICK-052)
+#ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
+#include "compat/hookshot_env.h"
+#endif
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -46,7 +49,7 @@ struct Device {
     uint32_t queue_family = 0;
     VkQueue queue = VK_NULL_HANDLE;
     // extensions in use
-    bool mesh_shader = false, external_memory_host = false, external_memory_fd = false, dma_buf_import = false, pipeline_library = false,
+    bool mesh_shader = false, mesh_queries = false, external_memory_host = false, external_memory_fd = false, dma_buf_import = false, pipeline_library = false,
          graphics_pipeline_library = false, custom_border_color = false, dynamic_state3 = false,
          depth_clip_control = false, null_descriptor = false, index_uint8 = false, push_descriptor = false,
          conditional_rendering = false, provoking_vertex = false, vertex_divisor = false, stencil_export = false, memory_budget = false,
@@ -62,18 +65,28 @@ struct Device {
     bool swapchain_colorspace = false;   // (hookshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
     bool hdr = false;                    // (hookshot) the swapchain is HDR10 (ST 2084, Rec. 2020): framegen_hdr writes it
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
+    bool task_mesh_fallback = false;
+    bool uses_mesh_fallback(bool has_task) const {
+        return mesh_fallback || (task_mesh_fallback && has_task);
+    }
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
+    uint32_t subgroup_size = 32, subgroup_max = 32;   // (the lanes a stage not pinned runs at, and the most it can have)
+    VkDriverId driver_id{};
     uint32_t max_push_descriptors = 0;
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;
     // the window
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    uint64_t swapchain_generation = 0;   // (under the presentation lock)
     VkFormat swap_format = VK_FORMAT_UNDEFINED;
     VkExtent2D swap_extent{};
     std::vector<VkImage> swap_images;
+    // (hookshot) how many of its images may be held acquired at once with no acquire timeout: the count less the surface's
+    // minImageCount (the Vulkan spec's limit). vk_framegen.cpp's present ahead holds two
+    std::atomic<uint32_t> swap_spare{0};
     std::vector<VkImageView> swap_views;   // (hookshot) a view of each, for Dear ImGui's overlays (VK_NULL_HANDLE: none)
     VkFormat swap_view_format = VK_FORMAT_UNDEFINED;   // (their format: the UNORM one of an sRGB swapchain when it can be)
     bool swap_mutable = false;   // (VK_KHR_swapchain_mutable_format: an sRGB swapchain's images viewed as UNORM)
@@ -83,6 +96,7 @@ struct Device {
     // (hookshot) a queue of a compute family for vkQueuePresentKHR alone (vk_main.cpp create_device; RX_VK_PRESENT_QUEUE=0 / 1).
     // VK_NULL_HANDLE: presents go on `queue` under present_mu. Its own lock: taken after present_mu, never before it
     VkQueue present_queue = VK_NULL_HANDLE;
+    bool present_queue_supported = false;
     std::mutex present_queue_mu;
     uint32_t present_family = 0;   // (present_queue's family, the swapchain's images shared with it)
 };
@@ -99,6 +113,11 @@ struct BufferRef {
 };
 bool memory_init();                                   // vk_memory.cpp
 void memory_cpu_owned(uint64_t guest, uint64_t size);   // (hookshot: words the replay writes on the CPU, left out of write-backs)
+// (hookshot) The replay's own CPU writes of guest memory, by GPU address: every one goes through guest_cpu_write (or, for a
+// write made in pieces, host->gpu_write and then guest_cpu_wrote over the whole range), so that the write-back diff's shadows
+// hear of it before this submission's write-back (vk_memory.cpp, "the write-back's diff"). tests/test_wb_diff_cpu_writes.py
+int guest_cpu_write(uint64_t gpu, const void* src, uint64_t n);
+void guest_cpu_wrote(uint64_t gpu, uint64_t n);
 void memory_table_begin();                         // (hookshot: a recording's page table changes held back for its upload commands)
 bool memory_table_flush();
 uint64_t memory_guest_pages();                        // (hookshot: the device address of guest memory's page table, 0: none)
@@ -108,6 +127,14 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool hold
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
 BufferRef stream_copy(const void* src, uint64_t n);   // vk_draw.cpp: bytes in the recording's stream, as a binding
+/// Authored constants in the recording's stream: never recycled until its recording completes.
+/// Fill mapped, then flush memory through binding.offset + binding.size before GPU use.
+struct UniformUpload {
+    BufferRef binding;
+    uint8_t* mapped = nullptr;
+    VmaAllocation memory = nullptr;
+};
+UniformUpload uniform_upload(uint64_t size);   // empty: no recording or no room; no history consumed
 /// Changes when a read binding remembered earlier must be looked up again (a pool left, a mirror was made, a new submission)
 uint64_t gpu_bind_stamp();
 /// Around each submission's recording: mirrors wanted since the last one are made (begin), what the GPU wrote into
@@ -232,7 +259,10 @@ uint64_t gpu_pool_start(uint64_t gpu); // (EvilOOT) and where it begins
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
                           void** mapped, bool dedicated = false);   // (vk_vma.cpp: cached host memory, mapped)
 void flush_mapped(VmaAllocation allocation, uint64_t size);
+void flush_mapped_range(VmaAllocation allocation, uint64_t offset, uint64_t size);
 void invalidate_mapped(VmaAllocation allocation, uint64_t size);   // (the CPU is to read what the GPU wrote: a no-op in coherent memory)
+bool flush_mapped_checked(VmaAllocation allocation, uint64_t size);
+bool invalidate_mapped_checked(VmaAllocation allocation, uint64_t size);
 void memory_stamp_gpu(uint64_t guest, uint64_t size);   // (a GPU write: memory_stamp, and the pages noted)
 void memory_protect_gpu(uint64_t guest, uint64_t size);  // (RX_VK_PROTECT_BARE=1: pages a shader writes through a table pointer)
 /// (vk_replay.cpp) guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
@@ -251,6 +281,8 @@ void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel r
 void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
+/// A future submission completion covering images retired during replay; zero: no safe value.
+uint64_t vk_retirement_value();
 void vk_timeline_wait(uint64_t v);
 void gpu_tail_note_late(uint64_t v);   // (TICK-057, vk_replay.cpp: a capture waited for v's late pages: the GPU's busy tail before it)
 uint32_t memory_generation();
@@ -292,7 +324,26 @@ void res_note_pipeline_use(VkPipeline pl);   // (vk_draw.cpp, RX_VK_RES_LOG: a p
 void res_pipeline_counts(size_t* graphics, size_t* used, int64_t* modules_dropped);
 // device memory (vk_vma.cpp, Vulkan Memory Allocator)
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false, bool target = false);
+/// (textures: from the textures' own pool, the one image_compact_* moves allocations in: vk_texture.cpp's compaction)
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false, bool target = false,
+                  bool textures = false);
+// (hookshot) the textures' pool compacted: VMA's defragmentation, a pass at a time (vk_texture.cpp's compact_step)
+struct ImageMove {
+    VmaAllocation src;   // (the allocation to move: it stays the texture's, and points at the new place once the pass ends)
+};
+/// The free space inside the textures' pool's blocks, and what the blocks hold in all; false without the pool
+bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes);
+bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass);
+bool image_compact_active();
+/// A pass begun: the moves VMA asks for. False: nothing left to move, the compaction is over (then *freed_bytes and
+/// *freed_blocks say what went back to the driver in all)
+bool image_compact_pass(std::vector<ImageMove>& moves, uint64_t* freed_bytes, uint32_t* freed_blocks);
+/// The new image of move i bound at its new place; false: not bound (the caller destroys the image and ignores the move)
+bool image_compact_bind(size_t i, VkImage image);
+void image_compact_ignore(size_t i);
+/// The pass ended (its old images destroyed by the caller, nothing of the pool freed since it began). False: that was
+/// the last one; then *freed_bytes and *freed_blocks say what went back to the driver in all
+bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks);
 void destroy_image(VkImage image, VmaAllocation allocation);
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
 uint64_t allocation_size(VmaAllocation allocation);
@@ -320,19 +371,40 @@ void vma_log_image_blocks();   // (the image pools' blocks: what they hold, and 
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);
+int swapchain_framegen();   // (vk_main.cpp: frame generation's fixed multiplier as the swapchain is made for it, 0 none)
+bool swapchain_dlssg();     // (vk_main.cpp: and DLSS-G makes its sets: V-Sync Auto's FIFO)
+void retire_swapchain();   // (dev.present_mu held)
+bool invalidate_lost_surface(VkResult result);   // (dev.present_mu held)
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 bool precompile_blocking();                   // vk_draw.cpp: RX_VK_PRECOMPILE_WAIT=1 (else the pipelines are built while the game runs)
 void precompile_run(void (*progress)(size_t done, size_t total), bool wait = true);
-bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
+bool prepare_run(void (*progress)(size_t done, size_t total), bool background, bool refresh_states = false);
 bool prepare_is_update();
 void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
+/// (hookshot) A prediction a start began and did not finish (closed, or ended in it): the next start runs it again
+bool predict_pending();   // vk_draw.cpp
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
+/// (hookshot) The CPUs this process may run on: its affinity mask (sched_getaffinity on Linux, through host/posix), not every CPU
+/// the PC has. The prepare's pools are sized from it: a process limited to 12 of 24 CPUs ran 24 threads on them
+unsigned usable_cpus();   // vk_progcache.cpp
+/// (hookshot) Half the PC's CPUs (one a core where a core runs two threads: the translation's and the stage libraries' workers, at
+/// below normal priority), and never more than usable_cpus: on 12 of 24 CPUs, 6 workers made the translation 40% slower than 12
+unsigned half_cpus();   // vk_progcache.cpp
+/// (hookshot) The driver's shader cache folders' size, logged with when: at the start, after the prediction
+void driver_cache_log(const char* when);   // vk_draw.cpp
+/// (hookshot) At the start after a preparation, behind the game: a sample of its predicted pipelines asked of the driver without
+/// compiling, "the driver's shader cache kept N of M" (none: this driver keeps nothing the prediction builds)
+void predicted_check();   // vk_draw.cpp
+void prepare_guess(size_t out[3]);   // (the three parts' counts from the files, before they run: PrepareBar)
 /// (hookshot) The window was closed while the shaders were prepared: prepare_run and precompile_run take nothing more and return,
 /// what is done kept (the program cache, the driver's) and not counted as a start that ended inside them
 void prepare_stop();
 bool prepare_stopped();
+int driver_faults();   // (hookshot, vk_draw.cpp) the driver faults the pipeline compiles caught so far (guarded_graphics, guarded_compute)
+void prepare_left_workers_note();   // (hookshot, vk_draw.cpp) predict_run or precompile_run left workers inside the driver
+bool prepare_left_workers();
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 
 } // namespace mkwvk
@@ -383,7 +455,7 @@ inline int64_t prof_now() {
 // one around it. What is slow and rare inside (a program or pipeline made, a texture created or uploaded, a wait) is timed
 // by PROF / PROF_EXACT and counted once as it is, sampled draw or not: the PROF_HOT scopes around it weigh only the rest.
 // Every scope timed (prof_full): RX_VK_PROF_ALL=1, RX_VK_SLOW_LOG, and while RX_VK_BENCH replays its frame.
-inline std::atomic<int> prof_full{getenv("RX_VK_PROF_ALL") || getenv("RX_VK_SLOW_LOG") ? 1 : 0};
+inline std::atomic<int> prof_full{env_on("RX_VK_PROF_ALL") || getenv("RX_VK_SLOW_LOG") ? 1 : 0};
 struct ProfThread {
     uint32_t rng;    // (xorshift32, seeded at the thread's first pick)
     int open, k;     // (the PROF_HOT scopes open, and the outermost one's weight: 0 not timed)

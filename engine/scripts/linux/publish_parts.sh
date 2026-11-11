@@ -41,7 +41,12 @@ for zip in "$PARTS"/HookshotLinux-*.zip; do
         continue
     fi
     echo "uploading $name"
-    curl -fsSL --retry 5 --retry-delay 10 -X POST "${AUTH[@]}" -H "Content-Type: application/zip" \
-        --data-binary @"$zip" "$upload?name=$name" >/dev/null
+    # (a release and the nightly of the same commit can upload the same part at once: then one of them wins)
+    if ! curl -fsSL --retry 5 --retry-delay 10 -X POST "${AUTH[@]}" -H "Content-Type: application/zip" \
+        --data-binary @"$zip" "$upload?name=$name" >/dev/null; then
+        curl -fsSL "${AUTH[@]}" "$API/releases/tags/linux-parts" |
+            python3 -c 'import json, sys; sys.exit(sys.argv[1] not in [a["name"] for a in json.load(sys.stdin)["assets"]])' "$name"
+        echo "already on linux-parts: $name (uploaded by another run)"
+    fi
 done
 echo "parts published"
