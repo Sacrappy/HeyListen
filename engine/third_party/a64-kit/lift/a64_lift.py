@@ -274,7 +274,7 @@ MG_ADEF = re.compile(r"uint64_t _a=c->x\[(\d+)\];")
 # (call-like tokens that are plain: keywords, guest loads and stores without ordering (the stores are what is grouped),
 # and helpers that only compute or move values between locals, registers and vector registers)
 MG_PLAIN = re.compile(r"(?:if|for|while|sizeof|memcpy|memset|UINT64_C|INT64_C|fabsf|fabs|__builtin_add_overflow|"
-                      r"recomp_(?:load|ldp|store|stp)(?:8|16|32|64)(?:_sp)?|"
+                      r"recomp_(?:load|ldp|store|stp)(?:8|16|32|64)(?:_sp|_lr)?|"
                       r"recomp_(?:fixed_to_fp|fp_to_fixed|fp_to_int|fp_estimate|umulh|smulh|aes_sbox)|"
                       r"a64_(?:vset64|vset128|vset_lo|vst16|fcmp32|fcmp64|vfcmp)|a64_v?fpx_\w+)\Z")
 MG_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
@@ -1436,13 +1436,34 @@ def fpx_header(used):
             out.append(VFPX_FMA_HEADER)
     if lift_opt("A64_FPX_XMM"):   # (TICK-055; off by default: a64_fpx.h as before)
         out.append(xmm_header(used))
+    if lift_opt("A64_LR_SCALAR"):   # (TICK-055; off by default)
+        out.append(LR_HEADER)
     return "\n".join(out) + "\n"
 
 
 def op_text(text, fpx):
     """one instruction's emitted C as lifted code has it: FPX guards outlined (their shapes added to fpx, which
     fpx_header turns into a64_fpx.h), NEON FP vectorized, stores widened, flags packed"""
-    return stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
+    text = stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
+    return LR_STP.sub(r"recomp_stp64_lr(c,\1,c->x[29],c->x[30])", text) if lift_opt("A64_LR_SCALAR") else text
+
+
+# (HeyListen TICK-055) A64_LR_SCALAR=1 at lift time (off by default): the frame record's STP x29, x30 to the stack reads LR as
+# a scalar. clang's SLP vectorizer merged the two context reads (c->x[29], c->x[30]) into one 16-byte load (and with the
+# STPs after it, 32-byte ones), but the caller has just stored c->x[30] (the return address) with an 8-byte store: the wide
+# load cannot take its data from that store and waits for it to commit, at the entry of nearly every non-leaf function
+# (0.9% of the castle's guest samples sat there). recomp_stp64_lr passes LR through an empty asm, which the vectorizer
+# cannot see through; the stores are the same.
+LR_STP = re.compile(r"recomp_stp64_sp\(c,([^;]*?),c->x\[29\],c->x\[30\]\)")
+LR_HEADER = r"""
+/* (TICK-055) A64_LR_SCALAR: STP x29, x30 to the stack with LR read as a scalar (LR_STP in a64_lift.py) */
+static inline __attribute__((always_inline)) void recomp_stp64_lr(GuestContext *c, uint64_t a, uint64_t v0, uint64_t v1) {
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__("" : "+r"(v1));
+#endif
+    recomp_stp64_sp(c, a, v0, v1);
+}
+"""
 
 
 class Lifter:

@@ -1,4 +1,5 @@
-"""(HeyListen TICK-055) A64_FPX_XMM=1 (a64_lift.xmm_text / xmm_header), game-free: bit-exact with the default lowering.
+"""(HeyListen TICK-055) A64_FPX_XMM=1 (a64_lift.xmm_text / xmm_header) and A64_LR_SCALAR=1 (LR_STP), game-free: bit-exact
+with the default lowering.
 
 Guest words and short sequences of them (hand-encoded: scalar FADD / FSUB / FMUL / FNMUL / FDIV / FMADD / FMSUB / FNMADD /
 FNMSUB S, aliased registers too; LDR S / D / Q, LDP S / Q, pre- and post-index; FNEG / FABS / FMOV S and D; dependent chains
@@ -55,7 +56,11 @@ GUEST = (
     ("LDR s0,[x0]; FADD s0,s0,s1; STR s0,[x0]", [0xBD400000, 0x1E212800, 0xBD000000], 1),
     ("LDR q0,[x0]; FADD s1,s0,s2; FMUL v3.4s,v0.4s,v1.4s", [0x3DC00000, 0x1E222801, 0x6E21DC03], 1),
     ("FDIV s0,s0,s1; FMUL s0,s0,s1; FNMUL s2,s0,s0", [0x1E211800, 0x1E210800, 0x1E208802], 1),
+    # A64_LR_SCALAR: the frame record's STP
+    ("STP x29, x30, [sp, #-16]!", [0xA9BF7BFD], 1), ("SUB sp, sp, #0x60; STP x29, x30, [sp, #0x50]", [0xD10183FF, 0xA9057BFD], 1),
+    ("STP x29, x30, [sp, #-16]!; STP x19, x20, [sp, #-16]!", [0xA9BF7BFD, 0xA9BF53F3], 1),
 )
+SWITCHES = ("A64_FPX_XMM", "A64_LR_SCALAR")
 
 
 def lift_text(a64emit, a64_lift, words, used):
@@ -80,12 +85,15 @@ def generate(cxx, tmp, flags):
     try:
         rtgen.write(tmp)
         a64_rtgen.write(tmp)
-        os.environ["A64_FPX_XMM"] = "0"
+        for k in SWITCHES:
+            os.environ[k] = "0"
         olds = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for _, w, _ in GUEST]
-        os.environ["A64_FPX_XMM"] = "1"
+        for k in SWITCHES:
+            os.environ[k] = "1"
         news = [a64_lift.hot_text(lift_text(a64emit, a64_lift, w, used)) for _, w, _ in GUEST]
     finally:
-        os.environ["A64_FPX_XMM"] = "0"
+        for k in SWITCHES:
+            os.environ[k] = "0"
         if a64emit._lib is not None:
             import _ctypes
             (_ctypes.FreeLibrary if os.name == "nt" else _ctypes.dlclose)(a64emit._lib._handle)
@@ -108,15 +116,19 @@ def generate(cxx, tmp, flags):
     used |= {("add32", "add32", 2, 2), ("sub32", "sub32", 2, 2), ("mul32", "fma32", 2, 3), ("fma32", "fma32", 3, 3),
              ("div32", "div32", 2, 2)}
     # the switch off: the header and the hot text as without it
-    os.environ.pop("A64_FPX_XMM", None)
+    for k in SWITCHES:
+        os.environ.pop(k, None)
     plain = a64_lift.fpx_header(used)
-    os.environ["A64_FPX_XMM"] = "0"
+    for k in SWITCHES:
+        os.environ[k] = "0"
     off = a64_lift.fpx_header(used)
-    os.environ["A64_FPX_XMM"] = "1"
+    for k in SWITCHES:
+        os.environ[k] = "1"
     try:
         on = a64_lift.fpx_header(used)
     finally:
-        os.environ["A64_FPX_XMM"] = "0"
+        for k in SWITCHES:
+            os.environ[k] = "0"
     if off != plain or "TICK-055" in off or "TICK-055" not in on or not on.startswith(off.rstrip("\n")):
         raise SystemExit("fpx xmm: the switch off must leave a64_fpx.h as it was, and on only add to it")
     with open(os.path.join(tmp, "a64_fpx.h"), "w", newline="\n") as f:

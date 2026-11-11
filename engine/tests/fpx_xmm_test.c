@@ -84,6 +84,8 @@ int main(int argc, char **argv) {
         /* x1: an address for the sequences that store through it, else random data (FMOV from it) */
         A.x[1] = strstr(fn_names[g], "STR") || rnd() % 2 ? SCRATCH + rnd() % (SIZE - 64) : rf(0) | (uint64_t)rf(0) << 32;
         A.x[2] = rnd();
+        A.x[19] = rnd(); A.x[20] = rnd(); A.x[29] = rnd(); A.x[30] = rnd();
+        A.x[31] = SCRATCH + SIZE / 2 + rnd() % 64 * 16;   /* SP: 16-byte aligned, in the scratch area */
         A.fpsr = fpsrs[rnd() % (sizeof fpsrs / sizeof *fpsrs)];
         A.fpcr = rnd() % 4 ? fpcrs[rnd() % 2] : fpcrs[rnd() % (sizeof fpcrs / sizeof *fpcrs)];
         B = A;
