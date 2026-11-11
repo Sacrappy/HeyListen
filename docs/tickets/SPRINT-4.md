@@ -150,4 +150,4 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 
 ### TICK-048 on the main PC (2026-11-11)
 - Diff on loses here: castle-move 70.5 -> 62.9 fps (3 runs each), frame prep +3.2 ms; the bytes it saves cost only 0.4 ms of GPU on Gen5 x16.
-- The default now follows the card's maximum PCIe link (NVML): on at <= 8 GB/s (PC 3050 Gen3 x4), off otherwise. Tests fixed (2 broken by TICK-048). Game folder holds this build. Branch `verify/TICK-048-mainpc`, not merged. See docs/benchmarks/2026-11-11-tick048mainpc.md.
+- The default now follows the card's maximum PCIe link (NVML): on at <= 8 GB/s (PC 3050 Gen3 x4), off otherwise. Tests fixed (2 broken by TICK-048). Game folder holds this build. Branch `verify/TICK-048-mainpc`, not merged. See docs/benchmarks/2026-11-11-tick048-mainpc.md.
