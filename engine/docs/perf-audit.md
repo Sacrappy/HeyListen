@@ -2817,3 +2817,60 @@ Saves equal the backup after every run; no game process left. `run_all`: 229 pas
 - Next: (1) the program pick's "other textures" path (`still_valid` + `answer_handles`, ~10% of the workers; vk_shader.cpp, needs
   `--prepare-shaders`), and its shared statics `st_calls` / `st_hit` bumped at every pick; (2) the per-submission touches (~390 a
   command buffer) done once ahead of the segments; (3) TICK-050's ROUNDS+SELF+BALANCE again with these switches on (fewer segment starts).
+
+## TICK-053: the CPU's wait for the GPU on PC 3050, and the overlap that does not pay there (2026-11-11)
+
+**Result: PC 3050's frame is serial, not GPU-bound: ~22 ms of GPU work and ~13 ms of idle GPU a frame, the idle being the game's
+thread draining the GPU at its first submit of each frame (the capture's wait for its late pages, on the submitting thread) and
+then recording the frame. Without the wait the frame is 24-26 ms (40 fps) for a while, then the queue idles 25-50 ms a frame
+between our own command buffers while both game threads wait for the GPU: 15-23 fps, worse than the 28.5 of main. The late pages
+can now be merged into their mirrors without a wait (`RX_VK_LATE_MERGE`, off by default), the queue's gaps are measured every
+frame (`gpu_gap_ms`, `gpu_up_ms`, the blit's own timestamps), and the stall itself is not placed. Measured over SSH, in session 0.**
+
+### Where a PC 3050 frame goes (main 4b170f0, castle-move)
+- 35.1 ms a frame (28.5 fps). The game's thread: 27.4 ms in submits (the replay records on it: `RX_VK_ASYNC` is off), of which
+  8.8 ms is one wait a frame in `take_capture` for the previous frame's last write-back (`late_wait_ms`), and ~18.6 ms recording.
+- GPU busy 63% (nvidia-smi): ~22 ms. Profiled (`RX_VK_PASS_TIMING`, inflated): 25.1 ms: recordings 19.7 (passes 12.4, dispatches
+  4.5, barriers 1.1, write-backs 0.75), uploads 5.4 (rbrefresh 1.9, msync 1.5 for 4.1 MB with the chunk diff on, mmake 0.8, ASTC
+  0.65). The engine's share is ~5.5 ms; the game's rendering ~17.
+- So the frame is CPU + GPU, not max(CPU, GPU): the wait at the first submit drains the GPU, the first submission is then
+  recorded with the GPU idle, and the game's own work for the next frame runs after the GPU is done with this one. TICK-048 cut
+  9 ms of GPU and gained 3 fps for the same reason.
+
+### What the overlap gave, and the stall
+`RX_VK_CAPTURE_DEFER=1` with no pacing wait (TICK-017's experiment): 24-26 ms frames for 60 of the 110 s, 66 ms frames for 16 s:
+29.3 fps, 1% low 11. Any pacing slack of 6 or more, the late merge, and the standing scene (15.2 fps the whole run) show the same
+66 ms mode. In it: nvidia-smi 99% busy at 62-63 W (75 W at 40 fps), 1905-1935 MHz, P0; `dmon` SM 99%, memory 8-12%, PCIe rx
+20-85 MB/s; WDDM's counters: our 3D engine 27-74%, the System process 1-7% on the Copy engine; the game's main thread 55% of its
+time in `vkWaitSemaphores` (its own fence waits, ~10 values ahead of the GPU; `HOS_SAMPLE_ALL` by module, lr in `wait_recorded`),
+the Presentation thread polling 28 ms a frame; the recordings' own timestamps 5-8 ms a frame, the upload command buffers ~2 ms,
+and **25-50 ms a frame of gaps on the queue between two of our recordings**, one long gap a frame. Ruled out one by one: the
+swapchain's acquire (`RX_VK_ACQUIRE_FENCE=1`: the fence signals in 0.00 ms), the present mode (immediate, honoured), the presents'
+place on the queue (`RX_VK_PRESENT_QUEUE=1`: p50 46 -> 31 ms, the stalls stay), the blit (0.08 ms, gaps around it 0.01 ms), VRAM
+headroom (`RX_VK_MIRROR_MB=1024`, 76% of the allowance: worse), clocks, the game's event ordering (no 50 ms holds; 12x more
+captures at CPU-event waits), batched submits (off). Our submits carry no GPU-side waits and the values the game waits for are
+submitted ("recorded whole"). Not placed; it looks like a submission-side circular wait that a timeout ends, and may be particular
+to session 0 (no DWM). TICK-017 saw the GPU "slow" under overlap on the main PC with a desktop, so it may not be.
+
+### Changes (all behind switches)
+- `RX_VK_LATE_MERGE=1` (off): a late page is merged into its mirror word by word against a 4 KB shadow of what the mirror was last
+  synced with (`vk_memory.cpp` "the late pages merged": `late_shadows`, `late_diff_runs`, the capture table's `kCapLateBit`);
+  the GPU's words stay. A page with no shadow waits as before, once; the shadow is void when the mirror takes the page another
+  way (live, a readback refresh, a segment's sync, a kept bare page, a new mirror). Log `vk: late pages merged`: on PC 3050 ~90 of
+  600 takes merge and ~100 wait, 91 of them for a shadow the live path voided. `tests/test_late_merge.py`.
+- `RX_VK_ACQUIRE_FENCE=1` (off): the acquire's fence waited for on the presentation thread, the blit submitted with no wait.
+- On always: `gpu_time_collect` keeps absolute timestamps of the upload and recording command buffers; the trace has `gpu_up_ms`
+  and `gpu_gap_ms`; `vk: GPU time ... uploads ... gaps between recordings` every 120 presents; `vk: the blit on the GPU` with the
+  queue's gaps before and after it.
+
+### Screen and decisions (castle-move, 3 interleaved runs, PC 3050; `docs/benchmarks/2026-11-12-tick053.md`)
+main 28.21 fps (1% low 14.4, p99 56.6 ms), branch defaults 28.64 (14.9, 54.4), `RX_VK_RB_RANGES=1` 27.97 (13.8, 53.9): no gain, so
+RB_RANGES, LATE_MERGE and ACQUIRE_FENCE all stay off; the timestamps and trace columns stay on. Default speed ratio ~60.0; with
+the merge on several Market shots are white with only the HUD, so the merge needs a look before any run-ahead. The +20 fps is not
+reached here. Desktop A/B (`RX_VK_LATE_MERGE=1` against the default) in the benchmark doc.
+### What is next
+- The gap: a GPU-side trace of the queue (Nsight Systems with the WDDM trace, admin) or, without it, the game's two threads'
+  waits and the engine's submits on one timeline (`HOS_JOBTRACE` with the submit and signal values) in the slow mode, to see
+  what the first submission after a gap waited for. On the desktop first: if the stall is session 0's, the run-ahead is 40 fps.
+- With the stall gone, the merge's remaining waits: the live path voids the shadow of a late page written again after its
+  capture; a shadow refreshed from that live copy (the page as guest memory holds it at the record) would end most of them.

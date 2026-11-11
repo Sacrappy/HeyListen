@@ -819,11 +819,21 @@ std::vector<std::unique_ptr<Capture>> spare;   // (taken ones, their buffers kep
 // (RX_VK_SYNC_LIVE=1: dirty pages not in their submission's capture read from guest memory, as before)
 struct CapEntry { uint32_t gen, slot; };
 constexpr uint64_t kCapChunkPages = 1u << 16;   // (a chunk of the table: 256 MB of guest memory, made when first used)
+// (TICK-053) the slot's top bit: a late page (a write-back still on the GPU when the capture copied it) merged at its sync,
+// see "the late pages merged" below; cap_entry gives the slot without it, cap_entry_late the bit
+constexpr uint32_t kCapLateBit = 0x80000000u;   // (a slot is an index into a capture's pages: under 65536)
 std::vector<std::unique_ptr<CapEntry[]>> cap_table;
 inline CapEntry cap_entry(uint64_t page) {
     const uint64_t c = page / kCapChunkPages;
     if (c >= cap_table.size() || !cap_table[c]) return {0, 0};
-    return cap_table[c][page % kCapChunkPages];
+    CapEntry e = cap_table[c][page % kCapChunkPages];
+    e.slot &= ~kCapLateBit;
+    return e;
+}
+inline bool cap_entry_late(uint64_t page) {
+    const uint64_t c = page / kCapChunkPages;
+    if (c >= cap_table.size() || !cap_table[c]) return false;
+    return (cap_table[c][page % kCapChunkPages].slot & kCapLateBit) != 0;
 }
 inline void cap_entry_set(uint64_t page, CapEntry e) {
     const uint64_t c = page / kCapChunkPages;
@@ -2025,24 +2035,144 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
     if (completed > mem_completed) mem_completed = completed;
     inherit_watch_print();
 }
+// ---- (HeyListen TICK-053) the late pages merged: the capture's wait for the GPU ended ----
+// A late page is one a submission still on the GPU writes back when the capture copies it (capture_make): its copy has the
+// GPU's words as they were a frame before, and synced whole over the mirror it would put them back over the GPU's newer ones
+// (hookshot's reason for the wait: one-frame flashes of OoT's exposure). The wait is for the previous frame's last write-back,
+// i.e. for the GPU to finish the previous frame, once a frame on the game's thread: ~9 ms of a 35 ms frame on PC 3050 (RTX
+// 3050, i5-10400F), the GPU idle meanwhile (63% busy). Copying the page live from guest memory on the GPU instead (TICK-017's
+// RX_VK_CAPTURE_DEFER) reads the CPU's words of a later frame (the capture is there to stop that) and read the imported pages the
+// CPU is writing: 15 fps plateaus on PC 3050.
+// Here the page's copy from the capture is merged into the mirror word by word: only the words the CPU changed since the page
+// was last synced to this mirror are copied; the GPU's words stay the mirror's. For that the bytes the mirror was last synced
+// with are kept by page (a shadow, 4 KB in system memory), set at every sync of the page from a capture, and void when the
+// mirror takes the page another way (live from guest memory, a readback refresh, a parallel segment's sync, a new mirror).
+// A late page with no shadow yet is waited for as before (once; then it has one). The words the GPU wrote and the write-back
+// landed in guest memory since the shadow was taken read as changed: copied again with the mirror's own value, harmless.
+// RX_VK_LATE_MERGE=1: on; off by default: without the wait the game's thread runs ahead of the GPU, and on PC 3050 (over SSH, in
+// session 0) the queue then idles 25-50 ms a frame between our own command buffers while both game threads wait for the GPU
+// (TICK-053 in docs/perf-audit.md: not placed; the presentation, VRAM headroom and clocks ruled out), 23 fps against 28.5. The
+// late bit rides in the capture table's slot (kCapLateBit, above).
+bool late_merge_on() {
+    static const bool v = getenv("RX_VK_LATE_MERGE") && atoi(getenv("RX_VK_LATE_MERGE")) != 0;
+    return v;
+}
+struct LateShadow {
+    uint32_t mid = 0;                   // (the mirror whose page holds these bytes; 0: none, void)
+    uint64_t used = 0;                  // (gen_now at the last sync: the oldest go past kLateShadowMax)
+    std::unique_ptr<uint8_t[]> bytes;   // (4 KB)
+};
+constexpr size_t kLateShadowMax = 4096;   // (16 MB)
+std::unordered_map<uint32_t, LateShadow> late_shadows;   // (guest page -> its shadow; pools_mu)
+std::atomic<int64_t> st_late_merged{0}, st_late_merged_bytes{0}, st_late_waited{0}, st_late_no_shadow{0}, st_late_seg{0};
+void late_shadow_void(uint64_t page) {   // (pools_mu held: the mirror's page no longer holds what the shadow says)
+    if (late_shadows.empty()) return;
+    if (auto it = late_shadows.find((uint32_t)page); it != late_shadows.end()) it->second.mid = 0;
+}
+void late_shadow_void_range(uint64_t lo, uint64_t hi) {   // (pools_mu held)
+    if (late_shadows.empty() || hi <= lo) return;
+    for (uint64_t p = lo >> kPageShift; p <= (hi - 1) >> kPageShift; p++) late_shadow_void(p);
+}
+/// A shadow wanted for the page: an entry with no bytes yet, filled at the page's next sync from a capture (pools_mu held)
+void late_shadow_want(uint64_t page) {
+    if (late_shadows.size() >= kLateShadowMax && !late_shadows.count((uint32_t)page)) return;   // (full: the page waits as before)
+    late_shadows.try_emplace((uint32_t)page);
+}
+/// Whether the page's shadow holds what its pool's mirror has for the page now (pools_mu held)
+std::atomic<int64_t> st_late_why[4];   // (why a late page had no shadow: no entry, bytes not yet taken, void, another mirror)
+bool late_shadow_valid_locked(uint64_t page) {
+    const auto it = late_shadows.find((uint32_t)page);
+    if (it == late_shadows.end()) return st_late_why[0]++, false;
+    if (!it->second.bytes) return st_late_why[1]++, false;
+    if (!it->second.mid) return st_late_why[2]++, false;
+    const uint64_t g = page << kPageShift;
+    auto pit = imported.upper_bound(g);
+    if (pit == imported.begin()) return false;
+    --pit;
+    const Pool& p = pit->second;
+    if (g >= p.lo && g < p.hi && p.mstate == Pool::MIRROR_ON && p.mirror && p.mirror_id == it->second.mid) return true;
+    return st_late_why[3]++, false;
+}
+/// The page's shadow made or refreshed with the capture's bytes: the mirror holds them from this sync on (pools_mu held)
+void late_shadow_set(uint64_t page, uint32_t mid, const uint8_t* bytes) {
+    if (late_shadows.size() >= kLateShadowMax && !late_shadows.count((uint32_t)page)) {   // (the least recently synced go)
+        uint64_t oldest = ~0ull;
+        for (const auto& [p, s] : late_shadows) oldest = std::min(oldest, s.used);
+        for (auto it = late_shadows.begin(); it != late_shadows.end();)
+            it = it->second.used <= oldest + 64 ? late_shadows.erase(it) : std::next(it);
+    }
+    LateShadow& s = late_shadows[(uint32_t)page];
+    if (!s.bytes) s.bytes.reset(new uint8_t[4096]);
+    std::memcpy(s.bytes.get(), bytes, 4096);
+    s.mid = mid, s.used = gen_now;
+}
+/// The words of now (the capture's page) that differ from the shadow, as runs of bytes (offset, length), 4-byte granular,
+/// into out; the count. tests/test_late_merge.py
+int late_diff_runs(const uint8_t* now, const uint8_t* shadow, uint32_t* off, uint32_t* len, int max_runs) {
+    const uint64_t* a = (const uint64_t*)now;
+    const uint64_t* b = (const uint64_t*)shadow;
+    int n = 0;
+    uint32_t run_lo = 0, run_hi = 0;
+    for (uint32_t i = 0; i < 512; i++) {
+        if (a[i] == b[i]) continue;
+        const uint32_t* a4 = (const uint32_t*)(a + i);
+        const uint32_t* b4 = (const uint32_t*)(b + i);
+        for (uint32_t w = 0; w < 2; w++) {
+            if (a4[w] == b4[w]) continue;
+            const uint32_t at = i * 8 + w * 4;
+            if (run_hi == at && run_hi) { run_hi += 4; continue; }
+            if (run_hi) {
+                if (n == max_runs) return -1;   // (cannot happen with 512: a page's words alternating is 512 runs)
+                off[n] = run_lo, len[n] = run_hi - run_lo, n++;
+            }
+            run_lo = at, run_hi = at + 4;
+        }
+    }
+    if (run_hi) {
+        if (n == max_runs) return -1;
+        off[n] = run_lo, len[n] = run_hi - run_lo, n++;
+    }
+    return n;
+}
+
 bool memory_is_rb_page_locked(uint32_t page);
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
+    // (TICK-053) the late pages merged at their syncs instead (RX_VK_LATE_MERGE): no wait when every one of them has a shadow
+    // of what its mirror holds; else the wait below, and a shadow wanted for each, made at its sync from this fresh copy
+    bool late_merge = false;
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
-        // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
-        // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
-        // 35-45 fps instead of 55, issue 995)
-        const auto tw = std::chrono::steady_clock::now();
-        vk_timeline_wait(c->late_value);
-        st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
-        st_tk_late_n++;
-        st_tr_late_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
-                                std::memory_order_relaxed);
-        st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
-        uint8_t* const base = (uint8_t*)host->guest_base();
-        for (uint32_t i : c->late)
-            guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
-        flush_mapped(c->alloc, c->nbytes);
+        if (late_merge_on()) {
+            std::lock_guard sl(pools_mu);
+            late_merge = true;
+            for (uint32_t i : c->late)
+                if (!late_shadow_valid_locked(c->pages[i])) {
+                    late_merge = false;
+                    break;
+                }
+            if (late_merge) st_late_merged.fetch_add(1, std::memory_order_relaxed);
+            else {
+                st_late_no_shadow.fetch_add(1, std::memory_order_relaxed);
+                for (uint32_t i : c->late) late_shadow_want(c->pages[i]);
+            }
+        }
+        if (!late_merge) {
+            st_late_waited.fetch_add(1, std::memory_order_relaxed);
+            // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
+            // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
+            // 35-45 fps instead of 55, issue 995)
+            const auto tw = std::chrono::steady_clock::now();
+            vk_timeline_wait(c->late_value);
+            st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+            st_tk_late_n++;
+            st_tr_late_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
+                                    std::memory_order_relaxed);
+            st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
+            uint8_t* const base = (uint8_t*)host->guest_base();
+            for (uint32_t i : c->late)
+                guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+            flush_mapped(c->alloc, c->nbytes);
+        }
     }
     const auto tl = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
@@ -2132,7 +2262,13 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         cap_bufs.emplace(g, b);
         cap_bytes += b.size;
         cur_cap_gen = g;
-        for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i]});
+        // (TICK-053: a late page merged at its sync carries kCapLateBit; a slot is the page's index in c->pages, as c->late)
+        static thread_local std::vector<uint8_t> late_mark;
+        late_mark.assign(c->pages.size(), 0);
+        if (late_merge)
+            for (uint32_t i : c->late) late_mark[i] = 1;
+        for (size_t i = 0; i < c->copied.size(); i++)
+            cap_entry_set(c->copied[i], CapEntry{g, c->slots[i] | (late_mark[c->slots[i]] ? kCapLateBit : 0u)});
     }
     cap_view_bump();
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
@@ -2152,6 +2288,21 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                  cap_bufs.size(), (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
                  (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
             st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_lock = 0, st_tk_late_n = 0;
+            if (late_merge_on()) {   // (TICK-053)
+                static int64_t l_m, l_w, l_ns, l_b, l_seg;
+                const int64_t m = st_late_merged.load(), w = st_late_waited.load(), ns = st_late_no_shadow.load();
+                const int64_t b = st_late_merged_bytes.load(), seg = st_late_seg.load();
+                static int64_t l_why[4];
+                int64_t why[4];
+                for (int k = 0; k < 4; k++) why[k] = st_late_why[k].load();
+                logf("vk: late pages merged (RX_VK_LATE_MERGE): %lld takes merged (no wait), %lld waited (%lld for a page with no "
+                     "shadow yet: %lld never late, %lld not synced since, %lld void, %lld another mirror), %.1f KB of changed words a "
+                     "take, %lld pages in a segment; %zu shadows", (long long)(m - l_m), (long long)(w - l_w), (long long)(ns - l_ns),
+                     (long long)(why[0] - l_why[0]), (long long)(why[1] - l_why[1]), (long long)(why[2] - l_why[2]), (long long)(why[3] - l_why[3]),
+                     m - l_m ? (b - l_b) / 1024.0 / (m - l_m) : 0.0, (long long)(seg - l_seg), late_shadows.size());
+                l_m = m, l_w = w, l_ns = ns, l_b = b, l_seg = seg;
+                std::memcpy(l_why, why, sizeof why);
+            }
         }
     }
     return true;
@@ -3133,6 +3284,7 @@ int64_t mirror_sync(Pool& p) {
     mirror_synced.push_back(&p);
     std::vector<VkBufferCopy> runs;   // (from guest memory)
     std::map<VkBuffer, std::vector<VkBufferCopy>> cap_runs;   // (from the captures' copies)
+    std::map<VkBuffer, std::vector<VkBufferCopy>> late_runs;  // (TICK-053: the late pages' changed words, 4-byte granular copies)
     uint64_t run_lo = 0, run_hi = 0;
     // (TICK-048: the diff, and the counters)
     const int dmode = diff_mode();
@@ -3169,6 +3321,7 @@ int64_t mirror_sync(Pool& p) {
         if (dirty && protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
             st_prot_kept++;
             d_void(page);
+            late_shadow_void(page);
             page++;
             continue;
         }
@@ -3179,6 +3332,33 @@ int64_t mirror_sync(Pool& p) {
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
                     const uint64_t src0 = (uint64_t)e.slot * 4096 + (ga - (page << kPageShift));
+                    // (TICK-053) a late page, merged: the words the CPU changed since the mirror's last sync of the page, from
+                    // the capture; the GPU's words stay. The shadow then holds the capture's page. In a parallel segment
+                    // (the uploads' order is not the records'), or with the page cut by the pool's end, the whole page as
+                    // before and the shadow void (the next late capture of it waits once)
+                    auto lsh = late_merge_on() && !late_shadows.empty() ? late_shadows.find((uint32_t)page) : late_shadows.end();
+                    const bool seg = par_active.load(std::memory_order_relaxed);
+                    if (lsh != late_shadows.end() && cap_entry_late(page) && b->second.map) {
+                        LateShadow& s = lsh->second;
+                        if (!seg && gb - ga == 4096 && s.mid == p.mirror_id && s.bytes) {
+                            const uint8_t* now = (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096;
+                            uint32_t off[512], len[512];   // (512: a page's words alternating, the most runs there can be)
+                            const int nr = late_diff_runs(now, s.bytes.get(), off, len, 512);
+                            int64_t copied = 0;
+                            for (int k = 0; k < nr; k++) late_runs[b->second.buffer].push_back({src0 + off[k], ga - p.lo + off[k], len[k]});
+                            for (int k = 0; k < nr; k++) copied += len[k];
+                            late_shadow_set(page, p.mirror_id, now);
+                            d_void(page);   // (the GPU's words in the mirror are not the capture's: the hashes do not describe it)
+                            st_late_merged_bytes.fetch_add(copied, std::memory_order_relaxed);
+                            (e.gen == cur_cap_gen ? b_cap : b_old) += copied;
+                            b->second.last_use = std::max(b->second.last_use, cur_cap_value);
+                            (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
+                            page++;
+                            continue;
+                        }
+                        if (seg) st_late_seg.fetch_add(1, std::memory_order_relaxed);
+                        s.mid = 0;   // (copied whole below, in a segment or cut: the shadow does not say what the mirror holds)
+                    }
                     uint32_t mask = 0xffff;   // (TICK-048: the chunks to copy)
                     if (dmode) {
                         if (d_ok && gb - ga == 4096 && b->second.map) {
@@ -3218,6 +3398,13 @@ int64_t mirror_sync(Pool& p) {
                         }
                     }
                     b_skip += (int64_t)(gb - ga) - copied;
+                    // (TICK-053) a page with a shadow, synced whole or by chunks: the mirror holds the capture's page now
+                    if (lsh != late_shadows.end()) {
+                        if (!seg && gb - ga == 4096 && b->second.map)
+                            late_shadow_set(page, p.mirror_id, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096);
+                        else
+                            lsh->second.mid = 0;
+                    }
                     (e.gen == cur_cap_gen ? b_cap : b_old) += copied;
                     b->second.last_use = std::max(b->second.last_use, cur_cap_value);
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
@@ -3230,6 +3417,7 @@ int64_t mirror_sync(Pool& p) {
             st_sync_live_pages++;   // (dirty, not in this submit's capture: guest memory as it is now)
             live_by_pool[p.lo]++;
             d_void(page);
+            late_shadow_void(page);   // (TICK-053: the mirror takes guest memory as it is at the replay, not a capture's page)
             {   // (RX_VK_LOG_LIVE=1: why, 300 lines: the page's generation, its entry's, the newest capture's)
                 static const bool log_live = getenv("RX_VK_LOG_LIVE") != nullptr;
                 static int logged;
@@ -3282,6 +3470,17 @@ int64_t mirror_sync(Pool& p) {
         runs.clear();
     }
     if (!scatter_batch) scatter_flush(upload_command_buffer(), "msync scatter (CPU pages -> mirrors, one dispatch)");
+    if (!late_runs.empty()) {   // (TICK-053: the late pages' changed words, between two full barriers as the scatter's are)
+        full_barrier(upload_command_buffer(), "barrier (write-back or sync)");
+        for (const auto& [buf, rs] : late_runs) {
+            GprofSpan gp(upload_command_buffer(), "late merge copies (a late page's changed words -> mirror)");
+            gp.items = (int)rs.size();
+            vkCmdCopyBuffer(upload_command_buffer(), buf, p.mirror, (uint32_t)rs.size(), rs.data());
+            for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
+            st_sync_copies += (int64_t)rs.size();
+        }
+        full_barrier(upload_command_buffer(), "barrier (write-back or sync)");
+    }
     if (runs.empty()) return b_all;
     checkpoint_mark(upload_command_buffer(), p.lo, 'm');
     GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages live from guest memory -> mirror)");
@@ -3434,7 +3633,10 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     }
     if (by_pool.empty()) return false;
     for (auto& [pp, rs] : by_pool)   // (TICK-048: the mirror written there from guest memory)
-        for (const VkBufferCopy& r : rs) diff_gpu_wrote(pp->lo + r.dstOffset, r.size), st_rb_bytes += (int64_t)r.size;
+        for (const VkBufferCopy& r : rs) {
+            diff_gpu_wrote(pp->lo + r.dstOffset, r.size), st_rb_bytes += (int64_t)r.size;
+            late_shadow_void_range(pp->lo + r.dstOffset, pp->lo + r.dstOffset + r.size);   // (TICK-053: guest memory, not a capture)
+        }
     full_barrier(up);   // (after the older submissions' write-backs into guest memory and this one's other uploads)
     {   // (TICK-021: one dispatch rather than a copy region each; RX_VK_MSYNC_SCATTER=0: copies)
         GprofSpan gp(up, "rbrefresh copies (readback pages guest -> mirror)");
