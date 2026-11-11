@@ -62,7 +62,7 @@ adds is spread over the other rows; the findings below cut across them.
 
 ## Findings, ranked (expected gain against risk and effort)
 
-### 1. Scalar FP values bounce between the integer and the vector registers — fixed: `A64_FPX_XMM` (below)
+### 1. Scalar FP values bounce between the integer and the vector registers — built as `A64_FPX_XMM`, not adopted (below)
 
 The lifted C handles every FP value as an integer bit pattern (`uint64_t`, `memcpy` from `c->vreg`), and the FPX fast
 paths test the result's bits. clang therefore keeps the values in general registers and moves them to an XMM register
@@ -208,14 +208,14 @@ run_all (laptop): 235 pass, 2 fail (both from main's TICK-053 merge: test_parall
 
 ### Micro-benchmarks (`tools/bench/lifter_mb/lifter_mb.py`, both switches, ns per guest instruction)
 
-| kernel | laptop (Zen 2) base | new | |
-|---|---:|---:|---:|
-| FMUL / FADD / FMADD / FSUB S chain | 4.14 | 1.60 | -61% |
-| vec3 dot from memory | 1.08 | 0.91 | -16% |
-| FDIV S -> FMUL S chain | 4.78 | 2.29 | -52% |
-| FNEG S -> FADD .4S -> FNEG S | 3.04 | 1.45 | -52% |
-| LDR S -> FADD S -> STR S | 2.07 | 1.19 | -43% |
-| LDR Q -> FADD .4S | 4.26 | 2.11 | -51% |
+| kernel | laptop (Zen 2) base | new | | PC 3050 (Comet Lake) base | new | |
+|---|---:|---:|---:|---:|---:|---:|
+| FMUL / FADD / FMADD / FSUB S chain | 4.14 | 1.60 | -61% | 3.39 | 1.94 | -43% |
+| vec3 dot from memory | 1.08 | 0.91 | -16% | 1.26 | 1.10 | -13% |
+| FDIV S -> FMUL S chain | 4.78 | 2.29 | -52% | 4.05 | 2.42 | -40% |
+| FNEG S -> FADD .4S -> FNEG S | 3.04 | 1.45 | -52% | 2.79 | 1.33 | -52% |
+| LDR S -> FADD S -> STR S | 2.07 | 1.19 | -43% | 1.60 | 1.09 | -32% |
+| LDR Q -> FADD .4S | 4.26 | 2.11 | -51% | 4.18 | 2.10 | -50% |
 
 Static, one hot piece (code_hot_7, -O2, no profile): GPR -> XMM moves 25,605 -> 10,441; XMM -> GPR 9,186 -> 24,092 (the
 keep tests' copies of the result bits, off the data path); `vpinsr*` 1,278 -> 1,026; `vextractps`/`vpextr*` 4,889 -> 3,239;
