@@ -109,7 +109,19 @@ VkSemaphore timeline = VK_NULL_HANDLE;
 VkSemaphore rec_timeline = VK_NULL_HANDLE;
 uint64_t rec_seq = 0;                       // (the recordings submitted so far; replay_mu)
 std::vector<uint64_t> rec_open_values;      // (the submissions finished in the recording being made; replay_mu)
+std::vector<uint64_t> rec_open_qvalues;     // (TICK-058: those of them submitted on a queue, value_queue's; replay_mu)
 std::mutex rec_map_mu;
+// (HeyListen, TICK-058) RX_VK_FENCE_POLL_FAST=1: the submissions finished whole (not stopped at a wait) on a queue, by value
+// (slot = value & 16383 holds the value), marked once value_rec has their recording: a fence poll (a wait of timeout 0) on one of
+// them answers from the recordings' timeline without sync_order_mu, which submit_q and present hold for whole replays (the main
+// thread's two nvnSyncWait looks a frame, f_8042cd20, waited 1.4 ms a frame for it behind the Presentation Thread's replay).
+// See wait_inner.
+constexpr uint64_t kWholeSlots = 16384;
+std::atomic<uint64_t> whole_val[kWholeSlots];
+bool fence_poll_fast_on() {
+    static const bool v = getenv("RX_VK_FENCE_POLL_FAST") && atoi(getenv("RX_VK_FENCE_POLL_FAST")) != 0;
+    return v;
+}
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
 std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (sync_order_mu)
 std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (sync_order_mu)
@@ -239,7 +251,9 @@ void device_wait_idle_locked() {   // (dev.present_mu held)
 }
 namespace {
 void queue_flush_for(int why) {
+    if (why == FR_WAIT) jt_mark(34, 0);   // (TICK-058: 34/35 a wait taking dev.present_mu)
     std::lock_guard lk(dev.present_mu);
+    if (why == FR_WAIT) jt_mark(35, 0);
     if (pend.cbs.empty()) return;
     flush_reason = why;
     queue_flush_locked();
@@ -501,6 +515,9 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         if (r.value) value_rec.emplace(r.value, seq);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
+        // (TICK-058: after value_rec has them, so a poll that sees the mark finds the recording; see wait_inner)
+        for (uint64_t v : rec_open_qvalues) whole_val[v & (kWholeSlots - 1)].store(v, std::memory_order_release);
+        rec_open_qvalues.clear();
     }
     si.signalSemaphoreInfoCount = nsig;
     si.pSignalSemaphoreInfos = nsig ? signals : nullptr;
@@ -2778,6 +2795,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     } else {
         done_max = std::max(done_max, value);
         rec_open_values.push_back(value);
+        if (queue && rec_timeline) rec_open_qvalues.push_back(value);   // (TICK-058: value_queue has it: submit_q)
     }
     if (!burst_open) finish_recording(value);   // (a burst's: at its end)
     if (stop) return false;
@@ -3000,12 +3018,29 @@ int wait(uint64_t f, uint64_t timeout_ns) {
 int wait_inner(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
     queue_flush_for(FR_WAIT);
+    // (HeyListen, TICK-058) RX_VK_FENCE_POLL_FAST=1: a poll (timeout 0) of a fence whose submission was finished whole on its
+    // queue skips sync_order_mu below, held by submit_q / present for whole replays (1.4 ms a frame on the main thread). The
+    // answer is the locked path's: (1) "mine" is true for such a value: a queue's submissions run in order, so one finished
+    // whole has no unfinished one of its queue at or below it (qruns' oldest() > f or not blocked), and value_queue has it (it
+    // was submitted on a queue, and fewer than 8000 values came since: value_queue keeps the last 8192); being finished never
+    // reverts, so the lock would only have made the same decision later; (2) then wait_recorded(f) as there, under rec_map_mu,
+    // which the mark is set under (after value_rec has f). Only a poll: a wait with a timeout keeps the locked path (with
+    // batched submits, a wait right after the mark could miss the flush of its recording: RADV's load hang). Any other case
+    // (not marked, an older value, a slot reused by a newer one) takes the locked path.
+    if (!timeout_ns && fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off() &&
+        whole_val[f & (kWholeSlots - 1)].load(std::memory_order_acquire) == f && f + 8000 > q_values.load()) {
+        int ok = 0;
+        wait_path = 1;
+        if (wait_recorded(f, 0, &ok)) return ok;
+    }
     // (hookshot) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
     // queues' stopped work the timeline above waits for (which a wait for it forced past its waits after RX_VK_WAIT_HOLD_US)
     if (!async_on() && sync_waits_on() && !per_queue_fences_off()) {
         bool mine = false;
         {
+            jt_mark(32, 0);   // (TICK-058: 32/33 the wait taking sync_order_mu)
             std::lock_guard lk(sync_order_mu);
+            jt_mark(33, 0);
             auto it = value_queue.find(f);
             if (it != value_queue.end()) {
                 auto q = qruns.find(it->second);
