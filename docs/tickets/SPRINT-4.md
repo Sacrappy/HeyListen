@@ -224,3 +224,8 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Counts: only OptimizeChangeBanc (225k) and SceneLowPriority (61k) call GetCurrentCoreNumber after their start; svc 0x10 never.
 - castle-move screens (3 rounds): B1 +2.4, B4 +1.7, B2 +0.8, pack -1.0 fps, stack +1.5: inside the spread; chain A traces not separable. Nothing adopted; shots alike, speed ~60.
 - Next: the module workers and NavMeshCAStepDepWorker1 virtual-core waits.
+## TICK-061 (2026-11-12): chain B, the render chain, item by item
+- Built, off by default: `RX_VK_CAPTURE_CLAIM` (C1), `RX_VK_COLLECT_FAST` (C2), `RX_VK_SHADOW_FAST` (C3/E2), `RX_VK_STAMP_SPLIT` (E3), `RX_VK_DRY_LEAN` (D2; `=2` D3, not exact in play), `RX_VK_WORK_LOCAL` (D6), `RX_VK_SEG_SETUP_PAR` (D7), `RX_VK_OCC_PROXY_SKIP` (F2); 4 new tests. Not built: D5 (shader-stamp files), D8 (never runs with the parallel replay).
+- Per item (castle-move screens + `chainb.py`): each does what it says (scan -30%, shadow block 9 -> 4 us a take, setup 0.10 -> 0.02 ms) and each is under the spread; the suspect list's sizes were too large for the main PC. F2 found ~11 draws a frame, not the proxies.
+- Stacked + TICK-056's `MSYNC_FAST` + `SEG_EARLY`: chain B 11.99 -> 10.20 ms (every run below), the main thread's part 1.92 -> 3.06, frame 13.91 -> 13.27, fps 75.7 -> 77.6 (inside the spread). No confirm; nothing adopted.
+- Shots alike, speed 60, saves identical. One program-cache reset from a `Program` field (stamp input), fixed and the cache re-prepared at once. Branch `feature/TICK-061-chain-b`, not merged. Next: chain A, then restack.

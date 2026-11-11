@@ -3106,9 +3106,29 @@ void set_checkpoint(VkCommandBuffer cmd, uint32_t i, uint32_t seq) {
         vkCmdSetCheckpointNV(cmd, (void*)(uintptr_t)(i + 1));
     }
 }
+// (TICK-061, D6, RX_VK_WORK_LOCAL=1) Every draw and dispatch took the next marker with ++checkpoint_n, one atomic the five recording
+// threads of a parallel replay all bumped, and wrote its 24-byte entry next to another thread's. With the switch, a recording thread
+// inside a parallel segment (work_seg_local) takes 64 numbers at a time (one fetch_add) and uses them in order: each marker still
+// gets a number of its own (the blocks never overlap), its entry is written by one thread, and set_checkpoint records the same
+// call with it. A block is used only in the frame it was taken in (texture_frame_no), and a frame sets ~3,000 markers of the
+// ring's 65,536, so a block's entries are not reused by another thread while it holds it. What changes is the device-lost report
+// only: neighbouring entries of the ring are then the same thread's draws, not the last ones of all threads in time. The NV
+// checkpoints stay on as they were (VK_NV_device_diagnostic_checkpoints: the device was lost every run without them). The AMD buffer
+// markers (marker_words) keep the global order: their report reads the numbers as a time order.
+uint32_t checkpoint_seq() {
+    if (!work_seg_local || marker_words) return ++checkpoint_n;
+    thread_local uint32_t next = 0, end = 0;
+    thread_local uint64_t frame = ~0ull;
+    const uint64_t f = texture_frame_no();
+    if (next == end || frame != f) {
+        next = checkpoint_n.fetch_add(64) + 1, end = next + 64;
+        frame = f;
+    }
+    return next++;
+}
 void checkpoint(VkCommandBuffer cmd, const Program& p, char kind) {
     if (!checkpoints_on()) return;
-    const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
+    const uint32_t seq = checkpoint_seq(), i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {p.key, texture_frame_no(), seq, kind};
     set_checkpoint(cmd, i, seq);
 }
@@ -3182,7 +3202,7 @@ void device_fault_report() {
 
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind) {
     if (!checkpoints_on()) return;
-    const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
+    const uint32_t seq = checkpoint_seq(), i = (seq - 1) & 0xFFFF;   // (TICK-061: see checkpoint_seq)
     checkpoints[i] = {key, texture_frame_no(), seq, kind};
     set_checkpoint(cmd, i, seq);
 }
@@ -5825,6 +5845,66 @@ static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs&
     dlss_note_skinned_draw(k);
 }
 
+// ---- (TICK-061, F2) RX_VK_OCC_PROXY_SKIP=1 (off by default): draws that cannot change anything, left out of the command buffer ----
+// OoT starts each frame with ~900 occlusion proxy tests: a draw between a samples-passed reset and its report. With the default
+// occlusion (RX_VK_OCC_REAL off, RX_VK_OCC_FIXED >= 0) the report's count is the fixed value, written on the CPU in stream order
+// (vk_replay.cpp NOP_REPORT_COUNTER), whatever the draws did, and the render conditions read those words: the draws' own GPU
+// work is not observed. A draw is left out here only when it provably writes nothing and reads nothing a later command depends on:
+// - no colour write: every bound colour target's write mask is 0 (target_write_mask: the same masks the pipeline and the dynamic
+//   state use; no fragment stage writes no colour);
+// - no depth write (no depth target, or its write off) and no stencil test (no stencil aspect, or the test off: then it writes no
+//   stencil whatever its ops);
+// - its program binds no storage buffer, storage image, image buffer, texture or texture buffer in any stage, touches no global
+//   memory, and is neither a mesh nor a mesh fallback program (program_inert): a shader with no such resource has no memory to
+//   write, and with no texture it samples nothing (so draw_hazards has no hazard to find for it and adds nothing to the pass);
+// - no diagnosis that watches draws (dumps).
+// What it keeps, so that the command buffer's structure and every texture's state stay as they were: everything before the
+// draw's own commands (the program pick, the pipeline lookup and its not-ready rule: a draw whose pipeline is not ready is left out
+// earlier, as before), and begin_pass: the pass
+// ends and begins where it did, with the same barrier and the same texture_written / texture_rendered marks of its targets, and
+// the pass counts the draw (pass().draws: a clear after it still gets a pass of its own). What it leaves out: the draw's
+// descriptor build and bind, pipeline bind, push constants (and its NV checkpoint marker), dynamic state, vertex / index binds and
+// the vkCmdDraw. The caches that skip repeated binds (last_pipeline, the descriptor reuse, dynamic state, vertex sets) describe
+// what the command buffer has bound, and are left as the last recorded draw set them, which is what it still has bound.
+bool occ_proxy_skip_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_OCC_PROXY_SKIP");
+        const char* fixed = getenv("RX_VK_OCC_FIXED");
+        const bool v = e && atoi(e) != 0 && occ_mode() == 0 && (!fixed || atoll(fixed) >= 0);
+        logf("vk: draws that write nothing and sample nothing: %s (RX_VK_OCC_PROXY_SKIP)", v ? "left out (their pass kept)" : "recorded, as before");
+        return v;
+    }();
+    return on;
+}
+// (the answer kept by the program's key and variant, each thread its own: not in Program, whose size is part of the program
+// cache's stamp (vk_shader.cpp disk_stamp: sizeof(Program)); a field there made every program cache on disk start again.
+// A key and variant name one translation, so the same stages and the same answer)
+bool program_inert(const Program& p) {
+    thread_local std::unordered_map<uint64_t, bool> known;
+    const uint64_t id = p.key ^ (p.variant * 0x9E3779B97F4A7C15ull) ^ (p.compute ? 1 : 0);
+    if (const auto it = known.find(id); it != known.end()) return it->second;
+    bool inert = !p.compute && !p.mesh && !p.fallback && !p.stages.empty();
+    for (const Stage& st : p.stages) {
+        const Shader::Info& i = st.info;
+        if (!i.storage_buffers_descriptors.empty() || !i.image_descriptors.empty() || !i.image_buffer_descriptors.empty() ||
+            !i.texture_descriptors.empty() || !i.texture_buffer_descriptors.empty() || i.stores_global_memory || i.uses_global_memory ||
+            i.uses_atomic_image_u32 || i.num_global_tables)
+            inert = false;
+    }
+    if (known.size() > 65536) known.clear();
+    known.emplace(id, inert);
+    return inert;
+}
+bool draw_writes_nothing(const Program& p, const NvnState& s, const Targets& at) {
+    for (int i = 0; i < at.n; i++)
+        if (at.color[i] && target_write_mask(p, s, i)) return false;
+    if (at.depth && s.ds.dw) return false;
+    if (at.depth && has_stencil(at.depth_format) && s.ds.st) return false;
+    return true;
+}
+std::atomic<int64_t> st_occ_proxy_skips{0};
+int64_t occ_proxy_skips() { return st_occ_proxy_skips.load(std::memory_order_relaxed); }
+
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (par_stats_on) par_stats_draw();
     PROF_HOT(PROF_DRAW);
@@ -6001,6 +6081,46 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     dlss_skin_check(s, p, d, at);
     if (!record_progs().empty() && std::find(record_progs().begin(), record_progs().end(), p.key) != record_progs().end())
         record_draw(s, p, d, at);
+    if (occ_proxy_skip_on() && !dump_on() && !d.mesh && !(program_inert(p) && draw_writes_nothing(p, s, at))) {
+        // (TICK-061, diagnosis: the first 24 programs a frame draws most whose draws F2 keeps, and why, logged once each)
+        // (each thread's own count, no lock: the log is once a program on the thread that reaches 2000 first, 24 at most)
+        thread_local std::unordered_map<uint64_t, int64_t> seen;
+        if (seen.size() < 4096 && ++seen[p.key] == 2000) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 24) {
+                int sb = 0, img = 0, tex = 0, tb = 0, gm = 0, fs = 0;
+                for (const Stage& st : p.stages) {
+                    sb += (int)st.info.storage_buffers_descriptors.size(), img += (int)(st.info.image_descriptors.size() + st.info.image_buffer_descriptors.size());
+                    tex += (int)st.info.texture_descriptors.size(), tb += (int)st.info.texture_buffer_descriptors.size();
+                    gm += st.info.stores_global_memory || st.info.uses_global_memory;
+                    fs += st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+                }
+                uint32_t wm = 0;
+                for (int i = 0; i < at.n; i++) wm |= (at.color[i] ? target_write_mask(p, s, i) : 0u) << (4 * i);
+                logf("vk: F2 keeps the draws of program %016llx (2000 so far): storage %d, images %d, textures %d, texel buffers %d, "
+                     "global memory %d, fragment stage %d; colour masks %#x, depth %d write %d, stencil test %d", (unsigned long long)p.key,
+                     sb, img, tex, tb, gm, fs, wm, at.depth ? 1 : 0, (int)s.ds.dw, (int)(at.depth && has_stencil(at.depth_format) && s.ds.st));
+            }
+        }
+    }
+    if (!d.mesh && occ_proxy_skip_on() && !dump_on() && program_inert(p) && draw_writes_nothing(p, s, at)) {   // (TICK-061, F2)
+        {
+            // (draw_hazards is not called: for this draw it does nothing. Its writes are 0 by draw_writes_nothing, and what it
+            // samples (gfx_sampled) is empty in the old path: its program has no texture, so its own descriptor build set it
+            // empty, or it reused the descriptors of the same program, whose build set it empty. With no writes and nothing
+            // sampled draw_hazards neither logs nor ends the pass. Here gfx_sampled still holds the last recorded draw's, which is
+            // what a later draw reusing that draw's descriptors needs, so it is neither read nor changed)
+            FINE_SCOPE(FT_HAZARD);
+            begin_pass(cmd, at);
+        }
+        pass().prog = p.key;
+        if (!pass().first_prog) pass().first_prog = p.key;
+        st_draws++, pass().draws++;
+        if (const int64_t k = st_occ_proxy_skips.fetch_add(1, std::memory_order_relaxed) + 1; k % 200000 == 0)
+            logf("vk: draws left out, writing and sampling nothing (RX_VK_OCC_PROXY_SKIP): %lld so far, frame %llu", (long long)k,
+                 (unsigned long long)texture_frame_no());
+        return;
+    }
     // (RX_VK_DUMP_EACH=<key>,...: in a dump, the pass ends after each draw of those programs, so every one of them is
     // read back on its own)
     struct EachGuard {

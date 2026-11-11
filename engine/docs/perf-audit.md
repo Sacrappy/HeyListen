@@ -3376,3 +3376,95 @@ run stayed on the title (the save never loaded; cause not found), the next 69.3.
 
 ## TICK-062: host-layer switches on chain A (2026-11-11)
 Five env switches (HOS_CV_SIGNAL_FAST, HOS_THREAD_OF_CACHE, HOS_SHORT_SLEEP_PAUSE, HOS_OBJ_PACK, HOS_CORE_COUNT), all off. castle-move screens +2.4 / +0.8 / +1.7 / -1.0 fps, stack +1.5 (inside the spread); chain A single traces 12.9-15.1 ms, not separable. Only two low-priority threads call GetCurrentCoreNumber beyond their start. See docs/tickets/TICK-062.md.
+## TICK-061: chain B, item by item: the capture, the dry pass, the segments' setup, the shared counters, the inert draws (2026-11-12)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs cut at
+66 s. Branch `feature/TICK-061-chain-b` (main 9bfc390: TICK-054's defaults on, TICK-056's and TICK-058's switches off). One
+binary (`bin/v3`, 79da345), variants as environment. Raw data in the worktree's `build/tick061/` (not committed);
+docs/benchmarks/2026-11-12-tick061.md.
+
+### Built (each behind its own switch, off by default; the argument for "same bytes, same order" is in the code beside it)
+
+| switch | item | where | what |
+|---|---|---|---|
+| `RX_VK_CAPTURE_CLAIM=1` (`=<n>`: n pages a chunk) | C1 | vk_memory.cpp `copy_pages`, `ClaimJob` | the capture's copy in chunks claimed from one counter by the submitter and every helper that wakes in time, instead of 5 fixed parts; the submitter takes whatever is unclaimed and removes the tokens no helper took |
+| `RX_VK_COLLECT_FAST=1` | C2 | host/rx_backend.c `collect_in_fast` (the exe) | the write-mark scan with unaligned 256/32/8-byte loads wherever the walk is, not only from aligned page numbers |
+| `RX_VK_SHADOW_FAST=1` | C3 = E2 | vk_memory.cpp `shadow_take_fast` | take_capture's texture-shadow block: one merge walk against the spans, a copied page keeps its entry and its 4 KB block, new pages take freed blocks; the old code where the cap could be reached or the list is not sorted |
+| `RX_VK_STAMP_SPLIT=1` | E3 | vk_memory.cpp `stamp_split_run` | a take's page stamps and table entries on the copy helpers (takes of 1,024 pages and more), still inside pools_mu |
+| `RX_VK_DRY_LEAN=1` | D2 / D3 | vk_replay.cpp `replay_handle`, `count_work` | a header-only count first; the dry pass copies the 27 KB state only at the points next to the planned boundaries, none in a command buffer that will be one segment |
+| `RX_VK_WORK_LOCAL=1` | D6 | vk_work.h, vk_texture.cpp `work_seg_begin/end`, vk_draw.cpp `checkpoint_seq` | inside a parallel segment, `work_epoch` is not bumped per command (once at the segment's end), `all_work_by_cmd` not at all while nothing reads it, and the NV checkpoint numbers come 64 at a time a thread (the checkpoints stay on) |
+| `RX_VK_SEG_SETUP_PAR=1` | D7 | vk_replay.cpp `begin_segment_slot`, `segment_begin_here` | the segments' pool resets, begins and start timestamps on the thread that records each, the slots still taken in order by the PT |
+| `RX_VK_OCC_PROXY_SKIP=1` | F2 | vk_draw.cpp `draw` (`program_inert`, `draw_writes_nothing`) | with the default occlusion, a draw that writes no colour, depth or stencil and whose program binds no storage, image or texture and touches no global memory is not recorded; its pass is still begun (same pass edges, barriers and target marks) |
+
+Not built:
+- **D5** (the slow program pick's cache): `program_for`, `still_valid` and `answer_handles` live in vk_shader.cpp, and the
+  bank words in vk_bank.cpp, both shader-stamp inputs. Any change there re-prepares every shader (~14 min) and makes the shared
+  game folder's program cache start again for every other build. A cache built outside them would duplicate the variant rule
+  and could hand back a different, equally valid variant (another picture). Left for a ticket that re-prepares on purpose.
+- **D2's real skip of the dry pass** (a one-segment buffer replayed serially): the serial path writes the stream's reports and
+  small clears in step with recording, the dry pass all of them before the recording reads anything (a CPU-side buffer copy, an
+  event add, a handle read through a storage buffer). Not provably the same order, so only its state copies are cut (above).
+- **D8** (`RX_VK_CHUNK`): `maybe_split` runs only in the serial replay mode, and every command buffer goes through the dry pass
+  and a worker-mode segment while the parallel replay is on (the default; serial only with fewer than two replay threads, dumps or
+  pass timing). The chunking never fires in play: nothing to screen.
+
+### Measured (castle-move screens, 3 interleaved rounds each; chain B from `chainb.py` on a `HOS_JOBTRACE` window at 60-63 s)
+
+Chain B is the held flush + the Presentation Thread's submits + its last submit -> the present's end, ms a frame. The trace
+window is before the 66 s cut (the Market, standing), so the fps (the walk, after the cut) is not disturbed by it. Spread:
+between sessions the base's chain B was 10.67 (screen 2) and 11.99 ms (screen 3): only comparisons inside a screen count.
+
+| item | what moved (log or trace) | chain B / fps against the same screen's base |
+|---|---|---|
+| C1 claim | every helper token taken in time; the mean copy 0.20 ms a submit, unchanged | screen 1 fps 75.4 vs 73.5 (inside the spread; no trace) |
+| C2 scan | the scan 0.069 -> **0.048** ms a submit (-30%), ~0.12 ms a frame of CPU | fps 74.9 vs 73.5 (inside) |
+| C3 shadow | the shadow block 0.009 -> **0.004** ms a take (fast path in ~92% of takes) | fps 74.4 vs 73.5 (inside) |
+| E3 stamps | stamps + entries 0.010 -> 0.008 ms a take | 11.61 vs 11.99 ms (runs overlap); fps 75.4 vs 75.7 |
+| D1 `PARALLEL_SEG=96` | the PT's own segment 2.53 -> 2.36 ms, frame prep 7.60 -> 7.06 | 10.93 vs 10.67 ms; fps 77.0 vs 77.0 |
+| D2/D3 v3 (now `=2`) | other segment boundaries (first ~270 draws vs ~180), the PT's own segment +0.8 ms | **12.09 vs 10.67 ms (worse)**; fps 73.8 vs 77.0 |
+| D2 `DRY_LEAN=1` (exact) | 0.12 state copies a dry pass not made (one-segment dry passes are rare) | in the stack only |
+| D6 work counts | (no step of its own in the trace) | 11.28 vs 10.67 ms; fps 75.4 vs 77.0 |
+| D7 setup | "recordings begun" 0.10 -> **0.02** ms | 11.01 vs 10.67 ms; fps 75.0 vs 77.0 |
+| F2 proxies | ~11 draws a frame left out, not ~900 (see below) | 11.24 vs 10.67 ms; fps 77.0 vs 77.0 |
+| **stack** (all of the above, `DRY_LEAN=1`, + D1) | | **11.20 vs 11.99 ms (-0.8)**; fps 76.7 vs 75.7 |
+| **stack + `MSYNC_FAST` + `SEG_EARLY`** (TICK-056) | PT waits for segments 0.79 -> 0.15, flush memory work 0.85 -> 0.50 | **10.20 vs 11.99 ms (-1.8, every run below)**; fps 77.6 vs 75.7 |
+
+What the numbers say:
+- **The suspects' sizes were too large for the main PC.** The take's texture-shadow block is 9 us a take in play (the list's C3 =
+  E2: 0.2-0.4 ms a frame), the stamps and entries 10 us; the scan's edge cost is ~20 us a submit; the segment setup 0.08 ms a
+  frame. Each does what it says, measurably, and each is under the screen's spread (~0.5 ms of chain B, 2-4 fps).
+- **Stacked, chain B is ~2 ms shorter (with TICK-056's two switches), and the frame is not**: the main thread's part of the loop
+  grows by as much (1.92 -> 3.06 ms), the traced frame 13.91 -> 13.27 ms, fps +1.9 inside the spread. The frame is chain A again
+  (the game's draw code, job group and module phase: TICK-062/063). The switches stay off, ready to stack with chain A's cuts.
+- **F2 found few draws**: its two rules hold for ~11 draws a frame. The proxies (program 8350cd652f2bd017 in TICK-033's log, no
+  fragment invocations) are not among them: they bind something the rule refuses (a texture or a storage buffer), or write
+  depth. The diagnosis line (`F2 keeps the draws of program ...`, 24 at most) was used up by the title's programs; it needs a key
+  filter to name the proxies' reason.
+- **D2/D3**: the planned-boundary filter is not exact in play (the dry pass's count and the header count disagree there, not
+  found why), so it is a diagnosis (`=2`); the exact one-segment form (`=1`) saves almost nothing.
+
+### Correctness
+- Each switch's argument is in the code beside it. Tests (new): `test_capture_claim.py` (the claimed copy writes the same bytes
+  and ok[] as the parts, with failing pages and 8-page chunks), `test_collect_fast.py` (same pages, order and marks left over
+  random marks and ranges), `test_shadow_fast.py` (the same shadow after every capture, with the cap reached),
+  `test_dry_lean.py` (the boundary search over kept points). The touched areas' checks (`run_all.py` filtered: capture, msync,
+  collect, dry_lean, shadow, seg_early, segment_plan, presync, chainb, frame_trace, late_merge, wb_pages, split_count, parallel,
+  gpu_time, fence_poll, nvn_hold, submitted_page, pass_hazard, draw_binds, same_*, push_state, ub_*, shader_stamp*): 37 pass, 3 skipped (no
+  Vulkan headers here). The laptop's SSH was down: the whole suite was not run.
+- Shots (base against the full stack + TICK-056, standing and walking): the Market alike, luma in the same ranges;
+  `HOS_SPEED_LOG` median 60.00 / 60.01 standing, 60.00 / 59.98 walking. Saves identical after every run (47 runs, one of them the 0-frame start above); no game left.
+- **A program cache started again once (fixed)**: the first build added a field to `Program`, and `sizeof(Program)` is part of the
+  program cache's stamp (vk_shader.cpp `disk_stamp`); the first run truncated the shared `hookshot_programs.bin` and measured 0
+  frames. The field went (79da345: F2's answer kept by key and variant in vk_draw.cpp), and the cache was prepared again at once
+  with the game folder's own build (`--prepare-shaders`, 2.5 min, under the lock). Rule for the renderer: no change to
+  vk_shader.h's `Program` / `Stage` layout, or to the stamp's files (vk_shader.cpp, vk_bank.cpp, vk_state.h, vk_api.h, the
+  translator), without a planned re-prepare.
+
+### What is next
+1. Chain A (TICK-062/063): with it shorter, the stack + `MSYNC_FAST` + `SEG_EARLY` (-1.8 ms of chain B, measured) is ready to
+   screen again, then the confirm.
+2. F2 with the proxies named: log the rule's reason for 8350cd652f2bd017; if it is its vertex stage's storage buffer (read-only),
+   use `is_written` for storage buffers there (the risk F3 names: validate the flag first).
+3. D5 (the slow program pick, 1.4-1.85 ms summed) needs vk_shader.cpp: plan it with a re-prepare.
+4. The held flush's capture (1.2-1.3 ms on the hold thread in every trace) is the largest chain-B step left that no switch here
+   moved; C4 (identical pages) is the lever with a measurement first.

@@ -667,6 +667,25 @@ struct ParPoint {
 };
 std::vector<ParPoint> par_points;   // (every 64 draws and dispatches of the dry pass)
 int64_t dry_work = 0;
+// (TICK-061, D2/D3, RX_VK_DRY_LEAN=1) the points whose state the dry pass keeps: only those the boundaries can be at (see
+// lean_candidates in replay_handle); null: every point, as before
+struct LeanPoints {
+    int n = 0;
+    int64_t work[2 * 8] = {};
+    bool has(int64_t w) const {
+        for (int i = 0; i < n; i++)
+            if (work[i] == w) return true;
+        return false;
+    }
+};
+const LeanPoints* lean_points = nullptr;
+int64_t st_lean_kept = 0, st_lean_left = 0;   // (TICK-061: the dry passes' states kept and not, RX_VK_DRY_LEAN)
+// (TICK-050, RX_VK_PARALLEL_POINT=<n>: a point every n instead of 64, for finer boundaries; TICK-054: 32 by default, =0: 64)
+int64_t par_point_every() {
+    static const int64_t v = getenv("RX_VK_PARALLEL_POINT")
+        ? (atoi(getenv("RX_VK_PARALLEL_POINT")) <= 0 ? 64 : std::clamp(atoi(getenv("RX_VK_PARALLEL_POINT")), 8, 256)) : 32;
+    return v;
+}
 // (TICK-056, RX_VK_SEG_EARLY) segments handed out while the dry pass still runs: the dry pass appends to ub_updates and par_conds
 // while the workers read them (a deque's map and a vector's buffer may move as they grow). While ub_growing, the replay thread's
 // appends hold ub_grow_mu exclusively and the workers' reads (ub_overlay, ub_read, a render condition) hold it shared; the
@@ -1472,10 +1491,11 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (dry) {
                 const bool compute = h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT;
                 if (s.render_enabled && (compute || !s.raster_discard)) dry_mark_written(s, compute, dry_work == 0);
-                // (TICK-050, RX_VK_PARALLEL_POINT=<n>: a point every n instead of 64, for finer boundaries; TICK-054: 32 by default, =0: 64)
-                static const int64_t point_every = getenv("RX_VK_PARALLEL_POINT")
-                    ? (atoi(getenv("RX_VK_PARALLEL_POINT")) <= 0 ? 64 : std::clamp(atoi(getenv("RX_VK_PARALLEL_POINT")), 8, 256)) : 32;
-                if (++dry_work % point_every == 0) {
+                static const int64_t point_every = par_point_every();
+                if (++dry_work % point_every == 0 && lean_points && !lean_points->has(dry_work)) {
+                    st_lean_left++;   // (TICK-061: a point no boundary can be at, RX_VK_DRY_LEAN: its state not copied)
+                } else if (dry_work % point_every == 0) {
+                    if (lean_points) st_lean_kept++;
                     par_points.push_back({p + h.size, s, ub_updates.size(), par_conds.size(), dry_work});
                     if (seg_early_hook) seg_early_hook->on_point(par_points.back());   // (TICK-056, RX_VK_SEG_EARLY)
                 }
@@ -1627,6 +1647,49 @@ Recording& begin_segment_recording(uint64_t value) {
     vkBeginCommandBuffer(r.cmd, &bi);
     r.value = value;
     return r;
+}
+// ---- (TICK-061, D7) RX_VK_SEG_SETUP_PAR=1 (off by default): a segment's command buffers begun by the thread that records it ----
+// Before releasing any segment, the replay thread took each segment's slot, reset its two command pools, began its command buffer
+// and its upload one and wrote their start timestamps (gpu_time_begin): 5-6 segments, two big command buffers a frame, part of
+// the ~0.2 ms "setup" on the frame's loop (TICK-054). Here it only takes the slots, in order (begin_segment_slot: the wait for the
+// slot's last use, its GPU times collected, its value); the resets, the begins and the timestamps move to the start of record_job,
+// on the recording thread, before anything is recorded into them.
+// Same commands in the same command buffers: each pool and command buffer belongs to one slot, and only the job's thread touches
+// them from its start to its end (Vulkan's external synchronisation holds); the job is submitted only after its end (seg_mu), so
+// the queue sees the same command buffers. The timestamp writes and resets use the slot's own four queries, as before; the query
+// pool exists by then (begin_recording made it before any segment; without one the old path runs). The init command buffers stay
+// on the replay thread: texture_segments_begin hands them out before any job starts. A segment whose init could not be begun
+// (the fallback below) leaves its slot unsubmitted and its command buffers not begun: begin_recording resets the pools when the
+// slot comes round, as for a begun one.
+bool seg_setup_par_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_SEG_SETUP_PAR");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: a segment's command buffers: %s (RX_VK_SEG_SETUP_PAR)", v ? "begun by the thread recording it" : "begun by the replay thread, as before");
+        return v;
+    }();
+    return on;
+}
+Recording& begin_segment_slot(uint64_t value) {   // (begin_segment_recording without the pool reset and the begin)
+    Recording& r = recordings[recording_index];
+    recording_index = (recording_index + 1) % kRecordings;
+    if (r.value) {
+        PROF(PROF_SLOTWAIT);
+        recording_wait(r);
+        gpu_time_collect(r);
+        gprof_collect(r.slot);
+    }
+    r.value = value;
+    return r;
+}
+void segment_begin_here(Recording& r) {   // (the rest of it and of the upload's setup, on the recording thread)
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandPool(dev.device, r.pool, 0);
+    vkBeginCommandBuffer(r.cmd, &bi);
+    vkResetCommandPool(dev.device, r.upload_pool, 0);
+    vkBeginCommandBuffer(r.upload, &bi);
+    gpu_time_begin(r);
 }
 
 struct Segment {
@@ -1861,6 +1924,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     const auto now_ns = [] { return (int64_t)std::chrono::steady_clock::now().time_since_epoch().count(); };
     const auto record_job = [&seg_cv, &seg_mu, &now_ns](Job* j) {   // (as replay_handle's)
         j->t0 = now_ns();
+        work_seg_begin();   // (TICK-061, D6: par_active is on while these segments record)
         texture_set_segment(j->order);
         texture_segment_worker(j->index);
         texture_begin_recording(j->r->upload, j->r->value);
@@ -1874,6 +1938,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         texture_segment_worker(-1);
         vkEndCommandBuffer(j->r->upload);
         vkEndCommandBuffer(j->r->cmd);
+        work_seg_end();   // (TICK-061, D6)
         j->t1 = now_ns();
         par_stats_segment_parts(j->t0, ta, tc, j->t1);
         {
@@ -2033,6 +2098,29 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     rec_parts += (int)used + 1;
     return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, jobs[used - 1]->r) : stop;
 }
+// (TICK-061) RX_VK_DRY_LEAN: see replay_handle
+bool dry_lean_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_DRY_LEAN");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: the dry pass's states: %s (RX_VK_DRY_LEAN)", v ? "kept only where a boundary can be" : "every point, as before");
+        return v;
+    }();
+    return on;
+}
+/// The draws and dispatches of a command buffer's stream from h to its end, by the ops' headers alone (the ops replay() counts in
+/// dry_work, walked as replay() walks them: one after another to NOP_END)
+int64_t count_work(const uint8_t* p) {
+    int64_t n = 0;
+    for (;;) {
+        nvn_op_hdr h;
+        std::memcpy(&h, p, sizeof h);
+        if (h.op == NOP_END || h.size < sizeof h) return n;
+        n += h.op == NOP_DRAW || h.op == NOP_DRAW_IDX || h.op == NOP_DRAW_INDIRECT || h.op == NOP_DRAW_MESH || h.op == NOP_DISPATCH ||
+             h.op == NOP_DISPATCH_INDIRECT;
+        p += h.size;
+    }
+}
 const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop) {
     const int threads = par_threads();
     NvnState& state = *cur_state;
@@ -2113,12 +2201,60 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
         seg_early_count(2);
     }
+    // (TICK-061, D2/D3) RX_VK_DRY_LEAN=1 (off by default): the dry pass copies the state (NvnState, ~27 KB: 8 stages' texture,
+    // sampler and image handles, the buffers, 1 KB of push constants) at every point (each 32 draws and dispatches): ~26 copies
+    // in a big command buffer, of which the segments use at most kMaxBatch - 1; and up to ten in a small one that is never cut.
+    // Here a header-only walk of the stream (count_work: the same ops the dry pass counts, up to NOP_END) gives the count T first,
+    // and the dry pass keeps only the points the boundaries below can be at:
+    // - T under two segments' worth (segment_count(T) == 1, D2): none. dry_work <= T (the dry pass counts the same ops and may
+    //   stop sooner, at a wait or a report), and segment_count is monotonic in its count, so the command buffer is one segment
+    //   whatever the dry pass finds, and one segment needs no point (record_segment starts from `start`).
+    // - Else, only with RX_VK_DRY_LEAN=2 (D3; =1 keeps every point here): for each planned boundary k, the multiples of the point interval on either side of its target want_k, computed
+    //   as below from T and the same profile (nothing changes the profile in between). The boundary search takes, among the kept
+    //   points, the nearest to want_k (balance; ties to the first, the lower) or the first at or after it: both are one of those
+    //   two multiples of all the points there are, so when the dry pass ends at T (no stop) the chosen points, and so the segments,
+    //   are the ones it chose with every point kept. When it stops sooner the boundaries come from the kept points it reached:
+    //   other boundaries, or fewer, and any point is a valid boundary (the segments replay the stream from the state there), which
+    //   is what RX_VK_PARALLEL_BOUNDARY / MINWORK already rely on. Measured in play (TICK-061), =2 gave other segments than every
+    //   point did (the replay thread's own segment ~280 draws against ~180, +0.8 ms): the dry pass's count and the header count
+    //   differ there (not found why yet), so =2 stays a diagnosis.
+    // The dry pass's other products (reports, conditions, uniform updates, events, written marks) are made as before; nothing but
+    // the copies is left out. (RX_VK_SEG_EARLY's path keeps every point: it does not come here.)
+    LeanPoints lean;
+    if (dry_lean_on() && !only_boundary) {
+        const int64_t pe = par_point_every();
+        const int64_t T = count_work(h);
+        const int nplan = mkwvk::segment_plan::segment_count(T, per, recorders, kMaxBatch, one_round);
+        // (RX_VK_DRY_LEAN=1: the one-segment case only, exact whatever the dry pass finds. =2: the planned boundaries too, which
+        // is exact only when the dry pass reaches the counted end; measured (TICK-061 screen 2) the segments came out other than
+        // with every point (the first ~280 draws against ~180), the replay thread's own segment +0.8 ms: so =2 is not for play)
+        static const int lean_mode = getenv("RX_VK_DRY_LEAN") ? atoi(getenv("RX_VK_DRY_LEAN")) : 0;
+        if (nplan >= 2 && lean_mode >= 2) {
+            int64_t want[kMaxBatch] = {};
+            if (balance) mkwvk::segment_plan::balanced_targets(profile, nplan, T, want);
+            for (int k = 1; k < nplan; k++) {
+                const int64_t w = balance ? want[k - 1] : T * k / nplan;
+                const int64_t lo = w / pe * pe;
+                lean.work[lean.n++] = lo, lean.work[lean.n++] = lo + pe;
+            }
+        }
+        if (nplan < 2 || lean_mode >= 2) lean_points = &lean;
+    }
     rmode = Mode::Dry;
     VkCommandBuffer none = cmd;
     suspend_ok = may_stop;
     jt_mark(13, 0);
     replay(none, state, h);
     jt_mark(14, 0);
+    if (lean_points) {
+        lean_points = nullptr;
+        static int64_t passes;
+        if (++passes % 2000 == 0) {
+            logf("vk: the dry pass's states (RX_VK_DRY_LEAN): %.2f kept and %.2f not copied a dry pass (2000 dry passes)",
+                 st_lean_kept / 2000.0, st_lean_left / 2000.0);
+            st_lean_kept = st_lean_left = 0;
+        }
+    }
     suspend_ok = false;
     rmode = Mode::Serial;
     const uint8_t* const occ_stop = suspend_at ? nullptr : occ_stop_at;   // (TICK-033: stopped for a report's count)
@@ -2213,14 +2349,19 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         int64_t t0 = 0, t1 = 0;   // (TICK-050: its recording's start and end, steady clock ns)
     };
     std::vector<std::unique_ptr<Job>> jobs;
+    const bool setup_here = seg_setup_par_on() && ts_pool;   // (TICK-061, D7: see begin_segment_slot)
     for (size_t k = 0; k < seg.size(); k++) {
         auto j = std::make_unique<Job>();
-        j->r = &begin_segment_recording(rec_cur_value);
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkResetCommandPool(dev.device, j->r->upload_pool, 0);
-        vkBeginCommandBuffer(j->r->upload, &bi);
-        gpu_time_begin(*j->r);   // (TICK-057: the segments' GPU time too, in the trace's gpu_ms and gaps and the late waits' tail)
+        if (setup_here) {
+            j->r = &begin_segment_slot(rec_cur_value);
+        } else {
+            j->r = &begin_segment_recording(rec_cur_value);
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkResetCommandPool(dev.device, j->r->upload_pool, 0);
+            vkBeginCommandBuffer(j->r->upload, &bi);
+            gpu_time_begin(*j->r);   // (TICK-057: the segments' GPU time too, in the trace's gpu_ms and gaps and the late waits' tail)
+        }
         j->g = seg[k];
         j->order = base + k;
         j->index = (int)k;
@@ -2266,8 +2407,10 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // (one segment recorded into its own recording, on any recording thread: a worker, or with RX_VK_PARALLEL_SELF the replay
     // thread for the first. The thread's per-recording state (draw_begin_recording, texture_begin_recording) is set for it here;
     // the replay thread's is set again by begin_recording for what follows the segments, below)
-    const auto record_job = [&seg_cv, &seg_mu, &now_ns](Job* j) {
+    const auto record_job = [&seg_cv, &seg_mu, &now_ns, setup_here](Job* j) {
         j->t0 = now_ns();
+        work_seg_begin();   // (TICK-061, D6: RX_VK_WORK_LOCAL, vk_work.h; par_active is on until every job is done)
+        if (setup_here) segment_begin_here(*j->r);   // (TICK-061, D7)
         texture_set_segment(j->order);
         texture_segment_worker(j->index);
         texture_begin_recording(j->r->upload, j->r->value);
@@ -2282,6 +2425,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         gpu_time_end(*j->r, j->uploads);   // (TICK-057)
         vkEndCommandBuffer(j->r->upload);
         vkEndCommandBuffer(j->r->cmd);
+        work_seg_end();   // (TICK-061, D6)
         j->t1 = now_ns();
         par_stats_segment_parts(j->t0, ta, tc, j->t1);
         {
