@@ -88,7 +88,7 @@ int main(void) {
         c = os.path.join(tmp, "t.c")
         exe = os.path.join(tmp, "t.exe")
         Path(c).write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cc, "-O2", "-o", exe, c], check=True)
+        subprocess.run([args.cc, "-x", "c", "-O2", "-o", exe, c], check=True)   # (C, also with a C++ driver)
         r = subprocess.run([exe], capture_output=True, text=True)
         print(r.stdout.strip() or r.stderr.strip())
         raise SystemExit(r.returncode)
