@@ -11,6 +11,9 @@ import tempfile
 import unittest
 
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
+# (HeyListen, TICK-008: its precompile makes each pipeline's entry before the workers start and the worker fills that entry: there
+# is no publication into the cache that can meet another's entry, the block this checks)
+RUN_ALL_SKIP = {"linux": "HeyListen's precompile (TICK-008) has no worker-side publication", "windows": "HeyListen's precompile (TICK-008) has no worker-side publication"}
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER = None
 

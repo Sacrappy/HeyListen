@@ -344,7 +344,7 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
     {   // (TICK-010) what the capture waits for: how long, how far ahead of the GPU, and how long the GPU had it by then
         static std::mutex mu;
         static int64_t n, unsub, wait_ns, max_ns, gpu_had_ns, ahead, n_traced;
-        static const bool trace = getenv("RX_VK_CAPWAIT_TRACE") != nullptr;   // (TICK-010 diagnostic: each wait, 400 of them after 3000)
+        static const bool trace = env_on("RX_VK_CAPWAIT_TRACE");   // (TICK-010 diagnostic: each wait, 400 of them after 3000)
         const int64_t t1 = std::chrono::steady_clock::now().time_since_epoch().count();
         const uint64_t q = q_values.load();
         std::lock_guard lk(mu);
@@ -3146,7 +3146,7 @@ int wait(uint64_t f, uint64_t timeout_ns) {
     static std::mutex mu;
     static int64_t n, n_long, by_path[4], unrec, logged;
     static double sum_ms, max_ms, ahead;
-    static const bool each = getenv("RX_VK_FENCE_WAIT_LOG") != nullptr;
+    static const bool each = env_on("RX_VK_FENCE_WAIT_LOG");
     std::lock_guard lk(mu);
     if (!timeout_ns) return r;
     n++, sum_ms += ms, max_ms = std::max(max_ms, ms), ahead += (double)(f - done0), by_path[wait_path & 3]++, unrec += !recorded;
@@ -3481,6 +3481,19 @@ bool acquire_fence_on() {
 }
 double st_acq_wait_ms, st_acq_wait_max_ms;
 int64_t st_acq_waits;
+/// (RX_VK_ACQUIRE_FENCE) the acquired image's fence waited for and reset, timed (out of present_image: its own Vulkan calls are
+/// upstream's, each checked for a lost device, tests/test_present_device_loss.py)
+void acquire_fence_wait(VkFence acq) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (vkWaitForFences(dev.device, 1, &acq, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost();
+    if (vkResetFences(dev.device, 1, &acq) == VK_ERROR_DEVICE_LOST) device_lost();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    st_acq_wait_ms += ms, st_acq_wait_max_ms = std::max(st_acq_wait_max_ms, ms);
+    if (++st_acq_waits % 600 == 0) {
+        logf("vk: acquire waits (RX_VK_ACQUIRE_FENCE): %.2f ms each over 600 presents, the longest %.2f", st_acq_wait_ms / 600, st_acq_wait_max_ms);
+        st_acq_wait_ms = st_acq_wait_max_ms = 0;
+    }
+}
 // (TICK-053) the blit's own GPU time and the queue's gaps around it: a timestamp at the blit's start and end, read 3 presents
 // later (the slot's fence waited for). With the recordings' absolute timestamps (gpu_time_collect) the gap before the blit
 // (the last recording's end to the blit's start) and after it (to the next recording's start) tell where the queue stops
@@ -4890,26 +4903,15 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
     const bool acq_fence = acquire_fence_on() && f.acq;
-    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, acq_fence ? VK_NULL_HANDLE : f.acquired,
-                                         acq_fence ? f.acq : VK_NULL_HANDLE, &index);
+    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, acq_fence ? VK_NULL_HANDLE : f.acquired, acq_fence ? f.acq : VK_NULL_HANDLE, &index);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
+    if (acq_fence && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) acquire_fence_wait(f.acq);   // (the image free: waited for here, not on the queue)
+    if (acquire_t0) fps_wait(fps_stats::kPace, fps_clock() - acquire_t0);   // (with RX_VK_ACQUIRE_FENCE's wait: the display's pace too)
     if (res == VK_ERROR_SURFACE_LOST_KHR) {
         std::lock_guard qk(dev.present_mu);
         invalidate_lost_surface(res);
         return;
     }
-    if (acq_fence && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {   // (the image free: waited for here, not on the queue)
-        const auto t0 = std::chrono::steady_clock::now();
-        vkWaitForFences(dev.device, 1, &f.acq, VK_TRUE, UINT64_MAX);
-        vkResetFences(dev.device, 1, &f.acq);
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        st_acq_wait_ms += ms, st_acq_wait_max_ms = std::max(st_acq_wait_max_ms, ms);
-        if (++st_acq_waits % 600 == 0) {
-            logf("vk: acquire waits (RX_VK_ACQUIRE_FENCE): %.2f ms each over 600 presents, the longest %.2f", st_acq_wait_ms / 600, st_acq_wait_max_ms);
-            st_acq_wait_ms = st_acq_wait_max_ms = 0;
-        }
-    }
-    if (acquire_t0) fps_wait(fps_stats::kPace, fps_clock() - acquire_t0);   // (with RX_VK_ACQUIRE_FENCE's wait: the display's pace too)
 #ifndef _WIN32
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
         if (!unseen) logf("vk: the window is not shown (no image back in 100 ms): frames are not shown until it is");
@@ -5716,7 +5718,7 @@ void fill_replay_table(MkwVkRenderer& t) {
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !temporal_full_scale() : id == 3 ? (temporal_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y : id == HOS_OPT_GYRO_DEADZONE ? opts.gyro_deadzone :
                id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H || id == HOS_OPT_DLSS_JITTER_PHASES ? jitter_option(id) :
-               id == 10 ? (opts.fps_limit == 1 ? 90 : opts.fps_limit == 2 ? 120 : opts.fps_limit == 3 ? 144 : opts.fps_limit == 4 ? 165 : opts.fps_limit == 5 ? 240 : 60) : 0;   // (HeyListen: the frame rate limit, host/nn_vi.c; 9 is upstream's rumble)
+               id == HOS_OPT_FPS_LIMIT ? (opts.fps_limit == 1 ? 90 : opts.fps_limit == 2 ? 120 : opts.fps_limit == 3 ? 144 : opts.fps_limit == 4 ? 165 : opts.fps_limit == 5 ? 240 : 60) : 0;   // (HeyListen: the frame rate limit, host/nn_vi.c; 10 was ours until Sync 12)
     };
     t.option_set = menu_option_set;
     t.jitter_sample = jitter_sample;

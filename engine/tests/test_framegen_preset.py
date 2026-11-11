@@ -124,21 +124,22 @@ def fixture(source):
     if not options or not tabs or not row:
         raise SystemExit("the menu's options, tabs, or row definition is missing")
     fps_cap = re.search(r'\{TAB_GRAPHICS, "[^"]+", &opts\.fps_cap,', menu)
-    if not fps_cap:
-        raise SystemExit("missing game frame rate cap row")
+    result = FIXTURE
+    if not fps_cap:   # (HeyListen: no Game frame rate cap row; its Frame rate limit row, opts.fps_limit, is its own)
+        cap_checks = result[result.index("    Row fps_cap = /* FPS_CAP_ROW */;"):result.index("    CHECK(opts.framegen == 0);")]
+        result = result.replace(cap_checks, "")
     replacements = {
         "/* OPTIONS */": options.group(0),
         "/* TABS */": tabs.group(0),
         "/* ROW */": row.group(0),
         "/* STOPS */": definition(menu, "bool stops_at_ends"),
         "/* INI_KEY */": definition(menu, "const char* ini_key"),
-        "/* FPS_CAP_ROW */": block(menu, fps_cap.start()),
+        "/* FPS_CAP_ROW */": block(menu, fps_cap.start()) if fps_cap else "",
         "/* PRESET */": definition(menu, "void apply_preset"),
         "/* SET_ROW */": definition(menu, "void set_row"),
         "/* FRAMEGEN_ROW */": block(menu, menu.index('{TAB_GRAPHICS, "Frame generation"')),
         "/* QUALITY_ROW */": block(menu, menu.index('{TAB_GRAPHICS, "Quality preset"')),
     }
-    result = FIXTURE
     for marker, value in replacements.items():
         result = result.replace(marker, value)
     return result

@@ -43,9 +43,13 @@ def main():
     for name in ("vkBeginCommandBuffer", "vkCmdPipelineBarrier2", "vkCmdBeginRendering", "vkCmdDraw", "vkCmdDrawIndexed",
                  "vkCmdDrawIndirect", "vkCmdDrawIndexedIndirect", "vkCmdDrawIndirectCount", "vkCmdDrawIndexedIndirectCount",
                  "vkCmdDrawMeshTasksEXT", "vkCmdDrawMeshTasksIndirectEXT", "vkCmdDrawMeshTasksIndirectCountEXT"):
-        need(f"#define {name}(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::{name}(c_, __VA_ARGS__))" in work,
+        # (Sync 12: through upstream's recorder, RX_VK_RECORDER: the work calls go by their packer rec::rx_<name>, the begin is a
+        # recorder boundary)
+        call = ("::mkwvk::rec::boundary(::mkwvk::rec::B_vkBeginCommandBuffer), ::vkx::vkBeginCommandBuffer(c_, __VA_ARGS__)"
+                if name == "vkBeginCommandBuffer" else f"::mkwvk::rec::rx_{name}(c_, __VA_ARGS__)")
+        need(f"#define {name}(c_, ...) (::mkwvk::note_work_cmd(c_), {call})" in work,
              f"vk_work.h: {name} counted by its command buffer")
-    need("#define vkCmdEndRendering(c_, ...) (::mkwvk::note_work_cmd(c_), ::vkx::vkCmdEndRendering(c_ __VA_OPT__(,) __VA_ARGS__))"
+    need("#define vkCmdEndRendering(c_, ...) (::mkwvk::note_work_cmd(c_), ::mkwvk::rec::rx_vkCmdEndRendering(c_ __VA_OPT__(,) __VA_ARGS__))"
          in work, "vk_work.h: vkCmdEndRendering(cmd) with one argument")
     nw = body(work, "inline void note_work() {")
     need("foreign_work.fetch_add(1" in nw and "work_epoch.fetch_add(1" in nw, "vk_work.h: note_work counts foreign work and the epoch")

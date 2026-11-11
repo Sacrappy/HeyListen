@@ -152,7 +152,7 @@ static Obj *find_dead_locked(uint64_t key) {
 static void insert_locked(Obj *o) {
     if (!table || used * 2 >= cap) {
         uint64_t ncap = cap ? cap * 2 : 1 << 16;
-        if (!cap) tstride = getenv("HOS_OBJ_PACK") ? 2 : 1;
+        if (!cap) tstride = env_on("HOS_OBJ_PACK") ? 2 : 1;
         const uint64_t ns = tstride;
         Table *t = (Table *)calloc(1, sizeof(Table) + ncap * (sizeof(Obj *) + sizeof(uint64_t)));
         Obj **nt = t->slot;
@@ -606,7 +606,7 @@ HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
        waiter the slow path only bumps gen (compared only as a delta by waiters that registered later) and cv_reserve (a no-op
        with cv_waiting <= cv_owed, owed being 0 with no waiter) and wakes nobody. The wake order of waiters is untouched. */
     static int fast = -1;
-    if (fast < 0) fast = getenv("HOS_CV_SIGNAL_FAST") != NULL;
+    if (fast < 0) fast = env_on("HOS_CV_SIGNAL_FAST");
     if (fast && !__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST)) return;
     AcquireSRWLockExclusive(&cv->lk);
     cv_reserve(cv);

@@ -124,8 +124,7 @@ def check_source(draw):
         raise SystemExit("a cold library is not handed to a worker, or its job carries a flag a waiting draw would run")
     # (after the pipeline is ready, not before: the draw that waits for it runs this job itself, jobs_wait, and would be held
     # for as long as anything put before that takes)
-    job = between(draw, "    jobs_push([job] {
-        pipeline_note(job->key", "}, false, &e->ready,")   # (HeyListen, TICK-008: the note on the worker)
+    job = between(draw, "    jobs_push([job] {\n        pipeline_note(job->key", "}, false, &e->ready,")   # (HeyListen, TICK-008: the note on the worker)
     if job.index("job->e->ready.store(true") > job.index("gpl_build_cold("):
         raise SystemExit("the cold libraries are handed to the workers before the pipeline the draw waits for is ready")
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")

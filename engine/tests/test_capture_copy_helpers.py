@@ -48,6 +48,7 @@ def main():
              block(source, "struct CopyHelpers {", ";"),
              block(source, "void copy_helper_main()"),
              block(source, "int capture_copy_helpers()"),
+             block(source, "void copy_helpers_start_locked()"),   # (HeyListen: shared with TICK-043's collect_split)
              block(source, "void copy_split(CopyPart whole"),
              block(source, "void copy_pages(const uint32_t* pages"),
              block(source, "void copy_pairs(const CopyPair* pairs")]
@@ -66,7 +67,14 @@ def main():
 typedef size_t SIZE_T;
 constexpr uint64_t kPageShift = 12;
 static std::vector<uint8_t> guest(4096 * 4096);   // (16 MB of "guest memory")
-struct Host { void* guest_base() { return guest.data(); } uint64_t guest_size() { return guest.size(); } } host_obj, *host = &host_obj;
+struct Host { void* guest_base() { return guest.data(); } uint64_t guest_size() { return guest.size(); }
+    // (HeyListen, TICK-043: collect_split's parts, never queued here)
+    int64_t collect_written_in(const uint64_t (*)[2], int, uint32_t**) { return 0; } } host_obj, *host = &host_obj;
+static bool stream_on() { return false; }   // (HeyListen, TICK-037: streaming stores off here)
+static bool guarded_copy_stream(void*, const void*, size_t) { return false; }
+static void stream_fence() {}
+constexpr int THREAD_PRIORITY_ABOVE_NORMAL = 1;   // (HeyListen, TICK-054: RX_VK_CAPTURE_PRIO)
+static void SetThreadPriority(int, int) {}
 static std::atomic<bool> hold_guest{false};   // (copy_pages' guest copies wait while it is set: the helpers kept busy)
 static std::atomic<int> held{0};
 static bool guarded_copy(void* dst, const void* src, size_t n) {

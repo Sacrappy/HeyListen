@@ -26,9 +26,9 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t volume[MAX_PATH], root[MAX_PATH], game[MAX_PATH], exe[MAX_PATH], ordinary[MAX_PATH], cwd[MAX_PATH];
     wchar_t marker[MAX_PATH], pointer[MAX_PATH], moved[MAX_PATH], next[MAX_PATH], normalized[MAX_PATH];
     join(volume, argv[1], L"volume old");
-    join(root, volume, L"HookshotBuilder");
+    join(root, volume, L"HeyListenBuilder");   /* (HeyListen: its home's name) */
     join(game, volume, L"Game");
-    join(exe, root, L"versions\\v-authored\\HookshotBuilder\\HookshotBuilder.exe");
+    join(exe, root, L"versions\\v-authored\\HookshotBuilder\\HeyListenBuilder.exe");
     join(ordinary, argv[1], L"standard");
     join(cwd, argv[1], L"unrelated cwd");
     CHECK(SetCurrentDirectoryW(cwd));
@@ -49,7 +49,7 @@ int wmain(int argc, wchar_t **argv) {
     CHECK(hb_home_discover(&home, ordinary, exe, ordinary, 0) && !home.portable && !wcscmp(home.root, ordinary));
     CHECK(!hb_home_discover(&home, L"relative", exe, ordinary, 0) && !home.root[0]);
     join(pointer, game, HB_GAME_HOME);
-    const char relative[] = "../HookshotBuilder\n";
+    const char relative[] = "../HeyListenBuilder\n";
     CHECK(put(pointer, relative, sizeof relative - 1));
     CHECK(hb_home_game(&home, game) == 1 && home.portable && !wcscmp(home.root, root));
     wchar_t launcher[MAX_PATH]; join(launcher, game, L"hookshot.exe");
@@ -66,7 +66,7 @@ int wmain(int argc, wchar_t **argv) {
     CHECK(put(pointer, relative, sizeof relative - 1));
     join(moved, argv[1], L"volume moved");
     CHECK(MoveFileW(volume, moved));
-    join(next, moved, L"HookshotBuilder");
+    join(next, moved, L"HeyListenBuilder");
     join(game, moved, L"Game");
     join(launcher, game, L"hookshot.exe");
     CHECK(hb_home_discover(&home, NULL, launcher, ordinary, 1) && home.portable && !wcscmp(home.root, next));

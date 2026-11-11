@@ -213,7 +213,7 @@ def package(a):
             return 1
     else:
         print("no setup list: the package has no play profile and no prebuilt third_party files")
-    if a.profile:
+    if getattr(a, "profile", None):   # (a caller with no --profile: none)
         # (HeyListen TICK-045) the play profile recorded on this lifter's default lift, over the list's (upstream's or the previous
         # release's): a lift ships with its own profile. Function names, hashes and counts; no game code
         work = os.path.join(tools, "work")

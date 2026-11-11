@@ -49,6 +49,8 @@ FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS
 #include <stdlib.h>
 #include <string.h>
 #include "hookshot_env.h"   /* (env_value_off: the switches' one rule) */
+static int hos_jt_on;   /* (HeyListen, TICK-037: the job trace, off here) */
+#define HOS_JT(t, a, b) ((void)0)
 #ifndef _WIN32
 #define _WIN32 1   /* (the choice by processors is the Windows build's: the cut code is that build on every runner) */
 #endif

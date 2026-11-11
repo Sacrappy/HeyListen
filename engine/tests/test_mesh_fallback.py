@@ -221,8 +221,9 @@ def main():
     build = block(draw, "bool fallback_compute_pipelines(Program& p) {")
     if build.index("cached_compute(") < build.index("    }\n", build.index("std::lock_guard lk(mu);")):
         raise SystemExit("the fallback's build holds its lock through the compiles (one program at a time)")
-    precompile = block(draw, "void precompile_run(void (*progress)(size_t done, size_t total)) {")
-    if "else if (p.fallback) fallbacks.push_back(&p);" not in precompile or "fallback_compute_pipelines(p);" not in precompile:
+    # (HeyListen, TICK-008: the precompile can run in the background (wait), its work in a Pre of its own)
+    precompile = block(draw, "void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {")
+    if "else if (p.fallback) pre->fallbacks.push_back(&p);" not in precompile or "fallback_compute_pipelines(p);" not in precompile:
         raise SystemExit("the precompile leaves the mesh fallback's compute pipelines to play")
     shader = _with_cache(ROOT / "gpu" / "vk" / "vk_shader.cpp")
     if "(fallbacks && (it->second[0].kind & 4))" not in block(shader, "size_t program_cache_load_some(") or \

@@ -621,7 +621,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             /* (TICK-039) HOS_SAMPLE_NS=1: the instant of this thread's sample in ns (hos_now_ns, the clock of HOS_JOBTRACE)
                as a last ";@<ns>" frame, to match a sample to a trace's 50-200 us segments (the line's ms is 1 ms coarse) */
             static int at_ns = -1;
-            if (at_ns < 0) at_ns = getenv("HOS_SAMPLE_NS") != NULL;
+            if (at_ns < 0) at_ns = env_on("HOS_SAMPLE_NS");
             if (at_ns && len < (int)sizeof line - 24) snprintf(line + len, sizeof line - len, ";@%lld", (long long)at);
             fprintf(out, "%s\n", line);
         }

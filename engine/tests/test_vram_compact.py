@@ -38,10 +38,12 @@ def check_source():
     # (a texture that is not a render target's goes to the textures' pool only when they are compacted, in a branch before the
     # render targets' pool and blocks, which stay as they are)
     make = block(tex, "Texture* create(const Key& key")
-    own = "in_textures && create_image(ci, x.image, x.allocation, false, false, true)"
+    own = "in_textures && !big && create_image(ci, x.image, x.allocation, false, false, true)"
     need("vk_texture.cpp: create()", make,
          ["const bool in_textures = compact_on() && !x.sparse && !(as_target && !is_bc(x.format) && !is_astc(x.format));", own])
-    if not make.index(own) < make.index("pool_take(pool_key, x.image, x.allocation, x.views)"):
+    # (HeyListen: TICK-031's spare images are taken first, and pool_take is only for render targets, which the textures' pool
+    # never takes: the textures' pool is tried before an image is made in the targets' pool or the blocks)
+    if not make.index(own) < make.index("(st_pool_made += pool_key != 0, true)"):
         raise SystemExit("vk_texture.cpp: the textures' pool is no longer tried before the render targets' pool and blocks")
     # (while a pass is open nothing of the pool is freed: VMA holds the allocations it listed)
     frame = block(tex, "void texture_frame(uint64_t completed)")
@@ -57,7 +59,8 @@ def check_source():
           # it does not stop at the first texture past the excess, which kept it from the dead targets, the youngest)
           "const bool by_hold = evict_to != 0 && !sweep;",
           "if (shifted || drawn_over(tex)) hold_dead += tex->bytes + tex->pad;",
-          "if ((!sweep && !by_hold && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) ||",
+          # (HeyListen: TICK-027's overwritten targets go on past the budget's stop, so the stop is the usual pass's own)
+          "const bool usual_now = usual_on && (sweep || by_hold || (pending_bytes < total_bytes && total_bytes - pending_bytes > budget / 8 * 7));",
           "const uint64_t to = vram_compact::hold_target(frame_no - last, need_unused, rule_to, hold_to, evict_to);",
           # (and what the other rules ask on their own is kept from before the hold's lines, the 97% rule's with it, for the
           # pass's third tier: a texture unused for the eviction's own time goes for that part)
@@ -74,8 +77,8 @@ def check_source():
         raise SystemExit("vk_texture.cpp: the hold's pass judges a texture before it knows whether it is a dead render target")
     need("vk_texture.cpp: compact_step()", block(tex, "void compact_step(uint64_t completed)"),
          ["if (!compact_on()) return;", "vram_compact::run_from(min_free, compact.pressed)", "vram_compact::rest(compact.pressed)",
-          "t != present_source", "image_compact_ignore(i);", "destroy_gen++;"])
-    need("vk_vma.cpp: create_image()", block(vma, "bool create_image(const VkImageCreateInfo& ci"),
+          "t != present_source", "image_compact_ignore(i);", "destroy_gen_bump(nullptr);"])   # (HeyListen: TICK-052's ring, all of it)
+    need("vk_vma.cpp: create_image()", block(vma, "static bool create_image_(const VkImageCreateInfo& ci"),   # (HeyListen: TICK-038's accounting wraps it)
          ["textures && textures_pool() ? textures_pool()"])
     need("vk_vma.cpp: image_compact_begin()", block(vma, "bool image_compact_begin("), ["di.pool = texture_pool;"])
 

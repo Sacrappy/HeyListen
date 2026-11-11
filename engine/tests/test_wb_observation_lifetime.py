@@ -31,6 +31,8 @@ constexpr int VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT = 2;
 constexpr int VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO = 0;
 struct VkBufferDeviceAddressInfo { int type; void* next = nullptr; VkBuffer buffer = 0; };
 struct { int device = 0; } dev;
+enum class MemKind { Staging };   // (HeyListen, TICK-038: the allocations' kind for RX_VK_RES_LOG, none here)
+struct MemKindScope { explicit MemKindScope(MemKind) {} ~MemKindScope() {} };
 uint64_t mem_completed = 0, mem_rec_value = 1;
 bool flush_ok = true, invalidate_ok = true, allocate_ok = true;
 bool mapping_ok = true, address_ok = true;

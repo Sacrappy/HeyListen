@@ -58,7 +58,7 @@ def check_manifest():
 
 def check_build_links_it():
     src = (ROOT / "nx2" / "build.py").read_text(encoding="utf-8")
-    start = src.index('exe = os.path.join(out, EXE)', src.index("elif a.standalone and not a.only and not vk_only:"))   # (the Windows link)
+    start = src.index('exe = os.path.join(out, EXE)', src.index("elif a.standalone and not vk_only:"))   # (the Windows link)
     link = src[start:src.index("capture_output=True", start)]
     assert "win_manifest.write(" in link, "nx2/build.py links HeyListen.exe without nx2/win_manifest.py's resource"
 

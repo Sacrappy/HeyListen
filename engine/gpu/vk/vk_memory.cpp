@@ -4366,7 +4366,7 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
         p->idle_freed_epoch = mirror_epoch;
         mirror_free(*p);
     }
-    static const bool keep_lazy = getenv("RX_VK_KEEP_LAZY_MIRRORS") != nullptr;
+    static const bool keep_lazy = env_on("RX_VK_KEEP_LAZY_MIRRORS");
     if (!keep_lazy)
         for (auto& [lo, p] : imported)
             if (p.mstate == Pool::MIRROR_ON && p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed &&

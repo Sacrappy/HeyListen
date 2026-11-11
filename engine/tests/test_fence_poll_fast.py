@@ -60,11 +60,15 @@ def main():
 
     sr = function(rp, "void submit_recording(")
     lock = sr.index("std::lock_guard mk(rec_map_mu);")
-    emp = sr.index("for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);")
+    emp = sr.index("for (uint64_t v : rec_open_values) finished_in(v);")   # (upstream #2419: each value to its latest recording)
     mark = sr.index("whole_val[v & (kWholeSlots - 1)].store(v, std::memory_order_release);")
     clr = sr.index("rec_open_qvalues.clear();")
     need(lock < emp < mark < clr, "the mark is not set under rec_map_mu after value_rec has the values, then cleared")
-    need(sr[lock:clr].count("}") == 0, "the mark is set outside the rec_map_mu scope")
+    depth, low = 0, 0   # (upstream's finished_in lambda, #2419, has braces of its own: the scope is never left in between)
+    for ch in sr[lock:clr]:
+        depth += (ch == "{") - (ch == "}")
+        low = min(low, depth)
+    need(low >= 0, "the mark is set outside the rec_map_mu scope")
     need(rp.count("whole_val[") == 3, "whole_val is used outside the mark and wait_inner")
 
     wi = function(rp, "int wait_inner(uint64_t f, uint64_t timeout_ns) {")

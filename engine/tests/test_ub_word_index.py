@@ -38,6 +38,7 @@ def main():
 uint64_t rec_value_now = 1;
 uint32_t stamp = 1;
 size_t ub_limit = SIZE_MAX;
+struct UbReadGuard { UbReadGuard() {} ~UbReadGuard() {} };   // (HeyListen: the parallel replay's shared lock on the updates while they grow, none here)
 struct UbUpdate { uint64_t dst; std::vector<uint8_t> bytes; };
 std::vector<UbUpdate> ub_updates;
 uint32_t memory_page_stamp(uint64_t) { return stamp; }

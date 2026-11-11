@@ -20,6 +20,10 @@ SUBST = [(sig + _FMA_GUARD, sig + "#if RECOMP_FPX_HOST == 1 || RECOMP_FPX_FMA64\
 
 def patch(h):
     for old, new in SUBST:
+        # (HeyListen: TICK-044's A64_FPX_FMA3, a64_rtgen.py, fuses recomp_fpx_fma32 the same way already, with a comment after the
+        # guard: that one is left as it is)
+        if h.count(old[:-len(_FMA_GUARD)] + "#if RECOMP_FPX_HOST == 1 || RECOMP_FPX_FMA64") == 1:
+            continue
         n = h.count(old)
         if n != 1:
             raise SystemExit("suyu_rt_fixes: %r found %d times in a64_suyu.h (expected once): update nx2/suyu_rt_fixes.py"

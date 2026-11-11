@@ -53,7 +53,7 @@ static void held_flush(void) { clock_now += 2000000; }
 enum { HF_PRESENT = 1 };
 static void held_init(void) {}
 static void held_flush_why(int why) { (void)why; held_flush(); }
-static uint64_t present_thread;
+uint64_t present_thread;   /* (external: written, never read here) */
 static uint64_t hos_self(void) { return 1; }
 #define HOS_JT(kind, a, b) ((void)0)
 static int hos_vcore_away(void) { clock_now += 1000000; return has_vcore; }

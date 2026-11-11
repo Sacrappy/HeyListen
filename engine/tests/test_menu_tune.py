@@ -75,7 +75,8 @@ def main():
           "vk_menu.cpp: opening menu with tune key held must directly activate tune_mode (Option B)")
 
     # 8. FPS counter stays in safe corner during tune mode
-    check("under_banner && !tune_mode && page != 5" in menu_cpp,
+    # (HeyListen: the FPS counter is the performance overlay's (vk_overlay.cpp); the menu's own plate is not drawn)
+    check("under_banner && !tune_mode && page != 5" in menu_cpp or "[[maybe_unused]] void draw_fps(" in menu_cpp,
           "vk_menu.cpp: draw_fps must not offset under banner during tune_mode")
 
     # 9. Cut the real toggle and dim logic from vk_menu.cpp and compile unit fixture

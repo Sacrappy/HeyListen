@@ -1309,7 +1309,7 @@ NoteFile note_file_state(FILE* f, long* first) {
             (now.state == 0 && h.translator != now.translator))
             return NoteFile::Unusable;
         if (h.translator == now.translator) return NoteFile::Current;
-        return getenv("RX_VK_NOTES_STRICT") ? NoteFile::Unusable : NoteFile::Carried;
+        return env_on("RX_VK_NOTES_STRICT") ? NoteFile::Unusable : NoteFile::Carried;
     }
     if (got >= 16) {   // (the old header: the translator stamp, sizeof(PipeNote))
         uint64_t head[2];
@@ -3143,7 +3143,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
         for (const auto& d : st.info.image_descriptors) nimg += d.count;
     }
     dw().bufs.reserve(nbuf), dw().imgs.reserve(nimg), dw().views.reserve(nview);   // (stable pointers below)
-    static const bool no_slot_cache = getenv("RX_VK_NO_SLOT_CACHE") != nullptr;
+    static const bool no_slot_cache = env_on("RX_VK_NO_SLOT_CACHE");
     TexSlot* slots = nullptr;
     if (!no_slot_cache && ntex) {
         auto& table = prog_slots();
@@ -6040,7 +6040,7 @@ void occ_resolve(size_t n) {   // (the first n pending: their submissions are do
         occ_last[r.addr] = sum;
         if (r.key) occ_keyed[r.key] = {sum, r.present};
         if (auto pa = occ_pending_at.find(r.addr); pa != occ_pending_at.end() && --pa->second <= 0) occ_pending_at.erase(pa);
-        if (occ_mode() >= 4 && span_ok && occ_latest[r.addr] == r.seq) host->gpu_write(r.addr, &sum, 8);   // (over the fixed value)
+        if (occ_mode() >= 4 && span_ok && occ_latest[r.addr] == r.seq) guest_cpu_write(r.addr, &sum, 8);   // (over the fixed value; Sync 12: the write-back diff hears of it)
         occ_t.reports++;
         occ_t.draws += draws;
         if (!sum) {
@@ -6932,25 +6932,26 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
         // (upstream) never left out when a stage writes global memory or storage buffers / images: those writes are not in the
-        // earlier frame's picture
-        bool writes = false;
-        for (const Stage& st : p.stages) {
-            const auto& info = st.info;
-            const auto written = [](const auto& ds) {
-                return std::any_of(ds.begin(), ds.end(), [](const auto& d) { return d.is_written; });
-            };
-            if (info.stores_global_memory || written(info.storage_buffers_descriptors) ||
-                written(info.image_buffer_descriptors) || written(info.image_descriptors)) {
-                writes = true;
-                break;
+        // earlier frame's picture. The stages are looked at only when the draw could be left out
+        const auto writes = [&p] {
+            for (const Stage& st : p.stages) {
+                const auto& info = st.info;
+                const auto written = [](const auto& ds) {
+                    return std::any_of(ds.begin(), ds.end(), [](const auto& d) { return d.is_written; });
+                };
+                if (info.stores_global_memory || written(info.storage_buffers_descriptors) ||
+                    written(info.image_buffer_descriptors) || written(info.image_descriptors))
+                    return true;
             }
-        }
-        const bool may_skip = !always_wait && !writes && targets_persistent(at);
+            return false;
+        };
         // (TICK-008) A pipeline still being built: the draw is left out of the frame, except into targets made this frame (a shadow
         // map, a new effect target), which wait as before so the picture never lacks it (user's choice, 2026-11-09: no flicker on a
         // first visit). RX_VK_PIPE_WAIT_FRESH=0: those are left out too (counted: st_pipe_fresh_skips); RX_VK_PIPE_SKIP=0: every draw waits
         static const bool wait_fresh = !getenv("RX_VK_PIPE_WAIT_FRESH") || strcmp(getenv("RX_VK_PIPE_WAIT_FRESH"), "0") != 0;
-        if (may_skip || !(always_wait || wait_fresh || writes)) {
+        const bool persistent = !always_wait && targets_persistent(at);
+        const bool may_skip = persistent && !writes();
+        if (may_skip || (!always_wait && !persistent && !wait_fresh && !writes())) {
             st_pending_skips++;
             if (!may_skip) st_pipe_fresh_skips.fetch_add(1, std::memory_order_relaxed);
             return;

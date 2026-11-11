@@ -35,26 +35,29 @@ def main():
     a = p.parse_args()
     vk = ROOT / "gpu" / "vk"
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
-    row = re.search(r'\{TAB_GAMEPLAY, "FPS counter", &opts\.show_fps, 0, ([^,]+), 1, (\w+),', menu)
-    need(row, "the Gameplay tab has no FPS counter row on opts.show_fps")
-    need(row.group(1).strip() == "fps_stats::kLevels - 1" and row.group(2) == "tx_fps_level",
-         "the FPS counter row is not the levels' (0 to fps_stats::kLevels - 1, tx_fps_level)")
-    need("fps_stats::level_name(" in body(menu, "const char* tx_fps_level("), "tx_fps_level does not use fps_stats::level_name")
-    # (the key the row saves under is its name's: fps_counter, as before the levels, so an old file's 1 is FPS)
-    need("show_fps" not in body(menu, "const char* ini_key("), "the FPS counter's key was renamed: old options files would not load")
-    hints = body(menu, "MENU_HINTS(hn_fps,")
-    need(hints.count('"') // 2 >= 4, "the FPS counter's hints do not cover every level")
-    need(re.search(r'\{TAB_GAMEPLAY, "FPS counter position", &opts\.fps_corner, 0, 3, 1, tx_fps_corner,', menu),
-         "the Gameplay tab has no FPS counter position row")
-    tick = menu[menu.index("void menu_tick()"):menu.index("void menu_record(")]
-    need("fps_level_now.store(" in tick and "fps_texts(" in tick, "menu_tick does not tell vk_fps.cpp the level or write the lines")
-    need("fps_level_now.store(" in body(menu, "void menu_init()"), "menu_init does not tell vk_fps.cpp the saved level")
-    target = body(menu, "double fps_target_ms()")
-    need("fps_stats::cap_rate(fps_cap_started" in target and "HOS_FPS_MAX" in target and "menu_vsync() == 1" in target,
-         "the target is not the cap the game started with (HOS_FPS_MAX over it), or the display's with V-Sync On")
-    draw = body(menu, "void draw_fps(")
-    for use in ("fps_graph(", "fps_target_ms()", "fs::graph_top(", "fs::rate_grade(", "fps_part_text", "fps_ms_text"):
-        need(use in draw, "draw_fps does not use %s" % use)
+    # (HeyListen: the FPS counter is the performance overlay's (vk_overlay.cpp, F10: Off, FPS, Full), not upstream's levels; its
+    # menu row and drawing are its own, and what feeds upstream's levels below is checked as it is)
+    if '"FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,' not in menu:
+        row = re.search(r'\{TAB_GAMEPLAY, "FPS counter", &opts\.show_fps, 0, ([^,]+), 1, (\w+),', menu)
+        need(row, "the Gameplay tab has no FPS counter row on opts.show_fps")
+        need(row.group(1).strip() == "fps_stats::kLevels - 1" and row.group(2) == "tx_fps_level",
+             "the FPS counter row is not the levels' (0 to fps_stats::kLevels - 1, tx_fps_level)")
+        need("fps_stats::level_name(" in body(menu, "const char* tx_fps_level("), "tx_fps_level does not use fps_stats::level_name")
+        # (the key the row saves under is its name's: fps_counter, as before the levels, so an old file's 1 is FPS)
+        need("show_fps" not in body(menu, "const char* ini_key("), "the FPS counter's key was renamed: old options files would not load")
+        hints = body(menu, "MENU_HINTS(hn_fps,")
+        need(hints.count('"') // 2 >= 4, "the FPS counter's hints do not cover every level")
+        need(re.search(r'\{TAB_GAMEPLAY, "FPS counter position", &opts\.fps_corner, 0, 3, 1, tx_fps_corner,', menu),
+             "the Gameplay tab has no FPS counter position row")
+        tick = menu[menu.index("void menu_tick()"):menu.index("void menu_record(")]
+        need("fps_level_now.store(" in tick and "fps_texts(" in tick, "menu_tick does not tell vk_fps.cpp the level or write the lines")
+        need("fps_level_now.store(" in body(menu, "void menu_init()"), "menu_init does not tell vk_fps.cpp the saved level")
+        target = body(menu, "double fps_target_ms()")
+        need("fps_stats::cap_rate(fps_cap_started" in target and "HOS_FPS_MAX" in target and "menu_vsync() == 1" in target,
+             "the target is not the cap the game started with (HOS_FPS_MAX over it), or the display's with V-Sync On")
+        draw = body(menu, "void draw_fps(")
+        for use in ("fps_graph(", "fps_target_ms()", "fs::graph_top(", "fs::rate_grade(", "fps_part_text", "fps_ms_text"):
+            need(use in draw, "draw_fps does not use %s" % use)
 
     replay = (vk / "vk_replay.cpp").read_text(encoding="utf-8")
     present = body(replay, "void present(const nvn_tex* t, const int crop[4])")

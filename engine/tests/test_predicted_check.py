@@ -55,8 +55,10 @@ def main():
     graphics = body(draw, "VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part, bool* cold) {")
     if "? pcache : driver_ask_cache" not in graphics:
         raise SystemExit("FAIL: build_graphics does not hand the driver the check's own cache")
-    pre = body(draw, "void precompile_run(void (*progress)(size_t done, size_t total)) {")
-    if "predicted_check();" not in pre:
+    # (HeyListen, TICK-008: the precompile may finish behind the game: its last worker calls precompile_finished, which checks)
+    pre = body(draw, "void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {")
+    finished = body(draw, "void precompile_finished(Pre* pre) {")
+    if "precompile_finished(pre);" not in pre or "predicted_check();" not in finished:
         raise SystemExit("FAIL: the start does not check the predicted pipelines")
     started = body(main_cpp, "bool started_up() {")
     if 'driver_cache_log("at the start")' not in started or 'driver_cache_log("after the prediction")' not in predict:

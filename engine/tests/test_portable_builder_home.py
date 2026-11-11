@@ -29,7 +29,7 @@ def main():
         data = root / "authored filesystem"
         data.mkdir()
         native = root / "native roots é, fixture"
-        for part in ("volume old/HookshotBuilder/versions/v-authored/HookshotBuilder", "volume old/Game", "unrelated cwd", "standard", "broken"):
+        for part in ("volume old/HeyListenBuilder/versions/v-authored/HookshotBuilder", "volume old/Game", "unrelated cwd", "standard", "broken"):
             (native / part).mkdir(parents=True, exist_ok=True)
         exe = root / "native-home.exe"
         subprocess.run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-municode",
@@ -37,7 +37,7 @@ def main():
                         "-o", str(exe)], check=True)
         subprocess.run([str(exe), str(native)], check=True, timeout=30)
         subprocess.run([args.dotnet, "run", "--project", str(root / "Fixture.csproj"), "--configuration", "Release",
-                        "--disable-build-servers", "--", str(data), str(native / "volume moved/HookshotBuilder")], cwd=root, check=True)
+                        "--disable-build-servers", "--", str(data), str(native / "volume moved/HeyListenBuilder")], cwd=root, check=True)
         subprocess.run([str(exe), "--read", str(data / "csharp shared")], check=True, timeout=30)
 
 

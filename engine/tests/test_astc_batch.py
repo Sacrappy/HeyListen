@@ -54,7 +54,7 @@ class AstcBatchTests(unittest.TestCase):
         gate = gate[:gate.index("{")]
         for need in ("!tex.bc_resized", "bc_mode(tex.format) != 3", "bc_layer_views[kBcLayers - 1]"):
             self.assertIn(need, gate)
-        self.assertLess(self.upload.index("if (!bc_scratch_layout(cmd, tex.bc_resized)) return false;"),
+        self.assertLess(self.upload.index("if (!bc_scratch_layout(cmd, tex.bc_resized)) {"),
                         self.upload.index("if (astc_batch_on()"), "the batched path runs before the scratch is made")
 
     def test_each_piece_its_own_layer_and_range(self):

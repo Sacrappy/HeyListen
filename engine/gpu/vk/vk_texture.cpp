@@ -793,7 +793,7 @@ bool bc_ready() {
     if (r != VK_SUCCESS) return false;
     state = 1;
     // (TICK-031) BC1 and BC7 (RX_VK_ASTC_BC3=1: BC3 as before, for big ones only)
-    if (!getenv("RX_VK_ASTC_BC3")) {
+    if (!env_on("RX_VK_ASTC_BC3")) {
         auto samples = [](VkFormat f) {
             VkFormatProperties p{};
             vkGetPhysicalDeviceFormatProperties(dev.physical, f, &p);
@@ -2533,7 +2533,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                 // (TICK-031) BC1 (4 bits a texel) for blocks of 6x6 texels and more (3.6 bits a texel or less) none of whose
                 // blocks has alpha; else BC7 (8): ASTC 4x4's size, alpha kept. RX_VK_ASTC_NO_BC1=1: BC7 for all
                 x.format = VK_FORMAT_BC7_UNORM_BLOCK;
-                static const bool no_bc1 = getenv("RX_VK_ASTC_NO_BC1") != nullptr;
+                static const bool no_bc1 = env_on("RX_VK_ASTC_NO_BC1");
                 if (bc1_ok && !no_bc1 && bw * bh >= 36) {
                     const auto t0 = std::chrono::steady_clock::now();
                     const int a = astc_storage_alpha(t->gpu, t->L.size);
@@ -2934,7 +2934,7 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
 // spans, fps unchanged (72.6 / 72.6 against 72.6 / 73.9): the drains cost the GPU little, the frame is not limited by them. Left
 // off: no gain for the ordering the game may rely on.
 void pass_start_barrier(VkCommandBuffer cmd, const char* why) {
-    static const bool trust = getenv("RX_VK_PASS_TRUST") != nullptr;
+    static const bool trust = env_on("RX_VK_PASS_TRUST");
     if (trust && !par_active.load(std::memory_order_relaxed) && cmd == last_barrier_cmd &&
         other_work_slot(cmd).load(std::memory_order_relaxed) == last_barrier_other) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
@@ -2949,7 +2949,7 @@ void dispatch_barrier(VkCommandBuffer cmd, const char* why) {
         st_trust_dispatch_left.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    static const bool trust = getenv("RX_VK_DISPATCH_TRUST") != nullptr;
+    static const bool trust = env_on("RX_VK_DISPATCH_TRUST");
     const uintptr_t v = (uintptr_t)cmd;
     if (trust && !par_active.load(std::memory_order_relaxed) && cmd == last_barrier_cmd &&
         xfer_work_by_cmd[((v >> 4) ^ (v >> 10) ^ (v >> 16)) & 63].load(std::memory_order_relaxed) == last_barrier_xfer) {
@@ -4513,7 +4513,7 @@ void compact_step(uint64_t completed) {
         return;
     }
     full_barrier(cmd, "compaction: after the copies");
-    destroy_gen++;   // (what was resolved to the moved textures' views is stale)
+    destroy_gen_bump(nullptr);   // (what was resolved to the moved textures' views is stale: all of it, TICK-052's ring as a sweep)
     compact.in_pass = true, compact.value = rec_value;
 }
 
@@ -4787,7 +4787,7 @@ void texture_frame(uint64_t completed) {
         // the budget fell by what each eviction freed, down to 2.6 GB with 4 GB free in the blocks)
         // (TICK-030: counted whole as reusable, which it is: new images take it before VMA makes a block. Evicting a pooled
         // texture moves its bytes from the textures to the free space, so `rest` does not move and the budget does not ratchet)
-        static const bool free_capped = getenv("RX_VK_BUDGET_FREE_CAPPED") != nullptr;   // (TICK-023's 512 MB cap)
+        static const bool free_capped = env_on("RX_VK_BUDGET_FREE_CAPPED");   // (TICK-023's 512 MB cap)
         const uint64_t held = used - std::min(used, block_free) + (free_capped ? std::min<uint64_t>(block_free, 512ull << 20) : 0);
         const uint64_t rest = held > total_bytes ? held - total_bytes : 0;
         const uint64_t by_target = std::max<uint64_t>(target > rest ? target - rest : 0, 1024ull << 20);

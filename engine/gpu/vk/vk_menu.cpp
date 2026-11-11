@@ -788,7 +788,7 @@ Row rows[] = {
      "game's frames.", hn_reflex, false, true},
     {TAB_GRAPHICS, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_antilag,
      "AMD GPUs: each frame starts as late as it can, for less input delay. Not used with frame generation.", hn_antilag, false, true},
-    {TAB_GRAPHICS, "Frame rate limit", &opts.fps_limit, 0, 5, 1, tx_fps_limit,   // (HeyListen: option id 10, host/nn_vi.c)
+    {TAB_GRAPHICS, "Frame rate limit", &opts.fps_limit, 0, 5, 1, tx_fps_limit,   // (HeyListen: HOS_OPT_FPS_LIMIT, 60, host/nn_vi.c)
      "The game's own frame rate. Above 60 it needs Game speed on Real time (the game's time follows the clock, so it does not run "
      "faster), and your display must run that fast to show every frame.", nullptr, false, true},
     // (the picture's way, top to bottom: the output's size, what fills it from the 3D, the 3D's size, then the window)

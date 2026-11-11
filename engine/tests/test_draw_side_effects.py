@@ -18,6 +18,7 @@ FIXTURE = r"""
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #define PROF_EXACT() ((void)0)
 #define PROF_HOT(x) ((void)0)
@@ -30,6 +31,7 @@ struct Info {
 };
 struct Stage { Info info; };
 int scans, early_reads, translation_waits, pipeline_waits, draws, output, st_waits, st_pending_skips;
+std::atomic<int> st_pipe_fresh_skips{0};   // (HeyListen, TICK-008: RX_VK_PIPE_WAIT_FRESH=0's skips)
 double st_wait_ms;
 // Instrument only fixture iteration: reject inspecting ordinary stages before acquire-ready publication.
 struct Stages {

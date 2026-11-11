@@ -38,6 +38,9 @@ enum { HOS_OPT_DISABLE_CAMERA_CENTERING = 45 };
 /* (hookshot) the Insert menu's Camera speed: the right stick's camera turn in percent of the game's, 50 to 400 (host/nn_vi.c
    hos_camera_scale, nx2/oot_patches.py). 48: after the HDR and Discord rows' 40 to 43, Skip title's 44 and camera centering's 45 */
 enum { HOS_OPT_CAMERA_SPEED = 48 };
+/* (HeyListen) the Graphics tab's Frame rate limit (host/nn_vi.c fps_limit): the frames a second, 60 to 240. Option id 10 until
+   Sync 12, where upstream gave 10 to Text size: 60, far from upstream's ids */
+enum { HOS_OPT_FPS_LIMIT = 60 };
 /* (HOS_OPT_PROMPTS, 46: the Button prompts row, host/prompts.c: 0 Auto, else HOS_PROMPT_* + 1; a change shows at once) */
 enum { HOS_OPT_PROMPTS = 46 };
 

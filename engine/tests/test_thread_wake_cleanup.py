@@ -36,6 +36,7 @@ typedef struct { int closed, kind; } HostHandle;
 typedef HostHandle *HANDLE;
 typedef struct { HANDLE handle, wake; } HosThread;
 static HosThread *threads[1024], *destroying;
+static void thread_gen_bump(void) {}   /* (HeyListen, TICK-062: HOS_THREAD_OF_CACHE's generation) */
 static int nthreads, threads_lock, lock_held, frees, thread_closes, wake_closes, check_free_order;
 
 static void AcquireSRWLockExclusive(int *lock) {

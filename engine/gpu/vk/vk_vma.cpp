@@ -280,7 +280,7 @@ static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAlloca
         dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
         if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) {
             static std::atomic<int> told{0};
-            if (getenv("RX_VK_LOG_DEDICATED") && told++ < 200)
+            if (env_on("RX_VK_LOG_DEDICATED") && told++ < 200)
                 logf("vk: dedicated image %ux%ux%u x%u levels %u format %d usage %#x flags %#x tiling %d", ci.extent.width,
                      ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels, (int)ci.format, ci.usage, ci.flags, (int)ci.tiling);
             return true;

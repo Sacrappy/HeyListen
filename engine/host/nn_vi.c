@@ -121,7 +121,7 @@ static int fps_limit(void) {
         env = e ? atoi(e) : 0;
     }
     int rx_option(int id, int otherwise);
-    int v = env > 0 ? env : rx_option(10, 60);
+    int v = env > 0 ? env : rx_option(HOS_OPT_FPS_LIMIT, 60);   /* (gpu/vk/vk_api.h: id 10 until Sync 12) */
     v = v < 30 ? 30 : v > 360 ? 360 : v;
     return rx_option(0, 1) && v > 60 ? v : 60;   /* (Per frame: the game's steps are whole frames of 1/60 s: 60) */
 }
@@ -439,7 +439,7 @@ static void realtime_step(int64_t now) {
     {   /* (TICK-014 diagnostic, HOS_SPEED_LOG) whether the game rewrote the slot since the last present */
         static int on = -1, written;
         static long same, changed, last_seen;
-        if (on < 0) on = getenv("HOS_SPEED_LOG") != NULL;
+        if (on < 0) on = env_on("HOS_SPEED_LOG");
         if (on && written) {
             if (*slot == written) same++; else changed++, last_seen = *slot;
             if (same + changed >= 600) hos_log("vi: slot: kept %ld, rewritten %ld (last to %ld) of 600; written %d", same, changed, last_seen, written), same = changed = 0;
@@ -497,7 +497,7 @@ static void speed_log(int64_t now) {
     static int64_t start;
     static double sum_ratio, sum_step;
     static long frames;
-    if (on < 0) on = getenv("HOS_SPEED_LOG") != NULL;
+    if (on < 0) on = env_on("HOS_SPEED_LOG");
     if (!on) return;
     const uint64_t holder = G64(0x84c9e890), t = holder ? G64(holder) : 0;
     if (!t) return;

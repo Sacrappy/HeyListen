@@ -94,6 +94,7 @@ static int wait_until(Obj *o, int64_t deadline) { (void)o; (void)deadline; if (l
 typedef struct { uint64_t x[8]; } Ctx;
 #define ARG(i) (c->x[i])
 #define HLE(name) static void name(Ctx *c)
+#define HOS_JT(t, a, b) ((void)0)   /* (HeyListen, TICK-037: the job trace's marks, off here) */
 static SRWLOCK mw_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE mw_cv = CONDITION_VARIABLE_INIT;
 static volatile LONG mw_waiting;

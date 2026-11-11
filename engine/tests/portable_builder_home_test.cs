@@ -20,7 +20,7 @@ static class Program
     {
         var fixture = Path.GetFullPath(args[0]);
         var volume = Path.Combine(fixture, "authored volume é, one");
-        var root = Path.Combine(volume, "HookshotBuilder");
+        var root = Path.Combine(volume, "HeyListenBuilder");   // (HeyListen: its home's name)
         var app = Path.Combine(root, "versions", "v-authored", "HookshotBuilder");
         var standard = Path.Combine(fixture, "standard");
         Directory.CreateDirectory(app);
@@ -49,7 +49,7 @@ static class Program
         Check(BuilderHome.Base == root && BuilderHome.Portable, "Actual process context chose another home.");
         Check(Storage.Base == root && Storage.NgxSdk == Path.Combine(root, "ngx-sdk") && Storage.FfxSdk == Path.Combine(root, "ffx-sdk"), "Storage/SDKs escaped the home.");
         Check(Storage.Work == root, "Default work escaped the home.");
-        Check(BuilderHome.DefaultGame == Path.Combine(volume, "Hookshot"), "Default game escaped the portable volume.");
+        Check(BuilderHome.DefaultGame == Path.Combine(volume, "HeyListen"), "Default game escaped the portable volume.");
         var child = new ProcessStartInfo("authored-child-never-started");
         child.Environment["HOOKSHOT_SETUP_BASE"] = Path.Combine(fixture, "stale unrelated home");
         child.Environment["HOOKSHOT_BUILDER_PORTABLE"] = "0";
@@ -70,7 +70,7 @@ static class Program
 
         var moved = Path.Combine(fixture, "authored volume é, moved");
         Directory.Move(volume, moved);
-        var newRoot = Path.Combine(moved, "HookshotBuilder");
+        var newRoot = Path.Combine(moved, "HeyListenBuilder");
         var next = BuilderHome.Resolve(null, Path.Combine(newRoot, "versions", "v-authored", "HookshotBuilder"), standard);
         Check(next.Root == newRoot && next.Portable, "Fresh direct start after relocation chose another home.");
         Check(BuilderHome.LoadPath(next, saved) == Path.Combine(moved, "Games", "authored game"), "Relocated choice kept its old prefix.");

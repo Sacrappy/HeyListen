@@ -45,6 +45,10 @@ typedef struct { void *p; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
 #define SRWLOCK_INIT {0}
 #define HOS_TLS_SLOTS 64
 typedef struct { uint64_t x[32]; volatile int poll; } Ctx;
+/* (HeyListen: its switches through env_on, the job trace's marks off) */
+static int env_on(const char *name) { (void)name; return 0; }
+static int hos_jt_on;
+#define HOS_JT(t, a, b) ((void)0)
 static int64_t now_ns = 1000000000;
 static int64_t hos_now_ns(void) { return now_ns; }
 static int escapes_logged;

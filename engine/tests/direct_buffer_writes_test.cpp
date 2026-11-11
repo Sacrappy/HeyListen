@@ -62,6 +62,18 @@ struct Host { const uint8_t* (*gpu_ptr)(uint64_t, uint64_t*); uint64_t (*gpu_gue
 static Host interface{gpu_ptr, gpu_guest};
 static Host* host = &interface;
 
+// (HeyListen: what the fork's gpu_buffer_bind also names: TICK-052/054's thread-local pool lookup and lock-reason counters,
+// TICK-019's direct-bind stats, TICK-048's diff note; none of them changes what the cases below check)
+static bool par_stats_on = false;
+enum ParWhy : int {
+    PW_BIND_WRITTEN, PW_BIND_NO_TL, PW_BIND_TL_GEN, PW_BIND_TL_RANGE, PW_BIND_MIRROR_STATE, PW_BIND_SYNC_EPOCH, PW_BIND_SYNC_SEG, PW_BIND_SIZE,
+    PW_COUNT
+};
+static void par_why(int) {}
+static TlPool& tl_pool_entry(uint64_t guest) { return tl_pools[(guest >> 16) & 1023]; }
+static std::atomic<int64_t> st_lazy_direct{0}, st_direct_fast{0}, st_direct_fast_bytes{0};
+static void diff_gpu_wrote(uint64_t, uint64_t) {}
+
 #include "direct_write_actual.inc"
 
 static void readback_disabled(bool off) {

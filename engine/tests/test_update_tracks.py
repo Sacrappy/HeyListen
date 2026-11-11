@@ -131,9 +131,9 @@ class Tracks(unittest.TestCase):
         self.assertEqual(linux_update.latest_tag(get, "rc"), "v2.0.14")   # (no API answer: the latest release)
         self.assertEqual(linux_update.latest_tag(get, "nightly"), "v2.1.0-rc.1-3-g1a2b3c4")
         self.assertEqual(linux_update.list_url("v2.1.0-rc.1-3-g1a2b3c4"),
-                         "https://github.com/NotRexed/Hookshot/releases/download/nightly/hookshot-linux.txt")
+                         "https://github.com/NotRexed/HeyListen/releases/download/nightly/hookshot-linux.txt")
         self.assertEqual(linux_update.list_url("v2.1.0-rc.2"),
-                         "https://github.com/NotRexed/Hookshot/releases/download/v2.1.0-rc.2/hookshot-linux.txt")
+                         "https://github.com/NotRexed/HeyListen/releases/download/v2.1.0-rc.2/hookshot-linux.txt")
         self.assertEqual(linux_update.list_url(None), linux_update.LATEST_LIST)
 
     def test_what_each_track_updates_to(self):

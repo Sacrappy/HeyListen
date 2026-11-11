@@ -174,7 +174,7 @@ static int hb_home_discover(HbHome *home, const wchar_t *requested, const wchar_
     /* The original setup remains beside its dedicated data folder after --portable's first invocation. */
     if (!game_launcher) {
         wchar_t sibling[MAX_PATH];
-        if (hb_home_join(sibling, MAX_PATH, setup_directory, L"HookshotBuilder")) {
+        if (hb_home_join(sibling, MAX_PATH, setup_directory, L"HeyListenBuilder")) {   /* (HeyListen: its home's name, setup.c init_home) */
             int marked = hb_home_marked(sibling);
             if (marked < 0) return 0;
             if (marked) { wcscpy(home->root, sibling); home->portable = 1; return 1; }
