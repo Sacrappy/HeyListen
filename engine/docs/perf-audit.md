@@ -3367,5 +3367,16 @@ of 8 GB/s or less: off on the main PC's x16 link, where the switch is inert).
 ### Screens and decision
 Castle-move, 3 rounds, one binary: base 28.09, LATE_DEFER 29.80, + CAPTURE_HASH 33.19, + MSYNC_FAST **33.83** (1% low 13.6 -> 16.3,
 p99 58.4 -> 47.3). + SEG_EARLY 34.11 / + RX_VK_PARALLEL=5 34.19 against 33.18 (inside the spread, not taken). Shots alike standing
-and walking (Market luma 103.7 / 103.5 -> 103.3 / 102.6), speed 60.00-60.07. The confirm and the adoption: the benchmark doc and
-docs/tickets/TICK-060.md.
+and walking (Market luma 103.7 / 103.5 -> 103.3 / 102.6), speed 60.00-60.07.
+
+**Confirm** (one binary, base = no switch; 6 rounds, 4-6 reversed): kokiri-idle 30.85 -> **37.24** (1% low 24.5 -> 26.4, p99 38.9 ->
+33.6), castle-move 29.13 -> **34.40** (14.7 -> 16.9, 54.2 -> 47.0), hyrule-walk 31.35 -> **37.20** (19.5 -> 25.9, 45.1 -> 36.2): above
+base in 18 of 18 rounds (+18 to +21%). **Adopted, on by default** (=0 off): `RX_VK_LATE_DEFER`, `RX_VK_CAPTURE_HASH` (acts only
+with the chunk diff), and `RX_VK_MSYNC_FAST` where the chunk diff is on (TICK-056's switch: off elsewhere, as it was). On a fast
+link (the main PC) only the deferral is new and it acts only when a take finds its late value not reached: to be checked there.
+
+### What is next
+- The frame is now the CPU's recording chain (GPU 73-83%, gaps 4-7 ms a frame): the Presentation Thread's own segments, the held
+  flush's 3.1 ms capture copy (memory-bound), the dry passes; SEG_EARLY and RX_VK_PARALLEL=5 (+0.9-1.0 fps in a screen) next.
+- SEG_EARLY's early segments have no GPU timestamps (the trace's gpu_ms reads 8.7 with it): add them first.
+- After that the GPU's own ~22 ms (the game's 1440p passes and compute) is the limit at ~43 fps.

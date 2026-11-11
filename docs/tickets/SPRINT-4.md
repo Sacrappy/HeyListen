@@ -211,3 +211,19 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Found: the main thread's two nvnSyncWait polls a frame wait 1.42 ms for the renderer's `sync_order_mu`, held by `submit_q` / `present` for whole replays. `RX_VK_FENCE_POLL_FAST` (off) answers them without it: +1.4..+6 fps in screens, +3.0 / +1.5 / +1.9 in a confirm (16 of 18 rounds above), but the Market's exposure blew out to white. The lock also ordered the exposure readback after the replay's write-back registrations. With that wait moved to the readbacks (the picture right), castle-move 69.6 -> 63.2.
 - Decision: nothing adopted; the switch stays off. Game folder: TICK-054's build. Saves identical after every run (103 runs), no hang.
 - Next: the readbacks' ordering without the replay's whole lock (per-range write-back state published at a replay's start): ~1.4 ms off the main thread's chain, then MSYNC_FAST + SEG_EARLY.
+
+## TICK-060 (2026-11-12): PC 3050's idle GPU third
+- Found (unprofiled: frame trace, nvidia-smi/dmon, job trace): the GPU idled 12.8 ms of a 35 ms castle-move frame, not for PCIe
+  (0.54 of 3.9 GB/s) or uploads: the held flush waited ~8 ms for the previous frame's late pages holding the replay's lock, then the
+  Presentation Thread needed a 5.8 ms mirror pre-sync (~4 ms of it TICK-048's diff re-hashing capture buffers from DRAM) before the
+  GPU had the frame's first big command buffer.
+- Built: `RX_VK_LATE_DEFER` (the late-page wait moved from the take to the queue: recordings held until a fix thread applies the same
+  copies at the value's end; CPU readers of a pending slot wait or copy whole), `RX_VK_CAPTURE_HASH` (the capture's copy makes the
+  diff's hashes in the same pass, bit-exact); tests; trace column `late_fix_ms`.
+- Screen (castle-move): base 28.09, defer 29.80, + hash 33.19, + MSYNC_FAST 33.83. Confirm (6 rounds, 18 of 18 above base):
+  kokiri-idle 30.85 -> 37.24, castle-move 29.13 -> 34.40, hyrule-walk 31.35 -> 37.20 fps; 1% low and p99 better; shots alike,
+  speed ~60, saves identical after every run.
+- Adopted (on by default, =0 off): LATE_DEFER, CAPTURE_HASH, and MSYNC_FAST where the chunk diff is on. Main-PC check pending.
+  PC 3050's game folder: build t60e (exe 17c3e4fb, dll 2dc76b85); main32d kept in `C:\OOT\builds\main32d`. Branch
+  `feature/TICK-060-pc3050-gpu`, bundle `E:\OOT\tick060.bundle`, not merged.
+- Next: the CPU recording chain (SEG_EARLY, RX_VK_PARALLEL=5: +1 fps in a screen), then the GPU's ~22 ms at 1440p.
