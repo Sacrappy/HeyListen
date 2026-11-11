@@ -2817,3 +2817,80 @@ Saves equal the backup after every run; no game process left. `run_all`: 229 pas
 - Next: (1) the program pick's "other textures" path (`still_valid` + `answer_handles`, ~10% of the workers; vk_shader.cpp, needs
   `--prepare-shaders`), and its shared statics `st_calls` / `st_hit` bumped at every pick; (2) the per-submission touches (~390 a
   command buffer) done once ahead of the segments; (3) TICK-050's ROUNDS+SELF+BALANCE again with these switches on (fewer segment starts).
+
+## TICK-054: the frame's critical path as a timeline, and the main thread's submits taken off it (2026-11-12)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs cut at
+66 s. Branch `feature/TICK-054-cpu-frame` (main aa1da9a with TICK-052 merged).
+
+### Instrument: the frame timeline (`HOS_JOBTRACE` marks, `tools/bench/frameline.py`)
+
+The job trace (TICK-039) now also records, as `JT_MARK` records (type 21, a = kind): the NVN submits on the thread that makes
+them (1 begin, 2 end: the submit-time capture and the replay of that submit, `nvnQueueSubmitCommands`), a held submit (3,
+HOS_NVN_HOLD=2 below), the presents (5, 6, `nvnQueuePresentTexture`) and the GPU's progress (7: the trace thread polls
+`rx_nvn_replayed()` every ~2 us while the window is open). The renderer records nothing itself: its headers are shader-stamp
+inputs, and a changed stamp costs a full shader precompile at the next start (found the hard way: `vk_api.h` is one).
+
+`python -I tools/bench/frameline.py <jobtrace.txt> [--frames N] [--from <ms>] [--row <ms>] [--summary]` prints a gantt of N
+frames (a column per thread: main, Presentation Thread, BaseProcExecutor0-5, ModuleSystemWorker1-5, the GPU; a letter per
+row: `#` work, `.` a blocked wait, `j` the main thread's job-group wait (lr 80080188), `e` its end-of-frame wait (lr 83acfcf4),
+`p` a SleepThread poll, `s` the host's spin, `v` a virtual-core wait, `S` a submit, `C` a capture, `P` a present) and, per frame,
+the main thread's phases in order, the Presentation Thread's idle / replay / present time and the GPU's busy time (approximate:
+from a submit's end to the first completion after it). Frames are cut at the present's end. `tests/test_frameline.py`.
+
+### The timeline (base: main aa1da9a; `HOS_JOBTRACE` 88-91 s, ~210 frames each)
+
+Means a frame, kokiri-idle (13.6 ms with the trace) / castle-move (14.2 ms): the main thread works 4.7 / 5.4 ms, of it
+**alone** (no executor, no module worker, the Presentation Thread idle) **2.3 / 2.9 ms**; waits for job groups 6.5 / 6.6; at the
+end-of-frame event 1.4 / 1.1; in SleepThread polls 0.9 / 1.0. The Presentation Thread idles 4.5 / 5.0 ms, replays 7.3 ms
+(4.4 of them waiting for its segment workers), presents 0.4. No thread ever waits for the GPU: 0 game sync waits a run, the
+captures' late-page waits ~0.06 ms a take.
+
+One standing frame, from the present's end (`frameline.py --from 1000`, kokiri-idle):
+
+| ms | main thread | the others |
+|---|---|---|
+| 0.0-2.3 | waits at the end-of-frame event | the last BaseProc stage on **4 executors** (EX1/EX2 idle: their owner module workers are busy with a long job or waiting in a group of their own) |
+| 2.3-3.2 | a short job-group wait | **one module worker** runs a serial job, everything else idle |
+| 3.2-4.5 | **the capture copy** of its first submit (`C`, 0.6 ms mean, p90 1.2) | everything idle |
+| 4.5-5.2 | the replay of its submits (`S`, 0.17 ms each) and its own draw code | everything idle |
+| 5.2 | hands the frame over: the Presentation Thread's first capture starts 0.34 ms after the main thread's last submit ends (p10 0.24, p90 0.44) | |
+| 5.2-11.2 | the job group (6 ms): the executors with the gaps of the serial long jobs | the Presentation Thread replays frame N: captures, submits, waits for segments, 5.0-13.3 |
+| 11.2-13.3 | work, then **polls** (lr 8009a478) with 4 module workers | one module worker runs a serial job |
+| 13.3-14.5 | work with the module workers | the present (0.4 ms) on the Presentation Thread |
+
+So the game frame N+1 already overlaps the replay of frame N fully, the replay has 4.5-5 ms of slack, and the GPU is never a
+sync point at this frame rate. The frame is the game's own chain: the main thread's serial work, the job groups' serial tails,
+the module workers' serial job, the 4-executor last stage. The only engine work on the critical path is the main thread's two
+submits: the capture copy and the replay, ~1.6 ms a frame (11-12%).
+
+### HOS_NVN_HOLD=2: the main thread's submits replayed by a host thread (host/nvn_native.c, off by default)
+
+The two submits are held (the handles, their queue, the time) and a host thread ("hos held submits", woken by an event)
+takes their capture and replays them ~17 us later, off the main thread; the Presentation Thread's own submits flush any held
+one first under the same lock, so the order of submissions is kept; a fence wait, a finish, a present and an event poll flush
+too (nothing on the CPU can tell a held submit from a flushed one before one of those). A queue flush does not (the thread
+is on it). The recording sweep already keeps a held submit's recordings (dead copies are freed past the held count).
+`HOS_NVN_HOLD_CHECK=1` measures what the later capture changes: the marks over the GPU ranges read and the pages copied at
+the submit, compared at the flush. Castle-move, 40 M pages: 0.27% written again before the flush, 0.14% with other bytes
+(at most 406 in one submit) — an upper bound, as it scans every GPU range where the capture takes the mirrored pools, and
+measured with the check's own ~14 ms of scanning on the main thread (hold windows of ~1 ms); the production hold is 17 us.
+Tests: `tests/test_nvn_hold.py`.
+
+**Screen** (castle-move, 3 interleaved rounds, one binary; fps / 1% low / p99): base 67.4, 67.8, 69.1 = **68.1 / 31.8 /
+23.9**; HOLD=2 69.4, 68.8, 70.6 = **69.6 / 35.1 / 22.7**. Every hold run above its round's base run, +1.5 fps: inside the
+2-4 fps spread, far from the 1.6 ms (~+8 fps) taken off the main thread.
+
+**Where the 1.6 ms went: two chains end within ~1 ms of each other.** The hold-mode trace (castle-move, 15.7 ms with the
+trace): the main thread's "alone" time is still 2.9 ms, but now 0.58 ms of it is a wait (lr 81207a6c, an event the
+Presentation Thread sets after its present: ready at once in 197 of 210 base frames), and the Presentation Thread is busy
+13.8 ms a frame (idle 1.9, was 5.0): its first submit of the frame waits for the host thread's capture + replay of the main
+thread's submits (1.4 ms a flush under the replay's order lock), and its present takes 1.31 ms (was 0.41) when the next
+frame's held submits are being replayed. So:
+- chain A (main thread): draw code -> submits -> hand-over -> job group 6.5 -> module phase ~2 -> last stage 1.4 -> the
+  wait for the present;
+- chain B (Presentation Thread): hand-over -> replay 7.3 ms (4.4 of them waiting for the segment workers) -> present 0.4.
+In the base build chain B ends ~1 ms before chain A needs it. HOLD=2 takes 1.6 ms off chain A and puts ~1.1-1.4 ms onto
+chain B (the serialized flush ahead of the Presentation Thread's first submit). A gain needs both chains cut: the replay's
+7.3 ms (TICK-049/050/052: the per-draw cost and the waits for segments) is the lever on chain B, and it could not show
+while chain B had slack.

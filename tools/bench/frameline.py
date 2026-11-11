@@ -264,11 +264,11 @@ def main():
         t = fb
         step = 20000
         while t < fe:
-            if cell(main_th, t) in "#S" and all(state_at(segs.get(th, []), t) != "#" for th in others):
+            if cell(main_th, t) in "#SC" and all(state_at(segs.get(th, []), t) != "#" for th in others):
                 alone += step
             t += step
         tot = collections.Counter()
-        for c, d in col:
+        for c, d in phases:   # (the totals from the phases before the collapse)
             tot[c] += d
         pres = ""
         if pt is not None:

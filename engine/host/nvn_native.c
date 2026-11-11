@@ -1066,10 +1066,23 @@ static int held_ready, hold_on = -1;
    two, and those whose bytes differ: host/rx_backend.c hos_hold_*), logged every 600 flushes. */
 static HosThread *present_thread;
 static int hold_check = -1;
+static HANDLE hold_event;   /* (mode 2: a host thread replays a held submit as soon as it is held, ~10 us after the game's submit) */
 static int64_t st_hold_flushes, st_hold_submits, st_hold_pages, st_hold_again, st_hold_differ, st_hold_max_differ, st_hold_wait_ns,
-    st_hold_by[8];
+    st_hold_replay_ns, st_hold_by[8];
 int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy);   /* (rx_backend.c, HOS_NVN_HOLD_CHECK) */
 void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ);
+enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_THREAD, HF_OTHER, HF_N };
+static void held_flush_why(int why);
+/* (mode 2) the held submits' replay thread: woken at each hold; it takes the capture and replays on itself, off the game's
+   thread. A host thread: no virtual core, no guest code (the replay runs none) */
+static DWORD WINAPI hold_flush_thread(void *p) {
+    (void)p;
+    SetThreadDescription(GetCurrentThread(), L"hos held submits");
+    for (;;) {
+        WaitForSingleObject(hold_event, INFINITE);
+        held_flush_why(HF_THREAD);
+    }
+}
 static void held_init(void) {
     if (!held_ready) { InitializeCriticalSection(&held_cs); InitializeCriticalSection(&flush_cs); held_ready = 1; }
     if (hold_on < 0) {   /* (off: see below; 2: TICK-054) */
@@ -1077,9 +1090,13 @@ static void held_init(void) {
         hold_on = e ? atoi(e) : 0;
         hold_check = getenv("HOS_NVN_HOLD_CHECK") && atoi(getenv("HOS_NVN_HOLD_CHECK")) != 0;
         if (hold_on) hos_log("nvn: submits held (HOS_NVN_HOLD=%d%s)", hold_on, hold_check ? ", checked" : "");
+        if (hold_on == 2) {
+            hold_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+            HANDLE h = CreateThread(NULL, 0, hold_flush_thread, NULL, 0, NULL);
+            if (h) CloseHandle(h);
+        }
     }
 }
-enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_OTHER, HF_N };
 /* the held submits replayed now, on this thread, in their order: under flush_cs, so that no submit of the presenting
    thread comes between them (held_cs is let go before the replay: the replay reads the recordings under copy_lock) */
 static void held_flush_why(int why) {
@@ -1104,19 +1121,24 @@ static void held_flush_why(int why) {
                 if (differ > st_hold_max_differ) st_hold_max_differ = differ;
                 local[i].pages = NULL, local[i].copy = NULL;
             }
+            HOS_JT(JT_MARK, 1, (uint64_t)i);   /* (TICK-054: the held submit's capture and replay, on this thread) */
             if (hold_on == 2) rx_nvn_submit_q(local[i].h, local[i].n, local[i].queue);
             else rx_nvn_submit(local[i].h, local[i].n);
+            HOS_JT(JT_MARK, 2, (uint64_t)i);
             st_hold_wait_ns += t0 - local[i].t;
         }
         if (away) hos_vcore_back();
+        st_hold_replay_ns += hos_now_ns() - t0;
         st_hold_submits += n, st_hold_by[why < HF_N ? why : HF_OTHER]++;
         if (++st_hold_flushes % 600 == 0) {
             hos_log("nvn: held submits: %lld flushes (by: queue flush %lld, finish %lld, present %lld, sync wait %lld, event poll %lld, "
-                    "the presenting thread's submit %lld, other %lld), %lld submits, held %.2f ms each; this flush by %s%s",
+                    "the presenting thread's submit %lld, the held submits' thread %lld, other %lld), %lld submits, held %.3f ms each, "
+                    "replayed in %.2f ms a flush; this flush by %s%s",
                     (long long)st_hold_flushes, (long long)st_hold_by[0], (long long)st_hold_by[1], (long long)st_hold_by[2],
                     (long long)st_hold_by[3], (long long)st_hold_by[4], (long long)st_hold_by[5], (long long)st_hold_by[6],
-                    (long long)st_hold_submits, st_hold_wait_ns / 1e6 / (double)st_hold_submits,
-                    hos_self() ? hos_thread_name(hos_self()) : "a host thread", hos_self() == present_thread ? " (the presenting thread)" : "");
+                    (long long)st_hold_by[7], (long long)st_hold_submits, st_hold_wait_ns / 1e6 / (double)st_hold_submits,
+                    st_hold_replay_ns / 1e6 / (double)st_hold_flushes,
+                    hos_self() ? hos_thread_name(hos_self()) : "the held submits' thread", hos_self() == present_thread ? " (the presenting thread)" : "");
             if (hold_check)
                 hos_log("nvn: held submits checked: %lld pages captured at the submit, %lld written again before the flush, %lld of "
                         "them with other bytes at the flush (at most %lld in one submit)", (long long)st_hold_pages,
@@ -1238,7 +1260,7 @@ NV(nvnQueueBuilderSetQueueMemory) { QB(P(0))->mem = U64(1); QB(P(0))->mem_sz = U
 NV(nvnQueueInitialize) { nvn_queue *q = (nvn_queue *)P(0); q->magic = NVN_MAGIC('Q', 'U', 'E', 'U'); q->submits = 0; RET(1); }
 NV(nvnQueueFinalize) { ((nvn_queue *)P(0))->magic = 0; }
 NV(nvnQueueGetError) { if (P(1)) memset(P(1), 0, sizeof(NVNqueueErrorInfo)); RET(NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR); }
-NV(nvnQueueFlush) { held_flush_why(HF_FLUSH); }
+NV(nvnQueueFlush) { if (hold_on != 2) held_flush_why(HF_FLUSH); }   /* (mode 2: the held submits' thread is on it) */
 NV(nvnQueueFinish) {
     held_flush_why(HF_FINISH);
     const int away = hos_vcore_away();
@@ -2456,6 +2478,7 @@ NV(nvnQueueSubmitCommands) {
     if (hold_check) hs->npages = hos_hold_snapshot(&hs->pages, &hs->copy);
     nheld++;
     LeaveCriticalSection(&held_cs);
+    if (hold_event) SetEvent(hold_event);
     HOS_JT(JT_MARK, 3, q->submits);   /* (the submit held) */
 }
 
