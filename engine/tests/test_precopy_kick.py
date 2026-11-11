@@ -40,7 +40,8 @@ class PrecopyKickTests(unittest.TestCase):
     def test_export_sets_the_event(self):
         kick = block(self.mem, "void mkwvk_precopy_kick(void) {")
         self.assertIn("if (precopy_kick_event) SetEvent(precopy_kick_event)", kick)
-        self.assertIn("__declspec(dllexport)", self.mem[self.mem.index("mkwvk_precopy_kick") - 200:self.mem.index("mkwvk_precopy_kick")])
+        at = self.mem.index("void mkwvk_precopy_kick(void) {")
+        self.assertIn("__declspec(dllexport)", self.mem[at - 200:at])
 
     def test_host_takes_the_optional_export(self):
         self.assertIn('GetProcAddress(m, "mkwvk_precopy_kick")', self.rx)
