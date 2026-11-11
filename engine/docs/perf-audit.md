@@ -2414,3 +2414,50 @@ Shots and speed are as C's above.
 Not verified: other CPUs (TICK-041/044: without AVX2 the vector paths are SSE2 code, without FMA3 the FMA switch does
 nothing), Kokiri Forest and Hyrule Field (no saves), a builder release made with `--profile` (no release was
 made), more than 6 runs a variant.
+
+## TICK-048: the mirror syncs copy only the chunks that changed (2026-11-11)
+
+**Result: on PC 3050 (i5-10400F, RTX 3050 on PCIe 3.0 x4) the mirror syncs' scatter copied 29-32 MB a frame in 10-11 ms of GPU
+time; 85% of those bytes were what the mirror already held. Copying only the 256-byte chunks whose hash changed since the page's
+last sync (`RX_VK_MSYNC_DIFF`, on by default) took msync to 4.4 MB and 1.6 ms a frame: +4.1 fps standing (26.0 -> 30.1),
++2.6 walking (24.4 -> 26.9), +3.7 on the street (25.7 -> 29.4), 5 interleaved runs each.** Market save, `--fps-limit 360`.
+Not run on the main PC (see "To check").
+
+What the syncs copy (`RX_VK_MSYNC_STATS=1`, or `RX_VK_MSYNC_DIFF=1` to hash and count without leaving anything out; a report every
+600 submission parts, ~30 parts a frame at the Market): ~0.8 MB a part, all at a binding outside the parallel segments (the
+presync found every pool synced), 97-99% of it from an earlier submit's capture, nothing from guest memory. The game's 16-32 MB
+pools of flags 0 and a 48 MB pool of flags 0xa1 carry it, 0.05-0.1 MB a part each. Unchanged since the page's last sync: 85% at
+256 B, 80% at 512 B, 73% at 1 KB, 47% of whole pages. The per-frame data comes round with the bytes it held (TICK-037's "0% of a
+capture in the capture before it" was about the page lists, not their contents).
+
+The diff (`gpu/vk/msync_diff.h`, `vk_memory.cpp` "the mirror syncs' diff"): a sync hashes each page it copies from a capture by
+256-byte chunk (64-bit, XXH3's accumulation with a key per stripe, murmur3's finaliser, AVX2 and a portable form that agree) and
+keeps the 16 hashes by guest page (a flat table by 32 MB of guest memory, ~70 MB at the Market). The next sync of the page copies
+only the chunks whose hash changed (`RX_VK_MSYNC_DIFF_GROUP`: coarser chunks). TICK-021 left this out because of the GPU's words
+in a mirror (the exposure meter: the CPU writes 0, the GPU adds, the CPU writes 0 again). The rule here:
+- hashes are recorded only by a sync outside a parallel replay's segments (a segment's uploads run in queue order, not in the
+  order the workers record them), and name their mirror (`mirror_id`, new at each `mirror_make`) and their submission (epoch);
+- every GPU write the engine knows of notes the page's epoch (`diff_gpu_wrote`): written bindings (the write-backs' list),
+  `memory_stamp_gpu` (storage writes, GPU-timeline copies and fills, image-to-buffer copies), a bare entry's and a wide binding's
+  guessed range (`memory_protect_gpu`, `memory_note_gpu_write`), the readback refresh's copies;
+- a submission's uploads run before its work, so the hashes hold while recorded in a later submission than the page's last GPU
+  write; anything recorded in the same submission voids them;
+- pages a sync copies another way (live from guest memory, in a segment, kept by `RX_VK_PROTECT_BARE`) lose their hashes.
+Not seen by the rule: shader stores through the guest page table past a binding or a bare entry's guess (the syncs already copy
+the CPU's whole page over those today). In the Market runs 4-7 pages a part had hashes voided by GPU writes; the exposure meter
+looked right in every shot.
+
+GPU time a frame (pass timing): msync 11.26 ms / 32.1 MB -> 1.61 / 4.4 standing, 10.39 / 29.5 -> 1.63 / 4.4 walking; the profiled
+frame 35.8 -> 26.9 ms standing. CPU: hashing ~0.13 ms a part on the replay thread (~4 ms a frame, summed, on the i5).
+
+Also tried: `RX_VK_RB_RANGES=1`, the readback refresh copies only the bytes the CPU's invalidates covered instead of whole pages:
+5.4 -> 1.7 MB and 2.0 -> 0.7 ms a frame, but no fps on top of the diff (castle-move 27.05 -> 27.35, 3 runs). Off by default.
+Not done: GPU reads of host memory for some pools (the capture is not laid out as the pool, and live guest memory is the next
+frame), a transfer queue (the syncs are 1.6 ms now), the presync's pools no binding uses (it copied nothing here).
+
+Step 0 on PC 3050: TICK-045 over Sync 11 +0.3 / +0.8 / +1.6 fps (standing / walking / street, 5 runs, mostly inside the spread);
+Resizable BAR alone (BAR1 256 MiB -> 8 GiB): no change; the link stays Gen 3 x4 under load.
+
+To check on the main PC: `RX_VK_MSYNC_DIFF=0` against the default standing, walking and on the street (the bytes cost only 0.4-0.8
+ms of GPU there and the hashing costs the replay thread; if it loses there, the default should follow the link), shots and
+`HOS_SPEED_LOG`, Kokiri Forest (exposure, foliage records). Details: docs/benchmarks/2026-11-10-tick048-upload-bytes.md.
