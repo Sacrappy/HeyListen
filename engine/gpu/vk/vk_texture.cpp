@@ -2578,6 +2578,19 @@ bool barrier_dedupe_par_on() {
 }
 int64_t barriers_left_out_par() { return st_barriers_left_out_par.load(std::memory_order_relaxed); }
 void full_barrier(VkCommandBuffer cmd, const char* why) {
+    // (TICK-057, a measurement, never for play: RX_VK_TEST_BARRIER_DROP=1 leaves out the recordings' pass-start, dispatch and the
+    // game's own barriers (not the uploads', the write-backs' or a segment's edges). The picture may be wrong: it bounds what the
+    // GPU loses to those drains, nothing else)
+    static const bool drop_test = [] {
+        const bool v = getenv("RX_VK_TEST_BARRIER_DROP") && atoi(getenv("RX_VK_TEST_BARRIER_DROP")) != 0;
+        if (v) logf("vk: RX_VK_TEST_BARRIER_DROP=1: pass-start, dispatch and the game's barriers left out (a measurement: the picture may be wrong)");
+        return v;
+    }();
+    if (drop_test && why && (!strcmp(why, "barrier (pass start)") || !strcmp(why, "barrier (dispatch)") ||
+                             !strcmp(why, "barrier (the game's nvnCommandBufferBarrier)"))) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     static const bool off = getenv("RX_VK_BARRIER_DEDUPE_OFF") != nullptr;
     const bool par = par_active.load(std::memory_order_relaxed);
     const bool dedupe = !off && !par;   // (a parallel replay's threads share command buffers and the count)
