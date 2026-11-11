@@ -3319,3 +3319,36 @@ thread's part of the loop 1.82 -> 0.59 ms, the Presentation Thread's idle 2.0 ->
 2. `submit_q` holding `sync_order_mu` for the capture and the whole replay is the coupling between the two chains in general
    (PR 430 took the texture releases off it with `held_mu` for the same reason).
 3. The host's sync primitives themselves: no further lever (wake p50 6.4 us, ~0.3-0.5 ms a frame on the chain).
+
+## TICK-061: chain B, item by item: the capture, the dry pass, the segments' setup, the shared counters, the inert draws (2026-11-12)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs cut at
+66 s. Branch `feature/TICK-061-chain-b` (main 9bfc390: TICK-054's defaults on, TICK-056's and TICK-058's switches off). One
+binary (`bin/v3`, 79da345), variants as environment. Raw data in the worktree's `build/tick061/` (not committed);
+docs/benchmarks/2026-11-12-tick061.md.
+
+### Built (each behind its own switch, off by default; the argument for "same bytes, same order" is in the code beside it)
+
+| switch | item | where | what |
+|---|---|---|---|
+| `RX_VK_CAPTURE_CLAIM=1` (`=<n>`: n pages a chunk) | C1 | vk_memory.cpp `copy_pages`, `ClaimJob` | the capture's copy in chunks claimed from one counter by the submitter and every helper that wakes in time, instead of 5 fixed parts; the submitter takes whatever is unclaimed and removes the tokens no helper took |
+| `RX_VK_COLLECT_FAST=1` | C2 | host/rx_backend.c `collect_in_fast` (the exe) | the write-mark scan with unaligned 256/32/8-byte loads wherever the walk is, not only from aligned page numbers |
+| `RX_VK_SHADOW_FAST=1` | C3 = E2 | vk_memory.cpp `shadow_take_fast` | take_capture's texture-shadow block: one merge walk against the spans, a copied page keeps its entry and its 4 KB block, new pages take freed blocks; the old code where the cap could be reached or the list is not sorted |
+| `RX_VK_STAMP_SPLIT=1` | E3 | vk_memory.cpp `stamp_split_run` | a take's page stamps and table entries on the copy helpers (takes of 1,024 pages and more), still inside pools_mu |
+| `RX_VK_DRY_LEAN=1` | D2 / D3 | vk_replay.cpp `replay_handle`, `count_work` | a header-only count first; the dry pass copies the 27 KB state only at the points next to the planned boundaries, none in a command buffer that will be one segment |
+| `RX_VK_WORK_LOCAL=1` | D6 | vk_work.h, vk_texture.cpp `work_seg_begin/end`, vk_draw.cpp `checkpoint_seq` | inside a parallel segment, `work_epoch` is not bumped per command (once at the segment's end), `all_work_by_cmd` not at all while nothing reads it, and the NV checkpoint numbers come 64 at a time a thread (the checkpoints stay on) |
+| `RX_VK_SEG_SETUP_PAR=1` | D7 | vk_replay.cpp `begin_segment_slot`, `segment_begin_here` | the segments' pool resets, begins and start timestamps on the thread that records each, the slots still taken in order by the PT |
+| `RX_VK_OCC_PROXY_SKIP=1` | F2 | vk_draw.cpp `draw` (`program_inert`, `draw_writes_nothing`) | with the default occlusion, a draw that writes no colour, depth or stencil and whose program binds no storage, image or texture and touches no global memory is not recorded; its pass is still begun (same pass edges, barriers and target marks) |
+
+Not built:
+- **D5** (the slow program pick's cache): `program_for`, `still_valid` and `answer_handles` live in vk_shader.cpp, and the
+  bank words in vk_bank.cpp, both shader-stamp inputs. Any change there re-prepares every shader (~14 min) and makes the shared
+  game folder's program cache start again for every other build. A cache built outside them would duplicate the variant rule
+  and could hand back a different, equally valid variant (another picture). Left for a ticket that re-prepares on purpose.
+- **D2's real skip of the dry pass** (a one-segment buffer replayed serially): the serial path writes the stream's reports and
+  small clears in step with recording, the dry pass all of them before the recording reads anything (a CPU-side buffer copy, an
+  event add, a handle read through a storage buffer). Not provably the same order, so only its state copies are cut (above).
+- **D8** (`RX_VK_CHUNK`): `maybe_split` runs only in the serial replay mode, and every command buffer goes through the dry pass
+  and a worker-mode segment while the parallel replay is on (the default). The chunking never fires in play: nothing to screen.
+
+TICK061_RESULTS

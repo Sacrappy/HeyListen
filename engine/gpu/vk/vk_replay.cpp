@@ -2201,13 +2201,15 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // - T under two segments' worth (segment_count(T) == 1, D2): none. dry_work <= T (the dry pass counts the same ops and may
     //   stop sooner, at a wait or a report), and segment_count is monotonic in its count, so the command buffer is one segment
     //   whatever the dry pass finds, and one segment needs no point (record_segment starts from `start`).
-    // - Else (D3) for each planned boundary k, the multiples of the point interval on either side of its target want_k, computed
+    // - Else, only with RX_VK_DRY_LEAN=2 (D3; =1 keeps every point here): for each planned boundary k, the multiples of the point interval on either side of its target want_k, computed
     //   as below from T and the same profile (nothing changes the profile in between). The boundary search takes, among the kept
     //   points, the nearest to want_k (balance; ties to the first, the lower) or the first at or after it: both are one of those
     //   two multiples of all the points there are, so when the dry pass ends at T (no stop) the chosen points, and so the segments,
     //   are the ones it chose with every point kept. When it stops sooner the boundaries come from the kept points it reached:
     //   other boundaries, or fewer, and any point is a valid boundary (the segments replay the stream from the state there), which
-    //   is what RX_VK_PARALLEL_BOUNDARY / MINWORK already rely on.
+    //   is what RX_VK_PARALLEL_BOUNDARY / MINWORK already rely on. Measured in play (TICK-061), =2 gave other segments than every
+    //   point did (the replay thread's own segment ~280 draws against ~180, +0.8 ms): the dry pass's count and the header count
+    //   differ there (not found why yet), so =2 stays a diagnosis.
     // The dry pass's other products (reports, conditions, uniform updates, events, written marks) are made as before; nothing but
     // the copies is left out. (RX_VK_SEG_EARLY's path keeps every point: it does not come here.)
     LeanPoints lean;
@@ -2215,7 +2217,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         const int64_t pe = par_point_every();
         const int64_t T = count_work(h);
         const int nplan = mkwvk::segment_plan::segment_count(T, per, recorders, kMaxBatch, one_round);
-        if (nplan >= 2) {
+        // (RX_VK_DRY_LEAN=1: the one-segment case only, exact whatever the dry pass finds. =2: the planned boundaries too, which
+        // is exact only when the dry pass reaches the counted end; measured (TICK-061 screen 2) the segments came out other than
+        // with every point (the first ~280 draws against ~180), the replay thread's own segment +0.8 ms: so =2 is not for play)
+        static const int lean_mode = getenv("RX_VK_DRY_LEAN") ? atoi(getenv("RX_VK_DRY_LEAN")) : 0;
+        if (nplan >= 2 && lean_mode >= 2) {
             int64_t want[kMaxBatch] = {};
             if (balance) mkwvk::segment_plan::balanced_targets(profile, nplan, T, want);
             for (int k = 1; k < nplan; k++) {
@@ -2224,7 +2230,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
                 lean.work[lean.n++] = lo, lean.work[lean.n++] = lo + pe;
             }
         }
-        lean_points = &lean;
+        if (nplan < 2 || lean_mode >= 2) lean_points = &lean;
     }
     rmode = Mode::Dry;
     VkCommandBuffer none = cmd;

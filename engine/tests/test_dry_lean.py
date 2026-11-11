@@ -60,7 +60,7 @@ def main():
                  "mkwvk::segment_plan::balanced_targets(profile, nplan, T, want);",
                  "const int64_t w = balance ? want[k - 1] : T * k / nplan;",
                  "lean.work[lean.n++] = lo, lean.work[lean.n++] = lo + pe;",
-                 "lean_points = &lean;",
+                 "if (nplan < 2 || lean_mode >= 2) lean_points = &lean;",
                  "mkwvk::segment_plan::segment_count(total, per, recorders, kMaxBatch, one_round);",
                  "if (balance) mkwvk::segment_plan::balanced_targets(profile, nseg, total, wants);"):
         if need not in handle:
