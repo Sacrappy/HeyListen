@@ -6,7 +6,13 @@
 
 ## Result (2026-11-11): the frame is sync-bound, not GPU-bound; letting the CPU run ahead meets a stall on the queue that is not ours
 
-(filled in below as the measurements come; see the sections)
+**Screen (castle-move, 3 interleaved runs, PC 3050)**: main 28.21 fps (1% low 14.4, p99 56.6 ms), branch defaults 28.64 (14.9, 54.4),
+`RX_VK_RB_RANGES=1` 27.97 (13.8, 53.9). Nothing moves: the +20 fps is not reached on PC 3050.
+**Defaults chosen**: `RX_VK_LATE_MERGE` off, `RX_VK_ACQUIRE_FENCE` off, `RX_VK_RB_RANGES` off (no gain: -0.7 fps against the new defaults);
+GPU gap/upload/blit timestamps and the trace columns on. `C:\OOT\game` holds the branch build (`t53f`, = `C:\OOTuilds	ick053`).
+**Correctness**: default speed ratio ~60.0 (59.3-60.5); with `RX_VK_LATE_MERGE=1` 55.8-63.4 and several Market shots are white
+with only the HUD (base has none): the merge also needs a look. See `docs/benchmarks/2026-11-12-tick053.md` (screen, shots, the
+desktop-check instructions).
 
 ## Where a PC 3050 frame goes (main 4b170f0, castle-move, 110 s runs, 66 s cut)
 
@@ -62,7 +68,7 @@ submits (off). Not yet placed: what the queue waits for in that gap (the blit's 
   the log lines `vk: GPU time ... uploads ... gaps between recordings` and `vk: the blit on the GPU`.
 
 ## Correctness
-(to fill)
+Default build: speed log ~60.0, saves equal after every run; the merge's shots show white world-less frames (benchmark doc). Unit tests: `test_late_merge` and the suite on PC 3050 passed (`C:\OOTuns	53-test_*.log`).
 
 ## Not verified
 - Runs in session 0 only (SSH): the presentation engine's timing there is not a desktop's; the 40 fps run-ahead stretches need the
