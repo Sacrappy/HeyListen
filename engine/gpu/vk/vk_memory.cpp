@@ -804,6 +804,10 @@ struct Capture {
     std::vector<uint32_t> deferred;   // (TICK-017: pages left to the GPU's copy from guest memory, capture_make)
     std::vector<uint32_t> late;      // (indices into pages: copied again by the replay once late_value is done)
     uint64_t late_value = 0;
+    // (TICK-060, RX_VK_CAPTURE_HASH) the chunk hashes of each slot's bytes, made by the copy itself (16 a slot), and which slots have
+    // them (0: none, the mirror sync hashes the slot as before)
+    std::vector<uint64_t> hashes;
+    std::vector<uint8_t> hok;
 };
 std::mutex cap_mu;
 std::deque<std::unique_ptr<Capture>> captures;
@@ -847,7 +851,10 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
     cap_table[c][page % kCapChunkPages] = e;
 }
 // (each kept capture's copy on the GPU, by its generation)
-struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0; };
+struct CapHash { std::vector<uint64_t> h; std::vector<uint8_t> ok; };   // (TICK-060: a kept capture's slot hashes, see Capture)
+struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0;
+                std::shared_ptr<CapHash> hash = {}; };
+std::vector<std::shared_ptr<CapHash>> cap_hash_free;   // (pools_mu: retired captures' hash arrays, their capacity kept)
 std::map<uint32_t, CapBuf> cap_bufs;
 uint64_t cap_bytes = 0;
 constexpr size_t kKeep = 24;
@@ -907,6 +914,7 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
     for (int i = 0; i < n_old; i++) destroy_buffer(old[i].buffer, old[i].alloc);
 }
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
+    if (it->second.hash && cap_hash_free.size() < 32) cap_hash_free.push_back(std::move(it->second.hash));
     cap_bytes -= it->second.size;
     cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
     cap_bufs.erase(it);
@@ -1426,11 +1434,64 @@ struct CopyPart {
     const uint32_t* pages; int64_t i0, i1; uint8_t* out; uint8_t* ok;
     // (TICK-043, RX_VK_CAPTURE_SCAN_SPLIT: a part of the submit's scan of the write marks instead: these ranges, the pages into *res)
     const uint64_t (*ranges)[2] = nullptr; int nr = 0; uint32_t** res = nullptr; int64_t* res_n = nullptr;
+    uint64_t* hash = nullptr; uint8_t* hok = nullptr;   // (TICK-060, RX_VK_CAPTURE_HASH: page i's 16 chunk hashes at hash + 16 i)
 };
+// (HeyListen TICK-060) RX_VK_CAPTURE_HASH: the capture's copy also makes the mirror syncs' chunk hashes (TICK-048's diff) of the
+// bytes it copies, page by page in one pass (msync_diff::copy_hash_page: each 32-byte load stored and hashed from one register,
+// so the hashes are those of the slot's bytes even with the game writing the page meanwhile). The diff hashed each synced page
+// again on the Presentation Thread from the capture buffer, which the streaming stores had left in DRAM: on PC 3050 (i5-10400F)
+// ~4 ms of the frame's ~5.6 ms mirror pre-sync, on the thread the frame waits for once RX_VK_LATE_DEFER takes the late-page wait
+// off it (RX_VK_MSYNC_DIFF=0 there: 1.5 ms, with 30 MB more over the x4 link). The sync takes a slot's hashes when the copy made
+// them (hok) and hashes it as before otherwise: a page the copy could not read whole, the pre-copy's (RX_VK_CAPTURE_PRECOPY), a
+// late page copied again after the take (its slot's hashes dropped). Same hashes, same copies, same mirror. Only with the diff on
+// (RX_VK_MSYNC_DIFF, by default on links of 8 GB/s or less) and AVX2 builds. Off by default (=1: on). tests/test_msync_diff.cpp
+int diff_mode();
+bool capture_hash_on() {
+#if defined(__AVX2__)
+    static const bool v = [] {
+        const bool on = getenv("RX_VK_CAPTURE_HASH") && atoi(getenv("RX_VK_CAPTURE_HASH")) != 0 && diff_mode() != 0;
+        if (on) logf("vk: the capture's copy makes the mirror syncs' chunk hashes (RX_VK_CAPTURE_HASH)");
+        return on;
+    }();
+    return v;
+#else
+    return false;
+#endif
+}
+#ifdef _WIN32
+__declspec(noinline) bool guarded_copy_hash(uint8_t* dst, const uint8_t* src, uint64_t* h, bool nt) {   // (as guarded_copy)
+    __try {
+        msync_diff::copy_hash_page(dst, src, h, nt);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+    return true;
+}
+#else
+bool guarded_copy_hash(uint8_t* dst, const uint8_t* src, uint64_t* h, bool nt) {
+    msync_diff::copy_hash_page(dst, src, h, nt);
+    return true;
+}
+#endif
+std::atomic<int64_t> st_hash_made{0}, st_hash_used{0}, st_hash_again{0};   // (TICK-060: slots hashed by the copy; syncs that used them, that hashed)
 void copy_part(const CopyPart& w) {
     uint8_t* const base = (uint8_t*)host->guest_base();   // (guest addresses: no GPU translation per page)
     const uint64_t gsize = host->guest_size();
     const bool stream = stream_on();   // (TICK-037: streaming stores, fenced below)
+    if (w.hash) {   // (TICK-060: page by page, each copied and hashed in one pass)
+        int64_t made = 0;
+        for (int64_t i = w.i0; i < w.i1; i++) {
+            const uint64_t ga = (uint64_t)w.pages[i] << kPageShift;
+            if (ga + 4096 > gsize) continue;
+            if (guarded_copy_hash(w.out + (uint64_t)i * 4096, base + ga, w.hash + (uint64_t)i * msync_diff::kChunks, stream))
+                w.ok[i] = 1, w.hok[i] = 1, made++;
+            else
+                w.ok[i] = guarded_copy(w.out + (uint64_t)i * 4096, base + ga, 4096);
+        }
+        if (stream) stream_fence();
+        st_hash_made.fetch_add(made, std::memory_order_relaxed);
+        return;
+    }
     for (int64_t i = w.i0; i < w.i1;) {
         const uint64_t ga = (uint64_t)w.pages[i] << kPageShift;
         if (ga + 4096 > gsize) { i++; continue; }
@@ -1483,18 +1544,23 @@ void copy_helpers_start_locked() {   // (copy_helpers.mu held)
     copy_helpers.started = true;
     for (int i = 0; i < copy_helper_count(); i++) std::thread(copy_helper_main).detach();
 }
-void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok) {   // (one capture at a time: submit_order_mu)
+void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok, uint64_t* hash = nullptr, uint8_t* hok = nullptr) {   // (one capture at a time: submit_order_mu)
+    const auto part = [&](int64_t i0, int64_t i1) {
+        CopyPart w{pages, i0, i1, out, ok};
+        w.hash = hash, w.hok = hok;
+        return w;
+    };
     const int helpers = copy_helper_count();
-    if (!helpers || n < 128) return copy_part({pages, 0, n, out, ok});
+    if (!helpers || n < 128) return copy_part(part(0, n));
     const int k = helpers + 1;
     {
         std::lock_guard lk(copy_helpers.mu);
         copy_helpers_start_locked();
-        for (int i = 1; i < k; i++) copy_helpers.parts.push_back({pages, n * i / k, n * (i + 1) / k, out, ok});
+        for (int i = 1; i < k; i++) copy_helpers.parts.push_back(part(n * i / k, n * (i + 1) / k));
         copy_helpers.pending += k - 1;
     }
     copy_helpers.cv.notify_all();
-    copy_part({pages, 0, n / k, out, ok});
+    copy_part(part(0, n / k));
     std::unique_lock lk(copy_helpers.mu);
     copy_helpers.done.wait(lk, [] { return copy_helpers.pending == 0; });
 }
@@ -1823,6 +1889,7 @@ std::unique_ptr<Capture> capture_make() {
     }
     if (!c) c = std::make_unique<Capture>();
     c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->deferred.clear(), c->late.clear(), c->late_value = 0;
+    c->hok.clear();   // (TICK-060: no slot hashes unless the copy below makes them)
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
     // every written page was taken at first (hundreds of MB a submit where the game streams its world), and the whole
@@ -1971,7 +2038,13 @@ std::unique_ptr<Capture> capture_make() {
             cap_buf_get((uint64_t)n * 4096, c->buffer, c->alloc, c->map, c->bsize)) {
             static thread_local std::vector<uint8_t> ok;
             ok.assign((size_t)n, 0);
-            copy_pages(pages, n, (uint8_t*)c->map, ok.data());
+            if (capture_hash_on()) {   // (TICK-060)
+                c->hashes.resize((size_t)n * msync_diff::kChunks);
+                c->hok.assign((size_t)n, 0);
+                copy_pages(pages, n, (uint8_t*)c->map, ok.data(), c->hashes.data(), c->hok.data());
+            } else {
+                copy_pages(pages, n, (uint8_t*)c->map, ok.data());
+            }
             for (int64_t i = 0; i < n; i++)
                 if (ok[i] && (deferred.empty() || std::find(deferred.begin(), deferred.end(), pages[i]) == deferred.end()))
                     c->copied.push_back(pages[i]), c->slots.push_back((uint32_t)i);
@@ -2299,8 +2372,10 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                                     std::memory_order_relaxed);
             st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
             uint8_t* const base = (uint8_t*)host->guest_base();
-            for (uint32_t i : c->late)
+            for (uint32_t i : c->late) {
                 guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+                if (i < c->hok.size()) c->hok[i] = 0;   // (TICK-060: other bytes than the copy hashed)
+            }
             flush_mapped(c->alloc, c->nbytes);
         }
     }
@@ -2391,6 +2466,16 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     const auto tk1 = std::chrono::steady_clock::now();
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
         CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
+        if (c->hok.size() == c->pages.size() && !c->hok.empty()) {   // (TICK-060: the copy's slot hashes kept with it)
+            if (late_defer)
+                for (uint32_t i : c->late) c->hok[i] = 0;   // (copied again at its fix: hashed by the sync as before)
+            std::shared_ptr<CapHash> ch;
+            if (!cap_hash_free.empty()) ch = std::move(cap_hash_free.back()), cap_hash_free.pop_back();
+            else ch = std::make_shared<CapHash>();
+            ch->h.swap(c->hashes);
+            ch->ok.swap(c->hok);
+            b.hash = std::move(ch);
+        }
         c->buffer = VK_NULL_HANDLE, c->alloc = nullptr, c->map = nullptr, c->bsize = 0;
         cap_bufs.emplace(g, b);
         cap_bytes += b.size;
@@ -2448,6 +2533,13 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                  cap_bufs.size(), (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
                  (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
             st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_lock = 0, st_tk_late_n = 0;
+            if (capture_hash_on()) {   // (TICK-060)
+                static int64_t l_m, l_u, l_a;
+                const int64_t m = st_hash_made.load(), u = st_hash_used.load(), a = st_hash_again.load();
+                logf("vk: capture hashes (RX_VK_CAPTURE_HASH): %.0f slots hashed by the copy a submit; the syncs took %.0f, hashed %.0f again",
+                     (m - l_m) / 600.0, (u - l_u) / 600.0, (a - l_a) / 600.0);
+                l_m = m, l_u = u, l_a = a;
+            }
             if (late_defer_on()) {   // (TICK-060)
                 static int64_t l_d, l_p, l_t, l_u, l_f, l_r, l_s;
                 const int64_t d = st_late_deferred.load(), pg = st_late_def_pages.load(), t = st_late_def_tex.load(), u = st_late_def_unsent.load();
@@ -3634,7 +3726,14 @@ int64_t mirror_sync(Pool& p) {
                         if (!late_pending && d_ok && gb - ga == 4096 && b->second.map) {
                             DiffPage* d = diff_page(page, true);
                             uint64_t h[msync_diff::kChunks];
-                            msync_diff::page_hash((const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, h);
+                            const CapHash* ch = b->second.hash.get();   // (TICK-060: the capture's copy made them)
+                            if (ch && e.slot < ch->ok.size() && ch->ok[e.slot]) {
+                                std::memcpy(h, ch->h.data() + (uint64_t)e.slot * msync_diff::kChunks, sizeof h);
+                                st_hash_used.fetch_add(1, std::memory_order_relaxed);
+                            } else {
+                                msync_diff::page_hash((const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, h);
+                                if (capture_hash_on()) st_hash_again.fetch_add(1, std::memory_order_relaxed);
+                            }
                             sst.d_pages++;
                             if (d->rec && d->mid == p.mirror_id && d->rec > d->gw && d->rec > diff_gw_all) {
                                 sst.d_valid++;
