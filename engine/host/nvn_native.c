@@ -1186,7 +1186,10 @@ NV(nvnSyncWait) {
                             (unsigned long long)rx_nvn_fence(), (unsigned long long)rx_nvn_replayed());
     if (!s->fenced) { RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush_why(HF_SYNC);   /* (a wait flushes what it waits for) */
-    if (rx_nvn_wait(s->fence, 0)) { RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    /* (TICK-058) trace marks 30/31: the wait's first look (b: the caller; then 1 signalled, 0 not) */
+    HOS_JT(JT_MARK, 30, c->x[30]);
+    if (rx_nvn_wait(s->fence, 0)) { HOS_JT(JT_MARK, 31, 1); RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    HOS_JT(JT_MARK, 31, 0);
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */
     if (block < 0) block = getenv("HOS_NVN_SYNC_BLOCK") != NULL;
     const int away = hos_vcore_away();

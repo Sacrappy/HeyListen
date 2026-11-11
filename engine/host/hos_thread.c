@@ -1260,7 +1260,14 @@ static void vc_acquire(HosThread *t) {
         ReleaseSRWLockExclusive(&vc_lock);
         return;
     }
-    HOS_JT(JT_VC_WAIT_B, 0, 0);
+    /* (TICK-058) the record says whom it waits behind: a = its allowed cores | its priority << 8 | the holder's << 16,
+       b = the holder of its first allowed core (tools/bench/critpath.py names it) */
+    if (__builtin_expect(hos_jt_on, 0)) {
+        const unsigned am = vc_allowed(t);
+        HosThread *h = am ? vc_owner[__builtin_ctz(am)] : NULL;
+        HOS_JT(JT_VC_WAIT_B, am | (uint64_t)(t->priority & 0xff) << 8 | (uint64_t)(h ? h->priority & 0xff : 0xff) << 16,
+               (uintptr_t)h);
+    }
     const int64_t t0 = hos_now_ns();
     t->vc_since = t0;
     t->vc_queued = 1;
