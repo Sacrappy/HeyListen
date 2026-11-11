@@ -2616,7 +2616,19 @@ struct Frame {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
+    VkFence acq = VK_NULL_HANDLE;   // (TICK-053, RX_VK_ACQUIRE_FENCE: the acquire's fence, waited for here instead of the semaphore on the queue)
 };
+// (HeyListen TICK-053) The blit's submit waits on the queue for the acquired image's semaphore: the only wait the GPU is ever
+// given. With the game's thread let run ahead of the GPU (RX_VK_LATE_MERGE) the GPU sat in that wait 30-50 ms a frame on PC 3050
+// (the gaps between recordings, gpu_time_collect), every later submission behind it: 66 ms frames at "99% busy". With
+// RX_VK_ACQUIRE_FENCE=1 the acquire signals a fence instead, waited for on this thread before the blit is submitted without a wait:
+// the queue never stops, the presentation thread waits for the image. Timed: "vk: acquire waits"
+bool acquire_fence_on() {
+    static const bool v = getenv("RX_VK_ACQUIRE_FENCE") && atoi(getenv("RX_VK_ACQUIRE_FENCE")) != 0;
+    return v;
+}
+double st_acq_wait_ms, st_acq_wait_max_ms;
+int64_t st_acq_waits;
 Frame frames[3];
 uint32_t frame_index = 0;
 int64_t presents = 0;
@@ -3782,7 +3794,20 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     static bool unseen = false;
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
-    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
+    const bool acq_fence = acquire_fence_on() && f.acq;
+    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, acq_fence ? VK_NULL_HANDLE : f.acquired,
+                                         acq_fence ? f.acq : VK_NULL_HANDLE, &index);
+    if (acq_fence && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {   // (the image free: waited for here, not on the queue)
+        const auto t0 = std::chrono::steady_clock::now();
+        vkWaitForFences(dev.device, 1, &f.acq, VK_TRUE, UINT64_MAX);
+        vkResetFences(dev.device, 1, &f.acq);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        st_acq_wait_ms += ms, st_acq_wait_max_ms = std::max(st_acq_wait_max_ms, ms);
+        if (++st_acq_waits % 600 == 0) {
+            logf("vk: acquire waits (RX_VK_ACQUIRE_FENCE): %.2f ms each over 600 presents, the longest %.2f", st_acq_wait_ms / 600, st_acq_wait_max_ms);
+            st_acq_wait_ms = st_acq_wait_max_ms = 0;
+        }
+    }
 #ifndef _WIN32
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
         if (!unseen) logf("vk: the window is not shown (no image back in 100 ms): frames are not shown until it is");
@@ -3899,7 +3924,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     cb.commandBuffer = f.cmd;
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.waitSemaphoreInfoCount = 1;
+    si.waitSemaphoreInfoCount = acq_fence ? 0 : 1;   // (TICK-053: with the acquire's fence waited for above, no wait on the queue)
     si.pWaitSemaphoreInfos = waits;
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cb;
@@ -4455,6 +4480,8 @@ bool replay_start() {
         vkCreateFence(dev.device, &fi, nullptr, &f.done);
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(dev.device, &si, nullptr, &f.acquired);
+        VkFenceCreateInfo fa{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};   // (TICK-053: the acquire's fence, unsignalled)
+        if (vkCreateFence(dev.device, &fa, nullptr, &f.acq) != VK_SUCCESS) f.acq = VK_NULL_HANDLE;
     }
     if (par_threads() >= 2 && !init_pools_make(pi)) return false;   // (last: nothing after it fails and leaves them made)
     logf("vk: replay ready (%s; push descriptors %s (%u), extended dynamic state 3 %s, custom border colours %s)",
