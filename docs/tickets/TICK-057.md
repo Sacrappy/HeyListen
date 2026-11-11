@@ -67,7 +67,9 @@ No confirm was run (nothing cleared the spread except the bound).
   frame in play).
 - The switches' pictures were not shot and no validation run was made: none is adopted. The validation layer (SDK 1.4.363.0) is
   in `C:\OOT\tools\vkvalid` with `C:\OOT\scripts\val57.bat` (sync validation, `VK_LAYER_PATH` only) for the next step.
-- Laptop suite: 254 passed, 1 failed (`test_parallel_init_order`, fixed with the stubs, passes), 20 skipped.
+- Laptop suite on the final branch: 253 passed, 2 failed, 20 skipped; the two (`test_parallel_init_order`,
+  `test_parallel_rb_refresh`) were their harnesses missing the new segment timestamp calls and the trust point: declared,
+  both pass on their own. `test_gpu_time_057` passes.
 
 ## Not verified
 - Desktop session (all runs over SSH, session 0), kokiri-idle and hyrule-walk screens, other GPUs; a confirm (none needed).
