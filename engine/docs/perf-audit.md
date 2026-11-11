@@ -3376,3 +3376,64 @@ run stayed on the title (the save never loaded; cause not found), the next 69.3.
 
 ## TICK-062: host-layer switches on chain A (2026-11-11)
 Five env switches (HOS_CV_SIGNAL_FAST, HOS_THREAD_OF_CACHE, HOS_SHORT_SLEEP_PAUSE, HOS_OBJ_PACK, HOS_CORE_COUNT), all off. castle-move screens +2.4 / +0.8 / +1.7 / -1.0 fps, stack +1.5 (inside the spread); chain A single traces 12.9-15.1 ms, not separable. Only two low-priority threads call GetCurrentCoreNumber beyond their start. See docs/tickets/TICK-062.md.
+
+## TICK-060: PC 3050's idle GPU third: the late-page wait moved to the queue, the chunk hashes made by the capture's copy (2026-11-12)
+
+**Result: on PC 3050 (i5-10400F, RTX 3050 on PCIe 3.0 x4, the Market at 2560x1440) the GPU idled ~13 ms of a ~35 ms frame because
+the CPU did not record the next frame while it waited ~8 ms for the previous one's late pages, and then spent ~6 ms of mirror
+pre-sync (mostly re-hashing capture buffers from DRAM for TICK-048's chunk diff) before the GPU got the frame's first big command
+buffer. Two quality-preserving changes take both off the CPU's chain: `RX_VK_LATE_DEFER` (the wait moved from the take to the
+queue, the GPU sees the same bytes) and `RX_VK_CAPTURE_HASH` (the capture's copy makes the same hashes in the same pass). With
+TICK-056's `RX_VK_MSYNC_FAST`, castle-move 28.1 -> 33.8 fps in the screen (every run above every base run).** The confirm is in
+docs/benchmarks/2026-11-12-tick060-pc3050.md.
+
+### Measuring the GPU timeline without serialising it
+- The frame trace's GPU columns (timestamps at each recording's ends, TICK-053/057) give, unprofiled, base castle-move: recordings
+  19.7 ms, upload command buffers 2.8, **gaps between recordings 12.8** (p50 11.9, p90 18.6; the log: one long gap a frame, 10-17 ms),
+  late wait 7.7, nvidia-smi 60%, dmon PCIe rx 0.54 GB/s of 3.9. Not the link, not the uploads.
+- The job trace (`chainb.py`, 37.6 ms frames with it): held flush 11.5 ms (capture made 3.1, memory work 8.1 = the late wait, on
+  the held submits' host thread, holding the replay's lock: the Presentation Thread waits behind it), then the Presentation
+  Thread's submits 23.1 (dry pass 2.15, **mirror pre-sync 5.8**, own segment 5.7, segment waits 1.6, capture 1.05), present 2.2.
+- `RX_VK_PRESYNC_STATS`: the pre-sync looks at 105k pages, syncs 9.3k dirty ones (5.2 MB after the diff) in 5.6 ms; with
+  `RX_VK_MSYNC_DIFF=0` 1.5 ms (34.6 MB copied). The diff's hashing of 37 MB of capture buffers, which the capture's streaming
+  stores left in DRAM, is ~4 ms of it here (0.8 ms for the whole pre-sync on the 7800X3D).
+- `RX_VK_PASS_TIMING` (serialised): 26.0 ms = the game's passes 13.4 and dispatches 4.6 (top: pass `1a7482c0ec9991ea` 2560x1440
+  1.08, the upscaler dispatch `9dc98871eb7fc101` 0.52, pass `d8180bd8c6ecc77b` 0.48), rbrefresh 2.0, msync 1.5, barriers 1.2, wb 0.85.
+
+### `RX_VK_LATE_DEFER` (vk_memory.cpp take_capture / LateFix; vk_replay.cpp queue_flush_locked, submit_recording, late_fix_main)
+A capture whose late value is already sent to the queue (`vk_timeline_signal_sent`: a signal at or past it was submitted) is taken
+without the wait; its late slots become a pending fix. While one is pending, recordings are held (RX_VK_BATCH's pending list, used
+even with batching off); `queue_flush_locked`, which every submit site calls under `dev.present_mu`, applies the fixes first (the
+take's own copies: the late pages from guest memory into their slots, after the value); a fix thread waits for the value, applies
+and sends the held recordings, so they go out when the old frame's tail ends, as the take's wait let them before. Waits for a fix
+are made before the queue's lock (`late_fix_wait_unlocked`); a fence poll does neither (first try: the main thread's poll waited
+7.5 ms under the lock and held up the Presentation Thread's held submits: +1.8 fps only). CPU readers of a pending slot:
+`memory_read_as_submitted` waits for the value and reads guest memory (no cache of it); the mirror sync's diff copies the page whole
+without a hash. Not deferred: LATE_MERGE on, a late page in a live texture's storage (the take's texture shadow reads the slot), a
+value not yet sent, 4 fixes pending. In the Market ~100 late pages a take, once a frame, all deferred; 0 replay reads of a pending
+slot, a few syncs. Trace: marks 38/39 (the fix thread), column `late_fix_ms` (any thread's waits for a fix). Alone: 28.1 -> 29.8 fps,
+the held flush 11.5 -> 4.7 ms, and the frame becomes the CPU's recording chain, with the pre-sync on it.
+
+### `RX_VK_CAPTURE_HASH` (vk_memory.cpp copy_part; msync_diff.h copy_hash_page)
+The capture's copy hashes each page as it copies it (one register per 32 bytes: stored, then hashed), into a per-capture array kept
+with the capture buffer (`CapBuf::hash`); the mirror sync takes a slot's hashes when valid and hashes the slot as before otherwise
+(a page the copy could not read, the pre-copy's, a late slot copied again). Bit-exact with `page_hash` (tests/test_msync_diff.cpp).
+The copy stays at ~0.45 ms a submit (memory-bound); the pre-sync falls 5.6 -> 1.6 ms (with MSYNC_FAST). Only with the diff on (links
+of 8 GB/s or less: off on the main PC's x16 link, where the switch is inert).
+
+### Screens and decision
+Castle-move, 3 rounds, one binary: base 28.09, LATE_DEFER 29.80, + CAPTURE_HASH 33.19, + MSYNC_FAST **33.83** (1% low 13.6 -> 16.3,
+p99 58.4 -> 47.3). + SEG_EARLY 34.11 / + RX_VK_PARALLEL=5 34.19 against 33.18 (inside the spread, not taken). Shots alike standing
+and walking (Market luma 103.7 / 103.5 -> 103.3 / 102.6), speed 60.00-60.07.
+
+**Confirm** (one binary, base = no switch; 6 rounds, 4-6 reversed): kokiri-idle 30.85 -> **37.24** (1% low 24.5 -> 26.4, p99 38.9 ->
+33.6), castle-move 29.13 -> **34.40** (14.7 -> 16.9, 54.2 -> 47.0), hyrule-walk 31.35 -> **37.20** (19.5 -> 25.9, 45.1 -> 36.2): above
+base in 18 of 18 rounds (+18 to +21%). **Adopted, on by default** (=0 off): `RX_VK_LATE_DEFER`, `RX_VK_CAPTURE_HASH` (acts only
+with the chunk diff), and `RX_VK_MSYNC_FAST` where the chunk diff is on (TICK-056's switch: off elsewhere, as it was). On a fast
+link (the main PC) only the deferral is new and it acts only when a take finds its late value not reached: to be checked there.
+
+### What is next
+- The frame is now the CPU's recording chain (GPU 73-83%, gaps 4-7 ms a frame): the Presentation Thread's own segments, the held
+  flush's 3.1 ms capture copy (memory-bound), the dry passes; SEG_EARLY and RX_VK_PARALLEL=5 (+0.9-1.0 fps in a screen) next.
+- SEG_EARLY's early segments have no GPU timestamps (the trace's gpu_ms reads 8.7 with it): add them first.
+- After that the GPU's own ~22 ms (the game's 1440p passes and compute) is the limit at ~43 fps.

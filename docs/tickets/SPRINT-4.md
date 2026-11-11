@@ -224,3 +224,19 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Counts: only OptimizeChangeBanc (225k) and SceneLowPriority (61k) call GetCurrentCoreNumber after their start; svc 0x10 never.
 - castle-move screens (3 rounds): B1 +2.4, B4 +1.7, B2 +0.8, pack -1.0 fps, stack +1.5: inside the spread; chain A traces not separable. Nothing adopted; shots alike, speed ~60.
 - Next: the module workers and NavMeshCAStepDepWorker1 virtual-core waits.
+
+## TICK-060 (2026-11-12): PC 3050's idle GPU third
+- Found (unprofiled: frame trace, nvidia-smi/dmon, job trace): the GPU idled 12.8 ms of a 35 ms castle-move frame, not for PCIe
+  (0.54 of 3.9 GB/s) or uploads: the held flush waited ~8 ms for the previous frame's late pages holding the replay's lock, then the
+  Presentation Thread needed a 5.8 ms mirror pre-sync (~4 ms of it TICK-048's diff re-hashing capture buffers from DRAM) before the
+  GPU had the frame's first big command buffer.
+- Built: `RX_VK_LATE_DEFER` (the late-page wait moved from the take to the queue: recordings held until a fix thread applies the same
+  copies at the value's end; CPU readers of a pending slot wait or copy whole), `RX_VK_CAPTURE_HASH` (the capture's copy makes the
+  diff's hashes in the same pass, bit-exact); tests; trace column `late_fix_ms`.
+- Screen (castle-move): base 28.09, defer 29.80, + hash 33.19, + MSYNC_FAST 33.83. Confirm (6 rounds, 18 of 18 above base):
+  kokiri-idle 30.85 -> 37.24, castle-move 29.13 -> 34.40, hyrule-walk 31.35 -> 37.20 fps; 1% low and p99 better; shots alike,
+  speed ~60, saves identical after every run.
+- Adopted (on by default, =0 off): LATE_DEFER, CAPTURE_HASH, and MSYNC_FAST where the chunk diff is on. Main-PC check pending.
+  PC 3050's game folder: build t60e (exe 17c3e4fb, dll 2dc76b85); main32d kept in `C:\OOT\builds\main32d`. Branch
+  `feature/TICK-060-pc3050-gpu`, bundle `E:\OOT\tick060.bundle`, not merged.
+- Next: the CPU recording chain (SEG_EARLY, RX_VK_PARALLEL=5: +1 fps in a screen), then the GPU's ~22 ms at 1440p.
