@@ -151,3 +151,11 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 ### TICK-048 on the main PC (2026-11-11)
 - Diff on loses here: castle-move 70.5 -> 62.9 fps (3 runs each), frame prep +3.2 ms; the bytes it saves cost only 0.4 ms of GPU on Gen5 x16.
 - The default now follows the card's maximum PCIe link (NVML): on at <= 8 GB/s (PC 3050 Gen3 x4), off otherwise. Tests fixed (2 broken by TICK-048). Game folder holds this build. Branch `verify/TICK-048-mainpc`, not merged. See docs/benchmarks/2026-11-11-tick048-mainpc.md.
+
+## TICK-051 (2026-11-11): frame-time spikes, PC 3050
+- Instrument (off by default): `RX_VK_FRAME_TRACE=1` per-frame trace with late-page wait, GPU, driver, ASTC, textures made, scatter, VRAM; `tools/bench/spikes.py` classifies spikes (> 2x median).
+- Found: walking spikes = the game's thread waiting (late pages) for GPU work of ASTC transcodes (1.2-1.8 ms each on the 3050, 30-60 a frame); 82% re-transcode textures the eviction dropped. Standing: no spikes.
+- Built, on by default: `RX_VK_ASTC_BATCH` (8 pieces a group, 3 barriers a group) and `RX_VK_BC_CACHE_MB` (1024: BC blocks kept in system memory by ASTC bytes).
+- A/B (5 runs, main b17b933): castle-move 1% low 10.8 -> 14.0, p99 75.8 -> 58.1 ms, spikes 8.6 -> 2.4; standing and Hyrule inside the spread.
+- Found on the way: main b17b933's NVML link check reads Gen3 x16 on PC 3050 (slot is x4): the chunk diff is off there (-3 to -4 fps).
+- Branch `feature/TICK-051-stutter`, not merged; main PC not checked.

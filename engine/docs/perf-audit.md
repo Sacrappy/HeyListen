@@ -2629,3 +2629,85 @@ The replay's wall is per-draw cost under concurrency, not the segment plan. Next
    (driver locks in `nvoglv64.dll`, `pools_mu`, `ParLock`, the heap).
 2. Design 2, starting with the textures' share of the descriptor build (2.08 ms a frame).
 3. Overlap the dry pass with segment 0 (0.33-0.47 ms a command buffer, ~1.2 ms a frame), which needs a progress counter.
+
+## TICK-051: the frame-time spikes, by cause (2026-11-11)
+
+**Result: on PC 3050 (i5-10400F, RTX 3050, PCIe 3.0 x4) the walking spikes were the game's thread waiting for GPU work made of
+ASTC transcodes, 82% of them of textures the eviction had dropped a few seconds before. The transcodes are batched
+(`RX_VK_ASTC_BATCH`, on) and their BC blocks kept in system memory (`RX_VK_BC_CACHE_MB`, 1024 MB, on): castle-move 1% low 10.8 ->
+14.0 fps, p99 75.8 -> 58.1 ms, spikes 8.6 -> 2.4 a run, frames over 50 ms 86 -> 37 (5 interleaved runs, main b17b933); standing
+and Hyrule inside the spread.** Not run on the main PC.
+
+### The trace (`RX_VK_FRAME_TRACE=1`, off by default)
+`hookshot_frames.csv` (vk_replay.cpp `status_tick`) gained: `t_s` (seconds since the process started: the bench's 66 s cut),
+`gpu_ms`, `late_wait_ms` and `late_waits` (`take_capture`'s `vk_timeline_wait` for the late pages, running totals
+`st_tr_late_*` in vk_memory.cpp), `submit_ms`, `present_ms`, `qsubmit_ms`, `dispatch_ms`, `astc`, `tex_made`, `scatter_mb`
+(`memory_trace_counts`), `vram_mb` (`vram_usage_now` every frame), `astc_again` (an ASTC transcode of the same address, size,
+layers and format as one before) and `astc_mtexels` (`texture_trace_counts`). `RX_VK_PASS_TIMING` has a span "astc transcode
+(decode, BC encode, copies)" around each GPU transcode, and "astc from the BC cache (copies)". `tools/bench/spikes.py` reads a
+trace: frames after the cut over 2x the median; each goes to the cause whose excess over its median covers >= 40% of the frame's
+excess (late wait; memory sync besides it; pipelines / programs / translation; CPU texture uploads; texture lookups; replay CPU;
+driver submit; GPU-behind and slot waits; dispatch), else "unattributed". The columns are summed over threads, so this is a
+heuristic, not a critical path.
+
+### What the spikes were (before)
+- Standing (kokiri-idle, 8 runs): no frame over 2x the median; 2.4 frames a run over 50 ms.
+- Walking (castle-move), 3 runs on main 1bb7136: 21.7 spikes a run, 1058 ms over the median: late-page wait 12.3 (573 ms),
+  replay CPU 6.7 (326), unattributed 1.3 (88), pipelines 1.0 (58), dispatch 0.3. 5 runs on main b17b933 (diff off, median 39.5 ms):
+  8.6 a run: late wait 4.0, replay CPU 2.6, unattributed 1.2, pipelines 0.6, dispatch 0.2.
+- Every frame has one late wait, ~10 ms on PC 3050 (14.6 with the diff off): the game's thread waits for the previous frame's
+  GPU work at its first submit (the exposure meter's shared page, TICK-017). In the spikes it is 40-60 ms. Its correlation with the
+  previous frame's `astc` is 0.94, `uploads` 0.91, `tex_made` 0.61; with the same frame's, 0.32. The "replay CPU" spikes carry
+  25-44 ms of it too.
+- A transcode (`upload_astc_gpu`: per level and layer a decode dispatch, a BC1/BC7 encode dispatch and a copy, three full barriers)
+  costs 1.2-1.8 ms of GPU on the 3050; 30-60 of them in a walking frame.
+- `astc_again`: 1407 of 1711 transcodes in a walk (82%). `RX_VK_NO_EVICT=1` took them to 34 (and VRAM to 20 GB, 4.8 fps): the
+  eviction pass drops every texture unused for 60 frames while the textures are over the budget (3.0 GB of a 2.7 GB budget at the
+  Market), and the walk brings them back.
+- Not spikes here: the driver's submit (0.4 ms, flat), CPU-side uploads, the readback refresh, VRAM (6.2-6.7 of 7.1 GB, no
+  paging seen); pipeline builds ~1 spike a run; the game's own work (unattributed) ~1 a run.
+
+### Changes (vk_texture.cpp)
+- `RX_VK_ASTC_BATCH` (on; =0 as before), `astc_bc_batched`: an ASTC texture kept as BC1/BC7 (not BC3, not resized) is transcoded in
+  groups of up to 8 (level, layer) pieces: each piece decoded into its own scratch layer (8 one-layer views, made with the scratch
+  and given back with it), all encoded at offsets of their own in the encoder's buffer (`out_offset`, already in the shader), all
+  copied; one full barrier after each stage. The decoder and encoder see the same inputs as one piece at a time. GPU time 1.2-1.8 ->
+  1.06 ms a texture (pass timing).
+- `RX_VK_BC_CACHE_MB` (1024; 0: off; needs the batch): each batched transcode also copies its blocks (`vkCmdCopyBuffer` from the
+  encoder's buffer) into a host-cached buffer (`create_buffer_cached`, system memory), kept under a key of the format, size, layers,
+  levels, every piece's level, layer, offset and decoder constants, and a hash of the ASTC bytes read (msync_diff's 256-byte chunk
+  hash, folded). A texture made again whose bytes hash the same is filled by one `vkCmdCopyBufferToImage` from there. Not stored: a
+  BC1 upload that found alpha (made again as BC7). Least recently used entries go past the cap, freed once the GPU is done with them;
+  a line every 600 frames. Market walk: 2107 -> 327 transcodes a run, 1927 textures from the cache, ~900 MB held.
+
+### A/B (one dll on main b17b933, base = both switches off, 5 interleaved runs, 110 s, 66 s cut)
+
+| scene | fps | 1% low | p99 ms | spikes a run | frames > 50 ms | late wait ms a frame |
+|---|---|---|---|---|---|---|
+| castle-move base | 24.19 | 10.8 | 75.8 | 8.6 | 85.8 | 14.6 |
+| castle-move TICK-051 | 25.21 | 14.0 | 58.1 | 2.4 | 37.0 | 13.6 |
+| hyrule-walk base | 26.34 | 18.6 | 49.9 | 0.6 | 14.0 | 14.5 |
+| hyrule-walk TICK-051 | 25.55 | 16.9 | 50.5 | 0.6 | 13.6 | 14.9 |
+| kokiri-idle base | 26.62 | 20.5 | 45.1 | 0 | 2.4 | 14.6 |
+| kokiri-idle TICK-051 | 25.36 | 21.3 | 45.1 | 0 | 0.6 | 16.5 |
+
+kokiri-idle again (3 runs, nothing transcodes there): base 26.08, batch alone 25.78, both 27.42: the first gap was the spread
+(sd 0.8-1.5 fps on this machine with the diff off). Screens on main 1bb7136 (3 runs): batch 21.7 -> 4.3 spikes, 1% low 10.9 -> 14.0,
+p99 77.2 -> 63.2 ms; batch + cache 1% low 13.8, p99 60.1 ms, late wait 9.9 -> 8.1 ms a frame.
+
+### Tried, not kept
+- `RX_VK_CAPTURE_DEFER=1` (slack 2 and 1): no late wait, but the wait moves out of sight (unattributed spikes) and fps -1.3 / -1.1
+  (castle-move, one run each), as TICK-017 found on the main PC.
+- An eviction that stops at 3/4 of the budget: the same re-transcodes (the 60-frame candidates never bring the total that low).
+
+### Main b17b933 on PC 3050
+`pcie_link_gbps` reads `nvmlDeviceGetMaxPcieLinkWidth`: x16 on the RTX 3050 (the card's), while the slot runs x4. The log says
+"PCIe link maximum Gen3 x16 (15.8 GB/s)" and "chunk diff off by default": the scatter is back to ~36 MB a frame and kokiri-idle
+falls from 29.6 (`RX_VK_MSYNC_DIFF=2`, one run) to 25.4-27.4 fps. The current width (it does not drop at idle; the generation does)
+with the maximum generation would read x4 there.
+
+### What is next
+- The late wait itself: ~10-15 ms a frame of the game's thread on PC 3050 waits for the previous frame's GPU work (TICK-017's
+  overlap question, now that the spikes are gone).
+- The eviction's working set: a budget that keeps the walk's textures would remove the remaining re-made uploads.
+- Pipelines (~1 spike a run, 40-70 ms) and the unattributed ~1 a run (HOS_SAMPLE_ALL around them).
