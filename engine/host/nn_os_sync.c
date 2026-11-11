@@ -56,11 +56,17 @@ static SRWLOCK table_lock = SRWLOCK_INIT;
 static Obj **table;
 static uint64_t *table_keys;   /* each slot's object's key, beside it: a probe compares keys without visiting objects */
 static uint64_t cap, used;
-typedef struct Table {   /* (the slots, then the keys: cap of each) */
-    uint64_t cap;
+/* TICK-062 A4/B7, HOS_OBJ_PACK=1: the slot pointer and its key side by side (stride 2: {Obj *, key} pairs, 16 bytes) instead of
+   the pointer array and then the key array (stride 1): a probe touches one cache line, not two, before the object itself.
+   The same values at the same slot numbers, so every lookup answers as before. */
+static uint64_t tstride = 1;
+typedef struct Table {   /* (stride 1: the slots, then the keys, cap of each; stride 2: cap pairs) */
+    uint64_t cap, stride;
     Obj *slot[];
 } Table;
-static uint64_t *table_keys_of(const Table *t) { return (uint64_t *)(void *)(t->slot + t->cap); }
+static uint64_t *table_keys_of(const Table *t) {
+    return t->stride == 2 ? (uint64_t *)(void *)t->slot + 1 : (uint64_t *)(void *)(t->slot + t->cap);
+}
 static Table *live;
 
 static uint64_t slot_of(uint64_t key, uint64_t c) { return (key * 0x9E3779B97F4A7C15ULL >> 20) & (c - 1); }
@@ -68,8 +74,8 @@ static uint64_t slot_of(uint64_t key, uint64_t c) { return (key * 0x9E3779B97F4A
 static Obj *find_locked(uint64_t key) {
     if (!table) return NULL;
     for (uint64_t i = slot_of(key, cap);; i = (i + 1) & (cap - 1)) {
-        if (!table[i]) return NULL;
-        if (table_keys[i] == key && table[i]->kind) return table[i];
+        if (!table[i * tstride]) return NULL;
+        if (table_keys[i * tstride] == key && table[i * tstride]->kind) return table[i * tstride];
     }
 }
 
@@ -135,40 +141,43 @@ static void bury_locked(Obj *o) {
 static Obj *find_dead_locked(uint64_t key) {
     if (!table) return NULL;
     for (uint64_t i = slot_of(key, cap);; i = (i + 1) & (cap - 1)) {
-        if (!table[i]) return NULL;
-        if (table_keys[i] == key && !table[i]->kind) return table[i];
+        if (!table[i * tstride]) return NULL;
+        if (table_keys[i * tstride] == key && !table[i * tstride]->kind) return table[i * tstride];
     }
 }
 
 static void insert_locked(Obj *o) {
     if (!table || used * 2 >= cap) {
         uint64_t ncap = cap ? cap * 2 : 1 << 16;
+        if (!cap) tstride = getenv("HOS_OBJ_PACK") ? 2 : 1;
+        const uint64_t ns = tstride;
         Table *t = (Table *)calloc(1, sizeof(Table) + ncap * (sizeof(Obj *) + sizeof(uint64_t)));
         Obj **nt = t->slot;
         t->cap = ncap;
+        t->stride = ns;
         uint64_t *nk = table_keys_of(t);
         for (uint64_t i = 0; i < cap; i++)
-            if (table[i] && table[i]->kind) {
-                uint64_t j = slot_of(table[i]->key, ncap);
-                while (nt[j]) j = (j + 1) & (ncap - 1);
-                nt[j] = table[i];
-                nk[j] = table[i]->key;
-            } else if (table[i]) {
-                bury_locked(table[i]);
+            if (table[i * tstride] && table[i * tstride]->kind) {
+                uint64_t j = slot_of(table[i * tstride]->key, ncap);
+                while (nt[j * ns]) j = (j + 1) & (ncap - 1);
+                nt[j * ns] = table[i * tstride];
+                nk[j * ns] = table[i * tstride]->key;
+            } else if (table[i * tstride]) {
+                bury_locked(table[i * tstride]);
             }
         table = nt;
         table_keys = nk;
         cap = ncap;
         used = 0;
-        for (uint64_t i = 0; i < cap; i++) used += table[i] != NULL;
+        for (uint64_t i = 0; i < cap; i++) used += table[i * tstride] != NULL;
         __atomic_store_n(&live, t, __ATOMIC_RELEASE);
     }
     uint64_t i = slot_of(o->key, cap);
-    while (table[i] && table[i]->kind) i = (i + 1) & (cap - 1);
-    if (!table[i]) used++;
-    else bury_locked(table[i]);   /* (a tombstone of another address) */
-    __atomic_store_n(&table_keys[i], o->key, __ATOMIC_RELAXED);   /* (before the object: see find_unlocked) */
-    __atomic_store_n(&table[i], o, __ATOMIC_RELEASE);
+    while (table[i * tstride] && table[i * tstride]->kind) i = (i + 1) & (cap - 1);
+    if (!table[i * tstride]) used++;
+    else bury_locked(table[i * tstride]);   /* (a tombstone of another address) */
+    __atomic_store_n(&table_keys[i * tstride], o->key, __ATOMIC_RELAXED);   /* (before the object: see find_unlocked) */
+    __atomic_store_n(&table[i * tstride], o, __ATOMIC_RELEASE);
 }
 
 static Obj *find_unlocked(uint64_t key, int kind) {
@@ -176,10 +185,10 @@ static Obj *find_unlocked(uint64_t key, int kind) {
     if (!t) return NULL;
     const uint64_t *keys = table_keys_of(t);
     for (uint64_t i = slot_of(key, t->cap), n = 0; n < t->cap; i = (i + 1) & (t->cap - 1), n++) {
-        Obj *o = __atomic_load_n(&t->slot[i], __ATOMIC_ACQUIRE);
+        Obj *o = __atomic_load_n(&t->slot[i * t->stride], __ATOMIC_ACQUIRE);
         if (!o) return NULL;
         /* (the key beside the slot first; a slot changing meanwhile gives a miss, and the locked lookup answers) */
-        if (__atomic_load_n(&keys[i], __ATOMIC_RELAXED) == key && o->key == key &&
+        if (__atomic_load_n(&keys[i * t->stride], __ATOMIC_RELAXED) == key && o->key == key &&
             __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind)
             return o;
     }
@@ -444,12 +453,12 @@ static void cv_enter(Obj *cv, Obj *m) {
     if (cv->cv_waiting && cv->cv_mutex != m) cv->cv_mixed = 1;
     if (!cv->cv_waiting) cv->cv_mixed = 0;
     cv->cv_mutex = m;
-    cv->cv_waiting++;
+    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
 }
 /* a waiter out (cv->lk held): whether a signal reserved its mutex m for it. A reservation made on another mutex (a
    waiter with a different one came in after the signal) is given back: never left owed to nobody */
 static int cv_leave(Obj *cv, Obj *m) {
-    cv->cv_waiting--;
+    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
     if (cv->cv_owed <= 0) return 0;
     Obj *r = cv->cv_owed_mutex[--cv->cv_owed];
     if (r == m) return 1;
@@ -577,6 +586,18 @@ HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     Obj *cv = obj(ARG(0), K_COND);
     if (watched_cv(ARG(0))) watch_log("signal", watch_mutex(), ARG(0), c, NULL);
     HOS_JT(JT_CV_SIGNAL, ARG(0), c->x[30]);
+    /* TICK-062 B1, HOS_CV_SIGNAL_FAST=1: a signal with no waiter changes nothing a later wait can see, so it returns before
+       taking cv->lk. No wake is lost: (1) a waiter registers (cv_waiting++, seq_cst) under cv->lk BEFORE it releases the guest
+       mutex (mutex_release_all) and before it sleeps, and reads cv->gen before registering. (2) A signal the guest orders
+       after a wait's registration (it took the mutex the waiter released, or any release/acquire chain from it) reads
+       cv_waiting with a seq_cst load after that, so it sees >= 1 and takes the slow path below, exactly as before. (3) A
+       signal not ordered with the registration (no mutex, truly concurrent) may read 0: that is the signal ordered before the
+       wait, which the slow path also loses (it bumps gen before the waiter reads gen, so the waiter sleeps on). (4) With no
+       waiter the slow path only bumps gen (compared only as a delta by waiters that registered later) and cv_reserve (a no-op
+       with cv_waiting <= cv_owed, owed being 0 with no waiter) and wakes nobody. The wake order of waiters is untouched. */
+    static int fast = -1;
+    if (fast < 0) fast = getenv("HOS_CV_SIGNAL_FAST") != NULL;
+    if (fast && !__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST)) return;
     AcquireSRWLockExclusive(&cv->lk);
     cv_reserve(cv);
     cv->gen++;

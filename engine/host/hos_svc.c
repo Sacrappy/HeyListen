@@ -355,6 +355,8 @@ static void query_memory(uint64_t out, uint64_t addr) {
 #define CUR_THREAD 0xFFFF8000u
 static HosThread *thread_handle(uint32_t h) { return h == CUR_THREAD ? hos_self() : hos_thread_by_handle(h); }
 
+int hos_core_count_on(void);
+void hos_core_count_svc(void);
 void a64_svc(Ctx *c, uint32_t imm) {
     hos_vcore_checkpoint();
     switch (imm) {
@@ -443,6 +445,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
         return;
     }
     case 0x10:   /* GetCurrentProcessorNumber */
+        if (hos_core_count_on()) hos_core_count_svc();   /* (TICK-062 A10, HOS_CORE_COUNT) */
         c->x[0] = (uint32_t)hos_thread_core(hos_self());
         return;
     case 0x1E:   /* GetSystemTick */
