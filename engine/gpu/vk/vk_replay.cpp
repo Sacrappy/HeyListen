@@ -294,34 +294,56 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 // GPU time: a timestamp at the start and the end of each recording's command buffer, read when its slot comes
 // round again (the work done by then)
 VkQueryPool ts_pool = VK_NULL_HANDLE;
-bool ts_pending[kRecordings];
+bool ts_pending[kRecordings], ts_up_pending[kRecordings];
 int64_t st_gpu_ns, st_gpu_max_ns;
+// (TICK-053) the upload command buffer's time too, and the gaps on the queue between one recording's command buffers and the
+// next's (the GPU idle, or held in something of the driver's: a semaphore, paging): absolute timestamps, 4 a slot (the
+// upload's start and end, the recording's). The frame trace has them as gpu_up_ms and gpu_gap_ms
+int64_t st_gpu_up_ns, st_gpu_gap_ns, st_gpu_gap_max_ns;
+uint64_t ts_last_end;   // (the last collected command buffer's end, GPU ticks)
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
-    uint64_t t[2] = {0, 0};
-    if (vkGetQueryPoolResults(dev.device, ts_pool, 2 * r.slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+    const bool up = ts_up_pending[r.slot];
+    ts_up_pending[r.slot] = false;
+    uint64_t t[4] = {0, 0, 0, 0};
+    if (vkGetQueryPoolResults(dev.device, ts_pool, 4 * r.slot + 2, 2, sizeof t[0] * 2, t + 2, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
         return;
-    if (t[1] <= t[0]) return;
-    const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
+    if (up && vkGetQueryPoolResults(dev.device, ts_pool, 4 * r.slot, 2, sizeof t[0] * 2, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        t[0] = t[1] = 0;
+    if (t[3] <= t[2]) return;
+    const double period = (double)dev.props.limits.timestampPeriod;
+    const int64_t ns = (int64_t)((t[3] - t[2]) * period);
     st_gpu_ns += ns;
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
+    if (t[1] > t[0]) st_gpu_up_ns += (int64_t)((t[1] - t[0]) * period);
+    const uint64_t start = t[0] && t[0] < t[2] ? t[0] : t[2], end = std::max(t[1], t[3]);
+    if (ts_last_end && start > ts_last_end && (start - ts_last_end) * period < 2e9) {   // (in order on the one queue; a gap)
+        const int64_t gap = (int64_t)((start - ts_last_end) * period);
+        st_gpu_gap_ns += gap;
+        st_gpu_gap_max_ns = std::max(st_gpu_gap_max_ns, gap);
+    }
+    if (end > ts_last_end) ts_last_end = end;
 }
 void gpu_time_begin(Recording& r) {
     if (!ts_pool) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qi.queryCount = 2 * kRecordings;
+        qi.queryCount = 4 * kRecordings;
         if (vkCreateQueryPool(dev.device, &qi, nullptr, &ts_pool) != VK_SUCCESS) ts_pool = VK_NULL_HANDLE;
         if (!ts_pool) return;
     }
-    vkCmdResetQueryPool(r.cmd, ts_pool, 2 * r.slot, 2);
-    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 2 * r.slot);
+    vkCmdResetQueryPool(r.upload, ts_pool, 4 * r.slot, 2);   // (each command buffer resets its own: the upload one is not always sent)
+    vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot);
+    vkCmdResetQueryPool(r.cmd, ts_pool, 4 * r.slot + 2, 2);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot + 2);
 }
-void gpu_time_end(Recording& r) {
+void gpu_time_end(Recording& r, bool uploads) {
     if (!ts_pool) return;
-    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * r.slot + 1);
+    vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, ts_pool, 4 * r.slot + 1);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, ts_pool, 4 * r.slot + 3);
     ts_pending[r.slot] = true;
+    ts_up_pending[r.slot] = uploads;
 }
 
 /// The next recording slot, begun, for the submission that will signal value
@@ -362,7 +384,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
-    gpu_time_end(r);
+    gpu_time_end(r, uploads);
     vkEndCommandBuffer(r.upload);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -3022,8 +3044,12 @@ void log_frame_stats() {
         }
         static int64_t l_gpu;
         static uint64_t l_made;
-        logf("vk: GPU time %.1f ms a frame (the longest submission %.1f ms); %.1f textures made a frame",
-             (st_gpu_ns - l_gpu) / 120.0 / 1e6, st_gpu_max_ns / 1e6, (texture_made() - l_made) / 120.0);
+        static int64_t l_gpu_up, l_gpu_gap;
+        logf("vk: GPU time %.1f ms a frame (the longest submission %.1f ms), uploads %.1f ms, gaps between recordings %.1f ms "
+             "(the longest %.1f); %.1f textures made a frame",
+             (st_gpu_ns - l_gpu) / 120.0 / 1e6, st_gpu_max_ns / 1e6, (st_gpu_up_ns - l_gpu_up) / 120.0 / 1e6,
+             (st_gpu_gap_ns - l_gpu_gap) / 120.0 / 1e6, st_gpu_gap_max_ns / 1e6, (texture_made() - l_made) / 120.0);
+        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns, st_gpu_gap_max_ns = 0;
         {   // (issue 109: the movie networks too slow on this card: left out from now on, vk_draw.cpp movie_networks_slow)
             static const bool keep_all = getenv("RX_VK_NETWORK_KEEP") && !strcmp(getenv("RX_VK_NETWORK_KEEP"), "all");
             const double gpu_ms = (st_gpu_ns - l_gpu) / 120.0 / 1e6, draws = (d - l_d) / 120.0;
@@ -3080,7 +3106,9 @@ void status_tick() {
                           // (TICK-051: the time since launch, the GPU's time, the captures' waits for late pages, the submits'
                           // and presents' own time, the driver's submit, ASTC transcodes, textures made, the scatter's bytes, VRAM)
                           "t_s,gpu_ms,late_wait_ms,late_waits,submit_ms,present_ms,qsubmit_ms,dispatch_ms,astc,tex_made,scatter_mb,"
-                          "vram_mb,astc_again,astc_mtexels\n");
+                          "vram_mb,astc_again,astc_mtexels,"
+                          // (TICK-053: the upload command buffers' GPU time, the gaps between recordings on the queue)
+                          "gpu_up_ms,gpu_gap_ms\n");
         return f;
     }();
     // (TICK-051) seconds since the process started, for the bench's 66 s cut: the steady clock's offset from the creation time
@@ -3103,7 +3131,7 @@ void status_tick() {
         const auto dp = [](int i) { return (prof_ns[i] - l_prof[i]) / 1e6; };
         static uint64_t l_gone;
         const uint64_t gone = texture_destroy_generation();
-        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc;
+        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc, l_gpu_up, l_gpu_gap;
         static uint64_t l_made_t;
         int64_t late_ns = 0, late_n = 0, sc = 0;
         memory_trace_counts(&late_ns, &late_n, &sc);
@@ -3114,7 +3142,7 @@ void status_tick() {
         uint64_t vused = 0, vallowed = 0;
         vram_usage_now(&vused, &vallowed);
         fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
-                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f\n",
+                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f,%.2f,%.2f\n",
                 (unsigned long long)frames, (now_ns - last_ns) / 1e6, (long long)(pw - l_pw), pwms - l_pwms, (long long)(ps - l_ps),
                 tr - l_tr, (long long)(up - l_up), (upb - l_upb) / 1048576.0, texture_count(), dp(PROF_MEMSYNC), dp(PROF_PIPE),
                 dp(PROF_UPLOAD), dp(PROF_PROGRAM), dp(PROF_SLOTWAIT), (st_wait_ns - l_wait) / 1e6, dp(PROF_DRAW), dp(PROF_DESC),
@@ -3122,8 +3150,9 @@ void status_tick() {
                 (now_ns + launch_offset_ns) / 1e9, (st_gpu_ns - l_gpu_t) / 1e6, (late_ns - l_late_ns) / 1e6, (long long)(late_n - l_late_n),
                 dp(PROF_SUBMIT), dp(PROF_PRESENT), dp(PROF_QSUBMIT), dp(PROF_DISPATCH), (long long)(astc - l_astc),
                 (unsigned long long)(made - l_made_t), (sc - l_sc) / 1048576.0, (unsigned long long)(vused >> 20),
-                (long long)(again - l_again), (texels - l_texels) / 1e6);
+                (long long)(again - l_again), (texels - l_texels) / 1e6, (st_gpu_up_ns - l_gpu_up) / 1e6, (st_gpu_gap_ns - l_gpu_gap) / 1e6);
         l_gpu_t = st_gpu_ns, l_late_ns = late_ns, l_late_n = late_n, l_sc = sc, l_astc = astc, l_made_t = made; l_again = again, l_texels = texels;
+        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns;
         l_gone = gone;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;
