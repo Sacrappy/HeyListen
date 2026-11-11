@@ -187,3 +187,14 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Adopted (on by default, `=0` off): `HOS_NVN_HOLD=2`, `RX_VK_PARALLEL_ROUNDS`, `RX_VK_PARALLEL_SELF=2`, `RX_VK_PARALLEL_BALANCE`, `RX_VK_PARALLEL_POINT=32`, `RX_VK_PARLOCK_SPIN=4000`, `RX_VK_TL_POOLS_WIDE`, `RX_VK_GONE_RING`; `RX_VK_PARALLEL` 5 at 16+ threads.
 - Shots alike, speed ratio ~60, saves identical, run_all 235/2 (nup)/35. Not checked on PC 3050. Game folder holds this build. Branch `feature/TICK-054-cpu-frame`, not merged.
 - Next: the mirror pre-sync off the PT's path, segments started during the dry pass, a smaller held-flush capture.
+
+## TICK-057 (2026-11-12): GPU time a frame on PC 3050
+- Found: unprofiled, 19.4 ms of recordings + 2.6 ms of uploads, ~15 ms of it busy with no gap before each late-page wait (new
+  `GPU tail` line; the parallel segments are now timed, the trace's gpu_ms read 5 ms without them). The engine's own GPU work is
+  small; pass timing inflated it. Mirror churn at 84-90% VRAM: 101 of 111 mirrors given back came back within 6000 submissions.
+- Built, off by default: `RX_VK_MIRROR_STICKY`, `RX_VK_MIRROR_VRAM_FREE`, `RX_VK_BARRIER_DEDUPE_PAR`, `RX_VK_BARRIER_TRUST`,
+  `RX_VK_GAME_BARRIER_NARROW`, `RX_VK_TEST_BARRIER_DROP` (measurement only); `tests/test_gpu_time_057.py`.
+- Screens (castle-move, 3 runs): every switch inside the spread (28.9-29.5 fps against 28.95-29.52); the barrier-drop bound
+  31.47 against 28.95 (gpu_ms -2.8, late wait -2.3): the game's own barriers' drains, which narrowing does not shorten here.
+- Decision: nothing adopted. Game folder: main32d. Branch `feature/TICK-057-gpu-time`, bundle `E:\OOT\tick057.bundle`, not merged.
+  Next: fewer game barriers (disjoint targets, split barriers) under sync validation; the serial frame's 12 ms of queue gaps.

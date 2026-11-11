@@ -177,6 +177,7 @@ bool memory_rb_refresh(VkCommandBuffer) { return false; }
 void memory_rb_recording_begun() {}
 VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
 thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;
+thread_local VkCommandBuffer trust_cmd = VK_NULL_HANDLE;   // (TICK-057: the barrier trust point)
 bool is_bc(VkFormat) { return false; }
 bool is_astc(VkFormat) { return false; }
 struct Texture {   // (the fields texture.cpp's astc_trace_note reads (TICK-051 frame trace) are never set here: it returns at once)
@@ -274,6 +275,8 @@ const bool par_stats_on = false;   // (TICK-052, RX_VK_PARLOCK_STATS: off by def
 void par_counts_sum(int64_t* locks, int64_t* wait_ns) { *locks = par_locks.load(), *wait_ns = par_lock_wait_ns.load(); }
 void par_stats_segment_parts(int64_t, int64_t, int64_t, int64_t) {}
 void jt_mark(int, uint64_t) {}   // (TICK-054: the frame-timeline marks)
+template <class R> void gpu_time_begin(R&) {}   // (TICK-057: the segments' GPU timestamps)
+template <class R> void gpu_time_end(R&, bool) {}
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
 std::vector<std::thread> workers;

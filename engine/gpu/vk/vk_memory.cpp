@@ -83,6 +83,8 @@ struct Pool {
     VkDeviceAddress shadow_address = 0;
     std::vector<uint64_t> shadow_known;   // (a bit a page)
     uint32_t mirror_id = 0;      // (TICK-048: a new number at each mirror_make; the sync diff's page hashes name their mirror)
+    uint64_t idle_freed_epoch = 0;   // (TICK-057: its mirror last given back as idle, at this submission; 0: never)
+    uint32_t remade = 0;             // (TICK-057: its mirror made again within kLongIdle of being given back as idle)
 };
 void diff_gpu_wrote(uint64_t guest, uint64_t size);   // (TICK-048, below: the GPU may have written there)
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
@@ -2176,6 +2178,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
             // 35-45 fps instead of 55, issue 995)
             const auto tw = std::chrono::steady_clock::now();
+            if (c->late_value > vk_timeline_completed()) gpu_tail_note_late(c->late_value);   // (TICK-057: a real wait)
             vk_timeline_wait(c->late_value);
             st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
             st_tk_late_n++;
@@ -3939,6 +3942,18 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
 // with the submissions that bound it; a mirror not bound for kIdleEpochs submissions goes when a wanted one does not
 // fit, or after kLongIdle; and a pool refused for the budget is tried again when it is next bound.
 constexpr uint64_t kIdleEpochs = 600, kLongIdle = 6000;
+// (TICK-057) the idle mirrors given back by why, the ones made again soon after, and RX_VK_MIRROR_STICKY (mirrors_give_back)
+int64_t st_freed_tight = 0, st_freed_budget = 0, st_freed_long = 0, st_remade = 0, st_sticky_kept = 0;
+uint64_t st_remade_bytes = 0;
+bool mirror_sticky_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_MIRROR_STICKY");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: mirrors made again soon after going: %s (RX_VK_MIRROR_STICKY)", v ? "kept against the VRAM rule" : "given back as before");
+        return v;
+    }();
+    return on;
+}
 int64_t st_mirrors_freed = 0;
 uint64_t st_mirror_bytes_freed = 0;
 // (hookshot) A freed mirror's buffer is destroyed only once the GPU is past everything recorded until then. Its pool's
@@ -4047,17 +4062,41 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     // when their own budget is short (1.3-1.4 GB of mirrors held through a walk with the heaps at 83-89%)
     bool vram_tight = false;
     {
-        uint64_t used = 0, allowed = 0;
-        vram_tight = vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 80;
+        // (TICK-057, RX_VK_MIRROR_VRAM_FREE=1) what the process holds less the free space in VMA's blocks, as the textures'
+        // budget counts it (texture_evict): measured by the blocks alone, castle-move on PC 3050 read 84-87% with ~0.7 GB of
+        // the blocks free, and the mirrors went and came back ~3 times a second
+        static const bool count_free = [] {
+            const char* e = getenv("RX_VK_MIRROR_VRAM_FREE");
+            const bool v = e && atoi(e) != 0;
+            logf("vk: the mirrors' VRAM rule: %s (RX_VK_MIRROR_VRAM_FREE)", v ? "the free space in VMA's blocks counted as free" : "by the blocks, as before");
+            return v;
+        }();
+        uint64_t used = 0, allowed = 0, block_free = 0;
+        const bool known = vram_usage(&used, &allowed, &block_free);
+        if (count_free) used -= std::min(used, block_free);
+        vram_tight = known && allowed && used > allowed / 100 * 80;
     }
+    const uint64_t want_own = want_bytes;   // (TICK-057: what the mirrors' own budget needs, without the VRAM rule)
     if (vram_tight) want_bytes = std::max(want_bytes, mirror_budget());
     std::vector<Pool*> idle;
     for (auto& [lo, p] : imported)
         if (p.mstate == Pool::MIRROR_ON && !p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
             idle.push_back(&p);
     std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
-    for (Pool* p : idle)
-        if (mirror_epoch - p->synced_epoch > kLongIdle || mirror_bytes + want_bytes > mirror_budget()) mirror_free(*p);
+    for (Pool* p : idle) {
+        const bool long_idle = mirror_epoch - p->synced_epoch > kLongIdle;
+        if (!long_idle && mirror_bytes + want_bytes <= mirror_budget()) continue;
+        // (TICK-057, RX_VK_MIRROR_STICKY=1) a pool whose mirror came back within kLongIdle of being given back is not given back
+        // for the VRAM rule alone: castle-move on an 8 GB card sat at 84-87% of the allowance, every mirror idle 600 submissions
+        // went, and ~3 a second were made again (a 16 MB copy from guest memory over PCIe each, ~5.6 ms of GPU on PC 3050)
+        if (!long_idle && p->remade && mirror_sticky_on() && mirror_bytes + want_own <= mirror_budget()) {
+            st_sticky_kept++;
+            continue;
+        }
+        (long_idle ? st_freed_long : vram_tight && mirror_bytes + want_own <= mirror_budget() ? st_freed_tight : st_freed_budget)++;
+        p->idle_freed_epoch = mirror_epoch;
+        mirror_free(*p);
+    }
     static const bool keep_lazy = getenv("RX_VK_KEEP_LAZY_MIRRORS") != nullptr;
     if (!keep_lazy)
         for (auto& [lo, p] : imported)
@@ -4068,8 +4107,11 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     static int64_t logged_at;
     if (st_mirrors_freed / 16 != logged_at) {
         logged_at = st_mirrors_freed / 16;
-        logf("vk: %lld mirrors given back (%llu MB in all); %llu MB of mirrors now", (long long)st_mirrors_freed,
-             (unsigned long long)(st_mirror_bytes_freed >> 20), (unsigned long long)(mirror_bytes >> 20));
+        logf("vk: %lld mirrors given back (%llu MB in all); %llu MB of mirrors now; idle ones by why: the VRAM rule %lld, the "
+             "mirrors' budget %lld, long idle %lld; made again within %llu submissions of going %lld (%llu MB); kept as made again "
+             "(RX_VK_MIRROR_STICKY) %lld", (long long)st_mirrors_freed, (unsigned long long)(st_mirror_bytes_freed >> 20),
+             (unsigned long long)(mirror_bytes >> 20), (long long)st_freed_tight, (long long)st_freed_budget, (long long)st_freed_long,
+             (unsigned long long)kLongIdle, (long long)st_remade, (unsigned long long)(st_remade_bytes >> 20), (long long)st_sticky_kept);
     }
 }
 
@@ -4237,6 +4279,11 @@ bool mirror_make(Pool& pool) {
         if (!create_device_buffer(n, kUsage, p->mirror, p->mirror_alloc)) {
             p->mstate = Pool::MIRROR_REFUSED;
             return false;
+        }
+        if (p->idle_freed_epoch && mirror_epoch - p->idle_freed_epoch <= kLongIdle) {   // (TICK-057: given back as idle, wanted again)
+            st_remade++, st_remade_bytes += n;
+            p->remade++;
+            p->idle_freed_epoch = 0;
         }
         {   // (hookshot) the page table points at the mirror: what the GPU wrote is there, and guest memory has it only after the write-back
             VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};

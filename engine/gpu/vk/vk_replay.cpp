@@ -319,9 +319,35 @@ uint64_t ts_last_end;   // (the last collected command buffer's end, GPU ticks)
 // (TICK-053) the recordings' starts and ends by submission order, and the blits' places among them (blit_ts_mark at each
 // present's submit): ts_last_end_seen gives, for the oldest blit not yet matched, the last recording end before it and the
 // first start after it
-struct TsRec { uint64_t seq, start, end; };
+struct TsRec { uint64_t seq, start, end, value = 0; };
 std::mutex ts_mu;
 std::deque<TsRec> ts_recs;
+// (TICK-057) the GPU's busy tail before each late-page wait ended: the timeline value the capture waited for (gpu_tail_note_late),
+// and once its recordings are collected, the GPU time it ran without a gap up to that value's end. GPU work cut inside that tail
+// shortens the wait (the frame on PC 3050 is serial: the CPU waits there); work cut before a gap does not. Logged every 120
+// presents with the 'GPU time' line; with RX_VK_PASS_TIMING its spans by label (gprof_tail)
+uint64_t ts_sig[kRecordings];   // (the value each slot's submission signals)
+std::deque<uint64_t> late_values;
+int64_t st_tail_ns, st_tail_n, st_tail_recs;
+void gpu_tail_compute(uint64_t v, double period) {   // (ts_mu held)
+    std::vector<TsRec> s(ts_recs.begin(), ts_recs.end());
+    std::sort(s.begin(), s.end(), [](const TsRec& a, const TsRec& b) { return a.start < b.start; });
+    int at = -1;
+    uint64_t end = 0;
+    for (int i = 0; i < (int)s.size(); i++)
+        if (s[i].value == v && s[i].end >= end) end = s[i].end, at = i;
+    if (at < 0) return;
+    const uint64_t thr = (uint64_t)(20000.0 / std::max(period, 1e-3));   // (a gap of 20 us or more: the GPU waited for the CPU)
+    uint64_t lo = s[at].start;
+    int n = 1;
+    for (int j = at - 1; j >= 0; j--) {
+        if (s[j].end + thr < lo) break;
+        lo = std::min(lo, s[j].start), n++;
+    }
+    if (end <= lo) return;
+    st_tail_ns += (int64_t)((end - lo) * period), st_tail_n++, st_tail_recs += n;
+    if (gprof_on()) gprof_tail(lo, end);
+}
 std::deque<uint64_t> ts_blit_seqs;   // (the submission count at each blit)
 uint64_t ts_seq_submitted, ts_seq_collected;
 void gpu_time_collect(Recording& r) {
@@ -348,9 +374,21 @@ void gpu_time_collect(Recording& r) {
     }
     if (end > ts_last_end) ts_last_end = end;
     std::lock_guard lk(ts_mu);
-    ts_recs.push_back({++ts_seq_collected, start, end});
+    ts_recs.push_back({++ts_seq_collected, start, end, ts_sig[r.slot]});
     while (ts_recs.size() > 256) ts_recs.pop_front();
+    while (!late_values.empty() && late_values.front() < ts_sig[r.slot]) {   // (its recordings collected: the tail before it)
+        gpu_tail_compute(late_values.front(), period);
+        late_values.pop_front();
+    }
 }
+} // namespace
+void gpu_tail_note_late(uint64_t v) {
+    std::lock_guard lk(ts_mu);
+    if (!late_values.empty() && late_values.back() >= v) return;
+    late_values.push_back(v);
+    while (late_values.size() > 64) late_values.pop_front();
+}
+namespace {
 void blit_ts_mark() {
     std::lock_guard lk(ts_mu);
     ts_blit_seqs.push_back(ts_seq_submitted);
@@ -377,6 +415,7 @@ void gpu_time_begin(Recording& r) {
         if (vkCreateQueryPool(dev.device, &qi, nullptr, &ts_pool) != VK_SUCCESS) ts_pool = VK_NULL_HANDLE;
         if (!ts_pool) return;
     }
+    ts_sig[r.slot] = r.value;   // (TICK-057: a segment's, which signals nothing; submit_recording sets the value signalled)
     vkCmdResetQueryPool(r.upload, ts_pool, 4 * r.slot, 2);   // (each command buffer resets its own: the upload one is not always sent)
     vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, 4 * r.slot);
     vkCmdResetQueryPool(r.cmd, ts_pool, 4 * r.slot + 2, 2);
@@ -423,6 +462,7 @@ std::atomic<uint64_t> value_submit_v[1024];
 void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0) {
     {
         const uint64_t v = signal_at ? signal_at : r.value;
+        ts_sig[r.slot] = v;   // (TICK-057)
         value_submit_ns[v & 1023].store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
         value_submit_v[v & 1023].store(v, std::memory_order_relaxed);
     }
@@ -1270,7 +1310,11 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 st_barrier_flags[bits]++;
             }
             end_pass(cmd);
-            full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
+            {
+                const int32_t bits = payload<int32_t>(a, avail);   // (TICK-057: ORDER_FRAGMENTS(_TILED) and INVALIDATE_TEXTURE only)
+                if (game_barrier_narrow_on() && (bits & 0x6) && !(bits & ~0x16)) game_fragment_barrier(cmd);
+                else full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
+            }
             st_barriers++;
             break;
         // ---- work ----
@@ -1701,6 +1745,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandPool(dev.device, j->r->upload_pool, 0);
         vkBeginCommandBuffer(j->r->upload, &bi);
+        gpu_time_begin(*j->r);   // (TICK-057: the segments' GPU time too, in the trace's gpu_ms and gaps and the late waits' tail)
         j->g = seg[k];
         j->order = base + k;
         j->index = (int)k;
@@ -1759,6 +1804,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         j->uploads = texture_uploads_recorded();
         j->inits = texture_segment_end(j->index);   // (after its last new image)
         texture_segment_worker(-1);
+        gpu_time_end(*j->r, j->uploads);   // (TICK-057)
         vkEndCommandBuffer(j->r->upload);
         vkEndCommandBuffer(j->r->cmd);
         j->t1 = now_ns();
@@ -3168,9 +3214,22 @@ void log_frame_stats() {
             barrier_stats(&made, &left);
             static int64_t l_relaxed;
             const int64_t relaxed = pass_barriers_relaxed();
-            logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before), %.1f pass starts "
-                 "ordered in their fragment stages only (RX_VK_PASS_BARRIER=game)", (made - l_made) / 120.0, (left - l_left) / 120.0,
-                 (relaxed - l_relaxed) / 120.0);
+            static int64_t l_lpar;
+            const int64_t lpar = barriers_left_out_par();
+            logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before; %.1f of them inside a "
+                 "parallel replay), %.1f pass starts ordered in their fragment stages only (RX_VK_PASS_BARRIER=game)",
+                 (made - l_made) / 120.0, (left - l_left) / 120.0, (lpar - l_lpar) / 120.0, (relaxed - l_relaxed) / 120.0);
+            l_lpar = lpar;
+            {   // (TICK-057: RX_VK_BARRIER_TRUST, RX_VK_GAME_BARRIER_NARROW)
+                static int64_t l_pl, l_pa, l_dl, l_gn;
+                int64_t pl = 0, pa = 0, dl = 0, gn = 0;
+                trust_stats(&pl, &pa, &dl, &gn);
+                if (pl + pa + dl + gn)
+                    logf("vk: a frame: pass starts trusted %.1f (left out) + %.1f (attachments only), dispatch barriers left out %.1f, "
+                         "the game's barriers in the fragment stages only %.1f", (pl - l_pl) / 120.0, (pa - l_pa) / 120.0,
+                         (dl - l_dl) / 120.0, (gn - l_gn) / 120.0);
+                l_pl = pl, l_pa = pa, l_dl = dl, l_gn = gn;
+            }
             l_made = made, l_left = left, l_relaxed = relaxed;
             std::string fl;   // (NVN's barrier bits: ORDER_PRIMITIVES 1, ORDER_FRAGMENTS 2, ORDER_FRAGMENTS_TILED 4, ORDER_INDIRECT_DATA 8, INVALIDATE_TEXTURE 0x10, _SHADER 0x20, _TEXTURE_DESCRIPTOR 0x40, _ZCULL 0x80)
             std::lock_guard lk(st_barrier_flags_mu);
@@ -3190,6 +3249,16 @@ void log_frame_stats() {
              (st_gpu_ns - l_gpu) / 120.0 / 1e6, st_gpu_max_ns / 1e6, (st_gpu_up_ns - l_gpu_up) / 120.0 / 1e6,
              (st_gpu_gap_ns - l_gpu_gap) / 120.0 / 1e6, st_gpu_gap_max_ns / 1e6, (texture_made() - l_made) / 120.0);
         l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns, st_gpu_gap_max_ns = 0;
+        {   // (TICK-057) the GPU's busy tail before the late-page waits ended
+            std::lock_guard tl(ts_mu);
+            static int64_t l_tail_ns, l_tail_n, l_tail_recs;
+            const int64_t n = st_tail_n - l_tail_n;
+            if (n > 0)
+                logf("vk: GPU tail before the late waits: %.2f ms busy with no gap before the waited value's end (%lld waits, %.1f "
+                     "recordings each): GPU time cut inside it shortens the wait", (st_tail_ns - l_tail_ns) / (double)n / 1e6,
+                     (long long)n, (st_tail_recs - l_tail_recs) / (double)n);
+            l_tail_ns = st_tail_ns, l_tail_n = st_tail_n, l_tail_recs = st_tail_recs;
+        }
         {   // (issue 109: the movie networks too slow on this card: left out from now on, vk_draw.cpp movie_networks_slow)
             static const bool keep_all = getenv("RX_VK_NETWORK_KEEP") && !strcmp(getenv("RX_VK_NETWORK_KEEP"), "all");
             const double gpu_ms = (st_gpu_ns - l_gpu) / 120.0 / 1e6, draws = (d - l_d) / 120.0;

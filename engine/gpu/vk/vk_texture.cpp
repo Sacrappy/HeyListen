@@ -2544,7 +2544,16 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 std::atomic<uint64_t> work_epoch{0};
 std::atomic<uint64_t> other_work_by_cmd[64]{};
 std::atomic<uint64_t> xfer_work_by_cmd[64]{};
+std::atomic<uint64_t> all_work_by_cmd[64]{};   // (TICK-057, vk_work.h)
+std::atomic<uint64_t> foreign_work{0};
 namespace {
+thread_local uint64_t last_barrier_cmd_work = 0, last_barrier_foreign = 0;   // (TICK-057: the command buffer's count at this thread's last full barrier)
+// (TICK-057, RX_VK_BARRIER_TRUST / RX_VK_GAME_BARRIER_NARROW) this thread's last barrier of any kind (a full one, or the game's
+// narrowed one) and the command buffer's counts then: the trust point
+thread_local VkCommandBuffer trust_cmd = VK_NULL_HANDLE;
+thread_local uint64_t trust_other = 0, trust_xfer = 0, trust_all = 0, trust_foreign = 0;
+std::atomic<int64_t> st_trust_pass_left{0}, st_trust_pass_attach{0}, st_trust_dispatch_left{0}, st_game_narrow{0};
+std::atomic<int64_t> st_barriers_left_out_par{0};
 // (each thread's own: the display thread's present records barriers too)
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)
 thread_local uint64_t last_barrier_epoch = 0;
@@ -2558,11 +2567,114 @@ void barrier_stats(int64_t* made, int64_t* left_out) {
 // (hookshot) A full barrier right after another one on the same command buffer, no command that does or orders GPU work in between
 // (vk_work.h counts them), orders nothing the first did not: left out. The game's own barrier (end of a pass), then the next pass's
 // start barrier, then a dispatch's, were two or three in a row. RX_VK_BARRIER_DEDUPE_OFF=1: all recorded, as before.
+// (TICK-057) Inside a parallel replay work_epoch moves with every thread's work, so the dedupe was off there. RX_VK_BARRIER_DEDUPE_PAR=1:
+// there the count of the command buffer's own work (vk_work.h all_work_slot: each draw, pass edge, copy, dispatch, barrier and begin
+// recorded into it) decides instead. One command buffer is recorded by one thread at a time (Vulkan's rule), and any work another
+// thread records into it, or into one sharing its slot, moves the count: the barrier is kept
+bool barrier_dedupe_par_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_BARRIER_DEDUPE_PAR");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: full barriers inside a parallel replay: %s (RX_VK_BARRIER_DEDUPE_PAR)",
+             v ? "one right after another on the same command buffer left out" : "all recorded, as before");
+        return v;
+    }();
+    return on;
+}
+int64_t barriers_left_out_par() { return st_barriers_left_out_par.load(std::memory_order_relaxed); }
+namespace {
+std::atomic<uint64_t>& xfer_slot(VkCommandBuffer c) {
+    const uintptr_t v = (uintptr_t)c;
+    return xfer_work_by_cmd[((v >> 4) ^ (v >> 10) ^ (v >> 16)) & 63];
+}
+void note_trust_point(VkCommandBuffer cmd) {
+    trust_cmd = cmd;
+    trust_other = other_work_slot(cmd).load(std::memory_order_relaxed);
+    trust_xfer = xfer_slot(cmd).load(std::memory_order_relaxed);
+    trust_all = all_work_slot(cmd).load(std::memory_order_relaxed);
+    trust_foreign = foreign_work.load(std::memory_order_relaxed);
+}
+bool env_on(const char* name) {
+    const char* e = getenv(name);
+    return e && atoi(e) != 0;
+}
+} // namespace
+// (TICK-057) RX_VK_BARRIER_TRUST=1, off by default: the engine's own pass-start and dispatch barriers trust the game's, inside a
+// parallel replay too. Since this thread's last barrier on the command buffer (the trust point), with only draws and pass edges
+// recorded there, a pass start orders the previous passes' attachment writes against its own attachment use (an attachment
+// barrier, not a drain), or nothing when nothing at all was recorded since; with only draws and dispatches (no copy, clear, update
+// or query), a dispatch takes no barrier. What one pass or dispatch writes and the next reads through a shader the game orders with
+// its own nvnCommandBufferBarrier, which the console needs as much. Counts by command buffer (vk_work.h): another thread's work in
+// one sharing the slot keeps the barrier. TICK-016's RX_VK_PASS_TRUST / RX_VK_DISPATCH_TRUST are the serial-only forerunners
+bool barrier_trust_on() {
+    static const bool on = [] {
+        const bool v = env_on("RX_VK_BARRIER_TRUST");
+        logf("vk: the engine's pass-start and dispatch barriers: %s (RX_VK_BARRIER_TRUST)",
+             v ? "trust the game's barriers (attachment-only at a pass start after draws, none at a dispatch after draws and dispatches)"
+               : "full, as before");
+        return v;
+    }();
+    return on;
+}
+bool game_barrier_narrow_on() {
+    static const bool on = [] {
+        const bool v = env_on("RX_VK_GAME_BARRIER_NARROW");
+        logf("vk: the game's barriers: %s (RX_VK_GAME_BARRIER_NARROW)",
+             v ? "ORDER_FRAGMENTS (+ INVALIDATE_TEXTURE) ones wait in the fragment stages only" : "full, as before");
+        return v;
+    }();
+    return on;
+}
+void trust_stats(int64_t* pass_left, int64_t* pass_attach, int64_t* dispatch_left, int64_t* game_narrow) {
+    *pass_left = st_trust_pass_left.load(std::memory_order_relaxed), *pass_attach = st_trust_pass_attach.load(std::memory_order_relaxed);
+    *dispatch_left = st_trust_dispatch_left.load(std::memory_order_relaxed), *game_narrow = st_game_narrow.load(std::memory_order_relaxed);
+}
+// (TICK-057, RX_VK_GAME_BARRIER_NARROW=1) the game's barrier with only ORDER_FRAGMENTS / ORDER_FRAGMENTS_TILED and
+// INVALIDATE_TEXTURE (0x12 87 times a frame at the Market; 0x2, 0x4, 0x6, 0x14, 0x16): on the console the fragments after it wait
+// for the work before it, and the rest of the pipeline goes on. All the work before, made visible to the fragment-side stages
+// after (texture reads included); vertex, task, mesh and compute stages after it do not wait. ORDER_PRIMITIVES (0x1; 0x11 52 a
+// frame) orders every stage of the work after it: a full barrier by its definition, kept
+void game_fragment_barrier(VkCommandBuffer cmd) {
+    st_game_narrow.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, "barrier (the game's, fragments only)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    note_trust_point(cmd);   // (not a full one: last_barrier_cmd stays, and the next full barrier is recorded: work_epoch moved)
+}
 void full_barrier(VkCommandBuffer cmd, const char* why) {
+    // (TICK-057, a measurement, never for play: RX_VK_TEST_BARRIER_DROP=1 leaves out the recordings' pass-start, dispatch and the
+    // game's own barriers (not the uploads', the write-backs' or a segment's edges). The picture may be wrong: it bounds what the
+    // GPU loses to those drains, nothing else)
+    static const bool drop_test = [] {
+        const bool v = getenv("RX_VK_TEST_BARRIER_DROP") && atoi(getenv("RX_VK_TEST_BARRIER_DROP")) != 0;
+        if (v) logf("vk: RX_VK_TEST_BARRIER_DROP=1: pass-start, dispatch and the game's barriers left out (a measurement: the picture may be wrong)");
+        return v;
+    }();
+    if (drop_test && why && (!strcmp(why, "barrier (pass start)") || !strcmp(why, "barrier (dispatch)") ||
+                             !strcmp(why, "barrier (the game's nvnCommandBufferBarrier)"))) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     static const bool off = getenv("RX_VK_BARRIER_DEDUPE_OFF") != nullptr;
-    const bool dedupe = !off && !par_active.load(std::memory_order_relaxed);   // (a parallel replay's threads share command buffers and the count)
+    const bool par = par_active.load(std::memory_order_relaxed);
+    const bool dedupe = !off && !par;   // (a parallel replay's threads share command buffers and the count)
     if (dedupe && cmd == last_barrier_cmd && work_epoch.load(std::memory_order_relaxed) == last_barrier_epoch) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!off && par && barrier_dedupe_par_on() && cmd == last_barrier_cmd &&
+        all_work_slot(cmd).load(std::memory_order_relaxed) == last_barrier_cmd_work &&
+        foreign_work.load(std::memory_order_relaxed) == last_barrier_foreign) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        st_barriers_left_out_par.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     st_barriers_made.fetch_add(1, std::memory_order_relaxed);
@@ -2576,6 +2688,9 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
     last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    last_barrier_cmd_work = all_work_slot(cmd).load(std::memory_order_relaxed);   // (TICK-057: with this barrier's own count)
+    last_barrier_foreign = foreign_work.load(std::memory_order_relaxed);
+    note_trust_point(cmd);   // (TICK-057)
     last_barrier_other = other_work_slot(cmd).load(std::memory_order_relaxed);
     {
         const uintptr_t v = (uintptr_t)cmd;
@@ -2601,6 +2716,11 @@ void pass_start_barrier(VkCommandBuffer cmd, const char* why) {
 }
 
 void dispatch_barrier(VkCommandBuffer cmd, const char* why) {
+    if (barrier_trust_on() && cmd == trust_cmd && xfer_slot(cmd).load(std::memory_order_relaxed) == trust_xfer &&
+        foreign_work.load(std::memory_order_relaxed) == trust_foreign) {   // (TICK-057: only draws and dispatches since)
+        st_trust_dispatch_left.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     static const bool trust = getenv("RX_VK_DISPATCH_TRUST") != nullptr;
     const uintptr_t v = (uintptr_t)cmd;
     if (trust && !par_active.load(std::memory_order_relaxed) && cmd == last_barrier_cmd &&
@@ -2627,6 +2747,27 @@ void pass_start_barrier(VkCommandBuffer cmd) {
         if (on) logf("vk: RX_VK_PASS_BARRIER=game: a draw pass right after another, no barrier of the game's between, waits in its fragment stages only");
         return on;
     }();
+    if (barrier_trust_on() && cmd == trust_cmd && other_work_slot(cmd).load(std::memory_order_relaxed) == trust_other &&
+        foreign_work.load(std::memory_order_relaxed) == trust_foreign) {   // (TICK-057: only draws and pass edges since)
+        if (all_work_slot(cmd).load(std::memory_order_relaxed) == trust_all) {   // (nothing since: the barrier before stands)
+            st_trust_pass_left.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // (the passes before: their attachment writes ordered before this pass's attachment reads and writes)
+        st_trust_pass_attach.fetch_add(1, std::memory_order_relaxed);
+        GprofSpan gp(cmd, "barrier (pass start, attachments only)");
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &d);
+        return;
+    }
     if (!game || par_active.load(std::memory_order_relaxed) || cmd != last_pass_end_cmd ||
         work_epoch.load(std::memory_order_relaxed) != last_pass_end_epoch) {
         full_barrier(cmd, "barrier (pass start)");
@@ -2651,6 +2792,7 @@ void pass_start_barrier(VkCommandBuffer cmd) {
 
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     last_barrier_cmd = VK_NULL_HANDLE;
+    trust_cmd = VK_NULL_HANDLE;   // (TICK-057: a new recording trusts nothing before its first barrier)
     last_pass_end_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
     up_cmd = upload;
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)

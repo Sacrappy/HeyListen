@@ -111,6 +111,7 @@ uint64_t gpu_pool_end(uint64_t gpu) {
 
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
 thread_local VkCommandBuffer last_pass_end_cmd = VK_NULL_HANDLE;
+thread_local VkCommandBuffer trust_cmd = VK_NULL_HANDLE;   // (TICK-057: the barrier trust point)
 thread_local VkCommandBuffer up_cmd = VK_NULL_HANDLE;
 uint64_t rec_value = 0;
 thread_local bool up_used = false;
