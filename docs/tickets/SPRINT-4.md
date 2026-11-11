@@ -218,3 +218,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Measured: shots right (standing luma 102-105 against 102-106), speed 60.0; the main thread's wait moves from the poll (0.80 ms a frame) to its first readback (0.97 ms), with the virtual core given up there; module workers wait now too. Screen castle-move 68.7 -> 70.1; confirm rounds 1-3 73.9 / 66.5 / 63.3 -> 73.6 / 67.7 / 69.3, above in 5 of 9: the bar out of reach, stopped.
 - Decision: nothing adopted. Game folder: TICK-054's build. Saves identical after every run (34), no game left. `HOS_NVN_POLL_AWAY` once stayed on the title (not pursued).
 - Next: the capture out of `sync_order_mu` (shorter sections), a ticket that ends at the submission's `finish_recording`, a per-thread ticket for the workers.
+
+## TICK-062 (2026-11-11): host-layer overhead on chain A
+- Five switches, all off: HOS_CV_SIGNAL_FAST, HOS_THREAD_OF_CACHE, HOS_SHORT_SLEEP_PAUSE, HOS_OBJ_PACK, HOS_CORE_COUNT (counters). B9 and A7 analysed, not changed.
+- Counts: only OptimizeChangeBanc (225k) and SceneLowPriority (61k) call GetCurrentCoreNumber after their start; svc 0x10 never.
+- castle-move screens (3 rounds): B1 +2.4, B4 +1.7, B2 +0.8, pack -1.0 fps, stack +1.5: inside the spread; chain A traces not separable. Nothing adopted; shots alike, speed ~60.
+- Next: the module workers and NavMeshCAStepDepWorker1 virtual-core waits.

@@ -3373,3 +3373,6 @@ run stayed on the title (the save never loaded; cause not found), the next 69.3.
    after it are shown to register nothing more.
 3. The workers' new waits: a ticket handed on with the game's jobs (per thread) rather than global would spare readbacks that do
    not follow a poll; and the virtual core is the gain: any renderer wait on a guest thread should give it up.
+
+## TICK-062: host-layer switches on chain A (2026-11-11)
+Five env switches (HOS_CV_SIGNAL_FAST, HOS_THREAD_OF_CACHE, HOS_SHORT_SLEEP_PAUSE, HOS_OBJ_PACK, HOS_CORE_COUNT), all off. castle-move screens +2.4 / +0.8 / +1.7 / -1.0 fps, stack +1.5 (inside the spread); chain A single traces 12.9-15.1 ms, not separable. Only two low-priority threads call GetCurrentCoreNumber beyond their start. See docs/tickets/TICK-062.md.

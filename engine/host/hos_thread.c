@@ -36,6 +36,9 @@ struct HosThread {
     int vc_held, vc_last, vc_queued;
     volatile int vc_kick;
     int64_t vc_since;
+    /* (HOS_CORE_COUNT, TICK-062 A10) calls that ask for the core number (HLE, svc 0x10), waits for a virtual core and their time */
+    int64_t cc_hle, cc_svc, cc_vcw, cc_vcw_ns;
+    /* (TICK-062 B2) hos_thread_of's per-thread cache */
     CONDITION_VARIABLE vc_cv;
     /* (hookshot) fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
        switched to a guest fiber */
@@ -45,6 +48,7 @@ struct HosThread {
 
 /* The SDK's own mutexes (InternalCriticalSection) tag a lock word with the owner's handle, read from
    ThreadType+0x1B0 through TLR+0x1F8 (sdk+0x13186c). Every thread gets a unique handle there. */
+static void thread_gen_bump(void);
 #define TT_HANDLE 0x1B0
 static volatile LONG next_handle = 0x10000;
 uint32_t hos_thread_handle(HosThread *t) { return t->kernel_handle; }
@@ -55,6 +59,7 @@ void hos_thread_adopt_guest(HosThread *t) {
     uint64_t tt = G64(t->tlr + 0x1F8);
     if (tt && tt != t->guest_tt) {
         t->guest_tt = tt;
+        thread_gen_bump();
         G32(tt + TT_HANDLE) = t->kernel_handle;
     }
 }
@@ -311,6 +316,7 @@ static void setup_guest(HosThread *t) {
 static void track(HosThread *t) {
     AcquireSRWLockExclusive(&threads_lock);
     if (nthreads < 1024) threads[nthreads++] = t;
+    thread_gen_bump();
     ReleaseSRWLockExclusive(&threads_lock);
 }
 
@@ -399,12 +405,32 @@ void hos_thread_wake(HosThread *t) {
     SetEvent(t->wake);
 }
 
-HosThread *hos_thread_of(uint64_t guest_tt) {
+/* TICK-062 B2: hos_thread_of is a linear scan of every thread under a shared lock. HOS_THREAD_OF_CACHE=1: each thread keeps
+   a few (ThreadType, thread) pairs, valid while thread_gen has not changed. thread_gen is bumped by everything that can
+   change what the scan returns: a thread added (track) or removed (hos_thread_destroy), or a guest_tt rewritten (adopt).
+   A reader takes the generation BEFORE the scan and stores the pair under it: a change during the scan leaves the pair
+   stale at once, never served. The answer is then the scan's own (the first matching thread in the table), and a cached
+   pointer to a destroyed thread cannot be served (destroy bumps the generation before the free). */
+static volatile LONG thread_gen;
+static void thread_gen_bump(void) { InterlockedIncrement(&thread_gen); }
+static HosThread *thread_of_scan(uint64_t guest_tt) {
     HosThread *r = NULL;
     AcquireSRWLockShared(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i]->guest_tt == guest_tt) { r = threads[i]; break; }
     ReleaseSRWLockShared(&threads_lock);
+    return r;
+}
+HosThread *hos_thread_of(uint64_t guest_tt) {
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_THREAD_OF_CACHE") != NULL;
+    if (!on) return thread_of_scan(guest_tt);
+    static _Thread_local struct { uint64_t tt; HosThread *t; LONG gen; } cache[8];
+    const unsigned i = (unsigned)((guest_tt >> 4) * 0x9E3779B1u >> 7) & 7;
+    const LONG g = *(volatile LONG *)&thread_gen;
+    if (cache[i].tt == guest_tt && cache[i].gen == g && cache[i].t) return cache[i].t;
+    HosThread *r = thread_of_scan(guest_tt);
+    cache[i].tt = guest_tt, cache[i].t = r, cache[i].gen = g;
     return r;
 }
 
@@ -519,6 +545,7 @@ void hos_thread_destroy(HosThread *t) {
     AcquireSRWLockExclusive(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i] == t) { threads[i] = threads[--nthreads]; break; }
+    thread_gen_bump();
     ReleaseSRWLockExclusive(&threads_lock);
     if (t->handle) CloseHandle(t->handle);
     free(t);
@@ -735,6 +762,15 @@ static void sleep_ns(int64_t ns) {
     static int short_timer = -1;
     if (short_timer < 0) short_timer = getenv("HOS_SHORT_SLEEP_TIMER") != NULL;
     if (ns < 1000000 && !short_timer) {
+        /* TICK-062 B4, HOS_SHORT_SLEEP_PAUSE=1: one yield, then a PAUSE loop to the deadline (SwitchToThread in a loop
+           keeps calling into the kernel and bounces the SMT sibling's work) */
+        static int pause_spin = -1;
+        if (pause_spin < 0) pause_spin = getenv("HOS_SHORT_SLEEP_PAUSE") != NULL;
+        if (pause_spin) {
+            if (hos_now_ns() < until) SwitchToThread();
+            while (hos_now_ns() < until) { YieldProcessor(); YieldProcessor(); YieldProcessor(); YieldProcessor(); }
+            return;
+        }
         while (hos_now_ns() < until)
             if (!SwitchToThread()) YieldProcessor();
         return;
@@ -814,7 +850,34 @@ HLE(_ZN2nn2os17SetThreadCoreMaskEPNS0_10ThreadTypeEim) {
     hos_thread_affinity(t, (int)ARG(1), ARG(2));
 }
 
-HLE(_ZN2nn2os20GetCurrentCoreNumberEv) { RET((uint32_t)hos_thread_core(cur)); }
+/* TICK-062 A10, HOS_CORE_COUNT=1 (diagnostic, no behaviour change): per guest thread, the calls that ask for the core number
+   (nn::os::GetCurrentCoreNumber, svc 0x10) and the waits for a virtual core, logged every 5 s (cumulative) */
+int hos_core_count_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_CORE_COUNT") != NULL;
+    return on;
+}
+void hos_core_count_svc(void) { if (cur) cur->cc_svc++; }
+static void core_count_log(void) {
+    static volatile LONG64 last;
+    const int64_t now = hos_now_ns();
+    const int64_t l = last;
+    if (now - l < 5000000000LL || InterlockedCompareExchange64(&last, now, l) != l) return;
+    if (!l) return;
+    AcquireSRWLockShared(&threads_lock);
+    for (int i = 0; i < nthreads; i++) {
+        const HosThread *t = threads[i];
+        if (t->cc_hle + t->cc_svc + t->cc_vcw)
+            hos_log("corecount: %-24s core-number calls %lld (hle %lld, svc %lld), virtual-core waits %lld (%.1f ms)", t->name,
+                    (long long)(t->cc_hle + t->cc_svc), (long long)t->cc_hle, (long long)t->cc_svc, (long long)t->cc_vcw,
+                    t->cc_vcw_ns / 1e6);
+    }
+    ReleaseSRWLockShared(&threads_lock);
+}
+HLE(_ZN2nn2os20GetCurrentCoreNumberEv) {
+    if (hos_core_count_on()) { cur->cc_hle++; core_count_log(); }
+    RET((uint32_t)hos_thread_core(cur));
+}
 HLE(_ZN2nn2os26GetThreadAvailableCoreMaskEv) { RET((1u << hos_cores()) - 1); }   /* cores 0-2: what an application gets */
 
 HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
@@ -1323,6 +1386,7 @@ static void vc_acquire(HosThread *t) {
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
     vc_thread_note(t, waited);
+    t->cc_vcw++, t->cc_vcw_ns += waited;
     vc_stats_locked(hos_now_ns());
     ReleaseSRWLockExclusive(&vc_lock);
     HOS_JT(JT_VC_WAIT_E, 0, 0);
