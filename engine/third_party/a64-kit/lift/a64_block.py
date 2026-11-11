@@ -30,6 +30,7 @@ from collections import Counter
 STATS = Counter()
 BARRIERS = Counter()
 BLOCK_MIN_ARITH = int(os.environ.get("A64_FPX_BLOCK_MIN", "2"))
+GPR_IN_BLOCKS = os.environ.get("A64_FPX_BLOCK_GPR", "1") != "0"
 
 V = r"c->vreg\[(\d+)\]"
 # an address made of general registers and constants (no vector register, no assignment, one statement)
@@ -38,11 +39,12 @@ L4, L2, L1 = "A64_BK_L4", "A64_BK_L2", "A64_BK_L1"
 
 
 class Op:
-    __slots__ = ("kind", "dst", "srcs", "code", "arith", "text", "ends_run")
+    __slots__ = ("kind", "dst", "srcs", "code", "arith", "text", "ends_run", "gpr_reads", "gpr_writes")
 
     def __init__(self, kind, dst, srcs, code, arith=False, text="", ends_run=False):
         self.kind, self.dst, self.srcs, self.code, self.arith, self.text = kind, dst, srcs, code, arith, text
         self.ends_run = ends_run
+        self.gpr_reads, self.gpr_writes = [], []
 
 
 def bv(r):
@@ -435,6 +437,66 @@ class _G:
 
 SHAPES = [(rx, (zip_builder if fn is None else fn)) for rx, fn in SHAPES]
 
+# (general-register statements between FP ops: address arithmetic, pointer loads, immediates. Kept inside a block when they are
+# pure: only c->x[N] written, read from c->x / the flags / guest memory (recomp_load*), no call, no brace nesting)
+GPR_STMT = re.compile(r"(?:\{[^{}\n]*\}|[^{};\n]*;)")
+GPR_WORD = re.compile(r"[A-Za-z_]\w*")
+GPR_OK_WORDS = {"uint64_t", "int64_t", "uint32_t", "int32_t", "uint16_t", "int16_t", "uint8_t", "int8_t", "c", "x", "n", "z", "v",
+                "_a", "_b", "_r", "_s", "_o", "_t", "_v", "_p0", "_p1", "_lo", "_hi", "ULL", "LL", "U", "L",
+                "recomp_load8", "recomp_load16", "recomp_load32", "recomp_load64", "recomp_ldp32", "recomp_ldp64"}
+GPR_X = re.compile(r"c->x\[(\d+)\]")
+GPR_WRITE = re.compile(r"c->x\[(\d+)\]\s*(?:=(?!=)|&=|\|=|\^=|\+=|-=|<<=|>>=)")
+GPR_NUM = re.compile(r"(?<![A-Za-z_0-9])(?:0[xX][0-9a-fA-F]+|\d+)")   # (numbers, not the digits of uint64_t / recomp_load64)
+
+
+def gpr_op(stmt):
+    """an Op for a pure general-register statement, else None"""
+    t = stmt.strip()
+    if not t or "c->vreg" in t or "recomp_store" in t or "goto" in t or "A64_" in t or "TAILCALL" in t:
+        return None
+    body = GPR_NUM.sub("", t)
+    words = set(GPR_WORD.findall(body.replace("c->", " c->")))
+    if not words <= GPR_OK_WORDS:
+        return None
+    # (the flags and the context only through c->x / c->n.. reads: any other "c->" field is refused)
+    if re.search(r"c->(?!x\[|n\b|z\b|c\b|v\b)", t):
+        return None
+    writes = [int(x) for x in GPR_WRITE.findall(t)]
+    if not writes:
+        return None
+    reads = [int(x) for x in GPR_X.findall(t)]
+    code = GPR_X.sub(lambda m: "_bx%s" % m.group(1), t)
+    op = Op("gpr", None, [], code, False)
+    op.gpr_reads = sorted(set(reads))
+    op.gpr_writes = sorted(set(writes))
+    return op
+
+
+def find_gpr(text, ops):
+    """the pure general-register statements that lie between two shaped ops, as ops of their own"""
+    extra = []
+    for i in range(len(ops) - 1):
+        gap = text[ops[i][1]:ops[i + 1][0]]
+        if not gap.strip():
+            continue
+        pos = 0
+        found = []
+        ok = True
+        for m in GPR_STMT.finditer(gap):
+            if gap[pos:m.start()].strip():
+                ok = False
+                break
+            g = gpr_op(m.group(0))
+            if g is None:
+                ok = False
+                break
+            g.text = m.group(0)
+            found.append((ops[i][1] + m.start(), ops[i][1] + m.end(), g))
+            pos = m.end()
+        if ok and not gap[pos:].strip():
+            extra += found
+    return extra
+
 
 def find_ops(text):
     """[(start, end, Op)] of every statement one of the shapes matches, in text order (non-overlapping)"""
@@ -451,10 +513,20 @@ def find_ops(text):
         if s >= last:
             out.append((s, e, op))
             last = e
+    if GPR_IN_BLOCKS:
+        out = sorted(out + find_gpr(text, out), key=lambda t: t[0])
     return out
 
 
 def emit_block(ops):
+    gpr_used, gpr_written = [], []
+    for op in ops:
+        for r in op.gpr_reads + op.gpr_writes + [int(x) for x in GPR_X.findall(op.code)]:
+            if r not in gpr_used:
+                gpr_used.append(r)
+        for r in op.gpr_writes:
+            if r not in gpr_written:
+                gpr_written.append(r)
     read_first, written = [], []
     seen_w = set()
     for op in ops:
@@ -472,14 +544,17 @@ def emit_block(ops):
     only_w = [d for d in written if d not in read_first]
     if only_w:
         decl.append("__m128i " + ", ".join(bv(d) for d in only_w) + ";")
+    if gpr_used:
+        decl.append("uint64_t " + ", ".join("_bx%d = c->x[%d]" % (r, r) for r in gpr_used) + ";")
     n_arith = sum(1 for op in ops if op.arith)
     if any(op.kind == "fcmp" for op in ops):
         decl.append("uint32_t _bfl = 0;")
     out = ["{ /* (TICK-063) FP block: %d ops, %d arithmetic */" % (len(ops), n_arith), "#if A64_BK", "int _bk = 0;",
            "if (RECOMP_LIKELY(RECOMP_FPX_OPEN(c))) {",
            "const __m128i _fzm = a64_bk_fzm(c); __m128i _bad = _mm_setzero_si128();"] + decl
-    out += [op.code for op in ops]
+    out += [GPR_X.sub(lambda m: "_bx%s" % m.group(1), op.code) for op in ops]
     commit = " ".join("a64_bk_st(c->vreg[%d], %s);" % (d, bv(d)) for d in written)
+    commit += "".join(" c->x[%d] = _bx%d;" % (r, r) for r in gpr_written)
     if any(op.kind == "fcmp" for op in ops):
         commit += " a64_bk_fcmp_commit(c, _bfl);"
     out.append("if (RECOMP_LIKELY(!_mm_movemask_epi8(_bad))) { %s _bk = 1; A64_BK_PROBE(1); } else A64_BK_PROBE(0);" % commit)
@@ -503,15 +578,26 @@ def block_text(text):
     def flush():
         if not run:
             return
-        n_arith = sum(1 for _, _, op in run if op.arith)
+        # (general-register statements at a run's ends stay outside the block: nothing to carry them for)
+        lo, hi = 0, len(run)
+        while lo < hi and run[lo][2].kind == "gpr":
+            lo += 1
+        while hi > lo and run[hi - 1][2].kind == "gpr":
+            hi -= 1
+        kept = run[lo:hi]
+        n_arith = sum(1 for _, _, op in kept if op.arith)
         if n_arith >= BLOCK_MIN_ARITH:
             STATS["blocks"] += 1
-            STATS["ops_in_blocks"] += len(run)
+            STATS["ops_in_blocks"] += len(kept)
             STATS["arith_in_blocks"] += n_arith
-            STATS["block_len_max"] = max(STATS["block_len_max"], len(run))
-            for _, _, op in run:
+            STATS["block_len_max"] = max(STATS["block_len_max"], len(kept))
+            for _, _, op in kept:
                 STATS["op_" + op.kind] += 1
-            out.append(emit_block([op for _, _, op in run]))
+            if lo:
+                out.append(text[run[0][0]:kept[0][0]])
+            out.append(emit_block([op for _, _, op in kept]))
+            if hi < len(run):
+                out.append(text[kept[-1][1]:run[-1][1]])
         else:
             STATS["runs_short"] += 1
             out.append(text[run[0][0]:run[-1][1]])

@@ -82,6 +82,12 @@ GUEST = (
     ("fmov immediates", "fmov s0, #1.0\nfmov d1, #2.5\nmovi v2.2d, #0\nfmov v3.4s, #-0.5\nfmul s4, s0, s5\nfadd s6, s4, s3\nfmul v7.4s, v3.4s, v2.4s\nfadd v8.4s, v7.4s, v1.4s", 1),
     ("zip/ext 8-byte, fneg vector", "zip2 v0.2s, v1.2s, v2.2s\nzip1 v3.2s, v1.2s, v2.2s\next v4.8b, v0.8b, v3.8b, #4\nfneg v5.4s, v4.4s\nfmul v6.2s, v5.2s, v0.2s\nfadd v7.2s, v6.2s, v3.2s", 1),
     ("scalar fmul/fmla by element", "fmul s0, s1, v2.s[1]\nfmla s3, s0, v2.s[3]\nfmls s4, s3, v1.s[0]\nfmul s5, s4, v4.s[2]", 1),
+    # general-register statements inside a block: pointer loads, address arithmetic, immediates, a conditional select
+    ("gpr between FP ops", "fmul v0.4s, v1.4s, v2.4s\nldr x8, [x0, #8]\nand x8, x8, #0xff0\nadd x9, x0, x8\nfadd v3.4s, v0.4s, v1.4s\n"
+                           "ldr q4, [x0, x8]\nmov w10, #0x1d60\nadd x10, x0, x10\nfmul v5.4s, v4.4s, v3.4s\nldrb w11, [x9, #3]\nsxtw x12, w11\n"
+                           "fsub v6.4s, v5.4s, v0.4s\nldr s7, [x0, #12]\nfmul s8, s7, s6\nlsl w13, w11, #2\ncsel x14, x12, x13, eq\nfadd s9, s8, s7", 1),
+    ("gpr loads the FP ops read", "ldr x8, [x0]\nand x8, x8, #0xff0\nfmul v0.4s, v1.4s, v2.4s\nadd x9, x0, x8\nldr q3, [x9]\nfadd v4.4s, v3.4s, v0.4s\n"
+                                  "ldr x9, [x0, #8]\nand x9, x9, #0xff0\nadd x9, x0, x9\nldr q5, [x9, #16]\nfmul v6.4s, v5.4s, v4.4s\nstr x9, [x1]", 1),
     ("one op alone", "fmul v0.4s, v1.4s, v2.4s\nstr q0, [x0]\nfadd s3, s1, s2\nstr s3, [x1]", 0),
     ("moves alone", "dup v0.4s, v1.s[2]\nins v0.s[1], v3.s[0]\next v4.16b, v0.16b, v3.16b, #4", 0),
 )
@@ -227,6 +233,9 @@ def main():
             ran.append(march)
             if r.returncode:
                 failed.append(march)
+            if "block path taken" not in r.stdout:
+                failed.append(march + " (the driver exited with %d and no summary)" % r.returncode)
+                continue
             if march == "x86-64-v3":
                 taken = [int(x) for x in r.stdout.split("block path taken")[1].replace(",", " ").split() if x.isdigit()]
                 if not taken or taken[0] < a.cases // 10:
