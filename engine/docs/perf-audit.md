@@ -3319,3 +3319,57 @@ thread's part of the loop 1.82 -> 0.59 ms, the Presentation Thread's idle 2.0 ->
 2. `submit_q` holding `sync_order_mu` for the capture and the whole replay is the coupling between the two chains in general
    (PR 430 took the texture releases off it with `held_mu` for the same reason).
 3. The host's sync primitives themselves: no further lever (wake p50 6.4 us, ~0.3-0.5 ms a frame on the chain).
+
+
+## TICK-059: the readbacks' order by a ticket instead of the replay's whole lock (2026-11-12)
+
+Ryzen 7 7800X3D, RTX 5070, Market save, `--fps-limit 360`, frame generation off, windowed `run_bench.py`, 110 s runs cut at
+66 s. Branch `feature/TICK-059-readback-order` (main af1cc93). Benchmark: `docs/benchmarks/2026-11-12-tick059.md`.
+
+### Where the write-backs are registered, and what that allows
+
+`wb_pages_note` (vk_memory.cpp) runs at three places, all inside a recording of the sync-waits replay, so inside a
+`sync_order_mu` section (`submit_q`, `present`, `sync_drain` / `sync_settle` / `sync_watch`, `wait_queue_empty`): a small binding
+written in place (`gpu_buffer_bind`, as the recording goes), a submission's write-back (`memory_end_submission` in
+`finish_recording`, which with `burst_begin` runs at `burst_end`, the end of `submit_job`) and a lazy mirror's release (same place).
+A submission's write set is complete only when its recording ends; nothing at the start of a replay can say which ranges it will
+not write back. A readback that must see every registration the locked poll gave it therefore waits for the end of the section
+the poll would have waited for. What it need not do is wait at the poll, or for any later section (TICK-058's v3 waited at every
+readback with write-backs for whichever replay was in progress then).
+
+### RX_VK_READBACK_TICKET (gpu/vk/vk_replay.cpp, off): measured, not adopted
+
+`sync_order_mu` counts its sections (`entered` once taken, `left` before it is let go; only the holder changes them). TICK-058's
+fast poll notes `entered` as a ticket (a global maximum) and answers without the lock; `invalidate` first waits until `left`
+reaches the newest ticket (a condition variable; two loads when nothing is pending). The argument (the comment above
+`invalidate`): the sections up to the ticket took the lock before the poll looked, and their registrations are sequenced before
+their `left` increment, which the wait reads (seq_cst); the next section counts itself before it records anything, so none of its
+registrations is one the poll was ordered after; a newer ticket only makes the readback wait for a later section, as a later
+locked poll would have; the wait comes before `memory_cpu_reads` and the write-back check, so a range written back for the first
+time is seen as before. `=2` (diagnostic only) waits just for ranges with write-backs. `tests/test_readback_ticket.py`.
+
+Shots right: standing luma 102-105 against 102-106, walking alike, no white; speed 60.02 / 60.01. The trace (castle-move): the
+first looks 0.80 -> 0.012 ms a frame on the main thread, but its readback waits 0.97 ms a frame (93 waits in 197 frames, 2.05 ms
+each), and module workers 1-5 now wait too (0.97 / 0.93 / 0.61 / 0.28 / 0.12 ms a frame: the jobs handed out right after the poll
+read back as well). The main thread waits as long as it did; the difference is the virtual core: `rx_nvn_invalidate`
+(host/rx_backend.c) gives it up while the renderer waits, the first look never did (core 0, shared with BaseProcExecutor0).
+
+| run (fps / 1% low / p99) | base | ticket |
+|---|---|---|
+| screen, castle-move x3 | 69.5 69.3 67.4 = 68.7 / 17.5 / 32.8 | 70.5 68.6 71.3 = 70.1 / 38.3 / 21.3 |
+| confirm rounds 1-3: kokiri / castle / hyrule | 73.9 / 66.5 / 63.3 | 73.6 / 67.7 / 69.3 |
+| castle-move, every paired round (7) | 67.7 | 69.4 (above in 5) |
+
+Above base in 5 of the confirm's first 9 rounds: 15 of 18 out of reach, the confirm stopped. Not adopted.
+
+`HOS_NVN_POLL_AWAY` (host/nvn_native.c, off): the first look without the virtual core, the lock's order as it is. One castle-move
+run stayed on the title (the save never loaded; cause not found), the next 69.3. Not pursued.
+
+### What is next
+
+1. Shorter sections: the capture opens every `submit_q` section under `sync_order_mu`; under `submit_order_mu` alone it would keep
+   its order, and every section a poll or a ticket waits for would be shorter by it.
+2. A ticket that ends at the pending submission's `finish_recording` (its registrations made), once `schedule()` / `burst_end`
+   after it are shown to register nothing more.
+3. The workers' new waits: a ticket handed on with the game's jobs (per thread) rather than global would spare readbacks that do
+   not follow a poll; and the virtual core is the gain: any renderer wait on a guest thread should give it up.

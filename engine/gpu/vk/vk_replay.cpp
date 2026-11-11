@@ -119,8 +119,16 @@ std::mutex rec_map_mu;
 // thread, 2-12 on each module worker) waited 0.5-1.9 ms a frame each thread (TICK-058).
 constexpr uint64_t kWholeSlots = 16384;
 std::atomic<uint64_t> whole_val[kWholeSlots];
+// (HeyListen, TICK-059) RX_VK_READBACK_TICKET=1: the fast poll above, and the readbacks' order it skipped kept by a ticket: the
+// poll notes the sync_order_mu section in progress, and a CPU readback (invalidate) waits until that section has left, the order
+// the poll's lock gave it, instead of the poll waiting (see invalidate). =2 (a diagnostic, not the locked path's order): only
+// the readbacks of ranges with write-backs wait. Off: RX_VK_FENCE_POLL_FAST=1 alone is TICK-058's v3
+int readback_ticket() {
+    static const int v = getenv("RX_VK_READBACK_TICKET") ? atoi(getenv("RX_VK_READBACK_TICKET")) : 0;
+    return v;
+}
 bool fence_poll_fast_on() {
-    static const bool v = getenv("RX_VK_FENCE_POLL_FAST") && atoi(getenv("RX_VK_FENCE_POLL_FAST")) != 0;
+    static const bool v = (getenv("RX_VK_FENCE_POLL_FAST") && atoi(getenv("RX_VK_FENCE_POLL_FAST")) != 0) || readback_ticket();
     return v;
 }
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
@@ -2887,7 +2895,61 @@ bool per_queue_fences_off() {
     static const bool v = getenv("RX_VK_PER_QUEUE_FENCES") && atoi(getenv("RX_VK_PER_QUEUE_FENCES")) == 0;
     return v;
 }
-std::mutex sync_order_mu;   // (before replay_mu, always; all of the order's state: qruns, burst_*)
+// (HeyListen, TICK-059) sync_order_mu counts its sections: `entered` once a holder has it, `left` as it lets it go (both only
+// ever changed by the holder, so entered - left is 1 while one is held, else 0). Every recording of the sync-waits replay (and so
+// every write-back registration: wb_pages_note, at a binding written in place and at a submission's write-back) is made inside
+// such a section: submit_q, present, sync_drain / sync_settle / sync_watch, wait_queue_empty. A fast fence poll keeps the number
+// of the section in progress as a ticket (order_ticket_take); a readback waits only until that section has left
+// (order_ticket_wait), not for whichever replay holds the lock when it reads. See invalidate for why that is the order it needs.
+struct OrderMutex {
+    std::mutex mu;
+    std::atomic<uint64_t> entered{0}, left{0};
+    void lock() {
+        mu.lock();
+        entered.fetch_add(1, std::memory_order_seq_cst);
+    }
+    bool try_lock() {
+        if (!mu.try_lock()) return false;
+        entered.fetch_add(1, std::memory_order_seq_cst);
+        return true;
+    }
+    void unlock();
+};
+OrderMutex sync_order_mu;   // (before replay_mu, always; all of the order's state: qruns, burst_*)
+std::atomic<uint64_t> order_ticket{0};   // (TICK-059: the newest section a fast poll answered during; see order_ticket_take)
+std::atomic<int> order_waiters{0};
+std::mutex order_wait_mu;
+std::condition_variable order_wait_cv;
+void OrderMutex::unlock() {
+    left.fetch_add(1, std::memory_order_seq_cst);   // (after the section's registrations: release)
+    mu.unlock();
+    // (a readback waiting for this section: woken. Its waiters++ and this load are both seq_cst, as are this left++ and its
+    // check, so either it sees left or this sees it waiting and the notify comes after it is in the wait: no lost wake-up)
+    if (order_waiters.load(std::memory_order_seq_cst)) {
+        { std::lock_guard lk(order_wait_mu); }
+        order_wait_cv.notify_all();
+    }
+}
+/// (TICK-059) a fast poll: the section in progress now (0 or the one past the last that left: none to wait for), kept as the
+/// newest ticket (a maximum: tickets of polls on other threads only make a readback wait longer, never shorter)
+void order_ticket_take() {
+    const uint64_t t = sync_order_mu.entered.load(std::memory_order_seq_cst);
+    uint64_t cur = order_ticket.load(std::memory_order_relaxed);
+    while (cur < t && !order_ticket.compare_exchange_weak(cur, t, std::memory_order_seq_cst, std::memory_order_relaxed)) {}
+}
+/// (TICK-059) until the section of the newest ticket has left (at once when it has: two loads)
+void order_ticket_wait() {
+    const uint64_t t = order_ticket.load(std::memory_order_seq_cst);
+    if (sync_order_mu.left.load(std::memory_order_acquire) >= t) return;
+    jt_mark(36, 1);   // (36/37 with 1: the readback waiting for its ticket's section)
+    {
+        std::unique_lock lk(order_wait_mu);
+        order_waiters.fetch_add(1, std::memory_order_seq_cst);
+        order_wait_cv.wait(lk, [t] { return sync_order_mu.left.load(std::memory_order_seq_cst) >= t; });
+        order_waiters.fetch_sub(1, std::memory_order_seq_cst);
+    }
+    jt_mark(37, 1);
+}
 bool sync_waits_on() {
     static const bool v = !getenv("RX_VK_SYNC_WAITS") || atoi(getenv("RX_VK_SYNC_WAITS")) != 0;
     return v && event_waits_on() && !async_on() && !dump_on();
@@ -3034,6 +3096,7 @@ int wait_inner(uint64_t f, uint64_t timeout_ns) {
         whole_val[f & (kWholeSlots - 1)].load(std::memory_order_acquire) == f && f + 8000 > q_values.load()) {
         int ok = 0;
         wait_path = 1;
+        if (readback_ticket()) order_ticket_take();   // (TICK-059: the section the lock would have waited for; see invalidate)
         if (wait_recorded(f, 0, &ok)) return ok;
     }
     // (hookshot) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
@@ -3141,6 +3204,30 @@ bool tex_pages_any(uint64_t gpu, uint64_t size) {
 void texture_created_of(const nvn_tex* t) { tex_pages_add(t, +1); }
 uint64_t fence();
 void invalidate(uint64_t gpu, uint64_t size) {
+    // (HeyListen, TICK-059) RX_VK_READBACK_TICKET=1: the fast fence poll (wait_inner) no longer waits for the sync_order_mu
+    // section in progress (a submit_q / present replay); it notes that section's number t (order_ticket_take) and the CPU's
+    // readback here waits until section t has left, before anything else it does. Why that is all the locked path gave it:
+    // - The locked poll took sync_order_mu after every section that held it when the poll came; the readback after the poll then
+    //   saw every write-back registration (wb_pages_note) those sections made, and none they had not. Every registration is made
+    //   inside a section (all recording of the sync-waits replay is: submit_q, present, sync_drain / sync_settle / sync_watch,
+    //   wait_queue_empty; the condition of the fast path is that replay's), so the order to keep is "after sections 1..t".
+    // - t is `entered` read at the poll: the sections numbered up to t took the lock before that read; section t+1 increments
+    //   `entered` only after the read, at once after taking the lock and before it records anything, so none of its
+    //   registrations can be one the poll was ordered after (the locked poll could have taken the lock just before it).
+    // - Section t's registrations are sequenced before its `left` increment (seq_cst, a release); the wait here reads `left` >= t
+    //   (seq_cst / acquire) and so sees them all, and the earlier sections' (they left before t entered: the same mutex). The
+    //   write-back value below is then read under wb_pages_mu as before: the same registrations as after the locked poll, or
+    //   more (of sections after t, as a locked poll that came later would have seen).
+    // - The ticket is taken before the poll returns, so this thread's next readback sees it; any thread whose readback comes
+    //   after the poll (the game hands work on through its own synchronization, which orders it after the ticket) sees it or a
+    //   newer one: a newer ticket only makes it wait for a later section, which a later locked poll would have done too.
+    // - The wait is before memory_cpu_reads and the write-back check (`ever`), so a range written back for the first time by
+    //   section t is seen as the locked path saw it. Readbacks with no fast poll before them wait for nothing (ticket <= left).
+    // What it saves: the poll's wait (1.4 ms a frame on the main thread, TICK-058) becomes a wait at the first readback after
+    // it, only for what is left of that one section by then, and later readbacks wait for nothing until the next poll's ticket
+    // (TICK-058's v3 waited at every readback with write-backs for whichever replay was in progress then: castle-move -6 fps)
+    const int ticket = readback_ticket();
+    if (size && ticket == 1) order_ticket_wait();
     if (size) memory_cpu_reads(host->gpu_guest(gpu), size);   // (TICK-015: its pool's write-backs made from now on)
     static const bool log_inv = getenv("RX_VK_LOG_INVALIDATE") != nullptr;
     static std::atomic<int> logged{0};
@@ -3182,7 +3269,9 @@ void invalidate(uint64_t gpu, uint64_t size) {
             // here, to the CPU's read of GPU results that have write-backs: their write-back value below then has that replay's
             // registrations, the order the poll's lock gave. (Every invalidate waiting cost the main thread and the module
             // workers 1.2-1.8 ms a frame each: most ranges have no write-backs.)
-            if (fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off()) {
+            // (TICK-059) with RX_VK_READBACK_TICKET the ticket's wait above replaces this one (=2: here, a diagnostic)
+            if (ticket == 2) order_ticket_wait();
+            else if (!ticket && fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off()) {
                 jt_mark(36, 0);   // (36/37: the readback waiting for the replay in progress)
                 { std::lock_guard lk(sync_order_mu); }
                 jt_mark(37, 0);

@@ -14,7 +14,8 @@ By the text of gpu/vk/vk_replay.cpp:
 - submit_q still holds sync_order_mu for the replay (the reason for the fast path) and assigns value_queue only for a queue;
 - with the switch on, a readback of GPU results that have write-backs (invalidate's write-back branch) waits for the replay in
   progress (sync_order_mu) before it reads the range's write-back value: the poll's lock did that before (without it OoT's
-  exposure readback read the state of before that replay: the scene blown out to white).
+  exposure readback read the state of before that replay: the scene blown out to white); with TICK-059's
+  RX_VK_READBACK_TICKET the ticket's wait replaces it (tests/test_readback_ticket.py).
 
 python -I -B tests/test_fence_poll_fast.py
 """
@@ -94,8 +95,8 @@ def main():
     bar = inv.index("{ std::lock_guard lk(sync_order_mu); }")
     val = inv.index("const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);")
     need(br < bar < val, "the readback does not wait for the replay in progress before its write-back value")
-    need("if (fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off()) {" in inv[br:bar],
-         "the readback's wait is not under the fast poll's conditions")
+    need("else if (!ticket && fence_poll_fast_on() && !async_on() && sync_waits_on() && !per_queue_fences_off()) {" in inv[br:bar],
+         "the readback's wait is not under the fast poll's conditions (without TICK-059's ticket: test_readback_ticket.py)")
     print("ok")
 
 
