@@ -10,6 +10,7 @@
 
 #include "vk_loader.h"
 #include "vk_api.h"
+#include "split_count.h"   // (TICK-052)
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -134,21 +135,60 @@ void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
 /// what they share (textures and their uploads, programs, pipelines, samplers, pools and memory stamps) is used under
 /// one lock; the per-draw caches are each thread's own
 extern std::atomic<bool> par_active;
-extern std::atomic<int64_t> par_lock_wait_ns, par_locks;   // (contention: the time threads waited for it)
+/// (contention: how often the lock was taken and the time threads waited for it, summed over the threads' own counters)
+void par_counts_sum(int64_t* locks, int64_t* wait_ns);
+/// (TICK-052, RX_VK_PARLOCK_STATS) a recording thread starts or ends a segment; a draw or dispatch starts
+void par_stats_segment(bool begin);
+void par_stats_draw();
+void par_stats_log();
+/// (TICK-052, RX_VK_PARLOCK_STATS) why a recording thread's lookup went to the lock: par_why(kind) while segments are recorded
+enum ParWhy : int {
+    PW_BIND_WRITTEN, PW_BIND_NO_TL, PW_BIND_TL_GEN, PW_BIND_TL_RANGE, PW_BIND_MIRROR_STATE, PW_BIND_SYNC_EPOCH, PW_BIND_SYNC_SEG, PW_BIND_SIZE,
+    PW_VIEW_NEW, PW_VIEW_VERSION, PW_VIEW_DGEN, PW_TOUCH_VIEW, PW_TOUCH_SLOT, PW_SLOT_NEW, PW_SLOT_HANDLE, PW_SLOT_VERSION,
+    PW_SLOT_DGEN, PW_QUICK_NOT_UPLOADED, PW_QUICK_LATER_SEG, PW_QUICK_EPOCH, PW_COUNT
+};
+void par_why(int kind);
+/// (TICK-052, vk_texture.cpp) RX_VK_GONE_RING=1 (default on): whether a texture resolved at destroy generation `from` is still
+/// alive at `to`: no texture_destroy_generation bump between them was its own (or a sweep of all, the deferred ASTC uploads').
+/// A recording thread's view and slot caches then outlive another texture's eviction instead of all going stale at each one
+bool texture_gone_ring_on();
+struct Texture;
+bool texture_kept_since(const Texture* tex, uint64_t from, uint64_t to);
+/// (TICK-052, RX_VK_PARLOCK_STATS) a segment's recording in parts (ns): set up, before its first draw, its draws, after its last
+/// draw's start, and its command buffers ended
+void par_stats_segment_parts(int64_t t0, int64_t ta, int64_t tc, int64_t t1);
 std::recursive_mutex& par_mutex();
 int64_t par_now_ns();
+/// (TICK-052) RX_VK_PARLOCK_STATS=1: each ParLock place's takings, waits and holds while segments are recorded, and the
+/// recording threads' draws by their place in a segment, logged with the parallel replay's line (vk_replay.cpp)
+extern bool par_stats_on;
+int par_stats_site(const char* file, unsigned line);
+void par_stats_note(int site, int64_t wait_ns, int64_t hold_ns, bool released);
+/// (TICK-052) the shared counters each ParLock bumped (par_locks, par_lock_wait_ns) went to one cache line that every recording
+/// thread wrote ~1,000 times a command buffer: each thread counts its own now (par_counts_add), summed when the line is logged
+void par_counts_add(int64_t locks, int64_t wait_ns);
 struct ParLock {
     bool on;
-    explicit ParLock(bool want = true) : on(want && par_active.load(std::memory_order_relaxed)) {
+    int site = -1;
+    int64_t t_held = 0;
+    explicit ParLock(bool want = true, const char* file = __builtin_FILE(), unsigned line = __builtin_LINE())
+        : on(want && par_active.load(std::memory_order_relaxed)) {
         if (!on) return;
-        par_locks.fetch_add(1, std::memory_order_relaxed);
-        if (par_mutex().try_lock()) return;
+        if (par_mutex().try_lock()) {
+            par_counts_add(1, 0);
+            if (par_stats_on) site = par_stats_site(file, line), t_held = par_now_ns();
+            return;
+        }
         const int64_t t0 = par_now_ns();
         par_mutex().lock();
-        par_lock_wait_ns.fetch_add(par_now_ns() - t0, std::memory_order_relaxed);
+        t_held = par_now_ns();
+        par_counts_add(1, t_held - t0);
+        if (par_stats_on) site = par_stats_site(file, line), par_stats_note(site, t_held - t0, 0, false);
     }
     ~ParLock() {
-        if (on) par_mutex().unlock();
+        if (!on) return;
+        if (site >= 0) par_stats_note(site, 0, par_now_ns() - t_held, true);
+        par_mutex().unlock();
     }
     ParLock(const ParLock&) = delete;
     ParLock& operator=(const ParLock&) = delete;
@@ -299,7 +339,7 @@ void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 namespace mkwvk {
 enum ProfPhase { PROF_SUBMIT, PROF_PRESENT, PROF_DRAW, PROF_DESC, PROF_TEXGET, PROF_UPLOAD, PROF_PIPE, PROF_PROGRAM,
                  PROF_CMDS, PROF_DISPATCH, PROF_MEMSYNC, PROF_QSUBMIT, PROF_SLOTWAIT, PROF_COUNT };
-extern int64_t prof_ns[PROF_COUNT];
+extern SplitCount prof_ns[PROF_COUNT];   // (TICK-052: a cache line a thread, split_count.h)
 /// Nanoseconds from a performance-counter reading. An integer number of nanoseconds per tick is a multiply, so a
 /// reading past 2^53 does not lose its low bits the way the double divide does.
 inline int64_t perf_ticks_to_ns(int64_t ticks, int64_t freq) {
