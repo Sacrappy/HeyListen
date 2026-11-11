@@ -211,3 +211,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Found: the main thread's two nvnSyncWait polls a frame wait 1.42 ms for the renderer's `sync_order_mu`, held by `submit_q` / `present` for whole replays. `RX_VK_FENCE_POLL_FAST` (off) answers them without it: +1.4..+6 fps in screens, +3.0 / +1.5 / +1.9 in a confirm (16 of 18 rounds above), but the Market's exposure blew out to white. The lock also ordered the exposure readback after the replay's write-back registrations. With that wait moved to the readbacks (the picture right), castle-move 69.6 -> 63.2.
 - Decision: nothing adopted; the switch stays off. Game folder: TICK-054's build. Saves identical after every run (103 runs), no hang.
 - Next: the readbacks' ordering without the replay's whole lock (per-range write-back state published at a replay's start): ~1.4 ms off the main thread's chain, then MSYNC_FAST + SEG_EARLY.
+
+## TICK-062 (2026-11-11): host-layer overhead on chain A
+- Five switches, all off: HOS_CV_SIGNAL_FAST, HOS_THREAD_OF_CACHE, HOS_SHORT_SLEEP_PAUSE, HOS_OBJ_PACK, HOS_CORE_COUNT (counters). B9 and A7 analysed, not changed.
+- Counts: only OptimizeChangeBanc (225k) and SceneLowPriority (61k) call GetCurrentCoreNumber after their start; svc 0x10 never.
+- castle-move screens (3 rounds): B1 +2.4, B4 +1.7, B2 +0.8, pack -1.0 fps, stack +1.5: inside the spread; chain A traces not separable. Nothing adopted; shots alike, speed ~60.
+- Next: the module workers and NavMeshCAStepDepWorker1 virtual-core waits.

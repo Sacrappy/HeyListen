@@ -3319,3 +3319,6 @@ thread's part of the loop 1.82 -> 0.59 ms, the Presentation Thread's idle 2.0 ->
 2. `submit_q` holding `sync_order_mu` for the capture and the whole replay is the coupling between the two chains in general
    (PR 430 took the texture releases off it with `held_mu` for the same reason).
 3. The host's sync primitives themselves: no further lever (wake p50 6.4 us, ~0.3-0.5 ms a frame on the chain).
+
+## TICK-062: host-layer switches on chain A (2026-11-11)
+Five env switches (HOS_CV_SIGNAL_FAST, HOS_THREAD_OF_CACHE, HOS_SHORT_SLEEP_PAUSE, HOS_OBJ_PACK, HOS_CORE_COUNT), all off. castle-move screens +2.4 / +0.8 / +1.7 / -1.0 fps, stack +1.5 (inside the spread); chain A single traces 12.9-15.1 ms, not separable. Only two low-priority threads call GetCurrentCoreNumber beyond their start. See docs/tickets/TICK-062.md.
