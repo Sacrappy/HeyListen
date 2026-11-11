@@ -223,8 +223,8 @@ static int send_activity(Ipc p, long long started) {
     version[strcspn(version, " +")] = 0;   /* ("v2.0.12 (source ...)": the release alone) */
     snprintf(json, sizeof json,
              "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{\"details\":\"Ocarina of Time\","
-             "\"state\":\"Hookshot %s\",\"timestamps\":{\"start\":%lld},\"assets\":{\"large_image\":\"%s\",\"large_text\":"
-             "\"Hookshot %s\"}}}}",
+             "\"state\":\"HeyListen %s\",\"timestamps\":{\"start\":%lld},\"assets\":{\"large_image\":\"%s\",\"large_text\":"
+             "\"HeyListen %s\"}}}}",
              ++nonce, process_id(), version, started, HOOKSHOT_DISCORD_IMAGE_DEFAULT, version);
     if (!write_frame(p, OP_FRAME, json)) return 0;
     uint32_t op = 0;
