@@ -61,6 +61,9 @@ void hos_jt_rec(int type, uint64_t a, uint64_t b) {
 void hos_jt_job(uint64_t obj, uint64_t target, uint64_t site, int begin) {
     HOS_JT(begin ? JT_JOB_B : JT_JOB_E, obj, (target & 0xffffffffu) | site << 32);
 }
+/* (TICK-054) the renderer's marks (gpu/vk/vk_replay.cpp jt_mark: it looks this up in the exe, as it includes no host header):
+   a JT_MARK record of that kind, only while the window is open */
+__declspec(dllexport) void hos_jt_mark_ext(int kind, uint64_t v) { HOS_JT(JT_MARK, kind, v); }
 uint64_t hos_jt_lr(void) {
     Ctx *c = hos_ctx();
     return c ? c->x[30] : 0;

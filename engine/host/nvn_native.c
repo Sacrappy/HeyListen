@@ -1078,6 +1078,9 @@ static void held_flush_why(int why);
 static DWORD WINAPI hold_flush_thread(void *p) {
     (void)p;
     SetThreadDescription(GetCurrentThread(), L"hos held submits");
+    /* (TICK-054) HOS_NVN_HOLD_PRIO=1: above normal, as the replay's workers: the frame's job group starts at the hold, and its
+       threads (normal priority) took the cores from this thread's capture and its copy helpers (RX_VK_CAPTURE_PRIO) */
+    if (getenv("HOS_NVN_HOLD_PRIO") && atoi(getenv("HOS_NVN_HOLD_PRIO")) != 0) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     for (;;) {
         WaitForSingleObject(hold_event, INFINITE);
         held_flush_why(HF_THREAD);

@@ -5,9 +5,11 @@
 Reads the trace of engine/host/hos_jobtrace.c (the guest threads' waits, sleeps and virtual-core waits) and the host's
 JT_MARK records around the renderer (host/nvn_native.c, hos_jobtrace.c: a = kind, b = a count):
   1 submit begin  2 submit end  (nvnQueueSubmitCommands on the submitting thread: the capture and the replay of one submit)
+  3 a submit held (HOS_NVN_HOLD=2: its capture and replay later, on the held submits' thread)
   5 present begin 6 present end (nvnQueuePresentTexture on the Presentation Thread)
   7 the GPU finished more submissions (the trace thread polls the renderer's timeline every ~2 us)
-(The renderer itself records nothing: its headers are shader-stamp inputs.) The GPU column is an approximation: busy from
+  9/10 the replay thread waiting for its segments, 11/12 a submit's capture made (the renderer's marks, vk_replay.cpp jt_mark)
+(The renderer marks through hos_jt_mark_ext, looked up in the exe: its headers are shader-stamp inputs.) The GPU column is an approximation: busy from
 each submit's end to the first completion seen after it.
 A frame is cut at the Presentation Thread's present end (or, without marks, at the main thread's end-of-frame wait).
 The gantt has one column per thread of interest and one row per --row ms; letters:
@@ -24,7 +26,10 @@ EV_WAIT_B, EV_WAIT_E, EV_SIGNAL, SPIN_E, CV_WAIT_B, CV_WAIT_E, CV_SIGNAL, MX_WAI
     VC_WAIT_B, VC_WAIT_E, Q_WAIT_B, Q_WAIT_E, Q_SIGNAL, K_WAIT_B, K_WAIT_E, K_WAKE, MARK, JOB_B, JOB_E = range(1, 24)
 WAIT_B = {EV_WAIT_B: EV_WAIT_E, CV_WAIT_B: CV_WAIT_E, MX_WAIT_B: MX_WAIT_E, Q_WAIT_B: Q_WAIT_E, K_WAIT_B: K_WAIT_E}
 LR_JOBGROUP, LR_FRAME_END, LR_POLL = 0x80080188, 0x83acfcf4, 0x8009a478
-M_SUBMIT_B, M_SUBMIT_E, M_CAPTURE_B, M_CAPTURE_E, M_PRESENT_B, M_PRESENT_E, M_GPU_DONE, M_QUEUED, M_SEGWAIT_B, M_SEGWAIT_E = range(1, 11)
+M_SUBMIT_B, M_SUBMIT_E, M_HELD, M_PRESENT_B, M_PRESENT_E, M_GPU_DONE, M_QUEUED, M_SEGWAIT_B, M_SEGWAIT_E = 1, 2, 3, 5, 6, 7, 8, 9, 10
+# (the renderer's own marks, gpu/vk/vk_replay.cpp jt_mark: 11/12 a submit's capture made, 13/14 a dry pass, 15/16 a submission's
+# memory work, 17-21 the parallel replay's setup points; tools/bench/chainb.py reads them)
+M_CAPTURE_B, M_CAPTURE_E = 11, 12
 
 
 def load(path):

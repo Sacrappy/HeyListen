@@ -1430,6 +1430,8 @@ struct CopyHelpers {
 } copy_helpers;
 void copy_helper_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk capture copy");
+    // (TICK-054) RX_VK_CAPTURE_PRIO=1: above normal, as the replay's workers (a capture made while the game's job threads run)
+    if (getenv("RX_VK_CAPTURE_PRIO") && atoi(getenv("RX_VK_CAPTURE_PRIO")) != 0) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     for (;;) {
         CopyPart w;
         {

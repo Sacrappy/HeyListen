@@ -54,6 +54,21 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+// (HeyListen, TICK-054) the host's frame-timeline marks (HOS_JOBTRACE, tools/bench/frameline.py): hos_jt_mark_ext, exported by
+// the game's exe and looked up there (the host's headers are not included here; vk_api.h is a shader-stamp input). A call that
+// returns at once while the trace window is closed. Kinds: 9/10 the replay thread waiting for its segments, 11/12 a submit's
+// capture made, 13/14 a parallel replay's dry pass, 15/16 a submission's memory work (its capture taken), 17 the segments handed
+// out to the workers, 18 the replay thread's own segment recorded (RX_VK_PARALLEL_SELF);
+// 19, 20, 21 (points, diagnosis): the mirrors synced before the segments, what came before submitted, their recordings begun
+void jt_mark(int kind, uint64_t v) {
+#ifdef _WIN32
+    static void (*const fn)(int, uint64_t) =
+        reinterpret_cast<void (*)(int, uint64_t)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(nullptr), "hos_jt_mark_ext")));
+    if (fn) fn(kind, v);
+#else
+    (void)kind, (void)v;
+#endif
+}
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
 int64_t presents_now;   // (the presents so far, for SlowWatch)
 // (TICK-033, vk_draw.cpp: real occlusion counts, RX_VK_OCC_REAL) each draw and dispatch of the stream numbered in stream order: on
@@ -1504,7 +1519,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     rmode = Mode::Dry;
     VkCommandBuffer none = cmd;
     suspend_ok = may_stop;
+    jt_mark(13, 0);
     replay(none, state, h);
+    jt_mark(14, 0);
     suspend_ok = false;
     rmode = Mode::Serial;
     const uint8_t* const occ_stop = suspend_at ? nullptr : occ_stop_at;   // (TICK-033: stopped for a report's count)
@@ -1596,7 +1613,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     end_pass(r.cmd);
     full_barrier(r.cmd);
     memory_sync_mirrors_before_segments();   // (in r's uploads, ahead of every segment)
+    jt_mark(19, 0);
     submit_recording(r, false);
+    jt_mark(20, 0);
     static uint64_t seq = 0;   // (the segments' order, across submissions: a recording's uploads precede it)
     const uint64_t base = ++seq;
     seq += seg.size();
@@ -1624,6 +1643,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         j->index = (int)k;
         jobs.push_back(std::move(j));
     }
+    jt_mark(21, 0);
     std::vector<VkCommandBuffer> inits;   // (each one's init command buffer, begun)
     {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1702,7 +1722,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
     }
     par_pool.cv.notify_all();
+    jt_mark(17, jobs.size());   // (TICK-054: the segments handed out: the setup since the dry pass's end)
     if (self_rec) record_job(jobs[0].get());
+    jt_mark(18, 0);
     bool init_lost = false;
     int64_t pt_wait_ns = 0;   // (TICK-050: the replay thread waiting for segments, in seg_cv)
     for (auto& jp : jobs) {   // (in order, each as soon as it is done)
@@ -1722,9 +1744,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
         {
             const int64_t w0 = now_ns();
+            jt_mark(9, (uint64_t)j->index);
             std::unique_lock l(seg_mu);
             seg_cv.wait(l, [j] { return j->done.load(); });
             pt_wait_ns += now_ns() - w0;
+            jt_mark(10, (uint64_t)j->index);
         }
         if (j->inits < 0) init_lost = true;   // (its init command buffer could not be ended: the replay stops, below)
         if (init_lost) continue;              // (nothing from it on is submitted)
@@ -1934,6 +1958,8 @@ struct SlowWatch {
 /// (replay_mu held). In the order of the submits: one behind its queue's stopped one (submit_job) has it done as it comes.
 void submit_memory_work(uint64_t value) {
     PROF(PROF_MEMSYNC);
+    jt_mark(15, value);
+    struct JtEnd { ~JtEnd() { jt_mark(16, 0); } } jt_end;
     const auto m0 = std::chrono::steady_clock::now();
     memory_sync();
     // (the capture takes only the mirrored pools' pages, the collection the rest: skipping it whenever a capture was
@@ -4272,7 +4298,9 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         // counted into the other set, and the foliage, grass, characters and particles of that frame were never drawn.
         // With it the syncs take the submits' captures, as the console's GPU sees its memory. RX_VK_SYNC_CAPTURE=0: off.
         static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
+        jt_mark(11, 0);
         if (capture) memory_capture_submit();
+        jt_mark(12, 0);
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
         // arrive just after it, from the game's other threads?)
         static const int delay_us = getenv("RX_VK_SUBMIT_DELAY_US") ? atoi(getenv("RX_VK_SUBMIT_DELAY_US")) : 0;
