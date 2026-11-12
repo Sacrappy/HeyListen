@@ -229,3 +229,15 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Per item (castle-move screens + `chainb.py`): each does what it says (scan -30%, shadow block 9 -> 4 us a take, setup 0.10 -> 0.02 ms) and each is under the spread; the suspect list's sizes were too large for the main PC. F2 found ~11 draws a frame, not the proxies.
 - Stacked + TICK-056's `MSYNC_FAST` + `SEG_EARLY`: chain B 11.99 -> 10.20 ms (every run below), the main thread's part 1.92 -> 3.06, frame 13.91 -> 13.27, fps 75.7 -> 77.6 (inside the spread). No confirm; nothing adopted.
 - Shots alike, speed 60, saves identical. One program-cache reset from a `Program` field (stamp input), fixed and the cache re-prepared at once. Branch `feature/TICK-061-chain-b`, not merged. Next: chain A, then restack.
+## TICK-063 (2026-11-12): the lifted FP code as speculative blocks
+- Measured: half of the castle's guest time is FP / vector code at 12-60 x86 instructions per guest instruction (integer code
+  3-4); ~9.4 ms of lifted code sits on chain A's path a frame.
+- Built (lift switches, off): `A64_FPX_BLOCK` (straight-line FP runs in XMM registers, one keep test, the per-op code as the
+  exact fallback), `A64_FPX_BLOCK_ST` (stores inside blocks), `A64_FPX_BLOCK_CVT` (int <-> float conversions inside blocks).
+  `tests/test_fpx_block.py`: 2M runs, 0 mismatches, teeth for every keep test.
+- In the game (PC 3050, no PGO, castle-move): executors' guest work -8% / -13%, module workers -4 to -6%, main thread unchanged;
+  Market fps 29.16 -> 29.22 / 28.60 (the frame is the main thread's and the Presentation Thread's there). Shots right, speed
+  60.0, saves identical.
+- Decision: not adopted, the switches stay off. The main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
+  Game folders: main PC TICK-054's build, PC 3050 main32d. Branch `feature/TICK-063-lifter-speed`, not merged.
+- Next: the main-PC PGO screen (the executors are on the job-group wait there), then the main thread's guest loads.
