@@ -58,7 +58,8 @@ def main():
 #include <memory>
 #include <unordered_map>
 #include <vector>
-struct Cap { std::vector<uint32_t> pages, copied, slots; uint8_t* map = nullptr; };
+struct Cap { std::vector<uint32_t> pages, copied, slots, late; uint8_t* map = nullptr; };
+static const bool late_defer = false;   // (TICK-060: the fast block is not used with deferred late slots)
 ''' + decl + helpers + "\n" + fast + r'''
 void old_block(const Cap* c) ''' + old_body + r'''
 static uint64_t rng = 0x2545F4914F6CDD1Dull;

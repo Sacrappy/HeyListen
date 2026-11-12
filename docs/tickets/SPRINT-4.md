@@ -241,3 +241,25 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Decision: not adopted, the switches stay off. The main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
   Game folders: main PC TICK-054's build, PC 3050 main32d. Branch `feature/TICK-063-lifter-speed`, not merged.
 - Next: the main-PC PGO screen (the executors are on the job-group wait there), then the main thread's guest loads.
+
+## TICK-060 (2026-11-12): PC 3050's idle GPU third
+- Found (unprofiled: frame trace, nvidia-smi/dmon, job trace): the GPU idled 12.8 ms of a 35 ms castle-move frame, not for PCIe
+  (0.54 of 3.9 GB/s) or uploads: the held flush waited ~8 ms for the previous frame's late pages holding the replay's lock, then the
+  Presentation Thread needed a 5.8 ms mirror pre-sync (~4 ms of it TICK-048's diff re-hashing capture buffers from DRAM) before the
+  GPU had the frame's first big command buffer.
+- Built: `RX_VK_LATE_DEFER` (the late-page wait moved from the take to the queue: recordings held until a fix thread applies the same
+  copies at the value's end; CPU readers of a pending slot wait or copy whole), `RX_VK_CAPTURE_HASH` (the capture's copy makes the
+  diff's hashes in the same pass, bit-exact); tests; trace column `late_fix_ms`.
+- Screen (castle-move): base 28.09, defer 29.80, + hash 33.19, + MSYNC_FAST 33.83. Confirm (6 rounds, 18 of 18 above base):
+  kokiri-idle 30.85 -> 37.24, castle-move 29.13 -> 34.40, hyrule-walk 31.35 -> 37.20 fps; 1% low and p99 better; shots alike,
+  speed ~60, saves identical after every run.
+- Adopted (on by default, =0 off): LATE_DEFER, CAPTURE_HASH, and MSYNC_FAST where the chunk diff is on. Main-PC check pending.
+  PC 3050's game folder: build t60e (exe 17c3e4fb, dll 2dc76b85); main32d kept in `C:\OOT\builds\main32d`. Branch
+  `feature/TICK-060-pc3050-gpu`, bundle `E:\OOT\tick060.bundle`, not merged.
+- Next: the CPU recording chain (SEG_EARLY, RX_VK_PARALLEL=5: +1 fps in a screen), then the GPU's ~22 ms at 1440p.
+- Main-PC check (TICK-060m, branch `feature/TICK-060-main` on main 43cc30f): review found the late fixes' queue assumed rising late
+  values (a flush could send recordings reading unfixed slots), a CPU texture upload over a pending late page could read guest
+  memory before the write-back, and a replay read could differ from the slot the GPU reads: all fixed, tests
+  (`test_late_fix_order.py`). A/B on the 7800X3D + RTX 5070 (only the deferral differs there): screen 75.65 -> 77.54, confirm
+  kokiri 78.3 -> 79.4, castle 77.0 -> 76.9, hyrule 75.1 -> 77.4 fps, hitches alike, shots and speed right: does not lose.
+  Recommended: merge with the defaults on, with the fixes.

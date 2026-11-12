@@ -44,6 +44,7 @@ ARGS = {
     "tests/test_capture_claim.py": ["--cxx", "{cxx}"],
     "tests/test_shadow_fast.py": ["--cxx", "{cxx}"],
     "tests/test_collect_fast.py": ["--cc", "{cxx}"],
+    "tests/test_late_fix_order.py": ["--cxx", "{cxx}"],
     "tests/test_capture_stream_copy.py": ["--cxx", "{cxx}"],
     "tests/test_capture_merge.py": ["--cxx", "{cxx}"],
     "tests/test_flash_sampling.py": ["--cxx", "{cxx}"],

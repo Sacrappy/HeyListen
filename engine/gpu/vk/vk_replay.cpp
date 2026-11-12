@@ -174,6 +174,7 @@ int recording_index = 0;
 void recording_wait(Recording& r) {
     if (!r.submitted) return;
     if (r.batch) {
+        if (batch_flushed < r.batch) late_fix_wait_unlocked();   // (TICK-060; a stale read only waits or not for a fix)
         {
             std::lock_guard lk(dev.present_mu);
             if (batch_flushed < r.batch) flush_reason = FR_SLOT, queue_flush_locked();
@@ -217,8 +218,64 @@ bool batch_on() {
     }();
     return on && batch_tl != VK_NULL_HANDLE;
 }
+// (TICK-060, RX_VK_LATE_DEFER) the highest timeline value a submit sent to the queue signals: a capture's late value at or below it
+// is reached with nothing more submitted, so its wait can move to the queue (vk_memory.cpp take_capture)
+std::atomic<uint64_t> tl_signal_sent{0};
+void note_signal_sent(uint64_t v) {
+    uint64_t cur = tl_signal_sent.load(std::memory_order_relaxed);
+    while (v > cur && !tl_signal_sent.compare_exchange_weak(cur, v, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+int64_t st_lf_thread, st_lf_blocked, st_lf_held_cbs;   // (dev.present_mu: fixes applied by the fix thread, by a flush that waited)
+double st_lf_blocked_ms;
+std::atomic<int64_t> st_lf_wait_ns{0};   // (the frame trace's late_fix_ms: any thread's waits for a pending fix, the fix thread's not)
+/// (TICK-060) The pending late fixes applied before anything goes to the queue: a wait for their value (sent already: no flush
+/// needed, and none may be made here), then their copies. dev.present_mu held
+void late_fix_flush_locked() {
+    const uint64_t v = memory_late_fix_pending();
+    if (!v) return;
+    if (completed() < v) {
+        const auto t0 = std::chrono::steady_clock::now();
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &timeline;
+        wi.pValues = &v;
+        for (int i = 0; i < 8 && vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT; i++) {
+            static int logged;
+            if (logged++ < 8) logf("vk: a late fix's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
+        }
+        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        st_lf_blocked++, st_lf_blocked_ms += ns / 1e6;
+        st_lf_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
+    memory_late_fix_apply(std::max(completed(), v));   // (v: past the timeouts, as the take's wait went on after 250 ms)
+}
 } // namespace
+uint64_t vk_timeline_signal_sent() { return tl_signal_sent.load(std::memory_order_acquire); }
+void vk_timeline_wait_sent(uint64_t v) {
+    if (!timeline || completed() >= v) return;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &timeline;
+    wi.pValues = &v;
+    for (int i = 0; i < 8 && vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT; i++) {}
+}
+// (TICK-060) Before taking the queue's lock to send something: a pending late fix's value waited for here, outside the lock, so the
+// flush under it does not wait there and hold up the threads that only hold their recordings back meanwhile (the Presentation
+// Thread's submits; a poll of the main thread's waited 7.5 ms under it in the first try). A poll does not wait at all
+thread_local bool tl_poll = false;
+bool late_fix_wait_unlocked() {
+    for (uint64_t lv; (lv = memory_late_fix_pending()) && completed() < lv;) {
+        if (tl_poll) return false;   // (a poll: what is held is not done anyway; the fix thread sends it)
+        const auto t0 = std::chrono::steady_clock::now();
+        vk_timeline_wait_sent(lv);
+        st_lf_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                                std::memory_order_relaxed);
+        memory_late_fix_apply(completed());   // (TICK-060m: at once, as the fix thread: whichever wakes first copies)
+    }
+    return true;
+}
 void queue_flush_locked() {   // (dev.present_mu held)
+    late_fix_flush_locked();   // (TICK-060: before anything that may read a capture's late slots)
     if (pend.cbs.empty()) return;
     VkSemaphoreSubmitInfo sig[3]{{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO},
                                  {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}};
@@ -240,6 +297,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     si.pSignalSemaphoreInfos = sig;
     PROF(PROF_QSUBMIT);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
+    if (res == VK_SUCCESS && pend.any_signal) note_signal_sent(pend.signal);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -253,6 +311,64 @@ void queue_flush() {
     std::lock_guard lk(dev.present_mu);
     queue_flush_locked();
 }
+// (TICK-060, RX_VK_LATE_DEFER) The fix thread: waits for a pending late fix's value, then applies the fixes reached and sends
+// the recordings held behind them, so the GPU has the new frame's work as soon as it is done with the old one (a held recording
+// otherwise went out at the next submit that could not be held: a parallel segment's, or a present)
+namespace {
+std::mutex lf_mu;
+std::condition_variable lf_cv;
+uint64_t lf_want = 0;   // (lf_mu: the highest value a fix was noted for; 0: nothing to wait for)
+void late_fix_main() {
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk late fix");
+    for (;;) {
+        uint64_t v;
+        {
+            std::unique_lock l(lf_mu);
+            lf_cv.wait(l, [] { return lf_want != 0; });
+            v = lf_want;
+        }
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &timeline;
+        wi.pValues = &v;
+        vkWaitSemaphores(dev.device, &wi, 250000000ull);   // (a flush elsewhere may have applied it meanwhile)
+        jt_mark(38, v);
+        // (TICK-060m) the copies as soon as the value is reached, before the queue's lock (another thread's submit may hold it):
+        // the take's wait made them at once, and the game's CPU may write such a page again soon after the write-back (OoT's
+        // exposure page). Every fix reached, whatever the others' values; late_fix_mu orders this with any other apply
+        bool applied = false;
+        if (memory_late_fix_pending()) memory_late_fix_apply(completed()), applied = !memory_late_fix_pending();
+        {
+            std::lock_guard lk(dev.present_mu);
+            if (memory_late_fix_pending()) memory_late_fix_apply(completed()), applied |= !memory_late_fix_pending();
+            if (applied) st_lf_thread++;
+            if (!memory_late_fix_pending() && !pend.cbs.empty()) flush_reason = FR_VALUE, queue_flush_locked();
+            static int64_t n;
+            if (++n % 600 == 0) {
+                logf("vk: late fixes (RX_VK_LATE_DEFER): %lld applied by the fix thread, %lld by a submit or wait that needed the queue "
+                     "(%.2f ms each), %.1f command buffers held a fix", (long long)st_lf_thread, (long long)st_lf_blocked,
+                     st_lf_blocked ? st_lf_blocked_ms / (double)st_lf_blocked : 0.0, (double)st_lf_held_cbs / 600.0);
+                st_lf_thread = st_lf_blocked = st_lf_held_cbs = 0, st_lf_blocked_ms = 0;
+            }
+        }
+        jt_mark(39, v);
+        // (TICK-060m: idle only when nothing is pending. Every registration wakes with its value after it is pending, so lf_want is at
+        // least every pending value; a fix registered while this pass applied (its value reached) was lost before: lf_want reset
+        // under it, its held recordings left to the next submit or flush)
+        std::lock_guard l(lf_mu);
+        if (!memory_late_fix_pending()) lf_want = 0;
+    }
+}
+} // namespace
+void late_fix_wake(uint64_t v) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(late_fix_main).detach(); });
+    {
+        std::lock_guard l(lf_mu);
+        lf_want = std::max(lf_want, v);
+    }
+    lf_cv.notify_one();
+}
 void device_wait_idle_locked() {   // (dev.present_mu held)
     queue_flush_locked();
     std::lock_guard pq(dev.present_queue_mu);
@@ -260,6 +376,7 @@ void device_wait_idle_locked() {   // (dev.present_mu held)
 }
 namespace {
 void queue_flush_for(int why) {
+    if (!late_fix_wait_unlocked()) return;   // (TICK-060: a poll while a fix waits: nothing to send yet)
     if (why == FR_WAIT) jt_mark(34, 0);   // (TICK-058: 34/35 a wait taking dev.present_mu)
     std::lock_guard lk(dev.present_mu);
     if (why == FR_WAIT) jt_mark(35, 0);
@@ -275,6 +392,7 @@ void queue_flush_poll() {
     static const int64_t us = getenv("RX_VK_BATCH_POLL_US") ? atoll(getenv("RX_VK_BATCH_POLL_US")) : 2000;
     std::lock_guard lk(dev.present_mu);
     if (pend.cbs.empty()) return;
+    if (const uint64_t lv = memory_late_fix_pending(); lv && completed() < lv) return;   // (TICK-060: the fix thread sends them)
     if (us > 0 && std::chrono::steady_clock::now() - pend_since < std::chrono::microseconds(us)) return;
     flush_reason = FR_POLL;
     queue_flush_locked();
@@ -530,8 +648,17 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     si.signalSemaphoreInfoCount = nsig;
     si.pSignalSemaphoreInfos = nsig ? signals : nullptr;
+    if (batch_tl == VK_NULL_HANDLE) late_fix_wait_unlocked();   // (TICK-060: nothing can be held without the batch semaphore)
     std::lock_guard lk(dev.present_mu);   // (one queue: submits and presents take turns)
-    if (batch_on()) {
+    // (TICK-060, RX_VK_LATE_DEFER) a late fix pending: held with the batched ones until its value is reached (the fix thread
+    // sends them then); one already reached is applied here
+    bool late_hold = false;
+    if (memory_late_fix_pending()) {
+        memory_late_fix_apply(completed());   // (TICK-060m: the ones reached, whatever the others' values)
+        late_hold = memory_late_fix_pending() && batch_tl != VK_NULL_HANDLE;
+        if (late_hold) st_lf_held_cbs += n;
+    }
+    if (batch_on() || late_hold) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < n; i++) pend.cbs.push_back(cb[i]);
         if (signal_value) pend.signal = std::max(pend.signal, signal.value), pend.any_signal = true;
@@ -543,9 +670,11 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         if (pend.cbs.size() >= cap) flush_reason = FR_CAP, queue_flush_locked();
         return;
     }
+    queue_flush_locked();   // (TICK-060: recordings held for a fix go first, the fix applied (waited for here without a batch semaphore))
     PROF(PROF_QSUBMIT);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
     r.submitted = res == VK_SUCCESS;
+    if (r.submitted && signal_value) note_signal_sent(signal.value);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -1815,6 +1944,7 @@ void presync_early_finish(bool segments) {
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = 1;
         si.pCommandBufferInfos = &cb;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
@@ -2049,6 +2179,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = n;
         si.pCommandBufferInfos = cb;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
@@ -2489,6 +2620,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = n;
         si.pCommandBufferInfos = cb;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
@@ -3224,6 +3356,11 @@ int wait(uint64_t f, uint64_t timeout_ns) {
 }
 int wait_inner(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
+    struct PollFlag {   // (TICK-060: a poll does not wait for a pending late fix in its flushes)
+        bool prev;
+        explicit PollFlag(bool poll) : prev(tl_poll) { tl_poll = poll; }
+        ~PollFlag() { tl_poll = prev; }
+    } poll_flag(timeout_ns == 0);
     queue_flush_for(FR_WAIT);
     // (HeyListen, TICK-058) RX_VK_FENCE_POLL_FAST=1: a poll (timeout 0) of a fence whose submission was finished whole on its
     // queue skips sync_order_mu below, held by submit_q / present for whole replays (1.4 ms a frame on the main thread). The
@@ -4049,7 +4186,7 @@ void status_tick() {
                           "t_s,gpu_ms,late_wait_ms,late_waits,submit_ms,present_ms,qsubmit_ms,dispatch_ms,astc,tex_made,scatter_mb,"
                           "vram_mb,astc_again,astc_mtexels,"
                           // (TICK-053: the upload command buffers' GPU time, the gaps between recordings on the queue)
-                          "gpu_up_ms,gpu_gap_ms\n");
+                          "gpu_up_ms,gpu_gap_ms,late_fix_ms\n");
         return f;
     }();
     // (TICK-051) seconds since the process started, for the bench's 66 s cut: the steady clock's offset from the creation time
@@ -4072,7 +4209,7 @@ void status_tick() {
         const auto dp = [](int i) { return (prof_ns[i] - l_prof[i]) / 1e6; };
         static uint64_t l_gone;
         const uint64_t gone = texture_destroy_generation();
-        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc, l_gpu_up, l_gpu_gap;
+        static int64_t l_gpu_t, l_late_ns, l_late_n, l_sc, l_astc, l_gpu_up, l_gpu_gap, l_lf_wait;
         static uint64_t l_made_t;
         int64_t late_ns = 0, late_n = 0, sc = 0;
         memory_trace_counts(&late_ns, &late_n, &sc);
@@ -4083,7 +4220,7 @@ void status_tick() {
         uint64_t vused = 0, vallowed = 0;
         vram_usage_now(&vused, &vallowed);
         fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
-                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f,%.2f,%.2f\n",
+                       "%.3f,%.2f,%.2f,%lld,%.2f,%.2f,%.2f,%.2f,%lld,%llu,%.2f,%llu,%lld,%.2f,%.2f,%.2f,%.2f\n",
                 (unsigned long long)frames, (now_ns - last_ns) / 1e6, (long long)(pw - l_pw), pwms - l_pwms, (long long)(ps - l_ps),
                 tr - l_tr, (long long)(up - l_up), (upb - l_upb) / 1048576.0, texture_count(), dp(PROF_MEMSYNC), dp(PROF_PIPE),
                 dp(PROF_UPLOAD), dp(PROF_PROGRAM), dp(PROF_SLOTWAIT), (st_wait_ns - l_wait) / 1e6, dp(PROF_DRAW), dp(PROF_DESC),
@@ -4091,9 +4228,10 @@ void status_tick() {
                 (now_ns + launch_offset_ns) / 1e9, (st_gpu_ns - l_gpu_t) / 1e6, (late_ns - l_late_ns) / 1e6, (long long)(late_n - l_late_n),
                 dp(PROF_SUBMIT), dp(PROF_PRESENT), dp(PROF_QSUBMIT), dp(PROF_DISPATCH), (long long)(astc - l_astc),
                 (unsigned long long)(made - l_made_t), (sc - l_sc) / 1048576.0, (unsigned long long)(vused >> 20),
-                (long long)(again - l_again), (texels - l_texels) / 1e6, (st_gpu_up_ns - l_gpu_up) / 1e6, (st_gpu_gap_ns - l_gpu_gap) / 1e6);
+                (long long)(again - l_again), (texels - l_texels) / 1e6, (st_gpu_up_ns - l_gpu_up) / 1e6, (st_gpu_gap_ns - l_gpu_gap) / 1e6,
+                (st_lf_wait_ns.load(std::memory_order_relaxed) - l_lf_wait) / 1e6);
         l_gpu_t = st_gpu_ns, l_late_ns = late_ns, l_late_n = late_n, l_sc = sc, l_astc = astc, l_made_t = made; l_again = again, l_texels = texels;
-        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns;
+        l_gpu_up = st_gpu_up_ns, l_gpu_gap = st_gpu_gap_ns, l_lf_wait = st_lf_wait_ns.load(std::memory_order_relaxed);
         l_gone = gone;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;
@@ -4896,6 +5034,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     si.pCommandBufferInfos = &cb;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
+    late_fix_wait_unlocked();   // (TICK-060)
     std::unique_lock qk(dev.present_mu);
     if (!pend.cbs.empty()) flush_reason = FR_PRESENT;
     queue_flush_locked();

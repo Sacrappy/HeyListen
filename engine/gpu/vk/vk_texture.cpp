@@ -1006,6 +1006,8 @@ LevelGeo level_geo(const Texture& tex, uint32_t level) {   // (level: the image'
 const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scratch) {
     uint64_t avail = 0;
     const uint8_t* p = host->gpu_ptr(gpu, &avail);
+    // (TICK-060m, RX_VK_LATE_DEFER) a late page here whose fix is pending: guest memory has the write-back only once its value is done
+    if (gpu < (1ull << 40)) memory_late_fix_wait_range(gpu, n);
     // (below 1 TB the GPU address is the guest's: the storage as it was at the submit being replayed, where the game has
     // rewritten it since (vk_memory.cpp, "texture storage in the capture"))
     if (p && avail >= n) return gpu < (1ull << 40) ? memory_as_submitted(gpu, p, n, scratch) : p;
@@ -3409,6 +3411,7 @@ bool readback_submit_wait() {
     si.pCommandBufferInfos = &cb;
     vkResetFences(dev.device, 1, &rb_fence);
     {
+        late_fix_wait_unlocked();   // (TICK-060: a pending late fix waited for outside the queue's lock)
         std::lock_guard qk(dev.present_mu);   // (one queue: submits and presents take turns)
         queue_flush_locked();
         if (vkQueueSubmit2(dev.queue, 1, &si, rb_fence) != VK_SUCCESS) return false;
@@ -3827,6 +3830,7 @@ bool sparse_flush(Texture* tex) {
         // each made its other races worse)
         static const bool no_idle = getenv("RX_VK_SPARSE_IDLE") == nullptr;
         static int64_t binds;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard qk(dev.present_mu);
         queue_flush_locked();
         if (!no_idle) vkQueueWaitIdle(dev.queue);

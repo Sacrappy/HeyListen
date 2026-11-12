@@ -25,9 +25,14 @@ def main():
     args = parser.parse_args()
     source = (ROOT / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
     start = source.index("struct ClaimJob;\nstruct CopyPart {")
-    cp = source.index("void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok) {", start)
+    cp = source.index("void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok", start)
     end = source.index("\n}\n", cp) + 3
     block = source[start:end]
+    # (TICK-060's capture hashes, RX_VK_CAPTURE_HASH, sit between: cut out, with stubs below; the claimed copy makes none)
+    h0 = block.find("// (HeyListen TICK-060) RX_VK_CAPTURE_HASH")
+    if h0 >= 0:
+        h1 = block.index("std::atomic<int64_t> st_hash_made{0}", h0)
+        block = block[:h0] + block[block.index(chr(10), h1) + 1:]
     for need in ("claim_all(job, helpers);", "if (w.claim) w.claim->users++;", "copy_helpers.done.wait(lk, [&job] { return job.users == 0; });"):
         if need not in block:
             raise SystemExit("the claimed copy is not as this check knows it: " + need)
@@ -71,6 +76,9 @@ static bool guarded_copy(void* dst, const void* src, size_t n) {
 static bool guarded_copy_stream(void* dst, const void* src, size_t n) { return guarded_copy(dst, src, n); }
 static bool stream_on() { return (std::getenv("STREAM") != nullptr); }
 static void stream_fence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+namespace msync_diff { constexpr int kChunks = 16; }
+static bool guarded_copy_hash(uint8_t*, const uint8_t*, uint64_t*, bool) { std::abort(); }
+static std::atomic<int64_t> st_hash_made{0};
 ''' + block + r'''
 static uint64_t rng = 0x9E3779B97F4A7C15ull;
 static uint64_t nx() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }

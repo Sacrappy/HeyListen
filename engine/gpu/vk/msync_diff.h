@@ -84,6 +84,37 @@ inline void page_hash(const uint8_t* page, uint64_t h[kChunks]) {
     for (unsigned c = 0; c < kChunks; c++) h[c] = chunk_hash(page + c * kChunk);
 }
 
+/// (HeyListen TICK-060) A page copied src -> dst and the 16 hashes of the bytes copied (page_hash(dst) after the copy), in one
+/// pass: each 32-byte load is stored and hashed from the same register, so the hashes are those of what dst received even when
+/// src changes meanwhile. With AVX2 the stores are streaming ones when dst is 32-byte aligned (as the capture's copy: the caller
+/// fences them; stream false: plain stores); without AVX2 a copy, then page_hash of dst
+inline void copy_hash_page(uint8_t* dst, const uint8_t* src, uint64_t h[kChunks], bool stream = true) {
+#if defined(__AVX2__)
+    const bool nt = stream && ((uintptr_t)dst & 31) == 0;
+    for (unsigned c = 0; c < kChunks; c++) {
+        __m256i acc = _mm256_load_si256((const __m256i*)kKeys.init);
+        const uint8_t* p = src + c * kChunk;
+        uint8_t* q = dst + c * kChunk;
+        for (int s = 0; s < 8; s++) {
+            const __m256i v = _mm256_loadu_si256((const __m256i*)(p + s * 32));
+            if (nt) _mm256_stream_si256((__m256i*)(q + s * 32), v);
+            else _mm256_storeu_si256((__m256i*)(q + s * 32), v);
+            const __m256i dk = _mm256_xor_si256(v, _mm256_load_si256((const __m256i*)kKeys.k[s]));
+            const __m256i prod = _mm256_mul_epu32(dk, _mm256_srli_epi64(dk, 32));
+            const __m256i swapped = _mm256_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2));
+            acc = _mm256_add_epi64(acc, _mm256_add_epi64(swapped, prod));
+        }
+        alignas(32) uint64_t a[4];
+        _mm256_store_si256((__m256i*)a, acc);
+        h[c] = finish(a);
+    }
+#else
+    (void)stream;
+    std::memcpy(dst, src, 4096);
+    page_hash(dst, h);
+#endif
+}
+
 /// A chunk mask widened to groups of `group` chunks
 inline uint32_t group_mask(uint32_t m, unsigned group) {
     if (group <= 1) return m & 0xffffu;

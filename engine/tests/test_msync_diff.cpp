@@ -78,6 +78,25 @@ int main() {
         CHECK(back == m);
         CHECK(n <= 8);
     }
+    {   // (TICK-060) copy_hash_page: dst gets src's bytes and h page_hash(dst), aligned (streaming stores) and not
+        alignas(64) static uint8_t src[4096], dst[4096 + 64];
+        for (int round = 0; round < 500; round++) {
+            for (auto& b : src) b = (uint8_t)rng();
+            if (round % 5 == 0) std::memset(src + (rng() % 16) * kChunk, 0, kChunk);
+            for (unsigned off : {0u, 8u, 32u}) {
+                uint8_t* d = dst + off;
+                std::memset(d, 0xcd, 4096);
+                uint64_t h[kChunks], ref[kChunks];
+                copy_hash_page(d, src, h);
+#if defined(__AVX2__)
+                _mm_sfence();
+#endif
+                CHECK(std::memcmp(d, src, 4096) == 0);
+                page_hash(src, ref);
+                CHECK(std::memcmp(h, ref, sizeof h) == 0);
+            }
+        }
+    }
     std::printf("%s (%s)\n", fails ? "FAILED" : "msync_diff ok",
 #if defined(__AVX2__)
                 "AVX2"
