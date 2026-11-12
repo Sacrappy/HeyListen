@@ -50,8 +50,20 @@ MARK_NATIVE_64 = r"""extern uint8_t a64_dirty[A64_DIRTY_PAGES];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
 #define A64_DIRTY_AT(a) (((uint64_t)(a) >> 12) & (A64_DIRTY_PAGES - 1))
+#if defined(A64_GRAN)
+/* (HeyListen, sprint 5; -DA64_GRAN, off by default) a mark per 512 bytes too, eight to a page, set before the page's: a capture
+   that takes a page's mark then takes its eight (host/rx_backend.c hos_gran_take) and copies only what was written. A store is
+   at most 64 bytes (DC ZVA): its first and last byte's granules are all it touches. */
+extern uint8_t *a64_gran;
+#define A64_GRAN_AT(a) (((uint64_t)(a) >> 9) & (A64_DIRTY_PAGES * 8 - 1))
+#define A64_MARK(a, n) (__atomic_store_n(&a64_gran[A64_GRAN_AT(a)], 1, __ATOMIC_RELEASE), \
+                        __atomic_store_n(&a64_gran[A64_GRAN_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE), \
+                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
+                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
+#else
 #define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))"""
+                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
+#endif"""
 
 SUBST = {
     "a64.h": [
@@ -64,7 +76,8 @@ SUBST = {
     "a64_rt.c": [
         (LOOKUP, "#if A64_ADDR64\n    if (addr >> 32) return NULL;   /* (code lies below 4 GB: never a truncated match) */\n"
                  "#endif\n" + LOOKUP),
-        ("uint8_t a64_dirty[1u << 20];", "uint8_t a64_dirty[A64_DIRTY_PAGES];"),
+        ("uint8_t a64_dirty[1u << 20];", "uint8_t a64_dirty[A64_DIRTY_PAGES];\n#if defined(A64_GRAN)\n"
+         "uint8_t *a64_gran;   /* (nx2/rtgen.py: 8 marks a page, reserved and committed by host/hos_mem.c hos_gran_init) */\n#endif"),
     ],
 }
 

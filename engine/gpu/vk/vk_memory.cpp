@@ -809,6 +809,9 @@ struct Capture {
     // them (0: none, the mirror sync hashes the slot as before)
     std::vector<uint64_t> hashes;
     std::vector<uint8_t> hok;
+    // (sprint 5, RX_VK_CAPTURE_GRAN) slot i's written granules, bit k = its k-th 512 bytes hold the page's (0xff: all of it);
+    // empty: every slot whole
+    std::vector<uint8_t> gmask;
 };
 std::mutex cap_mu;
 std::deque<std::unique_ptr<Capture>> captures;
@@ -854,7 +857,47 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
 // (each kept capture's copy on the GPU, by its generation)
 struct CapHash { std::vector<uint64_t> h; std::vector<uint8_t> ok; };   // (TICK-060: a kept capture's slot hashes, see Capture)
 struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0;
-                std::shared_ptr<CapHash> hash = {}; };
+                std::shared_ptr<CapHash> hash = {};
+                std::shared_ptr<std::vector<uint8_t>> gmask = {}; };   // (sprint 5: see Capture::gmask; null: every slot whole)
+// ---- (HeyListen, sprint 5) RX_VK_CAPTURE_GRAN=1, with a game built with A64_GRAN=1 (off): the capture by written granules ----
+// A capture copied every page the game wrote since the last submit, whole: ~11,900 pages a frame at the Market (46 MB, at the
+// memory bus's speed: 1.3-1.9 ms on the frame's loop), of which ~1 MB of words differs from their last copy. The lifted stores
+// now mark the 512 bytes they write too (nx2/rtgen.py A64_MARK, host/hos_mem.c hos_gran_take), and a capture copies only the
+// granules written, into the page's slot at their place: the rest of the slot is not the page's. What reads a slot follows:
+// - a mirror sync copies the slot's granules only (the chunk mask TICK-048's diff already has);
+// - a granule set holds what was written since the page's last capture THAT A SYNC COPIED: a pool synced later than the next
+//   capture of the page would miss the first one's granules, so a capture adds the granules of the page's entry while no sync
+//   has copied that entry (PageX::syn < the entry's generation), read from guest memory, where they are unchanged since (no
+//   mark came). That is what the whole page gave, for those granules;
+// - a read of guest memory as submitted takes the slot's granules over what guest memory holds; a page read that way is
+//   captured whole from then on (PageX::full), as are the pages of a texture's storage (their shadow is a whole page), a page
+//   whose mark came without granules (given back by the host), and every page when the chunk diff, the pre-copy or the
+//   replay's own thread is on;
+// - a late page's copies (the take's wait, the late fix) stay whole pages: more than the mask says is the page's, never less.
+struct PageX { uint32_t syn; uint8_t gm; uint8_t full; uint16_t pad; };   // (the generation a sync copied it at; its entry's mask)
+std::atomic<PageX*> pagex_chunks[(1ull << 27) / 65536];
+inline PageX* pagex(uint64_t page, bool make) {
+    if (page >= (1ull << 27)) return nullptr;
+    std::atomic<PageX*>& c = pagex_chunks[page >> 16];
+    PageX* p = c.load(std::memory_order_acquire);
+    if (!p) {
+        if (!make) return nullptr;
+        PageX* n = (PageX*)calloc(65536, sizeof(PageX));
+        if (c.compare_exchange_strong(p, n, std::memory_order_acq_rel)) p = n;
+        else free(n);
+    }
+    return p + (page & 65535);
+}
+typedef void (*GranTakeFn)(const uint32_t*, int64_t, uint8_t*);
+GranTakeFn gran_take_fn();
+bool capture_gran_on();
+std::atomic<int64_t> st_gran_pages{0}, st_gran_bytes{0}, st_gran_full{0}, st_gran_union{0}, st_gran_made_full{0};
+inline uint32_t gran_chunk_mask(uint8_t m8) {   // (a granule is two of the diff's 256-byte chunks)
+    uint32_t m = 0;
+    for (int k = 0; k < 8; k++)
+        if (m8 >> k & 1) m |= 3u << (2 * k);
+    return m;
+}
 std::vector<std::shared_ptr<CapHash>> cap_hash_free;   // (pools_mu: retired captures' hash arrays, their capacity kept)
 std::map<uint32_t, CapBuf> cap_bufs;
 uint64_t cap_bytes = 0;
@@ -1278,6 +1321,19 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
                     continue;
                 }
             }
+            if (const uint8_t gm = b->second.gmask && e.slot < b->second.gmask->size() ? (*b->second.gmask)[e.slot] : 0xff; gm != 0xff) {
+                // (sprint 5: its granules only, over what guest memory holds; the page whole from its next capture on)
+                for (unsigned k = 0; k < 8; k++) {
+                    if (!(gm >> k & 1)) continue;
+                    const uint64_t g0 = (page << kPageShift) + (uint64_t)k * 512, a2 = std::max(a, g0), z2 = std::min(z, g0 + 512);
+                    if (a2 < z2)
+                        std::memcpy((uint8_t*)dst + (a2 - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a2 - (page << kPageShift)), z2 - a2);
+                }
+                if (PageX* x = pagex(page, true); x && !x->full) x->full = 1, st_gran_made_full.fetch_add(1, std::memory_order_relaxed);
+                late_read = true;   // (not kept as the page's whole copy below)
+                from++;
+                continue;
+            }
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
         }
@@ -1289,7 +1345,8 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             const CapEntry e = cap_entry(page0);
             if (e.gen && e.gen == submitted_page.pgen) {
                 auto b = cap_bufs.find(e.gen);
-                if (b != cap_bufs.end() && b->second.map) {
+                if (b != cap_bufs.end() && b->second.map &&
+                    !(b->second.gmask && e.slot < b->second.gmask->size() && (*b->second.gmask)[e.slot] != 0xff)) {
                     std::memcpy(submitted_page.bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
                     submitted_page.overlay = true;
                 }
@@ -1742,6 +1799,66 @@ void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok, uin
     copy_helpers.done.wait(lk, [] { return copy_helpers.pending == 0; });
 }
 
+// (sprint 5, RX_VK_CAPTURE_GRAN) pages [i0, i1) copied by their granule masks: whole pages in runs as copy_part, the others
+// run of granules by run, each into its place in the page's slot
+struct GranCopy { const uint32_t* pages; uint8_t* masks; uint8_t* out; uint8_t* ok; };
+void gran_copy_chunk(void* ctx, int64_t i0, int64_t i1) {
+    const GranCopy& w = *(const GranCopy*)ctx;
+    {   // (the chunk's granule marks taken and made the slots' masks here, on whichever thread copies it: ~9,000 cold marks a frame)
+        gran_take_fn()(w.pages + i0, i1 - i0, w.masks + i0);
+        int64_t full = 0, uni = 0;
+        for (int64_t i = i0; i < i1; i++) {
+            uint8_t m = w.masks[i];
+            PageX* x = pagex(w.pages[i], true);
+            if (!m || !x || x->full) m = 0xff;
+            else if (const CapEntry e = cap_entry(w.pages[i]); e.gen && x->syn < e.gen) {   // (its last capture not yet synced)
+                if ((m | x->gm) != m) uni++;
+                m |= x->gm;
+            }
+            w.masks[i] = m, full += m == 0xff;
+        }
+        st_gran_pages.fetch_add(i1 - i0, std::memory_order_relaxed), st_gran_full.fetch_add(full, std::memory_order_relaxed);
+        st_gran_union.fetch_add(uni, std::memory_order_relaxed);
+    }
+    uint8_t* const base = (uint8_t*)host->guest_base();
+    const uint64_t gsize = host->guest_size();
+    const bool stream = stream_on();
+    int64_t bytes = 0;
+    for (int64_t i = i0; i < i1;) {
+        const uint64_t ga = (uint64_t)w.pages[i] << kPageShift;
+        if (ga + 4096 > gsize) { i++; continue; }
+        if (w.masks[i] == 0xff) {
+            int64_t j = i + 1;
+            while (j < i1 && w.masks[j] == 0xff && w.pages[j] == w.pages[j - 1] + 1 && ((uint64_t)w.pages[j] << kPageShift) + 4096 <= gsize) j++;
+            if (stream ? guarded_copy_stream(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)
+                       : guarded_copy(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)) {
+                std::memset(w.ok + i, 1, (size_t)(j - i));
+            } else {
+                for (int64_t q = i; q < j; q++)
+                    w.ok[q] = guarded_copy(w.out + (uint64_t)q * 4096, base + ((uint64_t)w.pages[q] << kPageShift), 4096);
+            }
+            bytes += (j - i) * 4096;
+            i = j;
+            continue;
+        }
+        bool ok = true;
+        const unsigned m = w.masks[i];
+        for (unsigned k = 0; k < 8;) {
+            if (!(m >> k & 1)) { k++; continue; }
+            unsigned e = k + 1;
+            while (e < 8 && (m >> e & 1)) e++;
+            const uint64_t off = (uint64_t)k * 512, len = (uint64_t)(e - k) * 512;
+            ok &= stream ? guarded_copy_stream(w.out + (uint64_t)i * 4096 + off, base + ga + off, (SIZE_T)len)
+                         : guarded_copy(w.out + (uint64_t)i * 4096 + off, base + ga + off, (SIZE_T)len);
+            bytes += (int64_t)len;
+            k = e;
+        }
+        w.ok[i] = ok ? 1 : 0;
+        i++;
+    }
+    if (stream) stream_fence();
+    st_gran_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
 std::unique_ptr<Capture> capture_make();
 void shadow_written(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the CPU wrote)
 void shadow_free(Pool& p);
@@ -2231,6 +2348,31 @@ std::unique_ptr<Capture> capture_make() {
         else if (v) vk_timeline_wait(v);
     }
     if (n > 0) shadow_written(pages, n);
+    {   // (sprint 5, RX_VK_GRAN_DIAG=1, with a game built with A64_GRAN=1: the 512-byte granules written of each captured page)
+        static const bool on = getenv("RX_VK_GRAN_DIAG") != nullptr;
+        typedef void (*GranTake)(const uint32_t*, int64_t, uint8_t*);
+        static const GranTake take = on ? (GranTake)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gran_take") : nullptr;
+        if (take && n > 0) {
+            static std::mutex mu;
+            static int64_t caps, pages_n, gran_n, hist[9];
+            static std::vector<uint8_t> masks;
+            std::lock_guard lk(mu);
+            masks.assign((size_t)n, 0);
+            take(pages, n, masks.data());
+            for (int64_t i = 0; i < n; i++) {
+                const int k = __builtin_popcount(masks[i]);
+                hist[k]++, pages_n++, gran_n += k ? k : 8;
+            }
+            if (++caps % 600 == 0) {
+                char line[256];
+                int m = 0;
+                for (int k = 0; k <= 8; k++) m += snprintf(line + m, sizeof line - m, " %d:%.0f", k, hist[k] / 100.0), hist[k] = 0;
+                logf("vk: granules (a frame of 6 captures): %.0f pages, %.0f granules written of %.0f (%.1f%%; a page with none counts whole); "
+                     "pages by granules written:%s", pages_n / 100.0, gran_n / 100.0, pages_n * 8 / 100.0, 100.0 * gran_n / (pages_n * 8.0), line);
+                pages_n = gran_n = 0;
+            }
+        }
+    }
     {   // (sprint 5, RX_VK_CAPTURE_WHERE=1: the captures' pages by 16 MB of guest addresses, every 600 captures)
         static const bool on = getenv("RX_VK_CAPTURE_WHERE") != nullptr;
         if (on) {
@@ -2275,7 +2417,28 @@ std::unique_ptr<Capture> capture_make() {
         flush_mapped(c->alloc, c->nbytes);
     } else if (n > 0) {
         c->pages.assign(pages, pages + n);
-        if ((uint64_t)n * 4096 <= (256ull << 20) &&   // (a load writes more: those are read later, as before)
+        c->gmask.clear();
+        const bool gran = capture_gran_on();
+        if (gran) c->gmask.assign((size_t)n, 0);   // (sprint 5: made by the copy's chunks, gran_copy_chunk)
+        if (gran && (uint64_t)n * 4096 <= (256ull << 20) && cap_buf_get((uint64_t)n * 4096, c->buffer, c->alloc, c->map, c->bsize)) {
+            static thread_local std::vector<uint8_t> ok;
+            ok.assign((size_t)n, 0);
+            GranCopy w{pages, c->gmask.data(), (uint8_t*)c->map, ok.data()};
+            const int helpers = copy_helper_count();
+            if (!helpers || n < 128) gran_copy_chunk(&w, 0, n);
+            else {
+                ClaimJob job{nullptr, n, nullptr, nullptr, claim_chunk_pages(n, helpers + 1)};
+                job.fn = gran_copy_chunk, job.ctx = &w;
+                claim_all(job, helpers);
+            }
+            for (int64_t i = 0; i < n; i++)
+                if (ok[i] && (deferred.empty() || std::find(deferred.begin(), deferred.end(), pages[i]) == deferred.end()))
+                    c->copied.push_back(pages[i]), c->slots.push_back((uint32_t)i);
+            c->nbytes = (size_t)n * 4096;
+            flush_mapped(c->alloc, c->nbytes);
+        } else if (gran) {
+            c->gmask.clear();   // (no buffer: no slots)
+        } else if ((uint64_t)n * 4096 <= (256ull << 20) &&   // (a load writes more: those are read later, as before)
             cap_buf_get((uint64_t)n * 4096, c->buffer, c->alloc, c->map, c->bsize)) {
             static thread_local std::vector<uint8_t> ok;
             ok.assign((size_t)n, 0);
@@ -2345,6 +2508,14 @@ std::unique_ptr<Capture> capture_make() {
                  "copied (%.1f MB)", ms / 600, ms_lock / 600, ms_scan / 600, mirrored.size(),
                  (unsigned long long)(span >> 20), ms_copy / 600, written / 600.0, copied / 600.0, copied * 4096.0 / 600 / 1048576);
             ms = ms_lock = ms_scan = ms_copy = 0, written = copied = 0;
+            if (capture_gran_on()) {
+                const int64_t pg = st_gran_pages.exchange(0), by = st_gran_bytes.exchange(0), fu = st_gran_full.exchange(0),
+                              un = st_gran_union.exchange(0);
+                logf("vk: capture by granules (RX_VK_CAPTURE_GRAN): a submit %.0f pages, %.2f MB copied (%.0f%% of their bytes), %.0f whole, "
+                     "%.0f with granules of an entry no sync had copied; %lld pages made whole so far (read as submitted, a texture's storage)",
+                     pg / 600.0, by / 600.0 / 1048576, pg ? 100.0 * by / (pg * 4096.0) : 0.0, fu / 600.0, un / 600.0,
+                     (long long)st_gran_made_full.load());
+            }
             if (pre_on) {
                 int64_t again, left, runs, grown;
                 {
@@ -2832,6 +3003,24 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         }
         pages_collected += c->pages.size();
     }
+    if (!c->gmask.empty() && c->map && tex_capture_on()) {   // (sprint 5, RX_VK_CAPTURE_GRAN: a texture's storage is taken whole)
+        // (a page of it copied by granules: the rest of its slot from guest memory now, a few microseconds after the capture's
+        // copy (a late page's copy does the same later), and the page whole from its next capture on: the shadow below is a page)
+        std::lock_guard sk(shadow_mu);
+        if (!tex_merged.empty()) {
+            uint8_t* const base = (uint8_t*)host->guest_base();
+            for (size_t i = 0; i < c->copied.size(); i++) {
+                const uint32_t s = c->slots[i];
+                if (c->gmask[s] == 0xff || !in_tex_merged((uint64_t)c->copied[i] << 12)) continue;
+                for (unsigned k = 0; k < 8; k++)
+                    if (!(c->gmask[s] >> k & 1))
+                        guarded_copy((uint8_t*)c->map + (uint64_t)s * 4096 + k * 512, base + ((uint64_t)c->copied[i] << kPageShift) + k * 512, 512);
+                c->gmask[s] = 0xff;
+                if (PageX* x = pagex(c->copied[i], true)) x->full = 1;
+                st_gran_made_full.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     if (!c->pages.empty() && tex_capture_on()) {   // (the texture storage it took: the shadow, as of this submit)
         std::lock_guard sk(shadow_mu);
         shadow_seq++;
@@ -2916,6 +3105,12 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             ch->h.swap(c->hashes);
             ch->ok.swap(c->hok);
             b.hash = std::move(ch);
+        }
+        if (!c->gmask.empty()) {   // (sprint 5: the slots' granules kept with the buffer, and each page's with its entry)
+            for (size_t i = 0; i < c->copied.size(); i++)
+                if (PageX* x = pagex(c->copied[i], true)) x->gm = c->gmask[c->slots[i]];
+            b.gmask = std::make_shared<std::vector<uint8_t>>();
+            b.gmask->swap(c->gmask);
         }
         c->buffer = VK_NULL_HANDLE, c->alloc = nullptr, c->map = nullptr, c->bsize = 0;
         cap_bufs.emplace(g, b);
@@ -3984,6 +4179,21 @@ int diff_mode() {
     }();
     return v;
 }
+GranTakeFn gran_take_fn() {
+    static const GranTakeFn f = (GranTakeFn)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gran_take");
+    return f;
+}
+bool capture_gran_on() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_CAPTURE_GRAN");
+        const bool want = e && atoi(e) != 0;
+        const bool on = want && gran_take_fn() && !diff_mode() && !precopy_on() && !(getenv("RX_VK_ASYNC") && atoi(getenv("RX_VK_ASYNC")) != 0);
+        if (want) logf("vk: the capture by written granules: %s (RX_VK_CAPTURE_GRAN)", on ? "on" : !gran_take_fn() ? "off: the game was not built with A64_GRAN" : "off: the chunk diff, the pre-copy or RX_VK_ASYNC is on");
+        return on;
+    }();
+    return v;
+}
+
 unsigned diff_group() {
     static const unsigned v = getenv("RX_VK_MSYNC_DIFF_GROUP") ? std::clamp(atoi(getenv("RX_VK_MSYNC_DIFF_GROUP")), 1, 16) : 1;
     return v;
@@ -4145,7 +4355,11 @@ int64_t mirror_sync(Pool& p) {
             if (e.gen && e.gen == pg) {
                 auto b = fast && e.gen == last_gen ? last_buf : cap_bufs.find(e.gen);
                 if (fast) last_gen = e.gen, last_buf = b;
-                if (b != cap_bufs.end()) {
+                // (sprint 5) the slot's granules; a page the pool cuts with a partial slot is copied from guest memory below
+                const uint8_t gm8 = b != cap_bufs.end() && b->second.gmask && e.slot < b->second.gmask->size() ? (*b->second.gmask)[e.slot] : 0xff;
+                const bool gcut = gm8 != 0xff && (std::min((page + 1) << kPageShift, p.hi) - std::max(page << kPageShift, p.lo)) != 4096;
+                if (b != cap_bufs.end() && !gcut) {
+                    if (PageX* x = pagex(page, false)) x->syn = pg;
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
                     const uint64_t src0 = (uint64_t)e.slot * 4096 + (ga - (page << kPageShift));
                     // (TICK-053) a late page, merged: the words the CPU changed since the mirror's last sync of the page, from
@@ -4175,7 +4389,7 @@ int64_t mirror_sync(Pool& p) {
                         if (seg) st_late_seg.fetch_add(1, std::memory_order_relaxed);
                         s.mid = 0;   // (copied whole below, in a segment or cut: the shadow does not say what the mirror holds)
                     }
-                    uint32_t mask = 0xffff;   // (TICK-048: the chunks to copy)
+                    uint32_t mask = gm8 != 0xff ? gran_chunk_mask(gm8) : 0xffff;   // (TICK-048: the chunks to copy; sprint 5: the granules)
                     if (dmode) {
                         // (TICK-060) a late slot whose fix is pending: its bytes are not yet the ones the GPU will copy: whole, no hash
                         const bool late_pending = late_fix_slot_pending(e.gen, e.slot, nullptr);
@@ -4242,6 +4456,7 @@ int64_t mirror_sync(Pool& p) {
             }
         }
         if (dirty) {
+            if (PageX* x = pagex(page, false)) x->syn = pg;   // (sprint 5: the whole page as it is now: its entry's granules are in)
             st_sync_live_pages++;   // (dirty, not in this submit's capture: guest memory as it is now)
             live_by_pool[p.lo]++;
             d_void(page);
@@ -5248,6 +5463,15 @@ bool mirror_make(Pool& pool) {
                 auto b = cap_bufs.find(e.gen);
                 if (b == cap_bufs.end()) continue;
                 const uint64_t ga = std::max(page << kPageShift, p->lo), gb = std::min((page + 1) << kPageShift, p->hi);
+                if (const uint8_t gm = b->second.gmask && e.slot < b->second.gmask->size() ? (*b->second.gmask)[e.slot] : 0xff; gm != 0xff) {
+                    for (unsigned k = 0; k < 8; k++) {   // (sprint 5: the slot's granules only)
+                        if (!(gm >> k & 1)) continue;
+                        const uint64_t g0 = (page << kPageShift) + (uint64_t)k * 512, a2 = std::max(ga, g0), z2 = std::min(gb, g0 + 512);
+                        if (a2 < z2) over[b->second.buffer].push_back({(uint64_t)e.slot * 4096 + (a2 - (page << kPageShift)), a2 - p->lo, z2 - a2});
+                    }
+                    b->second.last_use = std::max(b->second.last_use, mem_rec_value);
+                    continue;
+                }
                 over[b->second.buffer].push_back({(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p->lo, gb - ga});
                 b->second.last_use = std::max(b->second.last_use, mem_rec_value);
             }

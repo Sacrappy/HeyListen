@@ -500,6 +500,8 @@ def ffmpeg_version_key():
 # instead of Windows' write watch (GetWriteWatch over the 6 GB MKW's GPU sees took ~20 ms a scan, in one thread or
 # four: the race's replay waited ~12 ms a frame for it). RX_SOFT_WRITE_WATCH=0: Windows' write watch (a full rebuild)
 WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WRITE_TRACK"]
+if WRITE_TRACK and os.environ.get("A64_GRAN") == "1":   # (HeyListen, sprint 5: a write mark per 512 bytes too, nx2/rtgen.py)
+    WRITE_TRACK = WRITE_TRACK + ["-DA64_GRAN"]
 
 # (hookshot) the host CPU the lifted game and the runtime are built for: x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT,
 # MOVBE; Haswell and Zen 1 on). With FMA the FPX1 fast paths cover double-precision FMA (RECOMP_FPX_FMA64; it took

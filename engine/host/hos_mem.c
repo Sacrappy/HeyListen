@@ -175,9 +175,32 @@ void hos_region_free(uint64_t addr) {
 void hos_mark_written(const void *p, size_t n) {
     const uintptr_t a = (uintptr_t)p - (uintptr_t)A64_MEM;
     if (!n || (uintptr_t)p < (uintptr_t)A64_MEM || a >= HOS_GUEST_SPACE) return;
+#if defined(A64_GRAN)
+    for (uintptr_t g = a >> 9; g <= (a + n - 1) >> 9 && g < A64_DIRTY_PAGES * 8; g++)   /* (before the pages': rtgen.py A64_MARK) */
+        __atomic_store_n(&a64_gran[g], 1, __ATOMIC_RELEASE);
+#endif
     for (uintptr_t q = a >> 12; q <= (a + n - 1) >> 12 && q < A64_DIRTY_PAGES; q++)
         __atomic_store_n(&a64_dirty[q], 1, __ATOMIC_RELEASE);
 }
+#if defined(A64_GRAN)
+/* (HeyListen, sprint 5) the granule marks: 1 GB of address space, committed whole (no physical memory until touched), before any
+   guest code runs */
+__attribute__((constructor)) static void hos_gran_init(void) {
+    a64_gran = (uint8_t *)VirtualAlloc(NULL, A64_DIRTY_PAGES * 8, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!a64_gran) { fprintf(stderr, "a64_gran: no address space\n"); abort(); }
+}
+/* The granule marks of n pages taken (read and cleared): masks[i] bit k = the page's k-th 512 bytes were written. 0 for a
+   page whose mark came without them (a page given back to the marks: the whole page then). Exported: the Vulkan back end finds
+   it by name. */
+__declspec(dllexport) void hos_gran_take(const uint32_t *pages, int64_t n, uint8_t *masks) {
+    for (int64_t i = 0; i < n; i++) {
+        const uint64_t w = __atomic_exchange_n((uint64_t *)(a64_gran + (uint64_t)pages[i] * 8), 0, __ATOMIC_ACQUIRE);
+        uint8_t m = 0;
+        for (int k = 0; k < 8; k++) m |= (uint8_t)(((w >> (8 * k)) & 0xFF) ? 1u << k : 0);
+        masks[i] = m;
+    }
+}
+#endif
 #endif
 
 /* (hookshot) a heap of size bytes ends below the address regions and the guest window's end (no wrap-around: the size

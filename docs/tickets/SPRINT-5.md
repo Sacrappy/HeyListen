@@ -103,6 +103,21 @@ One run a scene with shots (mean luma alike, speed 59.9-60.2): kokiri-idle 80.9 
   exposure moves (shots 96-140 against 64-107). 80.5-85 fps, no clear gain. Not merged; three source-reading tests would need
   to follow (test_late_defer, test_invalidate_vcore, test_readback_ticket).
 
+## Session 3 (2026-11-12): the capture by written granules, built and measured: no gain
+
+The first item of the list below, done: a write mark per 512 bytes (`A64_GRAN=1` at build time: `nx2/rtgen.py` A64_MARK,
+`host/hos_mem.c` `hos_gran_take`; 1 GB of address space for the marks) and a capture that copies only the granules written
+(`RX_VK_CAPTURE_GRAN=1`: `vk_memory.cpp`, the comment above `struct PageX`). Both off: the default build is as before.
+- Written granules (`RX_VK_GRAN_DIAG=1`): 37% of the captured pages' bytes (9,100-9,300 pages a frame: 3,400 with one granule,
+  900-1,100 whole). With the pages kept whole (a texture's storage, read as submitted: ~380) and the granules of entries no
+  sync had copied yet, 39-41% of the bytes are copied: 6.4 -> 2.5 MB a submit, the copy 0.16 -> 0.12 ms a submit, the GPU's
+  tail 2.0 -> 1.5 ms.
+- The picture is right (shots: castle-move 105-106, hyrule-walk 86-123, as the reference's).
+- **fps, castle-move, 3 interleaved rounds:** the checkpoint 83.3; the marks alone 81.6 (**the two more stores a guest store
+  cost 1.7 fps**); marks + granule capture 82.4, and 83.3 against 82.3 with the masks made on the copy's threads. With every
+  barrier dropped too (`RX_VK_TEST_BARRIER_DROP`) 86.8, as the drop alone (87.5): nothing adds up.
+- Decision: not adopted. What the capture saves is paid by the marks; the frame's other chains hold it where it was.
+
 ## Where this leaves the 120 fps goal (2026-11-12)
 
 Target since 2026-11-12 07:00: 120 fps average in Kokiri Forest, Hyrule Field and the castle town, no drop under 110 while
@@ -117,9 +132,7 @@ Three chains of ~11-12 ms each hold the frame, and each was seen to bind once an
 3. **The processors**: ~6.7 threads' worth of work on 8 cores; executors, recorders and helpers share cores at the peaks.
 
 What would move it, largest first (none is a switch; each is a piece of engine work with a picture risk):
-- **The capture by written bytes, not by page** (finer write marks in the lifted stores, slots that hold only what was written):
-  46 MB -> ~8-12 MB a frame; -1 ms on the sync loop, less bus traffic for the game's own code, smaller GPU uploads. The six
-  readers of the capture table (mirror syncs, reads as submitted, late fixes, texture shadows) must take partial slots.
+- ~~The capture by written bytes, not by page~~: built in session 3 (above); no gain, the marks cost what the copy saves.
 - **A wider job system** (twelve executors: a patch of the game's per-core tables, f_80b5e9e0 and its users): up to -1.6 ms
   of the game's chain. High risk.
 - **GPU time**: barriers only where a hazard is (bound: -1 ms), the 136 dispatches' global-memory emulation, a lower render
