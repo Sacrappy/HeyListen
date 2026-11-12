@@ -83,3 +83,68 @@ Game folder on PC 3050: build `t60e` (exe 17c3e4fb, dll 2dc76b85); main32d kept 
   fps in a screen (confirm both on PC 3050, and the main PC).
 - Then the GPU: ~22 ms of busy time a frame at 1440p (the game's passes and compute); at ~43 fps the GPU becomes the limit.
 - The trace's gpu_ms misses SEG_EARLY's early segments (no timestamps there): add them before measuring it.
+
+## Main-PC check (TICK-060m, 2026-11-11/12): review, fixes, A/B on the Ryzen 7 7800X3D + RTX 5070
+Branch `feature/TICK-060-main` (local main 43cc30f + this branch, worktree `HeyListen-wt/TICK-060m`); details and every table:
+`docs/benchmarks/2026-11-12-tick060-pc3050.md`, section 9.
+
+### Review of RX_VK_LATE_DEFER and RX_VK_CAPTURE_HASH
+- **Held recordings vs their fix: one real bug, fixed.** A capture's late value is the newest write-back of *its own* late pages, so
+  the next capture's can be lower (its late pages written back by an older submission still on the GPU). The fixes' queue assumed
+  rising values: `memory_late_fix_apply` applied from the front only and set `late_fix_top` to the *back's* value. With fixes
+  [10, 8] pending, the top was 8: a flush (`late_fix_flush_locked`) waited for 8, applied nothing (the front, 10, not reached) and
+  sent the held recordings that read the unfixed late slots of the first capture; the GPU could then pass that capture's
+  submission and `take_capture` retire its buffer into `cap_free` while the fix still pointed at it (a later fix would write into
+  another capture's buffer). Now every fix whose value is reached is applied, in any position, and the top is the highest pending
+  value (`late_fix_push` only raises it). Not seen on the main PC (the new log count "fixes below a pending one's value" was 0 in
+  every run read), so reachable but rare here; the PC 3050 numbers do not depend on it.
+- **Every path to the queue applies the fixes first.** The batched flush, the direct submit (after flushing the held ones), the
+  parallel/early segment submits, the early pre-sync, the readback submit, the sparse binds (textures, and now the pool import,
+  which also waits outside the lock), the present: all go through `queue_flush_locked` (wait for the top, apply) under
+  `dev.present_mu`; `tests/test_late_defer.py` checks every `vkQueueSubmit2`/`vkQueueBindSparse` on `dev.queue`. No submission waits
+  on the timeline, so a sent value is reached without the CPU (no deadlock in the waits under locks). A capture buffer under a
+  pending fix cannot be retired: its submission's value is held behind the fix.
+- **Fence polls (TICK-058's failure): nothing similar.** LATE_DEFER does not touch `sync_order_mu` or the poll's locked path. A
+  poll neither waits nor flushes while a fix is pending; the held recordings' timeline and recordings'-timeline signals are not
+  sent, so a poll can only answer "not yet" for them (as base, whose replay had not even recorded them, stopped at the take).
+  Write-back registrations are made while recording, before the hold; a readback (`invalidate`) waits with a timeout, so it waits
+  for the fix, sends the held work and then waits for the write-back value: it never reads guest memory before the GPU's results.
+  A liveness nit fixed: the fix thread could reset its wake value while a fix registered during its pass was pending (only delayed
+  that fix to the next submit or flush).
+- **Textures: reachable, fixed.** A deferred take gives no texture shadow of its late slots. A texture the host creates over such a
+  page after the take (so no live texture's storage at the take), uploaded by the CPU path (`guest_bytes`) in a later submission
+  before the fix, read guest memory possibly *before the write-back landed* (base read the take's shadow, after the write-back):
+  other bytes. Now `guest_bytes` waits for the value of any pending late page in its range and applies the fixes
+  (`memory_late_fix_wait_range`; log: "texture storage reads (waited)", 0 on the main PC). The GPU unswizzle path reads guest memory
+  on the GPU after the fix: fine as it was.
+- **CPU reads as submitted: tightened.** `memory_read_as_submitted` read guest memory after the value, while the GPU reads the slot
+  the fix copies at another moment; the game's CPU rewrites such pages soon after the write-back (OoT's exposure page), so the two
+  could differ. Now the reader waits, applies the fixes and reads the slot (guest memory only past the 2 s timeouts). The copies are
+  also made as soon as the value is reached, before the queue's lock (fix thread, `late_fix_wait_unlocked`), as the take's wait
+  made them, not after another thread's submit. (Reachable: 4 such reads in 25 main-PC runs; 0 on PC 3050.)
+- **Hashes: valid on reuse; no issue.** Each kept capture has its own arrays (`CapBuf::hash`); `hok` is cleared at every
+  `capture_make` and set only for a slot the one-pass copy read whole; the late slots lose theirs (waited or deferred); a pending
+  late slot is synced whole with its diff record voided (`d_void`); retired arrays are recycled by swap and come back with a fresh
+  `hok`; the pre-copy path makes none; slots are written only by the copy and the late copies. On the main PC the diff, hence the
+  hashes and MSYNC_FAST, are off (log: Gen5 x16, 63 GB/s, "chunk diff off by default").
+- Tests: `tests/test_late_fix_order.py` (new: the queue cut out and compiled; fails on the TICK-060 code: top 8 instead of 10),
+  `tests/test_late_defer.py` (needles updated, the sparse bind added). `run_all`: 247 pass, 2 fail (the nup tests, known), 35 skip.
+
+### A/B on the main PC (one binary, defaults = new against `RX_VK_LATE_DEFER=0 RX_VK_CAPTURE_HASH=0` = base)
+- Log: PCIe Gen5 x16 (63 GB/s), "chunk diff off by default": CAPTURE_HASH and MSYNC_FAST off in both; only the deferral differs.
+  Every take that would have waited was deferred (~95 late pages each; 1 waited for a texture's storage in 25 runs), the fix
+  thread applied them all.
+- Screen (castle-move x3): base 75.65, new **77.54** fps (every new run above every base run); frame prep 7.88 -> 6.69.
+- Shots (every 300 presents) standing and walking: the same Market, exposure as base (standing luma 103.2 / 101.8, walking 93.3 /
+  97.1, the same walk into the stalls' shade), no white or black frame; `HOS_SPEED_LOG` median 60.00 / 59.98 (new standing / walking).
+- Confirm (6 rounds, 4-6 reversed): kokiri-idle 78.3 -> 79.4, castle-move 77.0 -> 76.9, hyrule-walk 75.1 -> 77.4 fps; 1% low and
+  p99 medians alike; 10 of 18 rounds above base; all inside the spread. **Does not lose** (the bar for the main PC).
+- Saves identical to `user-save-backup-1111-2131` after all 46 runs; no game left; game folder restored after each lock session.
+
+### Recommendation
+Merge with the defaults on (LATE_DEFER on everywhere; CAPTURE_HASH and MSYNC_FAST follow the chunk diff), **with this branch's
+fixes** (the non-rising late values above all: without it a flush can send recordings that read unfixed slots). No gate by link
+speed: on the main PC the deferral costs nothing measurable and steadies the runs; its gain does not come from the link but from
+the CPU recording while the GPU finishes. Not verified: PC 3050 with the review's fixes (they only copy sooner and apply more
+fixes at once; the fast path is unchanged), Vulkan validation of the held recordings, frame generation on, a scene change by
+walking.

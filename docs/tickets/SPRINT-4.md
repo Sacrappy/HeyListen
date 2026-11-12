@@ -240,3 +240,9 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
   PC 3050's game folder: build t60e (exe 17c3e4fb, dll 2dc76b85); main32d kept in `C:\OOT\builds\main32d`. Branch
   `feature/TICK-060-pc3050-gpu`, bundle `E:\OOT\tick060.bundle`, not merged.
 - Next: the CPU recording chain (SEG_EARLY, RX_VK_PARALLEL=5: +1 fps in a screen), then the GPU's ~22 ms at 1440p.
+- Main-PC check (TICK-060m, branch `feature/TICK-060-main` on main 43cc30f): review found the late fixes' queue assumed rising late
+  values (a flush could send recordings reading unfixed slots), a CPU texture upload over a pending late page could read guest
+  memory before the write-back, and a replay read could differ from the slot the GPU reads: all fixed, tests
+  (`test_late_fix_order.py`). A/B on the 7800X3D + RTX 5070 (only the deferral differs there): screen 75.65 -> 77.54, confirm
+  kokiri 78.3 -> 79.4, castle 77.0 -> 76.9, hyrule 75.1 -> 77.4 fps, hitches alike, shots and speed right: does not lose.
+  Recommended: merge with the defaults on, with the fixes.
