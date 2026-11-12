@@ -164,6 +164,11 @@ recording, the game's code: a wider job system then the lifter). The job system 
   88.8 that made them candidates were not repeated. Not adopted.
 - `RX_HOT_FLAGS=<flags>` (nx2/build.py): more compiler flags for the hot pieces alone, for measurements (a tuning target,
   inlining thresholds).
+- **v0.3.0 released** (tag on 9a4b27a6, the user's request): the session 2 and session 4 defaults. Against v0.2.0 on the same
+  day, interleaved: castle-move 80.1 / 77.5 / 75.4 = 77.7 -> 83.4 / 83.7 / 84.0 = 83.7 (1% low 45.6 -> 46.5), kokiri-idle
+  80.6 -> 84.5, hyrule-walk 79.5 -> 83.1 (one run each). Shots (Kokiri standing: luma 105 on both) and speed (59.7-60.2)
+  right in the three scenes; tests 255 passed, 1 failed as before. The day's figures are 2-5 fps under session 4's for the same
+  build (85.0, and 90.0 / 89.3 / 85.5 in single runs): only runs of the same hour compare.
 
 ## Where this leaves the 120 fps goal (2026-11-12)
 
