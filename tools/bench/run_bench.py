@@ -134,7 +134,7 @@ def _trace_samples(path: Path) -> list[tuple[int, int]]:
         return out
     for line in text.splitlines():
         parts = line.strip().split(",")
-        if len(parts) != 3 or not parts[0].isdigit():
+        if len(parts) < 3 or not parts[0].isdigit():   # (Sync 12: upstream's trace has 4 phase columns after the three)
             continue
         try:
             out.append((int(parts[1]), int(parts[2])))
@@ -169,7 +169,7 @@ def trace_has_row(path: Path) -> bool:
             head = f.read(4096).decode("utf-8", errors="replace")
     except OSError:
         return False
-    return any(len(p) == 3 and p[0].isdigit() for p in (ln.strip().split(",") for ln in head.splitlines()))
+    return any(len(p) >= 3 and p[0].isdigit() for p in (ln.strip().split(",") for ln in head.splitlines()))
 
 
 _LOG_WINDOW = re.compile(r"vk:\s*\d+\s+presents,\s*([0-9.]+)\s+fps;")
