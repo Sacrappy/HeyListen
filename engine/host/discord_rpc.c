@@ -35,8 +35,9 @@
 
 #include "../gpu/vk/vk_api.h"
 
-#define HOOKSHOT_DISCORD_APP_ID_DEFAULT "1569529153349357731"   /* (the Hookshot application's id, digits) */
-#define HOOKSHOT_DISCORD_IMAGE_DEFAULT "hookshot"     /* (its large-image art asset key) */
+/* (HeyListen) the HeyListen Discord application ("Playing HeyListen"), not Hookshot's 1569529153349357731 */
+#define HOOKSHOT_DISCORD_APP_ID_DEFAULT "1570194109464051792"   /* (the HeyListen application's id, digits) */
+#define HOOKSHOT_DISCORD_IMAGE_DEFAULT "heylisten"    /* (its large-image art asset key) */
 
 void hos_log(const char *fmt, ...);
 int rx_option(int id, int otherwise);
@@ -225,8 +226,8 @@ static int send_activity(Ipc p, long long started) {
     version[strcspn(version, " +")] = 0;   /* ("v2.0.12 (source ...)": the release alone) */
     snprintf(json, sizeof json,
              "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{\"details\":\"Ocarina of Time\","
-             "\"state\":\"Hookshot %s\",\"timestamps\":{\"start\":%lld},\"assets\":{\"large_image\":\"%s\",\"large_text\":"
-             "\"Hookshot %s\"}}}}",
+             "\"state\":\"HeyListen %s\",\"timestamps\":{\"start\":%lld},\"assets\":{\"large_image\":\"%s\",\"large_text\":"
+             "\"HeyListen %s\"}}}}",
              ++nonce, process_id(), version, started, HOOKSHOT_DISCORD_IMAGE_DEFAULT, version);
     if (!write_frame(p, OP_FRAME, json)) return 0;
     uint32_t op = 0;
@@ -267,7 +268,7 @@ static void presence_main(void) {
         if (!app_id[0]) {
             if (!said_no_app)
                 hos_log("discord: no application id: discord_app_id= in hookshot_options.ini or HOS_DISCORD_APP_ID (the "
-                        "Discord application named Hookshot); the status stays off");
+                        "Discord application named HeyListen); the status stays off");
             said_no_app = 1;
             continue;
         }

@@ -224,3 +224,42 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Counts: only OptimizeChangeBanc (225k) and SceneLowPriority (61k) call GetCurrentCoreNumber after their start; svc 0x10 never.
 - castle-move screens (3 rounds): B1 +2.4, B4 +1.7, B2 +0.8, pack -1.0 fps, stack +1.5: inside the spread; chain A traces not separable. Nothing adopted; shots alike, speed ~60.
 - Next: the module workers and NavMeshCAStepDepWorker1 virtual-core waits.
+## TICK-061 (2026-11-12): chain B, the render chain, item by item
+- Built, off by default: `RX_VK_CAPTURE_CLAIM` (C1), `RX_VK_COLLECT_FAST` (C2), `RX_VK_SHADOW_FAST` (C3/E2), `RX_VK_STAMP_SPLIT` (E3), `RX_VK_DRY_LEAN` (D2; `=2` D3, not exact in play), `RX_VK_WORK_LOCAL` (D6), `RX_VK_SEG_SETUP_PAR` (D7), `RX_VK_OCC_PROXY_SKIP` (F2); 4 new tests. Not built: D5 (shader-stamp files), D8 (never runs with the parallel replay).
+- Per item (castle-move screens + `chainb.py`): each does what it says (scan -30%, shadow block 9 -> 4 us a take, setup 0.10 -> 0.02 ms) and each is under the spread; the suspect list's sizes were too large for the main PC. F2 found ~11 draws a frame, not the proxies.
+- Stacked + TICK-056's `MSYNC_FAST` + `SEG_EARLY`: chain B 11.99 -> 10.20 ms (every run below), the main thread's part 1.92 -> 3.06, frame 13.91 -> 13.27, fps 75.7 -> 77.6 (inside the spread). No confirm; nothing adopted.
+- Shots alike, speed 60, saves identical. One program-cache reset from a `Program` field (stamp input), fixed and the cache re-prepared at once. Branch `feature/TICK-061-chain-b`, not merged. Next: chain A, then restack.
+## TICK-063 (2026-11-12): the lifted FP code as speculative blocks
+- Measured: half of the castle's guest time is FP / vector code at 12-60 x86 instructions per guest instruction (integer code
+  3-4); ~9.4 ms of lifted code sits on chain A's path a frame.
+- Built (lift switches, off): `A64_FPX_BLOCK` (straight-line FP runs in XMM registers, one keep test, the per-op code as the
+  exact fallback), `A64_FPX_BLOCK_ST` (stores inside blocks), `A64_FPX_BLOCK_CVT` (int <-> float conversions inside blocks).
+  `tests/test_fpx_block.py`: 2M runs, 0 mismatches, teeth for every keep test.
+- In the game (PC 3050, no PGO, castle-move): executors' guest work -8% / -13%, module workers -4 to -6%, main thread unchanged;
+  Market fps 29.16 -> 29.22 / 28.60 (the frame is the main thread's and the Presentation Thread's there). Shots right, speed
+  60.0, saves identical.
+- Decision: not adopted, the switches stay off. The main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
+  Game folders: main PC TICK-054's build, PC 3050 main32d. Branch `feature/TICK-063-lifter-speed`, not merged.
+- Next: the main-PC PGO screen (the executors are on the job-group wait there), then the main thread's guest loads.
+
+## TICK-060 (2026-11-12): PC 3050's idle GPU third
+- Found (unprofiled: frame trace, nvidia-smi/dmon, job trace): the GPU idled 12.8 ms of a 35 ms castle-move frame, not for PCIe
+  (0.54 of 3.9 GB/s) or uploads: the held flush waited ~8 ms for the previous frame's late pages holding the replay's lock, then the
+  Presentation Thread needed a 5.8 ms mirror pre-sync (~4 ms of it TICK-048's diff re-hashing capture buffers from DRAM) before the
+  GPU had the frame's first big command buffer.
+- Built: `RX_VK_LATE_DEFER` (the late-page wait moved from the take to the queue: recordings held until a fix thread applies the same
+  copies at the value's end; CPU readers of a pending slot wait or copy whole), `RX_VK_CAPTURE_HASH` (the capture's copy makes the
+  diff's hashes in the same pass, bit-exact); tests; trace column `late_fix_ms`.
+- Screen (castle-move): base 28.09, defer 29.80, + hash 33.19, + MSYNC_FAST 33.83. Confirm (6 rounds, 18 of 18 above base):
+  kokiri-idle 30.85 -> 37.24, castle-move 29.13 -> 34.40, hyrule-walk 31.35 -> 37.20 fps; 1% low and p99 better; shots alike,
+  speed ~60, saves identical after every run.
+- Adopted (on by default, =0 off): LATE_DEFER, CAPTURE_HASH, and MSYNC_FAST where the chunk diff is on. Main-PC check pending.
+  PC 3050's game folder: build t60e (exe 17c3e4fb, dll 2dc76b85); main32d kept in `C:\OOT\builds\main32d`. Branch
+  `feature/TICK-060-pc3050-gpu`, bundle `E:\OOT\tick060.bundle`, not merged.
+- Next: the CPU recording chain (SEG_EARLY, RX_VK_PARALLEL=5: +1 fps in a screen), then the GPU's ~22 ms at 1440p.
+- Main-PC check (TICK-060m, branch `feature/TICK-060-main` on main 43cc30f): review found the late fixes' queue assumed rising late
+  values (a flush could send recordings reading unfixed slots), a CPU texture upload over a pending late page could read guest
+  memory before the write-back, and a replay read could differ from the slot the GPU reads: all fixed, tests
+  (`test_late_fix_order.py`). A/B on the 7800X3D + RTX 5070 (only the deferral differs there): screen 75.65 -> 77.54, confirm
+  kokiri 78.3 -> 79.4, castle 77.0 -> 76.9, hyrule 75.1 -> 77.4 fps, hitches alike, shots and speed right: does not lose.
+  Recommended: merge with the defaults on, with the fixes.

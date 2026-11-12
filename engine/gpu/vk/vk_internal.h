@@ -285,6 +285,16 @@ uint64_t vk_timeline_completed();
 uint64_t vk_retirement_value();
 void vk_timeline_wait(uint64_t v);
 void gpu_tail_note_late(uint64_t v);   // (TICK-057, vk_replay.cpp: a capture waited for v's late pages: the GPU's busy tail before it)
+/// (TICK-060, RX_VK_LATE_DEFER) vk_memory.cpp: the highest late value a pending fix waits for (0: none); the fixes whose value done
+/// reached, applied (the late slots copied again from guest memory). vk_replay.cpp: the highest timeline value a submit sent to
+/// the queue signals; the fix thread woken for a fix of value v
+uint64_t memory_late_fix_pending();
+void memory_late_fix_apply(uint64_t done);
+void memory_late_fix_wait_range(uint64_t guest, uint64_t n);   // (TICK-060m: before a CPU upload reads guest memory: a pending late page's value)
+uint64_t vk_timeline_signal_sent();
+void vk_timeline_wait_sent(uint64_t v);   // (TICK-060: a wait for a value already sent: no flush, safe under any lock)
+bool late_fix_wait_unlocked();   // (TICK-060, vk_replay.cpp: a pending late fix's value waited for before the queue's lock; false: a poll)
+void late_fix_wake(uint64_t v);
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);

@@ -1115,6 +1115,8 @@ LevelGeo level_geo(const Texture& tex, uint32_t level) {   // (level: the image'
 const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scratch) {
     uint64_t avail = 0;
     const uint8_t* p = host->gpu_ptr(gpu, &avail);
+    // (TICK-060m, RX_VK_LATE_DEFER) a late page here whose fix is pending: guest memory has the write-back only once its value is done
+    if (gpu < (1ull << 40)) memory_late_fix_wait_range(gpu, n);
     // (below 1 TB the GPU address is the guest's: the storage as it was at the submit being replayed, where the game has
     // rewritten it since (vk_memory.cpp, "texture storage in the capture"))
     if (p && avail >= n) return gpu < (1ull << 40) ? memory_as_submitted(gpu, p, n, scratch) : p;
@@ -2810,6 +2812,24 @@ bool barrier_dedupe_par_on() {
     return on;
 }
 int64_t barriers_left_out_par() { return st_barriers_left_out_par.load(std::memory_order_relaxed); }
+bool barrier_trust_on();
+// (TICK-061, D6: vk_work.h) a parallel segment's recording starts and ends on this thread
+void work_seg_begin() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_WORK_LOCAL");
+        const bool v = e && atoi(e) != 0;
+        logf("vk: the work counts inside parallel segments: %s (RX_VK_WORK_LOCAL)", v ? "left alone where nothing reads them" : "bumped at every command, as before");
+        return v;
+    }();
+    static const bool skip_all = on && !barrier_dedupe_par_on() && !barrier_trust_on();
+    work_seg_local = on;
+    work_seg_skip_all = skip_all;
+}
+void work_seg_end() {
+    if (!work_seg_local) return;
+    work_seg_local = false, work_seg_skip_all = false;
+    work_epoch.fetch_add(1, std::memory_order_relaxed);   // (the segment's work, counted once: see vk_work.h)
+}
 namespace {
 std::atomic<uint64_t>& xfer_slot(VkCommandBuffer c) {
     const uintptr_t v = (uintptr_t)c;
@@ -3736,6 +3756,7 @@ bool readback_submit_wait() {
     si.pCommandBufferInfos = &cb;
     vkResetFences(dev.device, 1, &rb_fence);
     {
+        late_fix_wait_unlocked();   // (TICK-060: a pending late fix waited for outside the queue's lock)
         std::lock_guard qk(dev.present_mu);   // (one queue: submits and presents take turns)
         queue_flush_locked();
         if (vkQueueSubmit2(dev.queue, 1, &si, rb_fence) != VK_SUCCESS) return false;
@@ -4157,6 +4178,7 @@ bool sparse_flush(Texture* tex) {
         // each made its other races worse)
         static const bool no_idle = !env_on("RX_VK_SPARSE_IDLE");
         static int64_t binds;
+        late_fix_wait_unlocked();   // (TICK-060)
         std::lock_guard qk(dev.present_mu);
         queue_flush_locked();
         if (!no_idle) vkQueueWaitIdle(dev.queue);
