@@ -1,0 +1,284 @@
+The BaseProc executors' twins (sprint 5, the refonte's job system): an experiment, NOT merged. It does not work, and the
+reason is in the game, not in this patch.
+
+What it does: HOS_EXECUTORS=<7..12> (with HOS_CORES at least as many) makes OoT's worker-set maker f_8069b020 create a
+BaseProc executor on cores 6 and up as well. The game goes on registering its six for a stage; the host adds each one's
+"twin" to the stage's scheduler (the list of contexts f_80b5ef60 makes for six gets 16 places), the worker's message
+handler f_8004aae0 sends its twin the stage's message before it runs the dispatcher f_8004ab40 and waits for the twin's
+end before it signals its own. That part works: with HOS_CORES=12 HOS_EXECUTORS=10 the stages run with 10 contexts
+("threads: stage: ... registered 0x3f (6), 4 twins, scheduler ... holds 10 of 16") and the twins take jobs.
+
+Why it fails: a twin crashes in its first actor job (BaseProcExecutor7, a read of [0 + 0x3e8] in f_8023b950 after
+f_8022e220 returned 0). The game knows its job threads by identity, not by count: the BaseProc manager keeps the six
+executors' thread ids ([manager + 128] + 32..52), each one's current BaseProc beside them (+56..), a seventh thread
+(+104, +112), and the code that asks "which executor am I, and which BaseProc am I running" is inlined: a read of the
+current thread from its TLS slot followed by the six compares is in 217 places of 152 functions (build/s5/idsites.py,
+the strict count; 1671 places of 976 functions load those six words). A link from one BaseProc to another is refused to
+a thread that is not one of the six (f_8022e220 returns 0), and the game's code does not expect the refusal on a job
+thread. The current core is used the same way (193 functions read the "core + 1" TLS slot; per-core tables of six, with
+`core < 6 ? core : 0`).
+A twin that passed for its executor (same thread id, same core) would share that executor's "current BaseProc" and its
+per-core tables with it while both run: the game's access checks and its lock-free per-core data would be wrong. More
+identities would need six more places in those tables and every one of the inlined lookups rewritten.
+
+So the six executors are a constant of the game. What the trace says there was to gain: all six run together for 2.3 ms
+of a 11.9 ms frame (castle-move), and 0.8 ms with four at the end of the frame; the rest of the job stages is one to
+five executors, held by the jobs' order.
+
+diff --git a/engine/host/hos_thread.c b/engine/host/hos_thread.c
+index c9f08d51..5b1e8133 100644
+--- a/engine/host/hos_thread.c
++++ b/engine/host/hos_thread.c
+@@ -116,11 +116,106 @@ int hos_cores(void) {
+     static int n;
+     if (!n) {
+         const char *e = getenv("HOS_CORES");
+-        n = e && atoi(e) >= 1 && atoi(e) <= 8 ? atoi(e) : 6;   /* (mkw-recomp: a Switch 2 application's six) */
++        n = e && atoi(e) >= 1 && atoi(e) <= 16 ? atoi(e) : 6;   /* (mkw-recomp: a Switch 2 application's six; sprint 5: up to 16) */
+         if (!e && hos_game_cores()) n = hos_game_cores();   /* (totk_cores.c: the game set up for more cores) */
+     }
+     return n;
+ }
++/* (HeyListen, sprint 5: the refonte's job system) HOS_EXECUTORS=<n> (7 to 12, with HOS_CORES at least n; off: 6): OoT's
++   BaseProc executors get twins.
++   A stage's jobs are run by a dispatcher (f_8004ab40(scheduler, context)) on every context registered for the stage: the
++   set's worker threads (one a core, made by f_8069b020: its text has the six cores, `mask & 0x3e` and a loop to 6;
++   nx2/oot_patches.py patch_executors) and the stage's owner. All that says which workers take part goes by the six cores
++   (a stage's mask `& 0x3f`, a worker found by `1 << the caller's core`, the count of registered workers the end of the
++   frame waits to see at zero), so the workers past the sixth stay out of it: a twin is one more worker thread of the set,
++   on a core of its own (6 and up), that the game never registers.
++   hos_worker_stage (f_806b0260, once the game registered its workers) puts the twin of each registered worker in the
++   scheduler's list of contexts (the dispatcher wakes sleeping contexts from that list; f_80b5ef60 made it for six:
++   hos_worker_list_room) and resets it as the game resets its own. The worker's message handler f_8004aae0 sends the twin
++   its message before it runs the dispatcher (hos_worker_twin_kick) and waits for the twin's end before it signals its own
++   (hos_worker_twin_wait): to the game a worker and its twin are one worker, done when both are.
++   name: the set's name in guest memory (its config + 24); every other set (the module system's workers) keeps its six. */
++static int worker_n(void) {
++    static int n = -1;
++    if (n < 0) {
++        const char *e = getenv("HOS_EXECUTORS");
++        n = e && atoi(e) > 6 && atoi(e) <= 12 && atoi(e) <= hos_cores() ? atoi(e) : 6;
++        if (n > 6) hos_log("threads: %d BaseProc executors (HOS_EXECUTORS; HOS_CORES=%d)", n, hos_cores());
++    }
++    return n;
++}
++int hos_worker_cores(uint64_t name) {
++    const char *s = name ? (const char *)hos_guest_range(name, 17) : NULL;
++    return s && !memcmp(s, "BaseProcExecutor", 16) ? worker_n() : 6;
++}
++/* the room in a scheduler's list of contexts (f_80b5ef60's 6: five workers and the owner, or six workers) */
++uint32_t hos_worker_list_room(void) { return worker_n() > 6 ? 16 : 6; }
++/* core 1's twin is on core 6 ... core 5's on core 10, core 0's on core 11: the stages' owner is on core 0 more often than
++   not and runs the dispatcher itself there, its worker left out, so core 0's twin comes last */
++static int twin_core(int core) { return core ? core + 5 : 11; }
++static struct { uint64_t prim, twin; volatile LONG armed; } twin_tab[6];
++void hos_light_event_clear(uint64_t ev);
++void hos_light_event_wait(Ctx *c, uint64_t ev);
++int hos_light_queue_try_send(uint64_t q, uint64_t v);
++void hos_worker_stage(uint64_t set) {
++    if (worker_n() <= 6 || !hos_guest_range(set, 272)) return;
++    const uint32_t workers = G32(set);
++    if (workers <= 6 || workers > 12) return;   /* (another set: the module system's workers) */
++    const uint64_t arr = G64(set + 8), sched = G64(set + 264);
++    if (!sched || !hos_guest_range(sched, 64) || !hos_guest_range(arr, 8 * (uint64_t)workers)) return;
++    const uint32_t active = G32(set + 256);
++    uint64_t by_core[12] = { 0 };
++    uint32_t cores = 0;   /* (the cores of the workers the game registered) */
++    for (uint32_t i = 0; i < workers; i++) {
++        const uint64_t w = G64(G64(arr + 8 * (uint64_t)i) + 8);
++        const uint32_t m = G32(w + 176);
++        if (!m || (m & (m - 1)) || m >= 1u << 12) continue;
++        by_core[__builtin_ctz(m)] = w;
++        if (active >> i & 1) cores |= m;
++    }
++    int armed = 0, short_of_room = 0;
++    for (int core = 0; core < 6; core++) {
++        InterlockedExchange(&twin_tab[core].armed, 0);
++        const uint64_t tw = by_core[twin_core(core)];
++        if (!(cores >> core & 1) || !tw) continue;
++        const int32_t have = (int32_t)G32(sched + 48), room = (int32_t)G32(sched + 52);
++        if (have < 0 || have >= room) { short_of_room = 1; continue; }
++        G64(G64(sched + 56) + 8 * (uint64_t)have) = tw + 216;   /* (its context: the dispatcher's wakes) */
++        G32(sched + 48) = (uint32_t)(have + 1);
++        G64(tw + 224) = 0;   /* (as f_806b0260 resets a worker: the context's state and flags, its two events, its scheduler) */
++        G32(tw + 232) = 0;
++        G32(tw + 432) = 0;   /* (no lane in the cores' status word: those are eight, and the game's own) */
++        hos_light_event_clear(tw + 392);
++        hos_light_event_clear(tw + 488);
++        G64(tw + 512) = sched;
++        twin_tab[core].prim = by_core[core];
++        twin_tab[core].twin = tw;
++        InterlockedExchange(&twin_tab[core].armed, 1);
++        armed++;
++    }
++    static volatile LONG logged, full;
++    if (InterlockedIncrement(&logged) <= 12 || (short_of_room && InterlockedIncrement(&full) <= 12))
++        hos_log("threads: stage: set %#llx, %u workers, cores %#x, registered %#x (%u), %d twins, scheduler %#llx holds %d of %d%s",
++                (unsigned long long)set, workers, G32(set + 248), active, G32(set + 252), armed, (unsigned long long)sched,
++                (int)G32(sched + 48), (int)G32(sched + 52), short_of_room ? " (NO ROOM for a twin)" : "");
++}
++/* the worker's twin for this stage, sent its message now; 0: none (not a worker with a twin, or its twin is not in this
++   stage, or was sent already) */
++uint64_t hos_worker_twin_kick(uint64_t worker) {
++    if (worker_n() <= 6) return 0;
++    for (int core = 0; core < 6; core++)
++        if (twin_tab[core].prim == worker && twin_tab[core].armed && InterlockedExchange(&twin_tab[core].armed, 0)) {
++            const uint64_t tw = twin_tab[core].twin;
++            __atomic_fetch_or((uint32_t *)GP(tw + 232), 1u, __ATOMIC_SEQ_CST);   /* (the game's mark of a worker sent its message) */
++            static volatile LONG kicks;
++            const int sent = hos_light_queue_try_send(tw + 40, 1);
++            if (InterlockedIncrement(&kicks) <= 6)
++                hos_log("threads: twin: %s %s its twin on core %d", hos_thread_name(hos_self()), sent ? "sent" : "could NOT send", twin_core(core));
++            return sent ? tw : 0;
++        }
++    return 0;
++}
++void hos_worker_twin_wait(Ctx *c, uint64_t twin) { hos_light_event_wait(c, twin + 488); }
+ int hos_thread_core(HosThread *t) {
+     if (!t) return 0;
+     if (t->vc_held) return t->vc_held - 1;   /* (virtual cores: the one it holds) */
+@@ -503,6 +598,13 @@ HosThread *hos_thread_create(uint64_t guest_tt, uint64_t entry, uint64_t arg, ui
+     t->arg = arg;
+     t->stack = stack;
+     t->stack_size = stack_size;
++    /* (HeyListen, sprint 5: HOS_EXECUTORS) a thread whose stack the game could not allocate: its heap was sized for the
++       threads it makes itself, and the last of the extra BaseProc executors got none (its first store went to address
++       0x7ffb0). The host gives it one. */
++    if (!stack && stack_size && worker_n() > 6) {
++        t->stack = hos_sys_alloc(stack_size, 0x1000);
++        hos_log("threads: a thread made without a stack (%#llx bytes asked): the host gives it one", (unsigned long long)stack_size);
++    }
+     t->priority = priority;
+     t->ideal_core = core;
+     t->id = InterlockedIncrement64(&next_id);
+@@ -1206,7 +1308,7 @@ void hos_thread_log_handles(void) {
+    core a thread holds. */
+ #if !defined(__EMSCRIPTEN__)
+ static SRWLOCK vc_lock = SRWLOCK_INIT;
+-static HosThread *vc_owner[8];
++static HosThread *vc_owner[16];
+ static HosThread *vc_queue[1024];
+ static int vc_nq;
+ static struct { int64_t takes, waits, wait_ns, max_ns, escapes, kicks, yields, since; } vc_st;
+@@ -1219,7 +1321,7 @@ int hos_vcores_on(void) {
+     }
+     return on;
+ }
+-static int vc_cores(void) { return hos_cores() > 8 ? 8 : hos_cores(); }
++static int vc_cores(void) { return hos_cores() > 16 ? 16 : hos_cores(); }
+ static unsigned vc_allowed(HosThread *t) {
+     const unsigned all = (1u << vc_cores()) - 1;
+     unsigned m = (unsigned)(t->core_mask & all);
+diff --git a/engine/host/nn_os_sync.c b/engine/host/nn_os_sync.c
+index f6c96778..bf7ed363 100644
+--- a/engine/host/nn_os_sync.c
++++ b/engine/host/nn_os_sync.c
+@@ -1039,6 +1039,11 @@ HLE(_ZN2nn2os21SendLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { queue_put
+ HLE(_ZN2nn2os24TrySendLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { RET(queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 1)); }
+ HLE(_ZN2nn2os20JamLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { queue_put(obj(ARG(0), K_QUEUE), ARG(1), 1, 0); }
+ HLE(_ZN2nn2os23TryJamLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { RET(queue_put(obj(ARG(0), K_QUEUE), ARG(1), 1, 1)); }
++/* (HeyListen, sprint 5: the BaseProc executors' twins, hos_thread.c hos_worker_stage) a light event cleared or waited
++   for and a light message queue sent to (without blocking; 1: sent) by host code on a guest thread, as the game's call would */
++void hos_light_event_clear(uint64_t ev) { event_clear(obj(ev, K_EVENT)); }
++void hos_light_event_wait(Ctx *c, uint64_t ev) { logged_wait(c, obj(ev, K_EVENT), 0, 0, "light"); }
++int hos_light_queue_try_send(uint64_t q, uint64_t v) { return queue_put(obj(q, K_QUEUE), v, 0, 1); }
+ HLE(_ZN2nn2os24ReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE) {
+     uint64_t v;
+     queue_get(obj(ARG(1), K_QUEUE), &v, 1, -1);
+diff --git a/engine/nx2/oot_patches.py b/engine/nx2/oot_patches.py
+index 264be017..94fd22ed 100644
+--- a/engine/nx2/oot_patches.py
++++ b/engine/nx2/oot_patches.py
+@@ -255,6 +255,62 @@ def patch_job_order(source):
+     return source, done
+ 
+ 
++# ---- (HeyListen, sprint 5: the refonte's job system) the BaseProc executors' twins: host/hos_thread.c hos_worker_* ----
++# OoT's executors are a worker set made by f_8069b020: a worker for each core of (config + 36) & 0x3e, and core 0 with the byte
++# at config + 16, in a loop over cores 0-5 (the set's array is sized by the mask's bits, f_8005e700). The six cores are in those
++# two constants: they ask the host, which answers as the game's text unless HOS_EXECUTORS widens the set named BaseProcExecutor
++# (the name at config + 24), and then cores 6 and up get a worker each. The game goes on using its six (a stage's cores are
++# `& 0x3f`, and its workers are found by their core): the others are twins. f_806b0260 registers a stage's workers with the
++# stage's scheduler; the host then adds each one's twin to the scheduler's list of contexts, which f_80b5ef60 made for six.
++# A worker's message handler f_8004aae0 runs the dispatcher (f_8004ab40) and signals the worker's end: it sends its twin the
++# same message first, and waits for the twin's end before its own signal.
++EX_DECL = ("int hos_worker_cores(uint64_t name);\nuint32_t hos_worker_list_room(void);\nvoid hos_worker_stage(uint64_t set);\n"
++           "uint64_t hos_worker_twin_kick(uint64_t worker);\nvoid hos_worker_twin_wait(Ctx *c, uint64_t twin);\n")
++EX_HEAD = "void f_8069b020(Ctx *__restrict A64_NOESC c) {\n"
++EX_MASK = "    { uint64_t _r = c->x[8] & 0x3eULL; _r &= 0xFFFFFFFFULL; c->x[8] = _r; }\n"
++EX_MASK_NEW = ("    { uint64_t _r = c->x[8] & (((1ULL << hos_worker_cores(recomp_load64(c,c->x[19] + 24))) - 1) & ~1ULL); "
++               "_r &= 0xFFFFFFFFULL; c->x[8] = _r; }   /* (nx2/oot_patches.py: the worker set's cores) */\n")
++EX_LOOP = "    { uint64_t _a=c->x[22], _b=6ULL; uint64_t _r=_a-_b; { uint64_t _fa=(_a),_fb=(_b),_fr=(_r); c->z=(_fr==0);    } }\n"
++EX_LOOP_NEW = EX_LOOP.replace("_b=6ULL", "_b=(uint64_t)hos_worker_cores(recomp_load64(c,c->x[19] + 24))")
++EX_RUN = "    { uint64_t _a=c->x[19], _b=216ULL; uint64_t _r=_a+_b; c->x[1]=_r; }\nc->x[30] = 0x8004ab10ULL; f_8004ab40(c);\n"
++# (function head, the text found once in it, its replacement)
++EX_EDITS = [
++    (EX_HEAD, EX_MASK, EX_MASK_NEW),
++    (EX_HEAD, EX_LOOP, EX_LOOP_NEW),
++    ("void f_80b5ef60(Ctx *__restrict A64_NOESC c) {\n",
++     "L_80b5f0c0:;\n    c->x[1] = 0x6ULL;\n",
++     "L_80b5f0c0:;\n    c->x[1] = (uint64_t)hos_worker_list_room();   /* (nx2/oot_patches.py: the list of contexts) */\n"),
++    ("void f_806b0260(Ctx *__restrict A64_NOESC c) {\n",
++     "L_806b03d0:;\nif (!((c->x[20] >> 0) & 1)) { goto L_806b0468; }\n",
++     "L_806b03d0:;\n    hos_worker_stage(c->x[19]);   /* (nx2/oot_patches.py: the workers' twins) */\n"
++     "if (!((c->x[20] >> 0) & 1)) { goto L_806b0468; }\n"),
++    ("void f_8004aae0(Ctx *__restrict A64_NOESC c) {\n",
++     EX_RUN,
++     "    { uint64_t _tw = hos_worker_twin_kick(c->x[19]);   /* (nx2/oot_patches.py: the worker's twin runs the stage too) */\n"
++     + EX_RUN + "    if (_tw) hos_worker_twin_wait(c, _tw); }\n"),
++]
++
++
++def patch_executors(source):
++    """None when none of the functions is here; else (text, how many of the edits are in it, made now or before)"""
++    done = 0
++    for head, old, new in EX_EDITS:
++        start, end = _body(source, head)
++        if start is None:
++            continue
++        body = source[start:end]
++        if new in body:
++            done += 1
++        elif body.count(old) == 1:
++            source = source[:start] + body.replace(old, new, 1) + source[end:]
++            done += 1
++    if not done:
++        return None
++    if EX_DECL not in source:
++        source = source.replace('#include "a64.h"\n', '#include "a64.h"\n' + EX_DECL, 1)
++    return source, done
++
++
+ def apply(gen, *, protect_hearts=False, required=False):
+     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
+     The other patches only warn when their place is not found once."""
+@@ -263,7 +319,7 @@ def apply(gen, *, protect_hearts=False, required=False):
+     import native_replace   # (TICK-026: native replacements of hot guest blocks, each behind HOS_NR_<NAME>, host/hos_native.c)
+     native_replace.apply(gen)
+     job_order = os.environ.get("OOT_JOB_ORDER") == "1"   # (TICK-047, lift time; off: no job order statements)
+-    done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0}
++    done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0, "worker sets' cores": 0}
+     if job_order:
+         done["job order"] = 0
+     if protect_hearts:
+@@ -315,6 +371,11 @@ def apply(gen, *, protect_hearts=False, required=False):
+             out, n = jo
+             done["job order"] += n
+             print("oot_patches: job order (%d of 2 functions) in" % n, os.path.basename(path))
++        ex = patch_executors(out)
++        if ex is not None:
++            out, n = ex
++            done["worker sets' cores"] += n
++            print("oot_patches: the worker sets' cores (%d of %d edits) in" % (n, len(EX_EDITS)), os.path.basename(path))
+         view = patch_view(out) if protect_hearts else None
+         if view is not None:
+             out = view
+@@ -323,7 +384,7 @@ def apply(gen, *, protect_hearts=False, required=False):
+         if out != s:
+             whole_write.write_whole(path, out, newline="")
+     for what, n in done.items():
+-        if n != (2 if what == "job order" else 1):
++        if n != (2 if what == "job order" else len(EX_EDITS) if what == "worker sets' cores" else 1):
+             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
+     apply_output_size(gen, required=required)
+ 

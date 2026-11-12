@@ -766,6 +766,9 @@ def main():
     # (hookshot) code_hot.c, the lift's hot functions together (A64_HOT_FUNCS + A64_HOT_CHUNK=1): at RX_HOT_OPT
     # (default O2), so the hot callees inline into their hot callers
     hot_fl = [("-" + os.environ.get("RX_HOT_OPT", "O2")) if f == "-" + a.opt else f for f in fl]
+    # (HeyListen, sprint 5) RX_HOT_FLAGS=<flags, space separated>: more compiler flags for the hot pieces alone (a measurement:
+    # a tuning target, inlining thresholds); they are in the objects' keys like the others
+    hot_fl = hot_fl + os.environ.get("RX_HOT_FLAGS", "").split()
     # (hookshot) RX_PGO=gen: code_hot.c counts its branches (host/pgo_rt.c writes them; -O1 builds much sooner, and the counters are
     # placed before the optimiser, so a profile from it fits the -O2 build). RX_PGO=<merged .prof>: built with that profile
     if PGO == "gen":

@@ -116,7 +116,7 @@ int hos_cores(void) {
     static int n;
     if (!n) {
         const char *e = getenv("HOS_CORES");
-        n = e && atoi(e) >= 1 && atoi(e) <= 8 ? atoi(e) : 6;   /* (mkw-recomp: a Switch 2 application's six) */
+        n = e && atoi(e) >= 1 && atoi(e) <= 16 ? atoi(e) : 6;   /* (mkw-recomp: a Switch 2 application's six; HeyListen: up to 16) */
         if (!e && hos_game_cores()) n = hos_game_cores();   /* (totk_cores.c: the game set up for more cores) */
     }
     return n;
@@ -1206,7 +1206,7 @@ void hos_thread_log_handles(void) {
    core a thread holds. */
 #if !defined(__EMSCRIPTEN__)
 static SRWLOCK vc_lock = SRWLOCK_INIT;
-static HosThread *vc_owner[8];
+static HosThread *vc_owner[16];
 static HosThread *vc_queue[1024];
 static int vc_nq;
 static struct { int64_t takes, waits, wait_ns, max_ns, escapes, kicks, yields, since; } vc_st;
@@ -1219,7 +1219,7 @@ int hos_vcores_on(void) {
     }
     return on;
 }
-static int vc_cores(void) { return hos_cores() > 8 ? 8 : hos_cores(); }
+static int vc_cores(void) { return hos_cores() > 16 ? 16 : hos_cores(); }
 static unsigned vc_allowed(HosThread *t) {
     const unsigned all = (1u << vc_cores()) - 1;
     unsigned m = (unsigned)(t->core_mask & all);

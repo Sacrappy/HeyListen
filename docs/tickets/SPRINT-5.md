@@ -134,6 +134,37 @@ The first item of the list below, done: a write mark per 512 bytes (`A64_GRAN=1`
   against 45). Shots right in the three scenes, speed 59.95-60.08; one run a scene 90.0 / 89.3 / 85.5 against 87.4 / 81.4 /
   83.0 (kokiri-idle / castle-move / hyrule-walk). Not checked on PC 3050 (the pre-copy is off there: its chunk diff is on).
 
+## Session 5 (2026-11-12, evening): the refonte starts with the job system: twelve executors cannot be had
+
+The user approved the engine rework (estimate given: 5-8 weeks, three works: the CPU<->GPU memory model, the Vulkan
+recording, the game's code: a wider job system then the lifter). The job system came first because it can be checked fast.
+
+- How a stage runs (read from the lifted code; `docs/research/executor-twins-experiment.patch` has the patch and the reading):
+  the worker set's maker f_8069b020 (the six cores: `mask & 0x3e`, a loop to 6), f_806b0260 registers the workers whose core
+  is in the stage's mask with the stage's scheduler (a list of contexts made for six by f_80b5ef60) and sends them their
+  message; the worker's handler f_8004aae0 runs the dispatcher f_8004ab40 and signals its end; f_806afc40 waits for every
+  registered worker; at the end of the frame f_83acfb90 has each owner thread send the worker of its own core and wait for it
+  (which is why that stage runs on four executors: four owners reach it).
+- Built: `HOS_EXECUTORS=<7..12>` made executors on cores 6 and up as "twins": the game goes on registering its six, the host
+  adds each one's twin to the scheduler's list (16 places), the worker sends its twin the stage's message and waits for it.
+  That part worked (10 contexts a stage, the twins took jobs).
+- **It cannot work.** A twin crashes in its first actor job: the game knows its job threads by identity, not by count. The
+  BaseProc manager holds the six executors' thread ids, each one's current BaseProc beside them and a seventh thread, and the
+  lookup "which executor am I, which BaseProc do I run" is inlined: the current thread read from its TLS slot followed by the
+  six compares is in 217 places of 152 functions (`tools/bench/idsites.py`; 1671 places load those six words), and 193
+  functions read the "core + 1" TLS slot for per-core tables of six (`tools/bench/tlsusers.py`). A thread that is not one of
+  the six is refused the links between BaseProcs (f_8022e220 returns 0, which a job does not expect); a twin passing for its
+  executor would share its "current BaseProc" and its lock-free per-core data while both run.
+- What was there to gain: all six executors run together for 2.3 ms of an 11.9 ms frame (castle-move), four for 0.8 ms at
+  the end of the frame; the rest of the job stages is held by the jobs' order (one to five executors).
+- Kept from it: `HOS_CORES` up to 16 (it was 8). The twins' code is not in the tree.
+- Two candidates from the earlier sessions screened on the clean build (castle-move, 3 interleaved rounds, reference 80.2 /
+  83.6 / 83.6 = 82.5): `HOS_CORES=12` 84.5 / 81.9 / 85.1 = 83.8, `HOS_CORES=8` 81.1 / 84.2 / 79.0 = 81.4,
+  `RX_VK_PARALLEL_SEG=96` with `RX_VK_CHUNK=0` 83.2 / 83.8 / 84.8 = 83.9. All inside the spread: the single runs at 89.8 and
+  88.8 that made them candidates were not repeated. Not adopted.
+- `RX_HOT_FLAGS=<flags>` (nx2/build.py): more compiler flags for the hot pieces alone, for measurements (a tuning target,
+  inlining thresholds).
+
 ## Where this leaves the 120 fps goal (2026-11-12)
 
 Target since 2026-11-12 07:00: 120 fps average in Kokiri Forest, Hyrule Field and the castle town, no drop under 110 while
@@ -149,8 +180,8 @@ Three chains of ~11-12 ms each hold the frame, and each was seen to bind once an
 
 What would move it, largest first (none is a switch; each is a piece of engine work with a picture risk):
 - ~~The capture by written bytes, not by page~~: built in session 3 (above); no gain, the marks cost what the copy saves.
-- **A wider job system** (twelve executors: a patch of the game's per-core tables, f_80b5e9e0 and its users): up to -1.6 ms
-  of the game's chain. High risk.
+- ~~A wider job system (twelve executors)~~: tried in session 5 (above); the six executors' identities are inlined in the
+  game's code at hundreds of places. Not possible short of rewriting the game's actor system.
 - **GPU time**: barriers only where a hazard is (bound: -1 ms), the 136 dispatches' global-memory emulation, a lower render
   resolution with an upscaler (DLSS / FSR are in the engine: a user's choice, not frame generation).
 - **The lifted code itself**: guest registers kept across calls; the block lift's stores and conversions with a profile of
