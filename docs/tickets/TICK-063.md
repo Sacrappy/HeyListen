@@ -28,9 +28,10 @@ main PC's lock queue being long; synthetic tests on the main PC at low priority,
   Shots right, speed 60.0 on every variant, saves identical after every run.
 - **Decision**: not adopted (no fps gain); the switches stay off. The executor cut is real and stacks with the render-chain
   work: where the executors are on the critical path (the main PC's job-group wait, TICK-039: ~97% execution), it should show.
-- **Not verified**: the main-PC PGO A/B (`bin/base` against `bin/blk`, both with their own profile, built and ready in
-  `build/tick063`; session2.sh is the screen); the block + stores + conversions lift with a PGO profile (session3.sh prepared);
-  kokiri-idle and hyrule-walk; the full confirm (the screen was not positive).
+- **Main PC with PGO** (both sides with their own profile, castle-move screen): 78.8 -> 79.3 fps, blk above base in 2 of 3
+  rounds: inside the spread, not clearly positive (section 4).
+- **Not verified**: the block + stores + conversions lift with a PGO profile (session3.sh prepared, not run: the screen was not
+  clearly positive); kokiri-idle and hyrule-walk; the full confirm.
 
 ## 1. The gap, quantified (castle-move, TICK-052's run B samples with its map; TICK-058's critical path)
 
@@ -192,7 +193,30 @@ Q, through SP or not), then FCVT / SCVTF (~900 vector / lane, ~900 to and from W
 - `bin/blk`, built from the same block lift (lifted code 877598a7ef, as gen's) with that profile;
 - the default lift put back in the shared work folder (verify_shared: base lift, the repo's profile; game folder as found).
 
-The screen (session2) was not run: the coordinator moved the in-game A/B to PC 3050.
+The screen (session2) was run later, after the PC 3050 measurement: see below.
+
+**Main PC, PGO pair (session 2, 2026-11-12 03:12-03:32, under the lock after TICK-060m and SYNC-12).** `bin/base` (default lift,
+the shipped profile) against `bin/blk` (`A64_FPX_BLOCK=1`, its own profile from three `gen` runs), the same host code; run_bench
+110 s, 66 s cut, castle-move:
+- Shots (every 600 presents) and the speed log first: the title, the save's load and the Market on both; shot-by-shot mean luma
+  alike (Market: base 106 104 101 98 100 72 81, blk 106 106 106 105 62 89 76, the walk's timing a little apart); speed (last 40 s)
+  median / min 59.99 / 59.11 base, 59.99 / 59.42 blk. fps in those runs 76.8 base, 79.5 blk.
+- Screen, 3 interleaved rounds (fps / 1% low / p99 ms; frame prep = the log's submit):
+
+| round | base | blk |
+|---|---|---|
+| 1 | 78.9 / 46.9 / 17.4 | 80.6 / 49.6 / 17.0 |
+| 2 | 77.6 / 47.1 / 18.1 | 78.4 / 46.3 / 19.0 |
+| 3 | 79.8 / 48.0 / 17.5 | 78.9 / 47.8 / 17.8 |
+| mean | 78.8 / 47.3 / 17.7, submit 7.67 | 79.3 / 47.9 / 17.9, submit 7.84 |
+
+  blk above base in 2 of 3 rounds (3 of 4 counting the shot runs; +0.5 fps on the screen, +1.0 over the four pairs): inside the
+  2-4 fps spread, **not clearly positive**, so session3 (blk + stores + conversions with its own profile) was not run.
+- One sampler run each (`HOS_JOBTRACE` 88-91 s inside `HOS_SAMPLE_ALL` 86-93 s; the sampling lengthens the traced frames to
+  12.6 / 13.3 ms): executors' work a frame 25.9 -> 25.2 ms (-2.6%), module workers 11.6 -> 11.8 ms, the executors' part of the
+  walked path 4.35 -> 4.05 ms, chain A's walked game work 8.52 -> 8.33 ms. One trace a side: inside the noise.
+- After the session: game folder as found (TICK-054's build), saves identical to user-save-backup-1111-2131, no game left, the
+  shared work folder on the base lift (verify_shared), the lock released at 03:32.
 
 **PC 3050** (i5-10400F 6C/12T, RTX 3050, 2560x1440, session 0 over SSH). Setup: the branch as a bundle in `C:\OOT\t63`, three
 work folders copied from `w56`, TICK-055's no-PGO recipe (`b63.bat`, `-march=x86-64-v3`). Builds:
@@ -233,9 +257,9 @@ The exe is 462 MB with blocks, against 448 MB without.
 
 ## 5. Next
 
-1. **Measure the PGO pair on the main PC.** `build/tick063/bin/base` and `bin/blk` are built, each with its own profile, and
-   session2.sh is the screen (~25 min of lock). There the executors are on the job-group wait (TICK-039), so their 8-13% cut
-   may show.
+1. **The main-PC PGO pair is measured** (+0.5 fps, 2 of 3 rounds: inside the spread). If the blocks are taken up later, take
+   them with the stores and conversions (session3.sh: its own instrumented build, training runs and profile) and a full
+   confirm; alone they do not clear the spread.
 2. **The NavMesh kernels.** In f_820e2520, 31 blocks already hold 145 of ~160 FP ops. What remains is the guest loads between
    the blocks and the code size: 118 KB with the fallback, against 94 KB. A block whose fallback is a call to an outlined copy
    of the run, instead of inlined text, would halve the hot text growth (29 -> 39.6 MB of hot code now).
