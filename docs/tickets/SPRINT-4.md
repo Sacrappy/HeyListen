@@ -238,9 +238,10 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - In the game (PC 3050, no PGO, castle-move): executors' guest work -8% / -13%, module workers -4 to -6%, main thread unchanged;
   Market fps 29.16 -> 29.22 / 28.60 (the frame is the main thread's and the Presentation Thread's there). Shots right, speed
   60.0, saves identical.
-- Decision: not adopted, the switches stay off. The main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
+- Main PC with PGO on both sides (castle-move screen): 78.8 -> 79.3 fps, blk above base in 2 of 3 rounds: inside the spread.
+- Decision: not adopted, the switches stay off.
   Game folders: main PC TICK-054's build, PC 3050 main32d. Branch `feature/TICK-063-lifter-speed`, not merged.
-- Next: the main-PC PGO screen (the executors are on the job-group wait there), then the main thread's guest loads.
+- Next: the main thread's guest loads and context traffic (the part of chain A the FP lowering does not reach).
 
 ## TICK-060 (2026-11-12): PC 3050's idle GPU third
 - Found (unprofiled: frame trace, nvidia-smi/dmon, job trace): the GPU idled 12.8 ms of a 35 ms castle-move frame, not for PCIe

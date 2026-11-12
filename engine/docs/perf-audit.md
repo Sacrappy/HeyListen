@@ -3495,7 +3495,8 @@ therefore sees, and is seen by, one of the interleavings the original run allows
 ### Measured (PC 3050, no PGO, castle-move)
 Executors' guest work -7.8% (block) / -12.6% (+ stores, conversions) a frame; module workers -4 to -6%; main thread unchanged.
 Market fps 29.16 / 29.22 / 28.60: the 3050's frame is held by the main thread and the Presentation Thread. Hot code 29.0 ->
-39.6 MB (the fallbacks). Not adopted; the main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
+39.6 MB (the fallbacks). Main PC, PGO on both sides, castle-move screen: 78.8 -> 79.3 fps (2 of 3 rounds above), inside
+the spread. Not adopted.
 
 ## TICK-060: PC 3050's idle GPU third: the late-page wait moved to the queue, the chunk hashes made by the capture's copy (2026-11-12)
 
