@@ -211,3 +211,16 @@ Branch `sync/hookshot-11` (from main ea5f68a), 158 upstream commits since 9a2e80
 - Found: the main thread's two nvnSyncWait polls a frame wait 1.42 ms for the renderer's `sync_order_mu`, held by `submit_q` / `present` for whole replays. `RX_VK_FENCE_POLL_FAST` (off) answers them without it: +1.4..+6 fps in screens, +3.0 / +1.5 / +1.9 in a confirm (16 of 18 rounds above), but the Market's exposure blew out to white. The lock also ordered the exposure readback after the replay's write-back registrations. With that wait moved to the readbacks (the picture right), castle-move 69.6 -> 63.2.
 - Decision: nothing adopted; the switch stays off. Game folder: TICK-054's build. Saves identical after every run (103 runs), no hang.
 - Next: the readbacks' ordering without the replay's whole lock (per-range write-back state published at a replay's start): ~1.4 ms off the main thread's chain, then MSYNC_FAST + SEG_EARLY.
+
+## TICK-063 (2026-11-12): the lifted FP code as speculative blocks
+- Measured: half of the castle's guest time is FP / vector code at 12-60 x86 instructions per guest instruction (integer code
+  3-4); ~9.4 ms of lifted code sits on chain A's path a frame.
+- Built (lift switches, off): `A64_FPX_BLOCK` (straight-line FP runs in XMM registers, one keep test, the per-op code as the
+  exact fallback), `A64_FPX_BLOCK_ST` (stores inside blocks), `A64_FPX_BLOCK_CVT` (int <-> float conversions inside blocks).
+  `tests/test_fpx_block.py`: 2M runs, 0 mismatches, teeth for every keep test.
+- In the game (PC 3050, no PGO, castle-move): executors' guest work -8% / -13%, module workers -4 to -6%, main thread unchanged;
+  Market fps 29.16 -> 29.22 / 28.60 (the frame is the main thread's and the Presentation Thread's there). Shots right, speed
+  60.0, saves identical.
+- Decision: not adopted, the switches stay off. The main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
+  Game folders: main PC TICK-054's build, PC 3050 main32d. Branch `feature/TICK-063-lifter-speed`, not merged.
+- Next: the main-PC PGO screen (the executors are on the job-group wait there), then the main thread's guest loads.

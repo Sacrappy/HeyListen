@@ -8,9 +8,29 @@ several-fold gap comes from); (2) build the biggest bit-exact lifter improvement
 off until proven; (3) prove exactness (lifter tests, differential tests on synthetic AArch64 words, every FPCR mode the game
 uses); (4) measure in the game, both sides with a PGO profile of their own lift: castle-move screen, shots, speed, chain A's
 length; (5) hand back.
-**Machines**: main PC under the lock (`E:/OOT/locks/mainpc`) for the lift, the builds and the runs; the laptop was unreachable
-(SSH timed out), so the synthetic tests ran on the main PC at low priority. PC 3050 not used.
+**Machines**: main PC under the lock (`E:/OOT/locks/mainpc`) for the lifts, the PGO builds and the PGO training runs; the
+in-game A/B moved to PC 3050 (i5-10400F, RTX 3050, 2560x1440, lock `C:\OOT\locks\pc3050`) on the coordinator's word, the
+main PC's lock queue being long; synthetic tests on the main PC at low priority, the final 2M-run test on the laptop.
 **Branch**: `feature/TICK-063-lifter-speed` (from main 9bfc390). Local only.
+
+## Result (2026-11-12): the block lift cuts the executors' CPU time 8-13%, no fps on PC 3050; not adopted, switches stay off
+
+- **Built** (lift switches, all off by default; the default lift is byte for byte main's, key e8dc207cb2): `A64_FPX_BLOCK`
+  (straight-line FP runs as speculative XMM blocks, one keep test, the exact per-op code as the fallback), and on top of it
+  `A64_FPX_BLOCK_ST` (vector stores inside blocks, made at the commit) and `A64_FPX_BLOCK_CVT` (SCVTF / UCVTF / FCVTZS / FCVTZU
+  inside blocks). Exactness: `tests/test_fpx_block.py`, 44 synthetic sequences x 3 switch sets, 2M runs, 0 mismatches; every
+  keep test and commit has a tooth that fails it (sections 3 and 2b).
+- **In the game** (PC 3050, no PGO on any side, castle-move; section 4): the guest work of the six executors (the job group's
+  FP-heavy jobs) is **-8% with the block lift, -13% with stores and conversions** (56.2 -> 51.8 -> 49.1 ms of executor work a
+  frame; every blkx trace is below every base trace); the module workers -4 to -6%; the main thread unchanged. Chain A's walked
+  work goes 30.0 -> 28.9 ms a frame, inside the trace-to-trace spread. **fps unchanged**: Market fps 29.16 (8 runs) / 29.22 (8) /
+  28.60 (4). At 2560x1440 the 3050's frame (36 ms) is held by the main thread and the Presentation Thread, not the executors.
+  Shots right, speed 60.0 on every variant, saves identical after every run.
+- **Decision**: not adopted (no fps gain); the switches stay off. The executor cut is real and stacks with the render-chain
+  work: where the executors are on the critical path (the main PC's job-group wait, TICK-039: ~97% execution), it should show.
+- **Not verified**: the main-PC PGO A/B (`bin/base` against `bin/blk`, both with their own profile, built and ready in
+  `build/tick063`; session2.sh is the screen); the block + stores + conversions lift with a PGO profile (session3.sh prepared);
+  kokiri-idle and hyrule-walk; the full confirm (the screen was not positive).
 
 ## 1. The gap, quantified (castle-move, TICK-052's run B samples with its map; TICK-058's critical path)
 
@@ -123,12 +143,101 @@ leaf 5,874 -> 7,921, the scalar chain 3,222 -> 5,184.
   (aligned and unaligned), random FPCR (FZ, DN, the rounding modes, other control bits, the host inhibit bit) and FPSR; the
   whole Ctx and the guest memory compared. **2,000,000 runs at x86-64-v3: 0 mismatches, the block path taken in 496,756 of
   them; 2,000,000 at x86-64-v2 (blocks compiled out): 0.** The switch off leaves `fpx_header` and `hot_text` as before.
+- With the stores and conversions (section 2b), 132 cases (44 sequences x 3 switch sets), on the laptop (Ryzen 7 5700U):
+  **2,000,000 runs at x86-64-v3, 0 mismatches, the block path taken in 441,297; 2,000,000 at x86-64-v2, 0**.
 - Teeth (each fault put in by hand, 100,000 runs, then restored): the product keep test without its FZ operand test 100
   mismatches; FMLS's negation dropped 122; EXT's byte map off by one 577; the sum's FZ big-or-zero test dropped 4; the scalar
   FMA's addend FZ test dropped 3; FCMP's unordered test dropped 100; FCMP's FZ subnormal test dropped 18; a general register
   written in a block but not committed 981.
-- `test_fpx_xmm`, `test_fpx_slowpath`, `test_fpx_sticky`, `test_vfpx_elem`: see the run_all line in the result.
+- `test_fpx_xmm`, `test_fpx_slowpath`, `test_fpx_sticky`, `test_vfpx_elem`: their inputs are unchanged with the switches off
+  (the default lift is byte for byte main's: `test_fpx_block` checks it, and the lifted-code key is e8dc207cb2 on both PCs).
+
+## 2b. The second lever: stores and conversions inside blocks (off by default)
+
+What still ended runs on the hot pieces (the pass over `code_hot_*.c`): the vector stores (~6,600 sites: STR S / D / Q, STP S / D /
+Q, through SP or not), then FCVT / SCVTF (~900 vector / lane, ~900 to and from W registers).
+- `A64_FPX_BLOCK_ST=1`: a store joins the run. Its address and value are taken where it stands (`_saK`, `_svK` locals), and the
+  store itself is made at the commit, after the keep test, in program order, through the same `recomp_store*` / `recomp_stp*`
+  helper, so the soft write watch's marks are the same. A vector load, or a general-register statement that reads guest
+  memory, after a store starts a new run, so no load in a block reads past a delayed store; stores move later only past register
+  arithmetic. Leading stores stay outside the block (nothing to carry them for). The fallback still starts from a run that stored nothing.
+- `A64_FPX_BLOCK_CVT=1`: SCVTF / UCVTF (binary32 from 32-bit: vector, lane, from a W register) and FCVTZS / FCVTZU (binary32 to
+  32-bit, toward zero: vector, lane, to a W register; the register is shadowed and committed like the other general registers).
+  In the gate the rounding is to nearest and IXC is set, so the host conversion is the Arm one with no new flag. Bad lanes (to the
+  fallback): UCVTF of a value >= 2^31; FCVTZ* of |x| >= 2^31 (NaN and infinity included); FCVTZU of x <= -1; under FZ a
+  subnormal operand (IDC). A to-W conversion is matched only as a statement on a line of its own.
+- Coverage (the pass over the hot pieces): blocks 11,236 -> 10,452 (runs merged), arithmetic ops in blocks 79,518 -> 82,545,
+  5,643 stores and 571 conversions inside blocks, the longest block 159 statements.
+- Exactness: 11 more sequences (stores inside a run, stores that overlap through register offsets, a register stored then
+  overwritten, a base register moved between stores, a load and a general-register load after a store, STP Q / STUR Q; the
+  conversions: vector, lane, to and from W registers, in range, subnormal). Every sequence runs three times against the default
+  lowering: the switch alone, + _ST, + _ST + _CVT. Teeth (100,000 runs each):
+  - stores committed in reverse order: 72 mismatches;
+  - a stored value replaced: 1,559;
+  - the value read at the commit, not where the store stands: 162;
+  - the address replaced: 1,605;
+  - no new run at a load after a store: 202;
+  - UCVTF without its >= 2^31 test: 6;
+  - FCVTZ* without its range test: 133;
+  - FCVTZU without its negative test: 124;
+  - FCVTZ* without its FZ subnormal test: 7;
+  - FCVTZ* to a W register, not committed: 206.
 
 ## 4. In the game
 
-(filled in below)
+**Main PC (PGO): built, not measured.** Session 1b (22:40-23:04, under the lock):
+- three PGO training runs of `bin/gen` (the block lift, instrumented): kokiri-idle, castle-move and hyrule-walk, 115 s each; saves
+  identical, no game left;
+- the merged profile (6:1 with the shipped one, as TICK-045);
+- `bin/blk`, built from the same block lift (lifted code 877598a7ef, as gen's) with that profile;
+- the default lift put back in the shared work folder (verify_shared: base lift, the repo's profile; game folder as found).
+
+The screen (session2) was not run: the coordinator moved the in-game A/B to PC 3050.
+
+**PC 3050** (i5-10400F 6C/12T, RTX 3050, 2560x1440, session 0 over SSH). Setup: the branch as a bundle in `C:\OOT\t63`, three
+work folders copied from `w56`, TICK-055's no-PGO recipe (`b63.bat`, `-march=x86-64-v3`). Builds:
+- `t63base`: the default lift (e8dc207cb2); every object came from the cache;
+- `t63blk`: A64_FPX_BLOCK (877598a7ef); hot pieces compiled in 1198 s;
+- `t63blkx`: + _ST + _CVT (6764240245).
+
+The exe is 462 MB with blocks, against 448 MB without.
+
+- Shots (every 300 presents) and the speed log, castle-move. All three show the title, the save's load and the Market. Market
+  shots' mean luma: base 99; blk 104, 104, 79, 65, 66, then a scene load (the triforce screen: with the Market loaded earlier,
+  Link walks into a door); blkx 96. Speed median 60.05 / 60.06 / 60.01. The first base run was spent in the start-up precompile
+  (a new hookshot_vk.dll: 3 min of pipelines, killed by run_bench at 112 s) and is left out.
+- fps: run_bench's 66 s cut takes in the end of the save's load (300+ fps) in some runs (one base run gave 85.5), so the table
+  counts the Market only (the log's fps lines after the load). castle-move, interleaved rounds (screen, trace rounds, shot runs):
+
+| variant | Market fps per run | mean |
+|---|---|---:|
+| base | 29.33 29.00 29.50 28.73 28.75 29.58 29.17 29.25 | 29.16 |
+| A64_FPX_BLOCK | 29.00 29.58 30.36 28.64 29.83 28.55 28.67 29.17 | 29.22 |
+| + _ST + _CVT | 28.17 28.42 28.00 29.83 | 28.60 |
+
+- Chain A (`HOS_JOBTRACE` 88-91 s, castle-move; `critpath.py --anchor main` and `jobtrace.py`; 4 / 4 / 3 traces):
+
+| variant | frame (ms) | chain A's walked work a frame (ms) | executors' work a frame (ms, six threads) | module workers' (ms) | main thread a second (ms) |
+|---|---|---|---|---|---|
+| base | 36.8 36.5 35.3 36.7 | 30.3 31.1 30.2 28.3 = 30.0 | 56.2 | 23.4 | 469-489 |
+| A64_FPX_BLOCK | 37.3 38.4 33.9 36.3 | 27.5 30.3 27.7 30.0 = 28.9 | 51.8 (-7.8%) | 22.0 | 471-488 |
+| + _ST + _CVT | 37.4 37.2 37.2 | 29.7 29.1 28.0 = 28.9 | 49.1 (-12.6%) | 22.5 | 474-488 |
+
+  Executors' work a second: base 1524-1567, blk 1384-1499, blkx 1302-1329 (no overlap between base and blkx).
+  - The main thread's work is the largest piece of the walked path (12.6-13.9 ms) and does not move. Its hot code (draw lists,
+    the module phase) is integer and pointer code, which the blocks do not touch.
+  - The frame is held by the main thread and the Presentation Thread (GPU 18.8 ms a frame at 1440p on the 3050), so the
+    executors' cut does not reach fps here.
+- After every run: no game left, saves identical to `C:\OOT\user-save-backup`. After each lock hold (00:17-00:54,
+  00:59-01:44, 01:48-02:08) the game folder went back to main32d (exe 2979897a, dll bbf74311) and the lock was released.
+
+## 5. Next
+
+1. **Measure the PGO pair on the main PC.** `build/tick063/bin/base` and `bin/blk` are built, each with its own profile, and
+   session2.sh is the screen (~25 min of lock). There the executors are on the job-group wait (TICK-039), so their 8-13% cut
+   may show.
+2. **The NavMesh kernels.** In f_820e2520, 31 blocks already hold 145 of ~160 FP ops. What remains is the guest loads between
+   the blocks and the code size: 118 KB with the fallback, against 94 KB. A block whose fallback is a call to an outlined copy
+   of the run, instead of inlined text, would halve the hot text growth (29 -> 39.6 MB of hot code now).
+3. **The main thread** is the part of chain A the FP lowering does not reach. Its guest loads (TICK-055: the critical path) and
+   the context traffic are the next lifter levers (guest registers in host registers across calls, TICK-041 / TICK-055).

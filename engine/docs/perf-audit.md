@@ -3319,3 +3319,32 @@ thread's part of the loop 1.82 -> 0.59 ms, the Presentation Thread's idle 2.0 ->
 2. `submit_q` holding `sync_order_mu` for the capture and the whole replay is the coupling between the two chains in general
    (PR 430 took the texture releases off it with `held_mu` for the same reason).
 3. The host's sync primitives themselves: no further lever (wake p50 6.4 us, ~0.3-0.5 ms a frame on the chain).
+
+## TICK-063: the lifted FP code as speculative blocks (2026-11-12)
+
+The gap: half of the castle's guest time runs in FP / vector functions at 12-60 x86 instructions per guest instruction, against
+3-4 for integer code. Each FP op of the default lowering re-reads the FPX gate, loads its operands from the context, tests its
+result's lanes and branches, and stores the register back, so the next op's operand comes through a store-to-load hop.
+
+### The switches (lift time, all off; `third_party/a64-kit/lift/a64_block.py`)
+- `A64_FPX_BLOCK=1`: a straight-line run of known FP statements (vector and scalar FADD / FSUB / FMUL / FDIV / FMA forms, by
+  element, FADDP, FSQRT, FCMP as a run's last op, the data moves, the vector loads, pure general-register statements between them)
+  becomes one block. The gate is read once; values stay in XMM registers; each op ORs its lane tests (the default helpers', lane
+  for lane) into one mask; the registers are committed only if no lane is bad. Otherwise the run's original statements run from
+  the untouched state (cold).
+- `A64_FPX_BLOCK_ST=1`: vector stores inside blocks, their address and value taken where they stand, the store made at the
+  commit in program order through the same helper; a load after a store starts a new run.
+- `A64_FPX_BLOCK_CVT=1`: SCVTF / UCVTF / FCVTZS / FCVTZU (binary32 <-> 32-bit) inside blocks, kept when the host conversion is
+  the Arm one.
+- Exactness: `tests/test_fpx_block.py` (44 sequences x 3 switch sets, random registers, memory, FPCR / FPSR; whole Ctx and guest
+  memory compared), 2M runs, 0 mismatches; teeth for every keep test and commit.
+
+### Data races
+A block makes the same guest loads as the run, in the same order, and no store precedes a load inside a block. Stores (with
+`_ST`) are made after the block's last load, in program order, moved later only past register arithmetic. A racing writer
+therefore sees, and is seen by, one of the interleavings the original run allows.
+
+### Measured (PC 3050, no PGO, castle-move)
+Executors' guest work -7.8% (block) / -12.6% (+ stores, conversions) a frame; module workers -4 to -6%; main thread unchanged.
+Market fps 29.16 / 29.22 / 28.60: the 3050's frame is held by the main thread and the Presentation Thread. Hot code 29.0 ->
+39.6 MB (the fallbacks). Not adopted; the main-PC PGO pair (`bin/base`, `bin/blk`) is built and not yet measured.
