@@ -369,10 +369,12 @@ NV(nvnMemoryPoolGetBufferAddress) {
     RET(((const nvn_pool *)P(0))->gpu);
 }
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
+static void hold_linger_end(void);   /* (HOS_NVN_HOLD_LINGER_US, below: the holder's readback is done) */
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     if (no_pool(c, "invalidate mapped range")) return;
     const nvn_pool *o = (const nvn_pool *)P(0);
     if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
+    hold_linger_end();
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
 /* NVNmappingRequest (0x28 bytes): physical pool (guest pointer), physical offset, virtual offset, size, storage class */
@@ -503,6 +505,7 @@ NV(nvnBufferFlushMappedRange) {}
 NV(nvnBufferInvalidateMappedRange) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
     if (o->pool) rx_nvn_invalidate(POOL(o->pool)->gpu + (uint64_t)o->off + U64(1), U64(2));
+    hold_linger_end();
 }
 NV(nvnBufferSetDebugLabel) {}
 
@@ -1074,6 +1077,29 @@ int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy);   /* (rx_backend.c,
 void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ);
 enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_THREAD, HF_OTHER, HF_N };
 static void held_flush_why(int why);
+/* (HeyListen, sprint 5) HOS_NVN_HOLD_LINGER_US=<us> (mode 2; off by default, 300 in the screens): the held submits' thread starts its flush
+   that long after the last hold at the latest, and at once when the holding thread has made its next readback
+   (nvn*InvalidateMappedRange). Why: OoT's main thread holds its two submits, polls two older fences (~0.14 ms later) and reads
+   GPU results back (the exposure meter). With the flush started ~4 us after the hold, that readback came inside the flush's
+   section of the replay's order and waited for all of it (the capture's ~30 MB copy and the replay: 1.3 ms a frame, every
+   executor and module worker idle meanwhile: the job group starts after it). A readback before the flush starts waits for
+   nothing and reads what the console's CPU would: the results of the submissions the GPU has finished, none of the frame just
+   submitted; the capture, taken after it, has what the CPU wrote after reading (the meter's reset), in order. The Presentation
+   Thread's event poll does not flush during the linger (it looks again); its own submit, a fence wait for a held value, a
+   finish and a present flush at once, as before. Measured (castle-move, docs/tickets/SPRINT-5.md): the main thread's wait goes
+   (1.3 -> 0.01 ms a frame) and the job group starts 1.5 ms earlier, but the Presentation Thread then makes the flush itself and
+   its first take waits ~1.3 ms for the GPU's late pages of the frame before: with the render-chain switches +2.6 fps, inside
+   the spread; shots not checked. Off until the render chain is shorter. */
+static int64_t hold_linger_ns = -1;
+static volatile LONG64 hold_linger_until;   /* (0: none) */
+static void *volatile hold_linger_thread;
+static int hold_lingering(void) {
+    const int64_t u = hold_linger_until;
+    return u && hos_now_ns() < u;
+}
+static void hold_linger_end(void) {
+    if (hold_linger_until && hold_linger_thread == (void *)hos_self()) InterlockedExchange64(&hold_linger_until, 0);
+}
 /* (mode 2) the held submits' replay thread: woken at each hold; it takes the capture and replays on itself, off the game's
    thread. A host thread: no virtual core, no guest code (the replay runs none) */
 static DWORD WINAPI hold_flush_thread(void *p) {
@@ -1084,6 +1110,10 @@ static DWORD WINAPI hold_flush_thread(void *p) {
     if (getenv("HOS_NVN_HOLD_PRIO") && atoi(getenv("HOS_NVN_HOLD_PRIO")) != 0) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     for (;;) {
         WaitForSingleObject(hold_event, INFINITE);
+        while (hold_lingering() && nheld) {   /* (short: a spin with yields, no timer) */
+            for (int i = 0; i < 32; i++) YieldProcessor();
+            SwitchToThread();
+        }
         held_flush_why(HF_THREAD);
     }
 }
@@ -1093,6 +1123,8 @@ static void held_init(void) {
         const char *e = getenv("HOS_NVN_HOLD");
         hold_on = e ? atoi(e) : 2;   /* (TICK-054: 2 by default; =0: off) */
         hold_check = getenv("HOS_NVN_HOLD_CHECK") && atoi(getenv("HOS_NVN_HOLD_CHECK")) != 0;
+        hold_linger_ns = (getenv("HOS_NVN_HOLD_LINGER_US") ? atoll(getenv("HOS_NVN_HOLD_LINGER_US")) : 0) * 1000;
+        if (hold_linger_ns < 0 || hold_on != 2) hold_linger_ns = 0;
         if (hold_on) hos_log("nvn: submits held (HOS_NVN_HOLD=%d%s)", hold_on, hold_check ? ", checked" : "");
         if (hold_on == 2) {
             hold_event = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -1235,7 +1267,7 @@ NV(nvnEventGetValue) {
         if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
         if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
     }
-    if (hold_on == 2 && nheld) held_flush_why(HF_EVENT);   /* (TICK-054: a held submit may be what signals it) */
+    if (hold_on == 2 && nheld && !hold_lingering()) held_flush_why(HF_EVENT);   /* (TICK-054: a held submit may be what signals it) */
     uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);
 }
@@ -2493,6 +2525,7 @@ NV(nvnQueueSubmitCommands) {
     hs->t = hos_now_ns();
     if (hold_check) hs->npages = hos_hold_snapshot(&hs->pages, &hs->copy);
     nheld++;
+    if (hold_linger_ns > 0) hold_linger_thread = (void *)hos_self(), InterlockedExchange64(&hold_linger_until, hs->t + hold_linger_ns);
     LeaveCriticalSection(&held_cs);
     if (hold_event) SetEvent(hold_event);
     HOS_JT(JT_MARK, 3, q->submits);   /* (the submit held) */

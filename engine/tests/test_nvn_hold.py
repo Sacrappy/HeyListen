@@ -89,7 +89,7 @@ class NvnHoldTests(unittest.TestCase):
         wait = block(self.nvn, "NV(nvnSyncWait)")
         self.assertIn("if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush_why(HF_SYNC);", wait)
         ev = block(self.nvn, "NV(nvnEventGetValue)")
-        self.assertIn("if (hold_on == 2 && nheld) held_flush_why(HF_EVENT);", ev)
+        self.assertIn("if (hold_on == 2 && nheld && !hold_lingering()) held_flush_why(HF_EVENT);", ev)   # (sprint 5: not during the linger, off by default)
         self.assertLess(ev.index("held_flush_why(HF_EVENT)"), ev.index("nvn_gpu_read("))
 
     def test_fence_counts_the_held_submits(self):
