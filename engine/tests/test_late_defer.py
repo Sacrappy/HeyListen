@@ -78,7 +78,8 @@ def main():
     rd = body(mem, "bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {")
     need("late_fix_slot_pending(e.gen, e.slot, &lv)" in rd and "vk_timeline_wait_sent(lv);" in rd and
          "memory_late_fix_apply(vk_timeline_completed());" in rd and
-         "if (page0 == page1 && !late_read) {" in rd, "memory_read_as_submitted: a pending late slot read after its value and fix")
+         ("if (page0 == page1 && !late_read) {" in rd or "if (page0 == page1 && from == 0) {" in rd),   # (Sync 12: upstream's rule, read from no capture, covers it)
+         "memory_read_as_submitted: a pending late slot read after its value and fix")
     need("const bool late_pending = late_fix_slot_pending(e.gen, e.slot, nullptr);" in mem and
          "if (!late_pending && d_ok && gb - ga == 4096 && b->second.map) {" in mem, "mirror sync: no hash of a pending late slot")
 

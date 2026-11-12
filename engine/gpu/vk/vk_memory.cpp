@@ -1797,6 +1797,8 @@ int capture_copy_helpers() {   // (copy_pages, copy_pairs and collect_split shar
 void copy_helpers_start_locked() {   // (copy_helpers.mu held)
     if (copy_helpers.started) return;
     copy_helpers.started = true;
+    for (int i = 0; i < capture_copy_helpers(); i++) std::thread(copy_helper_main).detach();
+}
 /// (hookshot) whole's n copies in helpers + 1 parts: the first on the calling thread, the others queued for the helpers.
 /// Under 128 copies (512 KB) all on the calling thread: waking the helpers costs more than they save. Its own parts no
 /// helper has taken yet the caller runs itself once its first is done, rather than waiting behind what another caller

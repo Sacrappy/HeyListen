@@ -21,6 +21,7 @@ FIXTURE = r"""
 #include <map>
 #include <mutex>
 #include <vector>
+static bool env_on(const char*) { return false; }   // (HeyListen: RX_VK_VALUE_REC_FIRST, off here)
 struct Recording { uint64_t value = 0; };
 std::mutex rec_map_mu;
 std::map<uint64_t, uint64_t> value_rec;

@@ -43,12 +43,20 @@ def main():
     if take.index("copy_pairs(pairs.data()") > take.index("const auto tk1"):
         raise SystemExit("take_capture: the shadow's copies are made after shadow_mu is let go")
     parts = [source[source.index("struct CopyPair {"):source.index("\n", source.index("struct CopyPair {"))],
+             "struct ClaimJob;",
              block(source, "struct CopyPart {", ";"),
              block(source, "void copy_part(const CopyPart& w)"),
              block(source, "struct CopyHelpers {", ";"),
+             # (HeyListen, TICK-061: the claimed chunks, off here (capture_claim_on is false); their code as it is)
+             block(source, "struct ClaimJob {", ";"),
+             block(source, "int64_t claim_chunk_pages("),
+             block(source, "void claim_run(ClaimJob& j)"),
+             "void copy_helpers_start_locked();",
+             block(source, "void claim_all(ClaimJob& job, int helpers)"),
+             "std::atomic<int64_t> st_claim_copies{0}, st_claim_helped{0};",
              block(source, "void copy_helper_main()"),
              block(source, "int capture_copy_helpers()"),
-             block(source, "void copy_helpers_start_locked()"),   # (HeyListen: shared with TICK-043's collect_split)
+             block(source, "void copy_helpers_start_locked() {"),   # (HeyListen: shared with TICK-043's collect_split)
              block(source, "void copy_split(CopyPart whole"),
              block(source, "void copy_pages(const uint32_t* pages"),
              block(source, "void copy_pairs(const CopyPair* pairs")]
@@ -71,6 +79,11 @@ struct Host { void* guest_base() { return guest.data(); } uint64_t guest_size() 
     // (HeyListen, TICK-043: collect_split's parts, never queued here)
     int64_t collect_written_in(const uint64_t (*)[2], int, uint32_t**) { return 0; } } host_obj, *host = &host_obj;
 static bool stream_on() { return false; }   // (HeyListen, TICK-037: streaming stores off here)
+// (HeyListen, TICK-060: the capture's chunk hashes, never asked for here; TICK-061's claiming, off)
+namespace msync_diff { constexpr int kChunks = 16; }
+static std::atomic<int64_t> st_hash_made{0};
+static bool guarded_copy_hash(uint8_t*, const uint8_t*, uint64_t*, bool) { return false; }
+static bool capture_claim_on() { return false; }
 static bool guarded_copy_stream(void*, const void*, size_t) { return false; }
 static void stream_fence() {}
 constexpr int THREAD_PRIORITY_ABOVE_NORMAL = 1;   // (HeyListen, TICK-054: RX_VK_CAPTURE_PRIO)

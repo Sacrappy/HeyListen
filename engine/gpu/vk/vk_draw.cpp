@@ -6825,7 +6825,7 @@ bool occ_proxy_skip_on() {
     return on;
 }
 // (the answer kept by the program's key and variant, each thread its own: not in Program, whose size is part of the program
-// cache's stamp (vk_shader.cpp disk_stamp: sizeof(Program)); a field there made every program cache on disk start again.
+// cache's stamp (program_cache_stamp: sizeof(Program)); a field there made every program cache on disk start again.
 // A key and variant name one translation, so the same stages and the same answer)
 bool program_inert(const Program& p) {
     thread_local std::unordered_map<uint64_t, bool> known;

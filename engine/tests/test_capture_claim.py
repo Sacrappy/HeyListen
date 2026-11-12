@@ -26,7 +26,8 @@ def main():
     parser.add_argument("--cxx", default="clang++")
     args = parser.parse_args()
     source = (ROOT / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
-    start = source.index("struct ClaimJob;\nstruct CopyPart {")
+    # (Sync 12: upstream's CopyPair (copy_pairs) comes right before)
+    start = source.index("struct CopyPair {") if "struct CopyPair {" in source else source.index("struct ClaimJob;\nstruct CopyPart {")
     cp = source.index("void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok", start)
     end = source.index("\n}\n", cp) + 3
     block = source[start:end]
@@ -81,6 +82,8 @@ static void stream_fence() { std::atomic_thread_fence(std::memory_order_seq_cst)
 namespace msync_diff { constexpr int kChunks = 16; }
 static bool guarded_copy_hash(uint8_t*, const uint8_t*, uint64_t*, bool) { std::abort(); }
 static std::atomic<int64_t> st_hash_made{0};
+static void copy_fence() {}   // (Sync 12: upstream's fence after a page-by-page retry)
+static bool env_on(const char* n) { const char* e = std::getenv(n); return e && *e && std::strcmp(e, "0") != 0; }   // (upstream's switch rule)
 ''' + block + r'''
 static uint64_t rng = 0x9E3779B97F4A7C15ull;
 static uint64_t nx() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }

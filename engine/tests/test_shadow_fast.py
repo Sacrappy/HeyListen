@@ -62,6 +62,8 @@ def main():
 #include <vector>
 struct Cap { std::vector<uint32_t> pages, copied, slots, late; uint8_t* map = nullptr; };
 static const bool late_defer = false;   // (TICK-060: the fast block is not used with deferred late slots)
+struct CopyPair { uint8_t* dst; const uint8_t* src; };   // (Sync 12: upstream's copy_pairs, the shadow's copies on the helpers)
+static void copy_pairs(const CopyPair* p, int64_t n) { for (int64_t i = 0; i < n; i++) std::memcpy(p[i].dst, p[i].src, 4096); }
 ''' + decl + helpers + "\n" + fast + r'''
 void old_block(const Cap* c) ''' + old_body + r'''
 static uint64_t rng = 0x2545F4914F6CDD1Dull;
