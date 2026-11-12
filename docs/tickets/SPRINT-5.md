@@ -118,6 +118,22 @@ The first item of the list below, done: a write mark per 512 bytes (`A64_GRAN=1`
   barrier dropped too (`RX_VK_TEST_BARRIER_DROP`) 86.8, as the drop alone (87.5): nothing adds up.
 - Decision: not adopted. What the capture saves is paid by the marks; the frame's other chains hold it where it was.
 
+## Session 4 (2026-11-12): small right gains added up, on by default
+
+- Barriers by class (`RX_VK_TEST_BARRIER_DROP=<mask>`: 2 pass starts, 4 dispatches, 8 the game's; 3 rounds): pass starts 84.5,
+  dispatches 82.6, the game's 83.1, all three 85.9 against 82.6: only all of them together pay, which is no picture.
+- Render resolution (the stack below, one run each): 67% with the game's upscaler 86.6, 67% with FSR 3.1 82.0, 50% 84.3
+  against ~85: the GPU's time is not the pixels'.
+- The job system's width, read: the worker set's maker f_8069b020 has the six cores in its text (`mask & 0x3e`, a loop to 6).
+  hos_thread.c already wraps a thread pinned past the cores onto a core number it shares (the TotK port's extra executors);
+  not tried: two threads with one core number run at once only if the game's per-core data allows it.
+- **Adopted** (set by `host/hos_main.c` before main, each `=0` off): the capture copied ahead in one parallel round when the
+  main thread leaves its end-of-frame wait (`RX_VK_CAPTURE_PRECOPY=1`, `RX_VK_PRECOPY_KICK=2`, `HOS_PRECOPY_KICK=1`; not where
+  the chunk diff is on), `RX_VK_BARRIER_TRUST=1`, `RX_VK_BARRIER_DEDUPE_PAR=1`. Each was inside the spread alone (+1.3, +0.3,
+  +1.5). Together, 5 interleaved rounds: by environment 85.0 against 82.3; as the default build 85.0 against 82.7 (1% low 51
+  against 45). Shots right in the three scenes, speed 59.95-60.08; one run a scene 90.0 / 89.3 / 85.5 against 87.4 / 81.4 /
+  83.0 (kokiri-idle / castle-move / hyrule-walk). Not checked on PC 3050 (the pre-copy is off there: its chunk diff is on).
+
 ## Where this leaves the 120 fps goal (2026-11-12)
 
 Target since 2026-11-12 07:00: 120 fps average in Kokiri Forest, Hyrule Field and the castle town, no drop under 110 while

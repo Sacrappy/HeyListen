@@ -2673,13 +2673,16 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     // (TICK-057, a measurement, never for play: RX_VK_TEST_BARRIER_DROP=1 leaves out the recordings' pass-start, dispatch and the
     // game's own barriers (not the uploads', the write-backs' or a segment's edges). The picture may be wrong: it bounds what the
     // GPU loses to those drains, nothing else)
-    static const bool drop_test = [] {
-        const bool v = getenv("RX_VK_TEST_BARRIER_DROP") && atoi(getenv("RX_VK_TEST_BARRIER_DROP")) != 0;
-        if (v) logf("vk: RX_VK_TEST_BARRIER_DROP=1: pass-start, dispatch and the game's barriers left out (a measurement: the picture may be wrong)");
+    // (sprint 5: =1 all three, or a mask: 2 pass starts, 4 dispatches, 8 the game's)
+    static const int drop_test = [] {
+        const int e = getenv("RX_VK_TEST_BARRIER_DROP") ? atoi(getenv("RX_VK_TEST_BARRIER_DROP")) : 0;
+        const int v = e == 1 ? 14 : e;
+        if (v) logf("vk: RX_VK_TEST_BARRIER_DROP=%d: %s%s%s barriers left out (a measurement: the picture may be wrong)", e, v & 2 ? "pass-start " : "",
+                    v & 4 ? "dispatch " : "", v & 8 ? "the game's" : "");
         return v;
     }();
-    if (drop_test && why && (!strcmp(why, "barrier (pass start)") || !strcmp(why, "barrier (dispatch)") ||
-                             !strcmp(why, "barrier (the game's nvnCommandBufferBarrier)"))) {
+    if (drop_test && why && (((drop_test & 2) && !strcmp(why, "barrier (pass start)")) || ((drop_test & 4) && !strcmp(why, "barrier (dispatch)")) ||
+                             ((drop_test & 8) && !strcmp(why, "barrier (the game's nvnCommandBufferBarrier)")))) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
         return;
     }

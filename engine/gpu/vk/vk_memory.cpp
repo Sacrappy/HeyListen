@@ -1936,8 +1936,12 @@ std::vector<uint32_t>& collect_split(const std::vector<std::pair<uint64_t, uint6
 bool precopy_on() {
     static const bool v = [] {
         const char* e = getenv("RX_VK_CAPTURE_PRECOPY");
-        const bool on = e && atoi(e) != 0 && capture_on() && !(getenv("RX_VK_CAPTURE_DEFER") && atoi(getenv("RX_VK_CAPTURE_DEFER")) != 0);
+        // (sprint 5: on by default from the host's environment, host/hos_main.c; not where the mirror syncs' chunk diff is on (slow
+        // links: PC 3050), whose hashes the capture's own copy makes: the pre-copy's slots have none)
+        const bool on = e && atoi(e) != 0 && capture_on() && !(getenv("RX_VK_CAPTURE_DEFER") && atoi(getenv("RX_VK_CAPTURE_DEFER")) != 0) &&
+                        !diff_mode();
         if (on) logf("vk: the submit-time capture is copied ahead on a thread of its own (RX_VK_CAPTURE_PRECOPY)");
+        else if (e && atoi(e) != 0 && diff_mode()) logf("vk: the capture is not copied ahead: the mirror syncs' chunk diff is on (RX_VK_CAPTURE_PRECOPY)");
         return on;
     }();
     return v;

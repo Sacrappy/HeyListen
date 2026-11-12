@@ -386,6 +386,23 @@ __attribute__((constructor)) static void heylisten_env_defaults(void) {
         "RX_VK_DRY_LEAN", "RX_VK_WORK_LOCAL", "RX_VK_SEG_SETUP_PAR", "RX_VK_OCC_PROXY_SKIP", "RX_VK_FENCE_POLL_FAST",
         "RX_VK_READBACK_TICKET", "HOS_CV_SIGNAL_FAST", "HOS_THREAD_OF_CACHE", "HOS_SHORT_SLEEP_PAUSE",
     };
+    /* (sprint 5, session 4: 85.0 against 82.3 fps over 5 rounds together, each inside the spread alone) the capture copied ahead in
+       one parallel round when the main thread leaves its end-of-frame wait, and the engine's pass-start and dispatch barriers
+       trusting the game's */
+    static const char *const more[][2] = {
+        {"RX_VK_CAPTURE_PRECOPY", "1"}, {"RX_VK_PRECOPY_KICK", "2"}, {"HOS_PRECOPY_KICK", "1"},
+        {"RX_VK_BARRIER_TRUST", "1"}, {"RX_VK_BARRIER_DEDUPE_PAR", "1"},
+    };
+    for (size_t i = 0; i < sizeof more / sizeof more[0]; i++)
+        if (!getenv(more[i][0])) {
+            char kv[64];
+            snprintf(kv, sizeof kv, "%s=%s", more[i][0], more[i][1]);
+#ifdef _WIN32
+            _putenv(kv);
+#else
+            setenv(more[i][0], more[i][1], 0);
+#endif
+        }
     for (size_t i = 0; i < sizeof on / sizeof on[0]; i++)
         if (!getenv(on[i])) {
             char kv[64];
