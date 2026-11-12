@@ -16,21 +16,40 @@ repository (the engine under `engine/`).
 - `heylisten-setup.txt`: the list of parts the setup reads (you do not need to download it).
 - `SHA256SUMS.txt`: checksums of the files above.
 
-## New in v0.2.1
+## New in this release
 
-- **Faster floating-point code**: the game's vector math runs as real SIMD instead of lane by lane, its slow paths (quiet
-  NaN lanes, estimates) are cut, and the builder ships an optimization profile recorded on that code. Market about
-  75 -> 78 fps standing, 68 -> 73 walking, street to the gate 71 -> 74 on the test PC. Results are bit-identical to before.
+Everything below is new since v0.1.0 (v0.2.0 and v0.2.1 were built but never published). Figures are from the two test PCs:
+a Ryzen 7 7800X3D + RTX 5070 on PCIe 5.0 x16, and an i5-10400F + RTX 3050 on PCIe 3.0 x4.
 
-## New in v0.2.0
-
-- **Castle Town Market ground fixed** while walking (no more flat mint/white or teal ground): ASTC textures are kept as
-  BC1/BC7 (decoded textures 3.0 -> 1.1 GB, VRAM peak -14%) and a pool-mirror ordering bug is fixed.
-- **Faster**: Market about 71 -> 75 fps standing, 64 -> 68 walking, with much better 1% lows (about 40 -> 50 fps
-  standing) on the test PC (Ryzen 7 7800X3D, RTX 5070), from faster capture copies and Hookshot's latest engine work.
-- **Less RAM**: about 2 GB less (compute pipelines built on first use, their modules dropped); faster shader start-up.
-- **Hookshot v2.0.12/v2.0.13**: the new Dear ImGui menu (Insert), keyboard shortcut choice, capture and screenshot fixes,
-  builder hardening. HeyListen's frame limit row and FPS counter (F10) are kept.
+- **Much faster on PCs with a slow graphics link** (the RTX 3050 test PC, PCIe 3.0 x4):
+  - The CPU now records the next frame while the GPU finishes its write-backs, instead of waiting for them (`RX_VK_LATE_DEFER`).
+  - The capture copy also hashes the pages for the mirror syncs, so the syncs no longer hash them again (`RX_VK_CAPTURE_HASH`).
+  - Mirror syncs copy only the 256-byte chunks that changed (32 -> 4.4 MB a frame).
+  - These are on by default where the link is 8 GB/s or less (read from the driver). Together they give +18-21% fps there:
+    Kokiri Forest 30.9 -> 37.2, Castle Town 29.1 -> 34.4, Hyrule Field 31.4 -> 37.2 fps at 1440p. Fast links keep the old
+    copies and the same speed.
+- **Faster frames on every PC**:
+  - The game's frame and the replay of its draws overlap better: the replay is held and recorded in parallel. That gives
+    +1.9 to +3.8 fps in Kokiri Forest, Castle Town and Hyrule Field on the 7800X3D.
+  - The capture copies use streaming stores (+2.4 to +3.3 fps).
+- **Faster floating-point code**:
+  - The game's vector math runs as real SIMD instead of lane by lane, and its slow paths (quiet NaN lanes, estimates) are cut.
+  - The builder ships an optimization profile recorded on that code.
+  - Market about 75 -> 78 fps standing, 68 -> 73 walking. Results are bit-identical to before.
+- **Fewer stutters on mid-range PCs**: ASTC texture transcodes are batched and their BC copies are cached in system RAM.
+- **Castle Town Market ground fixed** while walking (no more flat mint, white or teal ground):
+  - ASTC textures are kept as BC1/BC7 (decoded textures 3.0 -> 1.1 GB, VRAM peak -14%).
+  - A pool-mirror ordering bug is fixed.
+- **Less RAM**: about 2 GB less (compute pipelines are built on first use and their modules dropped); shaders start faster.
+- **Hookshot v2.0.12/v2.0.13**:
+  - The new Dear ImGui menu (Insert), keyboard shortcut choice, capture and screenshot fixes, and builder hardening.
+  - HeyListen keeps its frame limit row and FPS counter (F10).
+- **Discord**: the status now shows "Playing HeyListen" with its own icon (the Insert menu's "Discord status" row; it does
+  nothing without a Discord client running).
+- **For developers**:
+  - Many measured performance switches, off by default, each with its ticket and benchmark in `docs/`.
+  - Frame tracing tools (job trace, critical path, frame breakdown) and an analysis of where frame time can still be saved
+    (`docs/research/suspects/`).
 
 ## What HeyListen adds to Hookshot
 
@@ -48,6 +67,8 @@ repository (the engine under `engine/`).
 
 ## Known issues
 
+- **Hookshot's newest engine work (after v2.0.13) is not in this release.** Merged with HeyListen, it is about 29% slower
+  here for now (a readback wait and thread scheduling changes); it waits on the `sync/hookshot-12` branch.
 - **Occlusion is off** (a fixed value, as in Hookshot): real occlusion queries break the picture; some scenes draw more than
   they need.
 - **12 GB of VRAM recommended.** 8 GB cards are untested.
