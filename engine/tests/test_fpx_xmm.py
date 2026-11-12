@@ -116,6 +116,7 @@ def generate(cxx, tmp, flags):
     used |= {("add32", "add32", 2, 2), ("sub32", "sub32", 2, 2), ("mul32", "fma32", 2, 3), ("fma32", "fma32", 3, 3),
              ("div32", "div32", 2, 2)}
     # the switch off: the header and the hot text as without it
+    os.environ["A64_FPX_BLOCK"] = "0"   # (the block lift is on by default since sprint 5: this test is of the lowering under it)
     for k in SWITCHES:
         os.environ.pop(k, None)
     plain = a64_lift.fpx_header(used)

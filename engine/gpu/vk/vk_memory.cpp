@@ -1901,6 +1901,19 @@ bool precopy_kick_on() {
     static const bool v = getenv("RX_VK_PRECOPY_KICK") && atoi(getenv("RX_VK_PRECOPY_KICK")) != 0;
     return v;
 }
+// (HeyListen, sprint 5) RX_VK_PRECOPY_KICK=2 (with RX_VK_CAPTURE_PRECOPY=1): one round a frame, kicked by the renderer when a
+// present begins (memory_precopy_present), copied by the capture's own helpers (copy_pages: runs of pages, every helper), into a
+// buffer sized for what was collected. Why there: with the held flush early (HOS_NVN_HOLD_LINGER_US) the frame's first capture
+// (the pages the game wrote during the whole frame: 30-40 MB, 1.6-2 ms) is made on the Presentation Thread at the start of the
+// render chain, which the frame waits for; when the previous present begins, the game's job group and module phase of that next
+// frame are nearly over, the replay's workers and the copy helpers idle, and the present takes 0.6-1.5 ms. The capture at the
+// submit then copies what was written since and what was written again (capture_merge.h: the same pages as at the submit).
+// kick 1's single-thread page-by-page rounds copied 100-300 pages ahead of ~7,500 (TICK-054).
+int precopy_kick_mode() {
+    static const int v = getenv("RX_VK_PRECOPY_KICK") ? atoi(getenv("RX_VK_PRECOPY_KICK")) : 0;
+    return v;
+}
+std::atomic<int64_t> st_pre2_rounds{0}, st_pre2_pages{0}, st_pre2_skipped{0}, st_pre2_ns{0};
 HANDLE precopy_kick_event = nullptr;
 std::atomic<int64_t> st_precopy_kicks{0};
 void precopy_main() {
@@ -1928,6 +1941,35 @@ void precopy_main() {
         if (ranges.empty()) continue;
         std::unique_lock lk(pre.mu);
         if (pre.full || pre.stop.load(std::memory_order_relaxed)) continue;
+        if (precopy_kick_mode() >= 2) {   // (sprint 5: one round on the capture's helpers; see precopy_kick_mode)
+            if (!pre.pages.empty()) { st_pre2_skipped++; continue; }   // (the last round's copies not taken yet)
+            const auto r0 = std::chrono::steady_clock::now();
+            const uint64_t done = vk_timeline_completed();   // (before the marks are cleared, as below)
+            uint32_t* pages = nullptr;
+            const int64_t n = host->collect_written_in(reinterpret_cast<const uint64_t(*)[2]>(ranges.data()), (int)ranges.size(), &pages);
+            bool taken = false;
+            if (n > 0 && (uint64_t)n * 4096 <= (96ull << 20)) {
+                const uint64_t need = (uint64_t)n * 4096 * 5 / 4 + (4ull << 20);   // (room for the pages written after)
+                if (pre.map && pre.bsize < need) cap_buf_free(pre.buffer, pre.alloc, pre.map, pre.bsize), pre.buffer = VK_NULL_HANDLE, pre.map = nullptr, pre.bsize = 0;
+                if (!pre.map && !cap_buf_get(need, pre.buffer, pre.alloc, pre.map, pre.bsize)) {
+                    if (pre.buffer) destroy_buffer(pre.buffer, pre.alloc);
+                    pre.buffer = VK_NULL_HANDLE, pre.map = nullptr, pre.bsize = 0;
+                }
+                if (pre.map) {
+                    pre.ok.assign((size_t)n, 0);
+                    copy_pages(pages, n, (uint8_t*)pre.map, pre.ok.data(), nullptr, nullptr);
+                    pre.pages.assign(pages, pages + n);
+                    pre.done.assign((size_t)n, done);
+                    taken = true;
+                    st_pre2_rounds++, st_pre2_pages += n;
+                }
+            }
+            if (!taken)
+                for (int64_t i = 0; i < n; i++) host->mark_written(base + ((uint64_t)pages[i] << kPageShift), 4096), pre.st_left++;
+            if (pages) host->free_pages(pages);
+            st_pre2_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - r0).count();
+            continue;
+        }
         if (!pre.map) {   // (the next capture's buffer, made here: not on the submitting thread)
             const uint64_t want = pre.want;
             lk.unlock();
@@ -2189,6 +2231,28 @@ std::unique_ptr<Capture> capture_make() {
         else if (v) vk_timeline_wait(v);
     }
     if (n > 0) shadow_written(pages, n);
+    {   // (sprint 5, RX_VK_CAPTURE_WHERE=1: the captures' pages by 16 MB of guest addresses, every 600 captures)
+        static const bool on = getenv("RX_VK_CAPTURE_WHERE") != nullptr;
+        if (on) {
+            static std::mutex mu;
+            static std::unordered_map<uint64_t, int64_t> by;
+            static int64_t caps, total;
+            std::lock_guard lk(mu);
+            for (int64_t i = 0; i < n; i++) by[(uint64_t)pages[i] >> 12]++;
+            total += n;
+            if (++caps % 600 == 0) {
+                std::vector<std::pair<int64_t, uint64_t>> v;
+                for (const auto& kv : by) v.push_back({kv.second, kv.first});
+                std::sort(v.rbegin(), v.rend());
+                std::string line;
+                char t[64];
+                for (size_t k = 0; k < v.size() && k < 24; k++)
+                    snprintf(t, sizeof t, " %#llx:%.0f", (unsigned long long)v[k].second << 24, v[k].first / 100.0), line += t;
+                logf("vk: capture where (pages a frame of 6 captures, by 16 MB; %.0f in all, %zu chunks):%s", total / 100.0, v.size(), line.c_str());
+                by.clear(), total = 0;
+            }
+        }
+    }
     const auto t_copy = std::chrono::steady_clock::now();
     if (use_pre) {   // (TICK-043: the buffer copied ahead; the new pages after its pages, the ones written again into their slots)
         c->pages.assign(pages, pages + n);
@@ -2229,6 +2293,39 @@ std::unique_ptr<Capture> capture_make() {
             flush_mapped(c->alloc, c->nbytes);
         }
     }
+    {   // (sprint 5, RX_VK_CAPTURE_DIFF=1, a diagnostic: of each copied page, the 256-byte chunks that differ from its last copy)
+        static const bool on = getenv("RX_VK_CAPTURE_DIFF") != nullptr;
+        if (on && c->map) {
+            static std::mutex mu;
+            static std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> last;
+            static int64_t caps, pages_n, first_n, same_n, hist[17], bytes_changed;
+            std::lock_guard lk(mu);
+            for (size_t i = 0; i < c->copied.size(); i++) {
+                const uint8_t* cur = (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096;
+                auto& old = last[c->copied[i]];
+                pages_n++;
+                if (!old) {
+                    old.reset(new uint8_t[4096]);
+                    first_n++;
+                } else {
+                    int ch = 0;
+                    for (int k = 0; k < 16; k++) ch += std::memcmp(cur + k * 256, old.get() + k * 256, 256) != 0;
+                    hist[ch]++, same_n += ch == 0;
+                    for (int b8 = 0; b8 < 512; b8++) bytes_changed += std::memcmp(cur + b8 * 8, old.get() + b8 * 8, 8) != 0 ? 8 : 0;
+                }
+                std::memcpy(old.get(), cur, 4096);
+            }
+            if (++caps % 600 == 0) {
+                char line[512];
+                int m = 0;
+                for (int k = 0; k <= 16; k++) m += snprintf(line + m, sizeof line - m, " %d:%.0f", k, hist[k] / 100.0), hist[k] = 0;
+                logf("vk: capture diff (a frame of 6 captures): %.0f pages copied, %.0f first seen, %.0f identical to their last copy, "
+                     "%.0f KB of 8-byte words changed; pages by changed 256-byte chunks:%s", pages_n / 100.0, first_n / 100.0, same_n / 100.0,
+                     bytes_changed / 100.0 / 1024, line);
+                pages_n = first_n = same_n = bytes_changed = 0;
+            }
+        }
+    }
     if (pre_on) precopy_size(n);
     if (host_pages) host->free_pages(host_pages);
     {   // (what it cost, every 600 submits)
@@ -2261,6 +2358,11 @@ std::unique_ptr<Capture> capture_make() {
                      st_pre_k / 600.0, st_pre_new / 600.0, st_pre_again / 600.0, (long long)st_pre_fallback, (long long)st_pre_out, runs / 600.0,
                      again / 600.0, left / 600.0, (long long)grown);
                 st_pre_k = st_pre_new = st_pre_again = st_pre_fallback = st_pre_out = 0;
+                if (precopy_kick_mode() >= 2) {
+                    const int64_t r = st_pre2_rounds.exchange(0), pg = st_pre2_pages.exchange(0), sk = st_pre2_skipped.exchange(0), ns = st_pre2_ns.exchange(0);
+                    logf("vk: capture copied ahead at the presents (RX_VK_PRECOPY_KICK=2): %lld rounds, %.0f pages and %.2f ms each, %lld kicks "
+                         "skipped (the copies before not taken)", (long long)r, r ? (double)pg / (double)r : 0.0, r ? ns / 1e6 / (double)r : 0.0, (long long)sk);
+                }
             }
         }
     }
@@ -2650,9 +2752,35 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         // (TICK-060) RX_VK_LATE_DEFER: no wait here when the queue has the late value already and no late page is a live texture's
         // storage (the uploads read such pages as submitted, from the shadow the take copies below)
         if (!late_merge_on() && late_defer_on() && c->late_value > vk_timeline_completed()) {
+            // (HeyListen, sprint 5) RX_VK_LATE_DEFER_TEX (on; =0: such a take waits, as before): a late page in a live texture's
+            // storage no longer keeps the take waiting. In OoT it is one page, 0x11371e7000: two 1x1 textures of 128 bytes made at
+            // boot (0x...d80, 0x...e00) beside bytes the CPU writes and a submission writes back every frame; that page alone made
+            // 59-89 of ~106 takes wait for the GPU (~1.3 ms a frame once the held flush comes early). What an upload reads of such
+            // a page is the texture's own bytes, which a write-back does not write (write-backs are of buffers: "texture storage
+            // 0.00" in the write-backs' log): they are in the slot as copied at the submit, so the page's shadow is made from that
+            // copy below, at the take, as for any other page of a texture's storage; the write-back's bytes reach the slot with
+            // the fix, as for the other late pages. An upload over the page while its fix is pending still waits for the value
+            // first (memory_late_fix_wait_range).
+            static const bool defer_tex = !getenv("RX_VK_LATE_DEFER_TEX") || atoi(getenv("RX_VK_LATE_DEFER_TEX")) != 0;
             bool tex = false;
-            for (uint32_t i : c->late)
-                if (replay_tex_storage_in((uint64_t)c->pages[i] << kPageShift, 4096)) { tex = true; break; }
+            if (!defer_tex)
+                for (uint32_t i : c->late)
+                    if (replay_tex_storage_in((uint64_t)c->pages[i] << kPageShift, 4096)) { tex = true; break; }
+            {   // (sprint 5, RX_VK_LATE_TEX_LOG=1: which late pages lie in a live texture's storage, 40 takes)
+                static const bool lg = getenv("RX_VK_LATE_TEX_LOG") != nullptr;
+                static int logged;
+                if (lg && tex && logged < 40) {
+                    logged++;
+                    char line[1024];
+                    int n = 0, k = 0;
+                    for (uint32_t i : c->late)
+                        if (replay_tex_storage_in((uint64_t)c->pages[i] << kPageShift, 4096)) {
+                            k++;
+                            if (n < 900) n += snprintf(line + n, sizeof line - n, " %#llx", (unsigned long long)c->pages[i] << kPageShift);
+                        }
+                    logf("vk: late tex: %d of %zu late pages in a live texture's storage:%s", k, c->late.size(), line);
+                }
+            }
             if (tex) st_late_def_tex.fetch_add(1, std::memory_order_relaxed);
             else if (c->late_value > vk_timeline_signal_sent()) st_late_def_unsent.fetch_add(1, std::memory_order_relaxed);
             else if (late_fix_count() >= kLateFixMax) st_late_def_full.fetch_add(1, std::memory_order_relaxed);
@@ -2719,7 +2847,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 shadow_n--;
             }
         const auto tsh0 = std::chrono::steady_clock::now();
-        if (!tex_merged.empty() && !late_defer && shadow_fast_on() &&   // (TICK-061: see shadow_take_fast; not with deferred late slots, TICK-060)
+        if (!tex_merged.empty() && shadow_fast_on() &&   // (TICK-061: see shadow_take_fast; not with deferred late slots, TICK-060)
             shadow_take_fast(c->pages.data(), c->pages.size(), c->copied.data(), c->slots.data(), c->copied.size(),
                              (const uint8_t*)c->map)) {
             st_tk_shadow_fast++;
@@ -2731,9 +2859,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             for (size_t i = 0; i < c->copied.size(); i++) {
                 const uint32_t p = c->copied[i];
                 if (!in_tex_merged((uint64_t)p << 12)) continue;
-                // (TICK-060: a deferred late page's slot is not the write-back's yet: no shadow of it (no live texture's storage
-                // is there: a later upload over it reads guest memory)
-                if (late_defer && std::find(c->late.begin(), c->late.end(), c->slots[i]) != c->late.end()) continue;
+                // (TICK-060: a deferred late page's slot is not the write-back's yet. Sprint 5: its shadow is made all the same,
+                // from the slot as copied at the submit: a texture's own bytes there are not what the write-back writes; see
+                // RX_VK_LATE_DEFER_TEX in take_capture. Pages with no texture's storage never come here: in_tex_merged above)
                 if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) {
                     if (swept) break;
                     swept = true;
@@ -5768,6 +5896,9 @@ void memory_trace_counts(int64_t* late_ns, int64_t* late_n, int64_t* scatter_byt
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;
     *wb_bytes = st_wb_bytes;
+}
+void memory_precopy_present() {   // (sprint 5, RX_VK_PRECOPY_KICK=2: a present begins)
+    if (precopy_kick_mode() == 3 && precopy_on() && precopy_kick_event) SetEvent(precopy_kick_event), st_precopy_kicks.fetch_add(1, std::memory_order_relaxed);
 }
 } // namespace mkwvk
 

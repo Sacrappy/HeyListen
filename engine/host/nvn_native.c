@@ -369,12 +369,10 @@ NV(nvnMemoryPoolGetBufferAddress) {
     RET(((const nvn_pool *)P(0))->gpu);
 }
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
-static void hold_linger_end(void);   /* (HOS_NVN_HOLD_LINGER_US, below: the holder's readback is done) */
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     if (no_pool(c, "invalidate mapped range")) return;
     const nvn_pool *o = (const nvn_pool *)P(0);
     if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
-    hold_linger_end();
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
 /* NVNmappingRequest (0x28 bytes): physical pool (guest pointer), physical offset, virtual offset, size, storage class */
@@ -505,7 +503,6 @@ NV(nvnBufferFlushMappedRange) {}
 NV(nvnBufferInvalidateMappedRange) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
     if (o->pool) rx_nvn_invalidate(POOL(o->pool)->gpu + (uint64_t)o->off + U64(1), U64(2));
-    hold_linger_end();
 }
 NV(nvnBufferSetDebugLabel) {}
 
@@ -1077,28 +1074,20 @@ int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy);   /* (rx_backend.c,
 void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ);
 enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_THREAD, HF_OTHER, HF_N };
 static void held_flush_why(int why);
-/* (HeyListen, sprint 5) HOS_NVN_HOLD_LINGER_US=<us> (mode 2; off by default, 300 in the screens): the held submits' thread starts its flush
-   that long after the last hold at the latest, and at once when the holding thread has made its next readback
-   (nvn*InvalidateMappedRange). Why: OoT's main thread holds its two submits, polls two older fences (~0.14 ms later) and reads
-   GPU results back (the exposure meter). With the flush started ~4 us after the hold, that readback came inside the flush's
-   section of the replay's order and waited for all of it (the capture's ~30 MB copy and the replay: 1.3 ms a frame, every
-   executor and module worker idle meanwhile: the job group starts after it). A readback before the flush starts waits for
-   nothing and reads what the console's CPU would: the results of the submissions the GPU has finished, none of the frame just
-   submitted; the capture, taken after it, has what the CPU wrote after reading (the meter's reset), in order. The Presentation
-   Thread's event poll does not flush during the linger (it looks again); its own submit, a fence wait for a held value, a
-   finish and a present flush at once, as before. Measured (castle-move, docs/tickets/SPRINT-5.md): the main thread's wait goes
-   (1.3 -> 0.01 ms a frame) and the job group starts 1.5 ms earlier, but the Presentation Thread then makes the flush itself and
-   its first take waits ~1.3 ms for the GPU's late pages of the frame before: with the render-chain switches +2.6 fps, inside
-   the spread; shots not checked. Off until the render chain is shorter. */
+/* (HeyListen, sprint 5) HOS_NVN_HOLD_LINGER_US=<us> (mode 2; an experiment, off: 0): the held submits' thread starts its flush that
+   long after the last hold, and the Presentation Thread's event poll does not flush meanwhile. OoT's main thread holds its two
+   submits, polls two older fences and reads the light meter back ~0.15 ms later; with the flush begun ~4 us after the hold that
+   readback waits for the flush's whole section of the replay's order (1.3 ms a frame, the job group not started). With the
+   linger the readback comes first and the frame is 1.5 ms shorter (77.5 -> 84-91 fps at the Market), but **the picture is wrong**:
+   the readback then reads the meter's buffers while the GPU is still inside the frame before (raw sums a later submission of
+   that frame turns into measures: 2e7 where 78 is right) and the exposure burns out to white. What the wait gives is the GPU
+   done with everything submitted, not the flush itself: docs/tickets/SPRINT-5.md. Do not turn on. */
 static int64_t hold_linger_ns = -1;
 static volatile LONG64 hold_linger_until;   /* (0: none) */
 static void *volatile hold_linger_thread;
 static int hold_lingering(void) {
     const int64_t u = hold_linger_until;
     return u && hos_now_ns() < u;
-}
-static void hold_linger_end(void) {
-    if (hold_linger_until && hold_linger_thread == (void *)hos_self()) InterlockedExchange64(&hold_linger_until, 0);
 }
 /* (mode 2) the held submits' replay thread: woken at each hold; it takes the capture and replays on itself, off the game's
    thread. A host thread: no virtual core, no guest code (the replay runs none) */
@@ -1226,6 +1215,22 @@ NV(nvnSyncWait) {
        BaseProcExecutor0 shares; invalidate's waits give it up already (rx_backend.c). Nothing in it runs guest code */
     static int poll_away = -1;
     if (poll_away < 0) poll_away = getenv("HOS_NVN_POLL_AWAY") && atoi(getenv("HOS_NVN_POLL_AWAY")) != 0;
+    /* (HeyListen, sprint 5) HOS_NVN_POLL_HONEST=1 (a test): a poll (timeout 0) answers "not yet" while the GPU still has work of
+       the submissions handed to it: what the CPU reads after a poll says yes is guest memory as the GPU has it now, and a
+       frame's later submissions rewrite the buffers the earlier ones filled (OoT's light meter: raw sums, then the measures) */
+    static int honest = -1;
+    static volatile LONG64 st_honest, st_polls;
+    if (honest < 0) honest = getenv("HOS_NVN_POLL_HONEST") && atoi(getenv("HOS_NVN_POLL_HONEST")) != 0;
+    if (honest && U64(1) == 0) {
+        const LONG64 n = InterlockedIncrement64(&st_polls);
+        if (rx_nvn_replayed() < rx_nvn_fence()) {
+            const LONG64 k = InterlockedIncrement64(&st_honest);
+            if (k % 2000 == 1) hos_log("nvn: honest polls: %lld of %lld answered not yet (the GPU busy)", (long long)k, (long long)n);
+            HOS_JT(JT_MARK, 31, 0);
+            RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+            return;
+        }
+    }
     const int away0 = poll_away ? hos_vcore_away() : 0;
     const int first = rx_nvn_wait(s->fence, 0);
     if (away0) hos_vcore_back();

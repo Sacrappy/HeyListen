@@ -215,11 +215,15 @@ def generate(cc, cxx, tmp, flags):
     with open(os.path.join(tmp, "block_cases.c"), "w", newline="\n") as f:
         f.write("\n".join(out) + "\n")
     used |= NEEDS
-    # the switch off: the header as without it; on: only added to
-    os.environ.pop(SWITCH, None)
-    plain = a64_lift.fpx_header(used)
+    # the switch off: the header as before the switch; unset: on (the default since sprint 5), as =1; on: only added to
     os.environ[SWITCH] = "0"
+    plain = a64_lift.fpx_header(used)
     off = a64_lift.fpx_header(used)
+    os.environ.pop(SWITCH, None)
+    unset = a64_lift.fpx_header(used)
+    os.environ[SWITCH] = "1"
+    if unset != a64_lift.fpx_header(used):
+        raise SystemExit("fpx block: unset must be the switch on (the default since sprint 5)")
     os.environ[SWITCH] = "1"
     try:
         on = a64_lift.fpx_header(used)

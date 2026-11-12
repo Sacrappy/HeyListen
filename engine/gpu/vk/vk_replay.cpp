@@ -3457,6 +3457,14 @@ std::mutex tex_pages_mu;
 void tex_pages_add(const nvn_tex* t, int d) {
     if (!t || !t->gpu || t->gpu >= (1ull << 39) || !t->L.size) return;   // (the guest window: virtual pools are not read)
     const uint64_t p0 = t->gpu >> 12, p1 = std::min((t->gpu + t->L.size - 1) >> 12, uint64_t((1ull << 39 >> 12) - 1));
+    {   // (sprint 5, RX_VK_TEX_PAGE_WATCH=<hex address>: the textures whose storage has that page)
+        static const uint64_t watch = getenv("RX_VK_TEX_PAGE_WATCH") ? strtoull(getenv("RX_VK_TEX_PAGE_WATCH"), nullptr, 16) >> 12 : 0;
+        static std::atomic<int> logged{0};
+        if (watch && watch >= p0 && watch <= p1 && logged++ < 60)
+            logf("vk: tex page watch: %+d texture %#llx +%#llx target %d format %d flags %#x %ux%ux%u levels %u serial %llu", d,
+                 (unsigned long long)t->gpu, (unsigned long long)t->L.size, t->d.target, t->d.format, (unsigned)t->d.flags, t->d.width,
+                 t->d.height, t->d.depth, t->d.levels, (unsigned long long)t->serial);
+    }
     for (uint64_t p = p0; p <= p1; p++) {
         auto& c = tex_pages[p / kTexPageChunk];
         if (!c) {
@@ -3579,6 +3587,13 @@ void invalidate(uint64_t gpu, uint64_t size) {
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
                     wait_value(v);
                 }
+                // (sprint 5, RX_VK_READBACK_STRICT=1, a test: the value itself reached on the GPU's timeline before the CPU reads)
+                static const bool strict = getenv("RX_VK_READBACK_STRICT") && atoi(getenv("RX_VK_READBACK_STRICT")) != 0;
+                static std::atomic<int64_t> st_strict{0};
+                if (strict && v > completed()) {
+                    wait_value(v);
+                    if (st_strict.fetch_add(1) % 500 == 0) logf("vk: readback strict: %lld waits for the value past the recordings' timeline", (long long)st_strict.load());
+                }
                 w = true;
             }
             if (w) {
@@ -3598,6 +3613,22 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 logf("vk: readbacks of GPU results: %lld of 3000 waited for their write-back, %.2f ms each", (long long)n,
                      n ? ns.exchange(0) / (double)n / 1e6 : 0.0);
             }
+        }
+    }
+    {   // (sprint 5, RX_VK_LOG_READBACK2=<present>: what the CPU is about to read, after the waits: 400 ranges of 0x1000 bytes or more)
+        static const int64_t from = getenv("RX_VK_LOG_READBACK2") ? atoll(getenv("RX_VK_LOG_READBACK2")) : -1;
+        static std::atomic<int> n{0};
+        if (from >= 0 && presents_now >= from && size >= 0x20 && n++ < 400) {
+            std::vector<uint32_t> w(size / 4);
+            host->gpu_read(gpu, w.data(), w.size() * 4);
+            size_t nz = 0, first = 0;
+            uint64_t sum = 0;
+            for (size_t i = 0; i < w.size(); i++)
+                if (w[i]) { if (!nz) first = i; nz++, sum += w[i]; }
+            logf("vk: readback2 %lld %#llx +%#llx: %zu non-zero words (first at %zu: %08x %08x %08x %08x), sum %llx; value %llu done %llu fence %llu",
+                 (long long)presents_now, (unsigned long long)gpu, (unsigned long long)size, nz, first, w[first], first + 1 < w.size() ? w[first + 1] : 0,
+                 first + 2 < w.size() ? w[first + 2] : 0, first + 3 < w.size() ? w[first + 3] : 0, (unsigned long long)sum,
+                 (unsigned long long)memory_writeback_value(host->gpu_guest(gpu), size, nullptr), (unsigned long long)completed(), (unsigned long long)fence());
         }
     }
     // (textures the GPU wrote there: their texels into memory before the CPU reads it, as vmap_changing does. The game
@@ -5097,6 +5128,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
 }
 
 
+void memory_precopy_present();   // (vk_memory.cpp, sprint 5: RX_VK_PRECOPY_KICK=2)
 namespace {
 
 void set_texture_pool_size(int) {}
@@ -5415,6 +5447,7 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    memory_precopy_present();
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)

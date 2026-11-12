@@ -1192,7 +1192,7 @@ def hot_text(text):
     text = HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
     if lift_opt("A64_FPX_XMM"):
         text = xmm_text(text)
-    if lift_opt("A64_FPX_BLOCK"):   # (HeyListen TICK-063; off by default: the text as before)
+    if lift_switch("A64_FPX_BLOCK"):   # (HeyListen TICK-063; on since sprint 5, =0: the text as before)
         import a64_block
         text = a64_block.block_text(text)
     return text
@@ -1443,7 +1443,7 @@ def fpx_header(used):
         out.append(xmm_header(used))
     if lift_opt("A64_LR_SCALAR"):   # (TICK-055; off by default)
         out.append(LR_HEADER)
-    if lift_opt("A64_FPX_BLOCK"):   # (TICK-063; off by default: a64_fpx.h as before)
+    if lift_switch("A64_FPX_BLOCK"):   # (TICK-063; on since sprint 5, =0: a64_fpx.h as before)
         import a64_block
         out.append(a64_block.block_header())
     return "\n".join(out) + "\n"
@@ -2321,7 +2321,7 @@ class Lifter:
                                                                          ", in code_hot.c" if hot_chunk else ""))
         if lift_opt("A64_FPX_XMM"):
             print("A64_FPX_XMM: %s" % ", ".join("%s %d" % kv for kv in sorted(XMM_STATS.items())))
-        if lift_opt("A64_FPX_BLOCK"):
+        if lift_switch("A64_FPX_BLOCK"):
             import a64_block
             print(a64_block.report())
         self._write_table(out_dir)

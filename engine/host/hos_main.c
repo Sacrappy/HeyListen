@@ -375,6 +375,29 @@ static int env_line_allowed(const char *name, const char *value) {
     const int drive = ((value[0] | 0x20) >= 'a' && (value[0] | 0x20) <= 'z' && value[1] == ':');
     return !strpbrk(value, "/\\") && !drive && value[0] != '~' && strcmp(value, ".") && strcmp(value, "..");
 }
+/* (HeyListen, sprint 5) The switches adopted together on 2026-11-12, on unless the environment (or hookshot_env.txt, read
+   first) sets them, =0: off. One at a time each was inside the run-to-run spread; together, with the held flush's linger
+   (nvn_native.c), the late pages of a texture's storage deferred (vk_memory.cpp) and the block lift, castle-move went
+   77.5 -> ~91 fps (docs/tickets/SPRINT-5.md). Set before main (a constructor): hookshot_env.txt, read in main, and the
+   environment itself still decide. */
+__attribute__((constructor)) static void heylisten_env_defaults(void) {
+    static const char *const on[] = {
+        "RX_VK_MSYNC_FAST", "RX_VK_SEG_EARLY", "RX_VK_CAPTURE_CLAIM", "RX_VK_COLLECT_FAST", "RX_VK_SHADOW_FAST", "RX_VK_STAMP_SPLIT",
+        "RX_VK_DRY_LEAN", "RX_VK_WORK_LOCAL", "RX_VK_SEG_SETUP_PAR", "RX_VK_OCC_PROXY_SKIP", "RX_VK_FENCE_POLL_FAST",
+        "RX_VK_READBACK_TICKET", "HOS_CV_SIGNAL_FAST", "HOS_THREAD_OF_CACHE", "HOS_SHORT_SLEEP_PAUSE",
+    };
+    for (size_t i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (!getenv(on[i])) {
+            char kv[64];
+            snprintf(kv, sizeof kv, "%s=1", on[i]);
+#ifdef _WIN32
+            _putenv(kv);
+#else
+            setenv(on[i], "1", 0);
+#endif
+        }
+}
+
 static void load_hookshot_env(void) {
     char path[MAX_PATH + 32];
     const char *other = getenv("HOS_ENV_FILE");

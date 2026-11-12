@@ -36,6 +36,7 @@ struct HosThread {
     int vc_held, vc_last, vc_queued;
     volatile int vc_kick;
     int64_t vc_since;
+    int bg_kind; int64_t bg_since;   /* (HeyListen, sprint 5: HOS_BG_THROTTLE, hos_vcore_checkpoint) */
     /* (HOS_CORE_COUNT, TICK-062 A10) calls that ask for the core number (HLE, svc 0x10), waits for a virtual core and their time */
     int64_t cc_hle, cc_svc, cc_vcw, cc_vcw_ns;
     /* (TICK-062 B2) hos_thread_of's per-thread cache */
@@ -423,7 +424,7 @@ static HosThread *thread_of_scan(uint64_t guest_tt) {
 }
 HosThread *hos_thread_of(uint64_t guest_tt) {
     static int on = -1;
-    if (on < 0) on = getenv("HOS_THREAD_OF_CACHE") != NULL;
+    if (on < 0) on = getenv("HOS_THREAD_OF_CACHE") && atoi(getenv("HOS_THREAD_OF_CACHE")) != 0;
     if (!on) return thread_of_scan(guest_tt);
     static _Thread_local struct { uint64_t tt; HosThread *t; LONG gen; } cache[8];
     const unsigned i = (unsigned)((guest_tt >> 4) * 0x9E3779B1u >> 7) & 7;
@@ -765,7 +766,7 @@ static void sleep_ns(int64_t ns) {
         /* TICK-062 B4, HOS_SHORT_SLEEP_PAUSE=1: one yield, then a PAUSE loop to the deadline (SwitchToThread in a loop
            keeps calling into the kernel and bounces the SMT sibling's work) */
         static int pause_spin = -1;
-        if (pause_spin < 0) pause_spin = getenv("HOS_SHORT_SLEEP_PAUSE") != NULL;
+        if (pause_spin < 0) pause_spin = getenv("HOS_SHORT_SLEEP_PAUSE") && atoi(getenv("HOS_SHORT_SLEEP_PAUSE")) != 0;
         if (pause_spin) {
             if (hos_now_ns() < until) SwitchToThread();
             while (hos_now_ns() < until) { YieldProcessor(); YieldProcessor(); YieldProcessor(); YieldProcessor(); }
@@ -1432,8 +1433,35 @@ void hos_vcore_back(void) {
    mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
    read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
    stall dump of a thread spinning in a polled loop shows such older registers for the same reason. */
+/* (HeyListen, sprint 5) HOS_BG_THROTTLE=<run us>:<sleep us> (default 300:3000, =0: off): OoT's OptimizeChangeBanc (guest
+   priority 27, the lowest: on the console it gets only the time nothing else wants) runs without end here, 35-44% of a logical
+   processor at the Market, at the host's lowest priority, which keeps it off no SMT sibling: the executor, module worker or
+   replay thread on the other half of its core runs up to 1.7x slower while it does (the replay's measurement, hos_reserved_cpus).
+   After <run> of running it gives its virtual core up and sleeps <sleep>, at a checkpoint (an nn::os call or SVC, where Horizon
+   could switch it out too): ~9% of a processor instead. */
+static void bg_throttle(HosThread *t) {
+    static int64_t run_ns = -1, sleep_ms;
+    if (run_ns < 0) {
+        const char *e = getenv("HOS_BG_THROTTLE");
+        long long r = 300, s = 3000;
+        if (e && sscanf(e, "%lld:%lld", &r, &s) < 1) r = 300;
+        sleep_ms = s >= 1000 ? s / 1000 : 1;
+        if (r > 0) hos_log("threads: OptimizeChangeBanc runs %lld us, then sleeps %lld ms (HOS_BG_THROTTLE)", r, (long long)sleep_ms);
+        run_ns = r > 0 ? r * 1000 : 0;
+    }
+    if (!t->bg_kind) t->bg_kind = strstr(t->name, "OptimizeChange") ? 1 : 2;
+    if (t->bg_kind != 1 || !run_ns) return;
+    const int64_t now = hos_now_ns();
+    if (!t->bg_since) t->bg_since = now;
+    if (now - t->bg_since < run_ns) return;
+    const int away = hos_vcore_away();
+    Sleep((DWORD)sleep_ms);
+    if (away) hos_vcore_back();
+    t->bg_since = hos_now_ns();
+}
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
+    if (t && t->bg_kind != 2) bg_throttle(t);
     if (t && t->vc_kick) vc_yield(t, t->vc_kick == 1);
 }
 void hos_vcore_yield(void) {

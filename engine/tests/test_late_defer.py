@@ -1,7 +1,7 @@
 """(HeyListen TICK-060) RX_VK_LATE_DEFER: the late pages' wait moved from the capture's take to the queue, read from the source.
 
 - vk_memory.cpp take_capture: on by default since the PC 3050 confirm (=0: off); a take does not wait only when the switch is on, LATE_MERGE is off, the late value is
-  already sent to the queue (vk_timeline_signal_sent), no late page is a live texture's storage and fewer than kLateFixMax fixes are
+  already sent to the queue (vk_timeline_signal_sent), no late page is a live texture's storage (only with RX_VK_LATE_DEFER_TEX=0 since sprint 5) and fewer than kLateFixMax fixes are
   pending; otherwise the wait and the copies as before. A deferred take registers a LateFix (value, generation, buffer, slots) only
   for a kept buffer, and gives no texture shadow copy of a late slot.
 - memory_late_fix_apply copies each late slot from guest memory (as the take did after its wait), flushes the buffer, frees the
@@ -63,8 +63,10 @@ def main():
     push = body(mem, "void late_fix_push(LateFix&& f) {")
     need("late_fixes.push_back(std::move(f));" in push and "late_fix_top.store(std::max(top, v)" in push and
          push.index("late_fix_wake(v);") > push.index("late_fixes.push_back"), "late_fix_push: registered, the top raised only, then woken")
-    need("if (late_defer && std::find(c->late.begin(), c->late.end(), c->slots[i]) != c->late.end()) continue;" in take,
-         "take_capture: no texture shadow copy of a deferred late slot")
+    # (sprint 5, RX_VK_LATE_DEFER_TEX: a deferred late slot in a texture's storage gets its shadow from the copy at the submit)
+    need("if (late_defer && std::find(c->late.begin(), c->late.end(), c->slots[i]) != c->late.end()) continue;" not in take and
+         'static const bool defer_tex = !getenv("RX_VK_LATE_DEFER_TEX")' in take and "if (!defer_tex)" in take,
+         "take_capture: a deferred late slot of a texture's storage keeps its shadow copy (RX_VK_LATE_DEFER_TEX), =0 waits as before")
 
     ap = body(mem, "void memory_late_fix_apply(uint64_t done) {")
     need("if (f.value > done) {" in ap and "top = std::max(top, f.value);" in ap and "late_fixes.front()" not in ap and

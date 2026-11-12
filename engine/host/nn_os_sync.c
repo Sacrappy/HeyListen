@@ -596,7 +596,7 @@ HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
        waiter the slow path only bumps gen (compared only as a delta by waiters that registered later) and cv_reserve (a no-op
        with cv_waiting <= cv_owed, owed being 0 with no waiter) and wakes nobody. The wake order of waiters is untouched. */
     static int fast = -1;
-    if (fast < 0) fast = getenv("HOS_CV_SIGNAL_FAST") != NULL;
+    if (fast < 0) fast = getenv("HOS_CV_SIGNAL_FAST") && atoi(getenv("HOS_CV_SIGNAL_FAST")) != 0;
     if (fast && !__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST)) return;
     AcquireSRWLockExclusive(&cv->lk);
     cv_reserve(cv);

@@ -28,7 +28,7 @@ Goal unchanged: 120+ fps in game without frame generation (8.33 ms a frame). Mai
   and waits for all of it until 4.006 (the capture's ~30 MB copy and the replay). 1.3 ms a frame (mark 32 on the default path,
   mark 36 with the ticket: the ticket moves the wait, it does not remove it), with the job group not started.
 
-## `HOS_NVN_HOLD_LINGER_US` (built, off by default)
+## `HOS_NVN_HOLD_LINGER_US` (built, off by default; session 2 found its picture wrong: see below)
 
 The held submits' thread starts its flush at most that long after the last hold, and at once when the holding thread has made
 its next readback; the Presentation Thread's event poll does not flush meanwhile (host/nvn_native.c).
@@ -40,6 +40,48 @@ its next readback; the Presentation Thread's event poll does not flush meanwhile
 - Screen, linger 300 + the 13 switches + fast poll + ticket against main, 3 interleaved rounds: 81.9, 78.9, 79.6 against
   (77.x), 76.5, 78.9: **+2.6 fps, inside the spread**. Traced frame 13.05 -> 11.70 ms. Shots and speed not checked.
 - Decision: off by default; nothing adopted; game folder = main's build. `tests/test_nvn_hold.py` follows the new condition.
+
+## Session 2 (2026-11-12, night): what the frame's loop really is, and the checkpoint
+
+**The linger was wrong.** With `HOS_NVN_HOLD_LINGER_US=300`, `RX_VK_LATE_DEFER_TEX` (below) and the switch stack, castle-move read
+84 fps, 88.7 with the block lift, ~91 with the background throttle: the picture was burnt out to white in all of them
+(shots: mean luma 249 against 105, 95% of the pixels white; `build/s5/chk1-*`). Why: the main thread's readbacks after its
+submits are of the light meter's buffers (0x113c88b000 / 88e000 / 891000 +0x1040, 0x11371e7f00 +0xc0). Read while the GPU is
+still inside the frame before, they hold what an earlier submission of that frame left (raw sums: 2.1e7 where the measure is
+78; `RX_VK_LOG_READBACK2`). The wait the linger removed was not for the flush but for **the GPU done with everything
+submitted**. Waiting for exactly that (`RX_VK_READBACK_STRICT=1`) gives the right picture at 67 fps; answering the polls "not
+yet" while the GPU is busy (`HOS_NVN_POLL_HONEST=1`) changes nothing (the module workers read too). The linger stays in the
+source as a documented experiment, off.
+
+**So the frame's loop is:** the Presentation Thread's last submit -> the GPU's tail (2.1 ms busy with no gap, `GPU tail` in the
+log) -> the main thread's readback -> its hold -> the capture (1.3-1.9 ms: 46 MB, at the memory bus's ~60 GB/s) -> the replay
+(7-9 ms) -> the last submit. GPU time is on it, 1:1, though the GPU is only 2.8 ms a frame.
+
+**Measured on the way** (castle-move unless said):
+- The capture's pages (`RX_VK_CAPTURE_WHERE`, `RX_VK_CAPTURE_DIFF`): ~11,900 pages a frame (46 MB), ~9,000 of them in one
+  256 MB region (0x104e000000-0x105f000000). **51% are byte-identical to their last copy, and only ~1 MB of 8-byte words
+  differs a frame**; changed pages have 2.85 changed 256-byte chunks of 16 on average.
+- The pre-copy rewritten as one parallel round a frame (`RX_VK_PRECOPY_KICK=2` at the main thread's end-of-frame wait, `=3` at
+  the present; off): 7,900 pages copied ahead in 1.0 ms, 31 new and 44 copied again a submit; the main thread's wait
+  1.3 -> 0.25 ms, but the frame does not move (the copy takes the bus from the main thread's own code, and the GPU's tail is
+  waited for anyway).
+- The game's chain by how many executors run (`build/s5/par.py`): all six 2.7 ms, one alone 1.6, one module worker alone 1.4,
+  four (the last stage) 0.95, the main thread 3.0. By function it is flat (`build/s5/lone.py`: nothing over 11%).
+- Thread placement: `HOS_PIN_BY_CORE=1` 68-72 fps; `RX_VK_PARALLEL` 2 / 3 / 7 as 5; `HOS_OBJ_PACK` as without.
+- OptimizeChangeBanc ran 35-44% of a logical processor at the host's lowest priority; throttled (`HOS_BG_THROTTLE`, 300 us of
+  running then 3 ms asleep, on) it is 5%.
+
+**Checkpoint, on by default** (each `=0` off; `host/hos_main.c` sets the switches before main):
+- the switches of TICK-056 / 061 / 062 and TICK-058 / 059's fast poll with the ticket (`RX_VK_MSYNC_FAST`, `SEG_EARLY`,
+  `CAPTURE_CLAIM`, `COLLECT_FAST`, `SHADOW_FAST`, `STAMP_SPLIT`, `DRY_LEAN`, `WORK_LOCAL`, `SEG_SETUP_PAR`, `OCC_PROXY_SKIP`,
+  `FENCE_POLL_FAST`, `READBACK_TICKET`, `HOS_CV_SIGNAL_FAST`, `HOS_THREAD_OF_CACHE`, `HOS_SHORT_SLEEP_PAUSE`);
+- the block lift (`A64_FPX_BLOCK`, a lift switch) with its profile (`profile/hookshot_pieces.prof` is TICK-063's `blk.prof`);
+- `RX_VK_LATE_DEFER_TEX`: a late page in a live texture's storage no longer makes the take wait (it was one page,
+  0x11371e7000: two 1x1 textures of 128 bytes beside the meter's words; its shadow is made from the copy at the submit);
+- `HOS_BG_THROTTLE`.
+One run a scene with shots (mean luma alike, speed 59.9-60.2): kokiri-idle 80.9 -> 85.5, castle-move 78.3 -> 84.0, hyrule-walk
+79.7 -> 84.5 fps (`build/s5/chk2-*`). Castle-move, 3 interleaved rounds, no environment: 85.5, 82.0, 82.2 against (79.x), 79.0, 79.4:
+**+4 fps, every run above every reference run.** Tests: run_all 256 checks, 33 skipped, one failure (nx2/test_nup_paths.py, as on main).
 
 ## What a 120 fps frame needs (the three walls, in the order they bind now)
 
