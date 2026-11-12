@@ -1,0 +1,337 @@
+diff --git a/engine/gpu/vk/vk_memory.cpp b/engine/gpu/vk/vk_memory.cpp
+index 7252d920..ae7b408a 100644
+--- a/engine/gpu/vk/vk_memory.cpp
++++ b/engine/gpu/vk/vk_memory.cpp
+@@ -1897,6 +1897,7 @@ bool precopy_grow(std::unique_lock<std::mutex>& lk) {
+ // (mkwvk_precopy_kick, called when the game's main thread leaves its end-of-frame wait: the job threads' writes of the
+ // frame are final then and the main thread's draw code and submits are still 2-4 ms away), not on the 250 us timer whose
+ // rounds during the job threads' work cost more than they saved (TICK-043). The copies then run while the job threads idle.
++std::atomic<uint64_t> cap_scan_seq{0};   // (sprint 5: capture scans made, mkwvk_scan_seq)
+ bool precopy_kick_on() {
+     static const bool v = getenv("RX_VK_PRECOPY_KICK") && atoi(getenv("RX_VK_PRECOPY_KICK")) != 0;
+     return v;
+@@ -2153,6 +2154,7 @@ std::unique_ptr<Capture> capture_make() {
+             pages = host_pages;
+         }
+     }
++    cap_scan_seq.fetch_add(1, std::memory_order_seq_cst);   // (sprint 5, RX_VK_READBACK_OWN: the marks up to here are this capture's)
+     const auto t_scan = std::chrono::steady_clock::now();
+     // (TICK-043) the copied-ahead pages and these into one list (capture_merge.h): the new ones after the copied ones; or, when a
+     // copied page is outside the ranges now or the buffer has no room, every page copied now as without the thread
+@@ -2593,6 +2595,53 @@ size_t late_fix_count() {
+ /// can be older submissions' write-backs). With the front-only loop and the back's value as the top, a fix behind a lower one
+ /// left the top below its own value: a flush waited for the lower value and sent the recordings reading the unfixed slots, and
+ /// its buffer could be retired and reused before its fix
++// ---- (HeyListen, sprint 5) RX_VK_READBACK_OWN: the ranges a thread read back without waiting for its own held submits ----
++// The CPU writes such a range right after reading it (OoT sets its light meter's sums to 0), before the write-back of the held
++// submits lands there. The next capture has those bytes as the CPU left them, and the page is a late one (the write-back is
++// pending): its late copy would put the write-back's bytes over the CPU's, and the 0 would never reach the GPU (the meter then
++// adds every frame onto the last: the picture darkens). So a late copy of a page with such a range leaves the range's bytes as
++// the capture took them and copies only the rest of the page. At most 16 ranges, kept until the next hold's first readback.
++struct OwnRange { uint64_t lo, hi; };
++std::mutex own_ranges_mu;
++OwnRange own_ranges[16];
++std::atomic<int> own_ranges_n{0};
++void memory_own_ranges_clear() {
++    std::lock_guard lk(own_ranges_mu);
++    own_ranges_n.store(0, std::memory_order_release);
++}
++void memory_own_range_add(uint64_t guest, uint64_t size) {
++    if (!size) return;
++    std::lock_guard lk(own_ranges_mu);
++    const int n = own_ranges_n.load(std::memory_order_relaxed);
++    for (int i = 0; i < n; i++)
++        if (own_ranges[i].lo == guest && own_ranges[i].hi == guest + size) return;
++    if (n >= 16) return;
++    own_ranges[n] = {guest, guest + size};
++    own_ranges_n.store(n + 1, std::memory_order_release);
++}
++std::atomic<int64_t> st_own_merged{0};
++/// A late page copied again from guest memory into its slot, except the bytes of the own-readback ranges
++void late_copy_page(uint8_t* dst, const uint8_t* base, uint64_t page) {
++    const uint64_t p0 = page << kPageShift, p1 = p0 + 4096;
++    if (own_ranges_n.load(std::memory_order_acquire)) {
++        std::lock_guard lk(own_ranges_mu);
++        const int n = own_ranges_n.load(std::memory_order_relaxed);
++        bool hit = false;
++        for (int i = 0; i < n; i++) hit |= own_ranges[i].lo < p1 && own_ranges[i].hi > p0;
++        if (hit) {
++            uint8_t keep[4096];
++            std::memcpy(keep, dst, 4096);   // (the slot as the capture took it)
++            guarded_copy(dst, base + p0, 4096);
++            for (int i = 0; i < n; i++) {
++                const uint64_t a = std::max(own_ranges[i].lo, p0), b = std::min(own_ranges[i].hi, p1);
++                if (a < b) std::memcpy(dst + (a - p0), keep + (a - p0), b - a);
++            }
++            st_own_merged.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++    }
++    guarded_copy(dst, base + p0, 4096);
++}
+ void memory_late_fix_apply(uint64_t done) {
+     std::lock_guard lk(late_fix_mu);
+     if (late_fixes.empty()) return;
+@@ -2606,7 +2655,7 @@ void memory_late_fix_apply(uint64_t done) {
+             continue;
+         }
+         for (const auto& [slot, page] : f.slots)
+-            guarded_copy(f.map + (uint64_t)slot * 4096, base + ((uint64_t)page << kPageShift), 4096);
++            late_copy_page(f.map + (uint64_t)slot * 4096, base, page);
+         flush_mapped(f.alloc, f.nbytes);
+         for (int k = 0; k < kLateFixMax; k++)
+             if (late_fix_gens[k].load(std::memory_order_relaxed) == f.gen) {
+@@ -2801,7 +2850,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
+             st_tr_late_n.fetch_add(1, std::memory_order_relaxed);
+             uint8_t* const base = (uint8_t*)host->guest_base();
+             for (uint32_t i : c->late) {
+-                guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
++                late_copy_page((uint8_t*)c->map + (uint64_t)i * 4096, base, c->pages[i]);
+                 if (i < c->hok.size()) c->hok[i] = 0;   // (TICK-060: other bytes than the copy hashed)
+             }
+             flush_mapped(c->alloc, c->nbytes);
+@@ -5900,6 +5949,7 @@ void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, in
+ void memory_precopy_present() {   // (sprint 5, RX_VK_PRECOPY_KICK=2: a present begins)
+     if (precopy_kick_mode() == 3 && precopy_on() && precopy_kick_event) SetEvent(precopy_kick_event), st_precopy_kicks.fetch_add(1, std::memory_order_relaxed);
+ }
++uint64_t memory_scan_seq() { return cap_scan_seq.load(std::memory_order_seq_cst); }
+ } // namespace mkwvk
+ 
+ // (TICK-015) a second export, resolved by host/rx_backend.c if present: a game pool made, with its NVNmemoryPoolFlags (outside
+@@ -5922,3 +5972,12 @@ extern "C" __attribute__((visibility("default"))) void mkwvk_pool_flags(uint64_t
+ #endif
+     mkwvk::memory_pool_flags(gpu, size, flags);
+ }
++
++// (sprint 5, RX_VK_READBACK_OWN) for host/rx_backend.c, resolved by name: the capture scans made so far
++extern "C"
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
++uint64_t mkwvk_scan_seq(void) { return mkwvk::memory_scan_seq(); }
+diff --git a/engine/gpu/vk/vk_replay.cpp b/engine/gpu/vk/vk_replay.cpp
+index 5251c8c8..87562296 100644
+--- a/engine/gpu/vk/vk_replay.cpp
++++ b/engine/gpu/vk/vk_replay.cpp
+@@ -95,6 +95,8 @@ void hang_watch_start();   // (EvilOOT, vk_hangdump.cpp: RX_VK_HANG_DUMP)
+ struct CondNote { int64_t present; uint64_t addr, x, y; int mode; bool on; };   // (the last render conditions, for a dark frame)
+ CondNote cond_ring[1 << 15];
+ uint32_t cond_ring_at = 0;
++void memory_own_range_add(uint64_t guest, uint64_t size);   // (vk_memory.cpp, sprint 5: RX_VK_READBACK_OWN)
++void memory_own_ranges_clear();
+ namespace {
+ 
+ // ---- submissions: a timeline semaphore; value n = the n-th submit done ----
+@@ -3492,6 +3494,16 @@ bool tex_pages_any(uint64_t gpu, uint64_t size) {
+ }
+ void texture_created_of(const nvn_tex* t) { tex_pages_add(t, +1); }
+ uint64_t fence();
++thread_local uint64_t tl_rb_floor = 0;   // (sprint 5: the latest value handed out before the calling thread's hold; 0: none)
++bool readback_own_on() {
++    static const bool v = getenv("RX_VK_READBACK_OWN") && atoi(getenv("RX_VK_READBACK_OWN")) != 0;
++    return v;
++}
++void readback_floor_set(uint64_t f) {
++    static std::atomic<uint64_t> last{0};
++    if (f && last.exchange(f) != f) memory_own_ranges_clear();   // (a new hold: the last one's ranges are done)
++    tl_rb_floor = f;
++}
+ void invalidate(uint64_t gpu, uint64_t size) {
+     // (HeyListen, TICK-059) RX_VK_READBACK_TICKET=1: the fast fence poll (wait_inner) no longer waits for the sync_order_mu
+     // section in progress (a submit_q / present replay); it notes that section's number t (order_ticket_take) and the CPU's
+@@ -3516,7 +3528,16 @@ void invalidate(uint64_t gpu, uint64_t size) {
+     // it, only for what is left of that one section by then, and later readbacks wait for nothing until the next poll's ticket
+     // (TICK-058's v3 waited at every readback with write-backs for whichever replay was in progress then: castle-move -6 fps)
+     const int ticket = readback_ticket();
+-    if (size && ticket == 1) order_ticket_wait();
++    // (HeyListen, sprint 5) RX_VK_READBACK_OWN=1 (with HOS_NVN_OWN_READBACK=1, off): a readback by the thread whose held submits
++    // are being flushed (OoT's main thread: its light meter, 0.15 ms after its two submits) does not wait for that flush, nor for
++    // the GPU to run those submits. What made it wait: the first of them turns the frame's raw sums into the measures and the
++    // write-back puts them in guest memory; the CPU reads them and sets them to 0; the 0 goes to the GPU with the next capture.
++    // Without the wait the CPU reads what the last frame's conversion left (a frame late, as a console's CPU reads what its GPU
++    // has finished), and the 0 it writes still reaches the GPU after this frame's conversion: the host lets the readback go
++    // only once a capture scan was made after the hold (rx_backend.c), so the 0's mark is the next capture's. Write-backs of
++    // submissions handed out before the hold (tl_rb_floor) are waited for as before.
++    const bool own = tl_rb_floor != 0 && readback_own_on();
++    if (size && ticket == 1 && !own) order_ticket_wait();
+     if (size) memory_cpu_reads(host->gpu_guest(gpu), size);   // (TICK-015: its pool's write-backs made from now on)
+     static const bool log_inv = getenv("RX_VK_LOG_INVALIDATE") != nullptr;
+     static std::atomic<int> logged{0};
+@@ -3565,6 +3586,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
+                 { std::lock_guard lk(sync_order_mu); }
+                 jt_mark(37, 0);
+             }
++            if (own) memory_own_range_add(host->gpu_guest(gpu), size);   // (sprint 5: its late copies keep what the CPU writes there now)
+             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
+             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
+             const auto w0 = std::chrono::steady_clock::now();
+@@ -3581,7 +3603,11 @@ void invalidate(uint64_t gpu, uint64_t size) {
+             if (behind0 && !no_catchup && !unforced) wait_queue_empty(), w = true;   // (work handed over may write it back too)
+             const auto w1 = std::chrono::steady_clock::now();
+             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
+-            if (v > completed()) {
++            if (own && v > tl_rb_floor) {
++                static std::atomic<int64_t> st_own{0};
++                if (st_own.fetch_add(1) % 6000 == 0)
++                    logf("vk: readbacks not waiting for their thread's own held submits: %lld (RX_VK_READBACK_OWN)", (long long)st_own.load());
++            } else if (v > completed()) {
+                 int ok = 0;
+                 if (!(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
+                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
+@@ -5446,8 +5472,44 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
+ void submit(const uint64_t* handles, int n) {
+     submit_q(handles, n, 0);
+ }
++// (sprint 5, RX_VK_WATCH_WORD=<hex gpu address>[,<address>...]: a thread logs each change of those 32-bit words of guest memory
++// with the GPU's completed value and the latest handed out, 600 changes from present RX_VK_WATCH_FROM on: what the GPU's
++// write-backs leave there between its submissions)
++void watch_word_main() {
++    std::vector<uint64_t> addrs;
++    for (const char* e = getenv("RX_VK_WATCH_WORD"); e && *e;) {
++        char* end = nullptr;
++        addrs.push_back(strtoull(e, &end, 16));
++        e = *end == ',' ? end + 1 : end;
++        if (end == e && !*end) break;
++    }
++    const int64_t from = getenv("RX_VK_WATCH_FROM") ? atoll(getenv("RX_VK_WATCH_FROM")) : 17000;
++    std::vector<uint32_t> last(addrs.size(), 0);
++    int logged = 0;
++    const auto t0 = std::chrono::steady_clock::now();
++    while (logged < 600) {
++        if (presents_now < from) { Sleep(50); continue; }
++        for (size_t i = 0; i < addrs.size(); i++) {
++            uint32_t w = 0;
++            host->gpu_read(addrs[i], &w, 4);
++            if (w != last[i]) {
++                float f;
++                std::memcpy(&f, &w, 4);
++                last[i] = w, logged++;
++                logf("vk: watch %#llx = %08x (%g) at %.3f ms, present %lld, done %llu, fence %llu", (unsigned long long)addrs[i], w, (double)f,
++                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), (long long)presents_now,
++                     (unsigned long long)completed(), (unsigned long long)fence());
++            }
++        }
++        for (int k = 0; k < 200; k++) YieldProcessor();
++    }
++}
+ void present(const nvn_tex* t, const int crop[4]) {
+     memory_precopy_present();
++    {
++        static std::once_flag once;
++        if (getenv("RX_VK_WATCH_WORD")) std::call_once(once, [] { std::thread(watch_word_main).detach(); });
++    }
+     if (!async_on()) {
+         std::lock_guard order(sync_order_mu);
+         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
+@@ -5852,5 +5914,15 @@ int64_t par_now_ns() {
+ }
+ 
+ bool replay_tex_storage_in(uint64_t gpu, uint64_t size) { return tex_pages_any(gpu, size); }
++void replay_readback_floor(uint64_t f) { readback_floor_set(f); }
+ 
+ } // namespace mkwvk
++
++// (sprint 5, RX_VK_READBACK_OWN) for host/rx_backend.c, resolved by name: the floor of the calling thread's next readback
++extern "C"
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
++void mkwvk_readback_floor(uint64_t floor) { mkwvk::replay_readback_floor(floor); }
+diff --git a/engine/host/nvn_native.c b/engine/host/nvn_native.c
+index b01f0667..0df32113 100644
+--- a/engine/host/nvn_native.c
++++ b/engine/host/nvn_native.c
+@@ -1082,6 +1082,18 @@ static void held_flush_why(int why);
+    the readback then reads the meter's buffers while the GPU is still inside the frame before (raw sums a later submission of
+    that frame turns into measures: 2e7 where 78 is right) and the exposure burns out to white. What the wait gives is the GPU
+    done with everything submitted, not the flush itself: docs/tickets/SPRINT-5.md. Do not turn on. */
++/* (HeyListen, sprint 5) HOS_NVN_OWN_READBACK=1 (off): the thread that holds submits, the capture scans made at its first hold of
++   the batch and the latest value handed out then, while those submits are held or being flushed: rx_backend.c rx_nvn_invalidate */
++static void *volatile own_thread;
++static volatile LONG64 own_scan, own_floor;
++static volatile LONG own_active;
++static int own_on = -1;
++uint64_t rx_scan_seq(void);
++uint64_t hos_own_readback(uint64_t *scan_at_hold) {
++    if (own_on <= 0 || !own_active || own_thread != (void *)hos_self()) return 0;
++    *scan_at_hold = (uint64_t)own_scan;
++    return (uint64_t)own_floor;
++}
+ static int64_t hold_linger_ns = -1;
+ static volatile LONG64 hold_linger_until;   /* (0: none) */
+ static void *volatile hold_linger_thread;
+@@ -1154,6 +1166,7 @@ static void held_flush_why(int why) {
+         }
+         if (away) hos_vcore_back();
+         st_hold_replay_ns += hos_now_ns() - t0;
++        if (!nheld) InterlockedExchange(&own_active, 0);   /* (sprint 5: the held submits replayed: readbacks wait as before) */
+         st_hold_submits += n, st_hold_by[why < HF_N ? why : HF_OTHER]++;
+         if (++st_hold_flushes % 600 == 0) {
+             hos_log("nvn: held submits: %lld flushes (by: queue flush %lld, finish %lld, present %lld, sync wait %lld, event poll %lld, "
+@@ -2529,6 +2542,13 @@ NV(nvnQueueSubmitCommands) {
+     hs->pages = NULL, hs->copy = NULL, hs->npages = 0;
+     hs->t = hos_now_ns();
+     if (hold_check) hs->npages = hos_hold_snapshot(&hs->pages, &hs->copy);
++    if (own_on < 0) own_on = getenv("HOS_NVN_OWN_READBACK") && atoi(getenv("HOS_NVN_OWN_READBACK")) != 0;
++    if (own_on > 0 && !nheld) {   /* (the batch's first hold) */
++        own_thread = (void *)hos_self();
++        InterlockedExchange64(&own_scan, (LONG64)rx_scan_seq());
++        InterlockedExchange64(&own_floor, (LONG64)rx_nvn_fence());
++        InterlockedExchange(&own_active, 1);
++    }
+     nheld++;
+     if (hold_linger_ns > 0) hold_linger_thread = (void *)hos_self(), InterlockedExchange64(&hold_linger_until, hs->t + hold_linger_ns);
+     LeaveCriticalSection(&held_cs);
+diff --git a/engine/host/rx_backend.c b/engine/host/rx_backend.c
+index 8c485a8c..b6d9e578 100644
+--- a/engine/host/rx_backend.c
++++ b/engine/host/rx_backend.c
+@@ -281,6 +281,8 @@ static const MkwVkHost vk_host = {
+ };
+ 
+ static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
++static uint64_t (*vk_scan_seq)(void);
++static void (*vk_readback_floor)(uint64_t);
+ static void (*vk_precopy_kick)(void);   /* (TICK-054) the renderer's pre-copy thread kicked (RX_VK_PRECOPY_KICK=1) */
+ /* (TICK-054) HOS_PRECOPY_KICK=1 (host/nn_os_sync.c): the capture's pre-copy thread starts a round now */
+ void rx_precopy_kick(void) { if (vk_precopy_kick) vk_precopy_kick(); }
+@@ -372,6 +374,8 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
+     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
+     vk_pool_flags = (void (*)(uint64_t, uint64_t, uint32_t))(void *)GetProcAddress(m, "mkwvk_pool_flags");   /* (TICK-015; optional) */
+     vk_precopy_kick = (void (*)(void))(void *)GetProcAddress(m, "mkwvk_precopy_kick");   /* (TICK-054; optional) */
++    vk_scan_seq = (uint64_t (*)(void))(void *)GetProcAddress(m, "mkwvk_scan_seq");   /* (sprint 5; optional) */
++    vk_readback_floor = (void (*)(uint64_t))(void *)GetProcAddress(m, "mkwvk_readback_floor");
+     const MkwVkRenderer *r = init ? init(&vk_host) : NULL;
+     if (!r || r->version != MKWVK_API_VERSION) {
+         hos_log("rx: the Vulkan back end did not start: WebGPU");
+@@ -545,10 +549,26 @@ void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, cons
+     vk ? vk->nvn_write_texels(t, level, layer0, r, src, row, img)
+        : wgr_nvn_write_texels(t, level, layer0, r, src, row, img);
+ }
++/* (HeyListen, sprint 5) HOS_NVN_OWN_READBACK=1 with RX_VK_READBACK_OWN=1 (off): see vk_replay.cpp invalidate. A readback by the
++   thread whose held submits are being flushed first waits for a capture scan made after its hold (at most 2 ms: the flush's own
++   comes ~0.1 ms after the hold), then tells the back end the latest value handed out before the hold. */
++uint64_t rx_scan_seq(void) { return vk_scan_seq ? vk_scan_seq() : 0; }
++uint64_t hos_own_readback(uint64_t *scan_at_hold);   /* nvn_native.c */
+ void rx_nvn_invalidate(uint64_t gpu, uint64_t size) {
+     /* The callback can wait for replay or GPU write-back: let another guest thread use this core meanwhile. */
+     const int away = hos_vcore_away();
++    uint64_t scan0 = 0;
++    const uint64_t floor = vk && vk_scan_seq && vk_readback_floor ? hos_own_readback(&scan0) : 0;
++    if (floor) {
++        const int64_t t0 = hos_now_ns();
++        while (vk_scan_seq() == scan0 && hos_now_ns() - t0 < 2000000) {
++            for (int i = 0; i < 32; i++) YieldProcessor();
++            SwitchToThread();
++        }
++        vk_readback_floor(floor);
++    }
+     vk ? vk->nvn_invalidate(gpu, size) : wgr_nvn_invalidate(gpu, size);
++    if (floor) vk_readback_floor(0);
+     if (away) hos_vcore_back();
+ }
+ int rx_guest_imported(uint64_t lo, uint64_t hi) {

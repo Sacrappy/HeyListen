@@ -83,6 +83,54 @@ One run a scene with shots (mean luma alike, speed 59.9-60.2): kokiri-idle 80.9 
 79.7 -> 84.5 fps (`build/s5/chk2-*`). Castle-move, 3 interleaved rounds, no environment: 85.5, 82.0, 82.2 against (79.x), 79.0, 79.4:
 **+4 fps, every run above every reference run.** Tests: run_all 256 checks, 33 skipped, one failure (nx2/test_nup_paths.py, as on main).
 
+## Session 2, after the checkpoint (2026-11-12 morning): the GPU's tail, and why the readback cannot simply be let go
+
+- **GPU time is on the loop.** `RX_VK_TEST_BARRIER_DROP=1` (not shippable: every full barrier dropped) 87.5 against 83.0 fps, GPU
+  time 4.2 -> 3.2 ms a frame, tail 2.0 -> 1.3 ms. The real barrier switches do not reach it: `RX_VK_BARRIER_DEDUPE_PAR` 84.7,
+  `RX_VK_BARRIER_TRUST` 83.7, `RX_VK_GAME_BARRIER_NARROW` 81.8, the three 83.3, `RX_VK_PASS_BARRIER=game` 83.0 (ref 83.0-83.4).
+  `RX_VK_MSYNC_DIFF=1` 72.8 (the hashing costs the CPU more than the smaller uploads give). Pass timing: the 3D is drawn at
+  2560x1440 whatever the window; passes 56%, the 136 compute dispatches 26%, barriers ~10%, the mirror syncs' uploads 0.6 ms.
+- **The parallel pre-copy** (`RX_VK_PRECOPY_KICK=2` + `HOS_PRECOPY_KICK=1`): 83.6-83.9 against 82.4 over 3 rounds, inside the
+  spread: with the capture short the readback waits for the GPU's tail instead.
+- **The meter, watched** (a thread logging each change of the buffers' first words with the GPU's completed value): guest
+  memory holds 0 for all of the frame but ~0.3 ms: the main thread's first held submit writes the measure (77.8, 128.4), the
+  write-back lands, the CPU reads it and writes 0. The 0 must reach the GPU **after** that submit's conversion and before the
+  frame's accumulation: that is the order the wait keeps, and what the linger broke (the 0 went to the GPU first).
+- **Reading a frame late** (`docs/research/own-readback-experiment.patch`, not merged): the readback of the thread whose held
+  submits are being flushed waits only for a capture scan after its hold, reads what the last frame's conversion left, and the
+  late copies of those ranges keep the CPU's bytes. The order is then right frame by frame, but the game's own polls now say
+  "not done" in some frames and it skips the read and the reset: the next measure is two frames' worth (78, 163, 254) and the
+  exposure moves (shots 96-140 against 64-107). 80.5-85 fps, no clear gain. Not merged; three source-reading tests would need
+  to follow (test_late_defer, test_invalidate_vcore, test_readback_ticket).
+
+## Where this leaves the 120 fps goal (2026-11-12)
+
+Target since 2026-11-12 07:00: 120 fps average in Kokiri Forest, Hyrule Field and the castle town, no drop under 110 while
+moving. Measured now (the checkpoint, main PC): 84-85.5 fps average in the three scenes, p50 10.9 ms, p90 13.1, p99 15.7, 1% low
+~50 fps. The target is every frame under 9.1 ms: the whole distribution has to move by ~40%, not its tail.
+
+Three chains of ~11-12 ms each hold the frame, and each was seen to bind once another was shortened:
+1. **The sync loop**: the GPU's tail (2 ms) -> the main thread's meter readback -> its hold -> the capture (1.3-1.9 ms) -> the
+   replay (7-9 ms). Bound by GPU time, by the 46 MB the capture copies, and by the replay's ~4 us a draw.
+2. **The game's chain** (~11 ms of lifted code, flat by function): all six executors 2.7 ms, one executor alone 1.6, one module
+   worker alone 1.4, the last stage on four executors 0.95, the main thread 3.0.
+3. **The processors**: ~6.7 threads' worth of work on 8 cores; executors, recorders and helpers share cores at the peaks.
+
+What would move it, largest first (none is a switch; each is a piece of engine work with a picture risk):
+- **The capture by written bytes, not by page** (finer write marks in the lifted stores, slots that hold only what was written):
+  46 MB -> ~8-12 MB a frame; -1 ms on the sync loop, less bus traffic for the game's own code, smaller GPU uploads. The six
+  readers of the capture table (mirror syncs, reads as submitted, late fixes, texture shadows) must take partial slots.
+- **A wider job system** (twelve executors: a patch of the game's per-core tables, f_80b5e9e0 and its users): up to -1.6 ms
+  of the game's chain. High risk.
+- **GPU time**: barriers only where a hazard is (bound: -1 ms), the 136 dispatches' global-memory emulation, a lower render
+  resolution with an upscaler (DLSS / FSR are in the engine: a user's choice, not frame generation).
+- **The lifted code itself**: guest registers kept across calls; the block lift's stores and conversions with a profile of
+  their own.
+- **Frames pipelined like a console's** (the CPU a frame ahead of the GPU): needs the meter's read-and-reset to be exact a
+  frame late, which the experiment above did not reach.
+Honest estimate: the first three together might reach ~100 fps; 120 with 110 minimum is not within reach of this machine
+without all of them and a faster replay.
+
 ## What a 120 fps frame needs (the three walls, in the order they bind now)
 
 1. **Render chain (binds now, ~12 ms):** capture copy 1.3-1.6 ms (30 MB of dirty pages a frame), the late-page GPU wait ~1.3 ms
