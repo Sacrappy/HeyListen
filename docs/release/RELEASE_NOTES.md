@@ -18,55 +18,70 @@ repository (the engine under `engine/`).
 
 ## New in this release
 
-Everything below is new since v0.1.0 (v0.2.0 and v0.2.1 were built but never published). Figures are from the two test PCs:
-a Ryzen 7 7800X3D + RTX 5070 on PCIe 5.0 x16, and an i5-10400F + RTX 3050 on PCIe 3.0 x4.
+Everything below is new since v0.2.0. It is a speed release: nothing changes in how the game looks or plays.
 
-- **Much faster on PCs with a slow graphics link** (the RTX 3050 test PC, PCIe 3.0 x4):
-  - The CPU now records the next frame while the GPU finishes its write-backs, instead of waiting for them (`RX_VK_LATE_DEFER`).
-  - The capture copy also hashes the pages for the mirror syncs, so the syncs no longer hash them again (`RX_VK_CAPTURE_HASH`).
-  - Mirror syncs copy only the 256-byte chunks that changed (32 -> 4.4 MB a frame).
-  - These are on by default where the link is 8 GB/s or less (read from the driver). Together they give +18-21% fps there:
-    Kokiri Forest 30.9 -> 37.2, Castle Town 29.1 -> 34.4, Hyrule Field 31.4 -> 37.2 fps at 1440p. Fast links keep the old
-    copies and the same speed.
-- **Faster frames on every PC**:
-  - The game's frame and the replay of its draws overlap better: the replay is held and recorded in parallel. That gives
-    +1.9 to +3.8 fps in Kokiri Forest, Castle Town and Hyrule Field on the 7800X3D.
-  - The capture copies use streaming stores (+2.4 to +3.3 fps).
-- **Faster floating-point code**:
-  - The game's vector math runs as real SIMD instead of lane by lane, and its slow paths (quiet NaN lanes, estimates) are cut.
-  - The builder ships an optimization profile recorded on that code.
-  - Market about 75 -> 78 fps standing, 68 -> 73 walking. Results are bit-identical to before.
-- **Fewer stutters on mid-range PCs**: ASTC texture transcodes are batched and their BC copies are cached in system RAM.
-- **Castle Town Market ground fixed** while walking (no more flat mint, white or teal ground):
-  - ASTC textures are kept as BC1/BC7 (decoded textures 3.0 -> 1.1 GB, VRAM peak -14%).
-  - A pool-mirror ordering bug is fixed.
-- **Less RAM**: about 2 GB less (compute pipelines are built on first use and their modules dropped); shaders start faster.
-- **Hookshot v2.0.12/v2.0.13**:
-  - The new Dear ImGui menu (Insert), keyboard shortcut choice, capture and screenshot fixes, and builder hardening.
-  - HeyListen keeps its frame limit row and FPS counter (F10).
-- **Discord**: the status now shows "Playing HeyListen" with its own icon (the Insert menu's "Discord status" row; it does
-  nothing without a Discord client running).
-- **For developers**:
-  - Many measured performance switches, off by default, each with its ticket and benchmark in `docs/`.
-  - Frame tracing tools (job trace, critical path, frame breakdown) and an analysis of where frame time can still be saved
-    (`docs/research/suspects/`).
+Measured on the fast test PC (Ryzen 7 7800X3D + RTX 5070), frame generation off, the frame limit lifted, v0.2.0 and this
+release run in turn on the same day:
+
+| Scene | v0.2.0 | this release |
+|---|---:|---:|
+| Castle Town, moving (3 runs each) | 77.7 fps | **83.7 fps** |
+| Kokiri Forest, standing (1 run each) | 80.6 fps | **84.5 fps** |
+| Hyrule Field, walking (1 run each) | 79.5 fps | **83.1 fps** |
+
+One run differs from the next by 1 to 2 fps, and the slowest frames (1% low, about 46 fps in Castle Town) are where they
+were. The picture (screenshots against v0.2.0's) and the game's speed were checked in the three scenes.
+
+What changed:
+
+- **Faster floating-point code.** Straight runs of the game's floating-point instructions now execute as one block on the
+  processor's SIMD registers, with a single check that falls back to the exact instruction-by-instruction code. The builder
+  ships an optimization profile recorded on that code. Results are bit-identical to before (2 million random test runs,
+  0 differences).
+- **The frame's memory copy starts earlier.** The pages the game changed are copied ahead, in parallel, while its job
+  threads wait at the end of the frame; when the frame is submitted only what changed since is copied.
+- **Less waiting between the game and the GPU.** A page written late into a texture that is still in use no longer makes
+  the copy wait for the GPU; finished GPU work is recognized without asking the driver again; the engine no longer repeats
+  barriers the game already asked for.
+- **Lighter bookkeeping every frame.** The mirror syncs, the copy's page stamps, the hazard scan and the set-up of the
+  parallel recording each do less work, and so do the waits of the game's threads (the switches measured in tickets 056
+  to 062, now on by default).
+- **A background thread of the game no longer takes a processor from the frame's threads** (it runs in short slices).
+- Each engine change above has a switch that turns it off (`=0` in the game folder's `hookshot_env.txt`;
+  `docs/tickets/SPRINT-5.md` lists them). The floating-point blocks are chosen when the game is built.
+
+Not measured again for this release: the slow-link test PC (RTX 3050 on PCIe 3.0 x4). Its copy-ahead stays off (it keeps
+v0.2.0's chunk-diff syncs); the floating-point blocks and the tickets' switches were checked there when they were built, the
+late texture pages and the background thread's slices were not.
+
+For developers: `docs/tickets/SPRINT-5.md` is the log of this work, with what holds the frame near 85 fps on the test PC
+(three chains of 11-12 ms each: the GPU round trip, the game's own job chain, the processors) and the experiments that did
+not pay: a copy by written 512-byte granules (in the code, off), a light-meter readback one frame late and twelve job
+executors instead of six (patches in `docs/research/`).
 
 ## What HeyListen adds to Hookshot
 
 - **Frame rate**: game speed correct at 60-360 fps (was +12% too fast at 120); engine copies cut (write-backs 67.5 -> 13.9 MB
-  a frame, mirror syncs as one compute pass); Hyrule Field about 68 -> 74 fps on the test PC; Castle Town turn/move drops
-  fixed (31-43 -> 51-57 fps).
-- **Fewer stutters**: pipelines used once are noted and precompiled at the next start; texture descriptor cache.
-- **VRAM**: a VRAM breakdown in the log, texture budget from the driver, big images in their own memory, idle mirrors freed
-  (peak use about 88% -> 81-87%); the teal ground regression fixed.
+  a frame, mirror syncs as one compute pass); the replay of the game's draws recorded in parallel and overlapping the game's
+  next frame; floating-point code run as real SIMD, a block at a time, with its own optimization profile; Castle Town
+  turn/move drops fixed (31-43 -> 51-57 fps at the time).
+- **Slow graphics links** (PCIe x4 cards): the CPU records the next frame while the GPU finishes its write-backs, the copy
+  hashes pages for the syncs, and the syncs send only the 256-byte chunks that changed (+18-21% on the RTX 3050 test PC).
+- **Fewer stutters**: pipelines used once are noted and precompiled at the next start; texture descriptor cache; ASTC
+  transcodes batched, their BC copies cached in system RAM.
+- **Memory**: a VRAM breakdown in the log, texture budget from the driver, big images in their own memory, idle mirrors
+  freed, ASTC textures kept as BC1/BC7 (decoded textures 3.0 -> 1.1 GB); about 2 GB less RAM.
+- **Picture fixes**: the Castle Town Market ground while walking (no more flat mint, white or teal ground).
 - **Builder**: the HeyListen Builder builds this fork (its own releases and updates, its own work folder), and copies Ocarina
   of Time saves **from and to emulators** (Lichii, Eden and its forks, NX2navi, or any folder) with a backup first
   (upstream Hookshot's `oot_saves.py`).
-- An original icon (a blue fairy orb), on the builder, the setup and the game; the game is `HeyListen.exe` (a folder built
-  with an earlier build had `hookshot.exe`: rebuilding it replaces that).
+- An original icon (a blue fairy orb), on the builder, the setup and the game; the game is `HeyListen.exe`; the Discord
+  status shows "Playing HeyListen"; a frame limit row in the menu and an FPS counter (F10).
 
 ## Known issues
 
+- **120 fps is not reached.** The test PC runs the three scenes at about 84 fps on average with drops to about 46; the work
+  goes on (`docs/tickets/SPRINT-5.md`).
 - **Hookshot's newest engine work (after v2.0.13) is not in this release.** Merged with HeyListen, it is about 29% slower
   here for now (a readback wait and thread scheduling changes); it waits on the `sync/hookshot-12` branch.
 - **Occlusion is off** (a fixed value, as in Hookshot): real occlusion queries break the picture; some scenes draw more than

@@ -376,9 +376,10 @@ static int env_line_allowed(const char *name, const char *value) {
     return !strpbrk(value, "/\\") && !drive && value[0] != '~' && strcmp(value, ".") && strcmp(value, "..");
 }
 /* (HeyListen, sprint 5) The switches adopted together on 2026-11-12, on unless the environment (or hookshot_env.txt, read
-   first) sets them, =0: off. One at a time each was inside the run-to-run spread; together, with the held flush's linger
-   (nvn_native.c), the late pages of a texture's storage deferred (vk_memory.cpp) and the block lift, castle-move went
-   77.5 -> ~91 fps (docs/tickets/SPRINT-5.md). Set before main (a constructor): hookshot_env.txt, read in main, and the
+   first) sets them, =0: off. One at a time each was inside the run-to-run spread; together, with the late pages of a
+   texture's storage deferred (vk_memory.cpp) and the block lift, castle-move went 77.5 -> ~85 fps with the picture and
+   the game's speed right (docs/tickets/SPRINT-5.md; the held flush's linger of nvn_native.c, first counted with them at
+   ~91 fps, is off: its picture was wrong). Set before main (a constructor): hookshot_env.txt, read in main, and the
    environment itself still decide. */
 __attribute__((constructor)) static void heylisten_env_defaults(void) {
     static const char *const on[] = {
