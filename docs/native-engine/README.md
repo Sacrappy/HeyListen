@@ -9,10 +9,22 @@ functional reference, and as the way the gameplay still runs until its turn come
 
 ## The directive (project owner, 2026-11-13): the reference for everything below
 
-### 1. Vision and final objective: an engine 100% native x64 (`hl::*`)
+### 1. Vision and final objective: a hybrid engine (scope set by the owner on 2026-11-13, late)
 
-The game's engine as translated from ARM is to be **replaced entirely by this project's own C++20 engine, written for
-x64** (`engine/native`). Only the purely gameplay logic and the game's data are kept.
+An engine 100% native was judged too long and too ambitious. The objective is a **hybrid HLE engine, in 3 to 4 weeks**:
+
+| Native x64, in `engine/native` (`hl::*`) | Stays on the translated code |
+|---|---|
+| rendering | non-critical audio |
+| memory | Havok's internal initialisation |
+| jobs | the menus' state machines |
+| streaming | the ~150,000 functions of actor and AI logic |
+| the physics loops | |
+
+Every heavy subsystem is native; what stays translated is what costs next to nothing. **Done means, from a player's
+point of view: the game runs at 120+ fps and uses 4 GB of RAM.** Sections 2 to 4 below stand as written, read within this
+scope: where they say "rewrite", the unit is the heavy part of a subsystem (its loops, its passes, its allocators), not
+every function of it.
 
 The replacement is **progressive and in production**: brick by brick, each native subsystem switched on in the game at
 once, validated in the three scenes (picture, fps, RAM and VRAM) and committed before the next one starts.
@@ -75,6 +87,14 @@ chain (ms) and fps**. `tools/bench/steptable.py` makes it from the runs' logs.
 The directive is the goal; these are the figures measured so far that bound it. They are kept here so that a step's
 table is read against them, not to argue with the goal.
 
+- **"What stays translated costs next to nothing" is the scope's assumption, and two measurements stand against it
+  today**; both are to be re-measured as the native parts land, since they decide whether the two targets are met inside
+  the scope:
+  - time: the actor stage jobs, which are actor logic, hold 1.25 ms of the 5.8 ms critical chain (0.29 ms of it scattered
+    logic in the instance the chain goes through, the rest animation pose, cloth and ray casts called from it);
+  - memory: the game's own heaps outside GPU pools are 3.7 GB of RAM. "4 GB of RAM" for the game needs them near 3.7 GB
+    with every GPU byte gone from RAM, or needs the memory and streaming modules to shrink what the heaps hold (resources'
+    CPU side); for the whole process it also needs the driver's and this engine's own share (2.8-5 GB today) cut.
 - **Game RAM**: 8.2 GB in the castle scene, of which 4.4 GB is CPU-side storage of GPU data (the directive's points 1
   and 2) and 3.7 GB the game's own heaps, which graphics work does not shrink ("The graphics front end and the memory
   target", below).
