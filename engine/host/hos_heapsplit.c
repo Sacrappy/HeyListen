@@ -223,9 +223,12 @@ static int add_heap(uint64_t obj, int parent, int depth) {
     /* (a heap's vtable has the heap base's own function in slot 29, 0x809dfe30, in all thirteen classes: a list node that
        moved under the walk leads to some other object, whose vtable does not) */
     if (nheaps >= MAX_HEAPS || depth >= MAX_DEPTH || (obj & 7) || !rd64(obj, &vt) || vt < hos_image_base ||
-        vt >= hos_image_end || !rd64(vt + 232, &slot29) || slot29 != 0x809dfe30 || !rd64(obj + 40, &start) || !rd64(obj + 48, &size) || !size || start < HOS_SYSTEM_BASE ||
-        start >= HOS_GUEST_SPACE || size > HOS_GUEST_SPACE - start || !seen_add(obj))
+        vt >= hos_image_end || !rd64(vt + 232, &slot29) || slot29 != 0x809dfe30 || !rd64(obj + 40, &start) || !rd64(obj + 48, &size))
         return -1;
+    /* (the address-region heap has no arena of its own: each allocation is a region of its own) */
+    if (!size && vt == 0x84c17628) start = HOS_SYSTEM_BASE;
+    else if (!size || start < HOS_SYSTEM_BASE || start >= HOS_GUEST_SPACE || size > HOS_GUEST_SPACE - start) return -1;
+    if (!seen_add(obj)) return -1;
     const int idx = nheaps++;
     Heap *h = &heaps[idx];
     memset(h, 0, sizeof *h);
@@ -359,7 +362,7 @@ static void log_tree(int idx, int depth) {
     uint64_t small_size = 0, small_res = 0;
     for (int c = h->first_child; c >= 0; c = heaps[c].next_sibling) {
         const Heap *k = &heaps[c];
-        if (k->res_incl >= 256 || k->size >= (64ull << 20)) log_tree(c, depth + 1);
+        if (k->res_incl >= 1024 || k->size >= (64ull << 20)) log_tree(c, depth + 1);
         else small++, small_size += k->size, small_res += k->res_incl;
     }
     if (small) {
@@ -411,8 +414,19 @@ static DWORD WINAPI heapsplit_main(void *p) {
         }
     }
     /* (and the address-region heap, "NinVirtualAddressHeap", made by 0x809e20c0 and kept at 0x84e9f460: in no array) */
-    uint64_t vah;
+    uint64_t vah = 0;
     if (rd64(0x84e9f460, &vah) && vah && add_heap(vah, -1, 0) >= 0) nroots++;
+    /* (the address-region heaps' own counters: their allocations are regions of their own, outside any arena; +264 and
+       +272 are added to by the allocation of 0x8080d440, +192 and +256 are the counts of its two lists) */
+    for (int i = 0; i < nheaps; i++)
+        if (heaps[i].vt == 0x84c17628) {
+            uint64_t a264 = 0, a272 = 0;
+            uint32_t n192 = 0, n256 = 0;
+            rd64(heaps[i].obj + 264, &a264), rd64(heaps[i].obj + 272, &a272), rd32(heaps[i].obj + 192, &n192), rd32(heaps[i].obj + 256, &n256);
+            hos_log("heapsplit: address-region heap %s at %#llx: +264 %.1f MB, +272 %.1f MB, lists %u and %u", heaps[i].name,
+                    (unsigned long long)heaps[i].obj, BMB(a264), BMB((uint64_t)-(int64_t)a272), n192, n256);
+        }
+    hos_log("heapsplit: the pointer at 0x84e9f460: %#llx", (unsigned long long)vah);
     const int64_t t_walk = hos_now_ns();
     hos_log("heapsplit: %d heaps read (%lld free blocks' insides kept), %.0f ms; counting their pages", nheaps, (long long)ninner,
             (t_walk - t0) / 1e6);
@@ -507,6 +521,40 @@ static DWORD WINAPI heapsplit_main(void *p) {
                 MB(parts[i].res), MB(inh), MB(inp));
     }
     line_done();
+    /* (the address regions hold no heap arena: their committed ranges by resident pages outside pools, the largest) */
+    {
+        enum { NREG = 4096 };
+        static struct { uint64_t lo, hi, res; } reg[NREG];
+        int nreg = 0;
+        uint64_t a = HOS_HEAP_BASE + hos_heap_size;
+        while (a < HOS_GUEST_SPACE && nreg < NREG) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(GP(a), &mbi, sizeof mbi)) break;
+            const uint64_t end = (uint64_t)((uint8_t *)mbi.BaseAddress - (uint8_t *)GP(0)) + mbi.RegionSize;
+            if (end <= a) break;
+            if (mbi.State == MEM_COMMIT) {
+                uint64_t r = 0;
+                for (uint64_t q = a; q < end;) {
+                    int mm = 0;
+                    for (; mm < BATCH && q < end; mm++, q += 0x1000) batch[mm].va = GP(q), batch[mm].attr = 0;
+                    if (!query_ws(GetCurrentProcess(), batch, (DWORD)(mm * sizeof(WsInfo)))) continue;
+                    for (int k = 0; k < mm; k++)
+                        if ((batch[k].attr & 1) && !in_pool((uint64_t)((uint8_t *)batch[k].va - (uint8_t *)GP(0)))) r++;
+                }
+                if (r >= 256) reg[nreg].lo = a, reg[nreg].hi = end, reg[nreg].res = r, nreg++;
+            }
+            a = end;
+        }
+        for (int k = 0; k < 25; k++) {
+            int best = -1;
+            for (int i = 0; i < nreg; i++)
+                if (reg[i].res && (best < 0 || reg[i].res > reg[best].res)) best = i;
+            if (best < 0) break;
+            hos_log("heapregion %2d: %#llx size %.1f MB committed, %.1f MB in RAM outside pools", k + 1, (unsigned long long)reg[best].lo,
+                    BMB(reg[best].hi - reg[best].lo), MB(reg[best].res));
+            reg[best].res = 0;
+        }
+    }
 
     /* 6. coldness: the heaps' resident pages outside pools out of the working set once, counted back after the window */
     if (cold > 0 && !hos_large_pages) {
