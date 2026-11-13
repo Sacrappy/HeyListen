@@ -5,7 +5,7 @@ only the **HeyListen Builder**: no game code, data, keys or shaders. You dump yo
 translates and compiles the game on your PC, prepares its shaders, and starts it. See the
 [user guide](https://github.com/Sacrappy/HeyListen/blob/main/docs/USER_GUIDE.md).
 
-HeyListen is a fork of [Hookshot](https://github.com/NotRexed/Hookshot) by NotRexed and its contributors (GPL-3.0); all credit
+HeyListen is a fork of Hookshot by NotRexed and its contributors (GPL-3.0); all credit
 for the recompiler, the builder and the Vulkan back end goes to them. HeyListen is GPL-3.0-or-later; the source is this
 repository (the engine under `engine/`).
 
@@ -18,7 +18,14 @@ repository (the engine under `engine/`).
 
 ## New in this release
 
-Everything below is new since v0.2.0. It is a speed release: nothing changes in how the game looks or plays.
+**v0.3.1 repairs the installation.** The setup downloaded four of the builder's tools (Python, emsdk, the CPM packages and
+wgpu-native) from the Hookshot repository, which is no longer online, so a new install of v0.3.0 stopped with a download
+error. Those parts are now served from this repository, byte for byte the same files (same SHA-256), and the release tool
+refuses a list that names any other host than this repository and llvm-mingw's official release. The game and the builder
+are those of v0.3.0: if v0.3.0 is installed and working, the update downloads only the builder's own few MB and you need
+not build again for anything new.
+
+The rest of these notes is v0.3.0's. Everything below is new since v0.2.0. It is a speed release: nothing changes in how the game looks or plays.
 
 Measured on the fast test PC (Ryzen 7 7800X3D + RTX 5070), frame generation off, the frame limit lifted, v0.2.0 and this
 release run in turn on the same day:

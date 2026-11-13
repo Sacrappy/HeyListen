@@ -12,8 +12,9 @@ Writes <out>/<tag>/:
     upload to the tag's release:     HeyListenBuilder.exe (the setup), heylisten-setup.txt, SHA256SUMS.txt,
                                      RELEASE_NOTES.md (the release body), USER_GUIDE.md
     upload to the builder-parts release (once each; named by checksum): parts/HeyListenBuilder-<part>-<sha>.zip
-The parts reused from upstream (Python, emsdk, CPM, wgpu-native, maybe third_party) are not written: heylisten-setup.txt points
-at Hookshot's builder-parts release for them, and llvm-mingw at its official release.
+The parts that did not change (Python, emsdk, CPM, wgpu-native, maybe third_party) are not written: heylisten-setup.txt points
+at this repository's builder-parts release for them (it mirrors the ones first made by upstream Hookshot, whose repository
+is gone), and at llvm-mingw's official release. No link of the list leads anywhere else: the build fails otherwise.
 Nothing is uploaded or tagged here: the maintainer does that (see the printed commands).
 """
 import argparse
@@ -28,7 +29,6 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENGINE = os.path.join(ROOT, "engine")
 REPO = "Sacrappy/HeyListen"
-UPSTREAM = "NotRexed/Hookshot"
 LIST = "heylisten-setup.txt"
 
 # Never in a release asset: the game, keys, what is made from the game, caches.
@@ -130,10 +130,10 @@ def main():
     parts_py = os.path.join(ENGINE, "scripts", "release_parts.py")
     print("HeyListen release %s -> %s" % (tag, dist), flush=True)
 
-    # 1. the previous release's setup list (ours, else upstream Hookshot's): the Python, emsdk, CPM, wgpu-native and
+    # 1. the previous release's setup list: the Python, emsdk, CPM, wgpu-native and
     #    third_party parts and the play profile come from it
     previous = os.path.join(work, "previous-setup.txt")
-    run(py + [parts_py, "previous", previous, "--repo", REPO, "--repo", UPSTREAM, "--skip-tag", tag], env=env)
+    run(py + [parts_py, "previous", previous, "--repo", REPO, "--skip-tag", tag], env=env)
 
     # 2. llvm-mingw (official release, SHA-256 checked) and the setup exe
     llvm = out_of(py + [parts_py, "llvm-mingw", os.path.join(cache, "llvm")], env=env).splitlines()[-1]
@@ -166,6 +166,16 @@ def main():
     for f in os.listdir(staging):
         shutil.copyfile(os.path.join(staging, f), os.path.join(dist, "parts" if f.endswith(".zip") else "", f))
     shutil.copyfile(setup, os.path.join(dist, "HeyListenBuilder.exe"))
+    #    (every part from this repository's builder-parts release or llvm-mingw's own: an install must not depend on another
+    #    repository staying online, as v0.3.0's did on upstream's)
+    ours = "https://github.com/%s/releases/download/builder-parts/" % REPO
+    with open(os.path.join(dist, LIST), encoding="utf-8") as f:
+        links = [l.split()[6] for l in f.read().splitlines() if l.startswith("part ")]
+    foreign = [u for u in links if not u.startswith((ours, "https://github.com/mstorsjo/llvm-mingw/releases/download/"))]
+    if foreign:
+        sys.exit("refusing: %s names parts hosted elsewhere:
+  %s" % (LIST, "
+  ".join(foreign)))
 
     # 6. notes, guide, checksums
     with open(os.path.join(ROOT, "docs", "release", "RELEASE_NOTES.md"), encoding="utf-8") as f:
