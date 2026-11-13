@@ -103,24 +103,82 @@ archive from the romfs because these are by construction the bytes the game deco
 mod they came from, and because nothing has to parse the archive: the same id can never mean other bytes. A frame whose
 dictionary is not in the tree fails to decode (the translated function would read through a null node there).
 
-## 5. The chunked case and its hand-off
+## 5. The chunked case and its hand-off (read whole 2026-11-13, second session)
 
-A file whose compressed size is at least a chunk (902,912 bytes) is decoded while it is read: the loading thread fills the
-descriptor (state 1, destination, decompressed size, workspace, the two source buffers, the DDict), waits on and clears its
-events, then in a loop: hands the chunk just read to the decoding thread (count at `+1624`, the callback's slot 0 with the
-descriptor), reads the next chunk into the other buffer, and waits for the decoding thread to finish the previous one. A
-short read ends the loop (a last partial chunk is handed over and waited for). The decoding thread (`0x80115bf0`) decodes
-the chunk from the buffer its index chooses with the game's own block decoder (`0x80115c80`), counts the chunk, and
-signals; an error goes to the status. Success is the state byte at 4.
+A file whose compressed size is at least a chunk (902,912 bytes) is decoded while it is read. Everything before the
+decision is the main path's: the header, the dictionary, the limit, the destination (section 3, steps 1 to 5); the
+chunked case is chosen after the destination is had, when the first read filled the chunk.
 
-**What the native path does with it**: the chunked case is decided only after the first read (the read filled the
-chunk). At that point the native path has opened the file and read one chunk, and nothing else: no header was acted on, no
-memory allocated. It closes the file as the translated function closes it, and gives the request, unchanged, to the
-translated function, which opens and reads the file again from its start. What the game can see of that: one more
-prepare/open/read/close of the same file object, with the same arguments, before the real one; the read buffer's first
-chunk written twice with the same bytes. Nothing else changes (the request, the heap and the results are untouched until
-the translated function runs). Reproducing the hand-off natively would mean reproducing the game's block decoder's
-progress fields in the descriptor; it was not done.
+**Who takes part.** Each decompressor owns one decoding thread (made with it by `0x8069a5e0`, the `ParallelDecompThread`
+of its creator: a message-queue thread, class `0x84c376e0`). The decompressor's `+1640` is a small callback object in
+place (vtable `0x84c37578`, `+8` the thread): its slot 0 (`0x801c5e80`) posts the descriptor to the thread's queue
+(the thread's slot 2, `0x801c5ea0`). The thread's loop (`0x80df2680`) takes a message and calls its slot 14
+(`0x836dda20`), which calls the message's slot 2: for the descriptor, the step `0x80115bf0`. The thread does nothing
+else with the descriptor before or after. The descriptor is made in place by `0x8069a8d0` (its events: the one at
+`+1544` is made signalled, the one at `+1592` not); the decompressor's destructor (`0x836dea10`) calls the callback's
+slot 3 (which does nothing) and finalizes the events. No other code was found that reads the descriptor.
+
+**The descriptor** (offsets in the decompressor; the step sees it at `+1440`, its decoder state at `+1456`):
+
+| Offset | Set by the loading thread | What the step does with it |
+|---|---|---|
+| `+1456` (8 bits) | 1 | the state: 1 a frame to start (the step reads the frame header, resets the decoder context in the workspace, sets 2), 2 under way, 3 failed, 4 decoded (the input ended at the frame's end) |
+| `+1464` | the destination | advanced by every byte written |
+| `+1472` (32 bits) | the decompressed size | room left: decreased by every byte written |
+| `+1476` (32 bits) | 0 | set to the header's content size at the frame's start, decreased by every byte written; **the step's result** |
+| `+1480` | the read buffer (the workspace) | the decoder context |
+| `+1488` | the read buffer + `0x271f8` | a staging area for a block split between two chunks |
+| `+1496` (32 bits), `+1500` (32 bits) | 128 KB, 0 | the staging area's size and fill |
+| `+1504` | 0 | the decoder context, set at the frame's start |
+| `+1544`, `+1592` | (light events) | `+1544` signalled when a step ends the frame or fails; `+1592` signalled at the end of every step |
+| `+1608` | the source (the first buffer; the second is a chunk after it) | |
+| `+1616` (32 bits) | the chunk | |
+| `+1620` (32 bits) | 0 | chunks decoded: the step picks the buffer by its parity, then counts the chunk |
+| `+1624` (32 bits) | the byte count of the chunk handed over (before each hand-off) | |
+| `+1628` (32 bits) | 0 | the step's error, when negative |
+| `+1632` | the guest DDict (0: none) | |
+
+**The hand-off.** The loading thread waits on the event `+1544` (the previous frame finished: it is signalled when
+idle), clears it, fills the descriptor (above), then for each full chunk: stops if the status is negative, clears
+`+1592`, stores the chunk's count, posts the descriptor (the callback), reads the next chunk into the other buffer (the
+same read calls and checks as the first read: the handle's kind and readiness each time, one read of a chunk or reads
+of at most `+64`), waits on `+1592`. A chunk shorter than the chunk ends the loop; a last non-empty one is handed over
+and waited for the same way. Then: a negative status gives the result code of the decoder's error, state 4 is success,
+state 2 code 3, anything else code 1; on every failure a destination allocated here is freed and 0 returned. A failed
+read in the loop gives code 9 (whatever the quiet bit), frees an allocated destination, and returns without waiting for
+the chunk handed over last (the decoding thread may still be writing into the freed destination: the game's own
+behaviour, never seen).
+
+**The step** (`0x80115bf0`): when the status is not negative, decodes the chunk (`0x80115c80` on `+1456`, the source
+chosen by the index, the count, the DDict), counts it, and with the result r (the frame's bytes still to come, `+1476`):
+r < 0 stores the status and signals both events, r = 0 (the frame ended) signals both, r > 0 signals `+1592` only. The
+chunk decoder decodes block by block with the game's own decoder over the context in the workspace; a block split
+between two chunks waits in the staging area; once the frame has ended a further chunk is an error (-3); what follows
+the frame's end in the chunk that ended it is ignored.
+
+**What later code reads.** The loading thread reads the state byte and the status after the last wait; nothing reads the
+other fields after a decode (the next chunked decode sets every one of them before use, and the step's frame start resets
+the decoder context and the fields it reads). The two events stay as the last decode left them: `+1544` signalled,
+`+1592` signalled.
+
+**What the native path does** (`HL_STREAM=1`, `decode_chunked` in `hl_stream.c`): the same function, on the loading
+thread, with the step's decode done in place instead of on the decoding thread. It waits on and clears `+1544`, fills
+every field the translated function fills with the same values, then for each chunk clears `+1592`, stores the count,
+decodes the chunk from the buffer its index chooses with zstd's streaming decoder (`ZSTD_decompressStream`, the
+destination as a stable output buffer: no window copy whatever the frame's window, any window accepted as the game's
+decoder accepts it, a context of its own per thread, the game's dictionary bytes as for one-read files), counts it,
+signals as the step signals (`+1544` once the frame's bytes are all written, `+1592` each time), reads the next chunk
+into the other buffer with the same calls, and waits on `+1592` (already signalled: it returns at once). After the
+frame, the descriptor is left as the step leaves it (state 4, the destination advanced by the size, room and bytes to
+come 0, the decoder context set). The decoding thread is never given the descriptor: it only runs the step for a
+descriptor it is given, so nothing of it is missing. What differs: the decoder context in the workspace and the staging
+area are not written (scratch: the next frame start resets them), the staging area's fill (`+1500`) stays 0, and the
+reads and the decode alternate on one thread instead of overlapping on two.
+
+If zstd fails, a chunk comes after the frame's end, or the input ends before it (never seen; the game's decoder gives an
+error code there), the native path signals `+1544`, frees a destination it allocated, closes the file and gives the
+request whole to the translated function, which opens and reads the file again and reproduces the game's own result;
+counted as `chunked-translated`.
 
 ## 6. The other callers of the decoder (not this brick)
 
@@ -133,21 +191,26 @@ progress fields in the descriptor; it was not done.
 | Piece | Where |
 |---|---|
 | The path a request takes, decided before anything is done for it (`hl::stream::choose`), the counters | `engine/native/include/hl/stream/Decode.h`, `src/stream/Decode.cpp` |
-| The provenance table: destination range -> file name (the per-file heap's), file object, compressed size (0 for a chunked file, whose later chunks the native side does not see) and decompressed size, dictionary id, chunked or not, a fingerprint of the decoded bytes; lookup by address; a new decode drops the ranges it overlaps; at most 65,536 ranges, oldest dropped | `engine/native/include/hl/stream/Provenance.h`, `src/stream/Provenance.cpp` |
+| The provenance table: destination range -> file name (the per-file heap's), file object, compressed size and decompressed size, dictionary id, chunked or not, a fingerprint of the decoded bytes; lookup by address; a new decode drops the ranges it overlaps; at most 65,536 ranges, oldest dropped | `engine/native/include/hl/stream/Provenance.h`, `src/stream/Provenance.cpp` |
+| The measurement of brick 6.3: a hash of every whole 4 KB page of every decode, checked again at 30 s and 60 s, by file kind (section 9) | `engine/native/include/hl/stream/Pages.h`, `src/stream/Pages.cpp` |
 | The C surface | `engine/native/include/hl/c/hl_stream.h`, `src/c/hl_stream.cpp` |
-| The answer of `0x80108da0` (and of `0x80115bf0` for the check), the native function, the dictionaries, the zstd calls | `engine/host/hl_stream.c` |
+| The answer of `0x80108da0` (and of `0x80115bf0` for the check), the native function and its chunked case, the dictionaries, the zstd calls, the pages' thread and the restore test | `engine/host/hl_stream.c` |
 | zstd's decoder in the game's executable (the vendored `third_party/zstd`, decoder only) | `engine/nx2/build.py` |
 | Tests without the game | `engine/native/tests/stream_test.cpp` |
 
-Switches: `HL_STREAM=1` the native function (the default; 0 the translated function, as before), `HL_STREAM_CHECK=1` the check (the translated function answers,
-then the same compressed bytes are decoded natively and compared), `HL_STREAM_LOG=1` the counters every 10 s.
+Switches: `HL_STREAM=1` the native function, the chunked case included (the default; 0 the translated function, as
+before), `HL_STREAM_CHECK=1` the check (the translated function answers, then the same compressed bytes are decoded
+natively and compared: a chunked file by the native path's streaming decode fed the same chunks), `HL_STREAM_CHECK=2`
+the native function answers and each chunked file it decoded is decoded again in one call from the bytes it read and
+compared, `HL_STREAM_LOG=1` the counters every 10 s, `HL_STREAM_PAGES=1` the measurement of section 9 (off by default).
 
 The native path takes a request when it has a file object of the usual kind, a heap, a granularity that is a multiple of
 32, and a decompressor with its own usable read buffer: every request seen in the three scenes. Everything the function
 does on that path goes through the game's own objects (the file object's slots, the heap's allocation, the guard, the
-close) on the calling thread's guest context, in the translated function's order, with its stack frame at the same
-address; only the header read and the decode are native (zstd 1.5.7). What is not reproduced: the decoder context's
-fields in the read buffer (scratch, section 3), and the chunked case (section 5).
+close, the descriptor's events) on the calling thread's guest context, in the translated function's order, with its
+stack frame at the same address; only the header read and the decode are native (zstd 1.5.7). What is not reproduced:
+the decoder context's fields in the read buffer and the chunked case's staging area (scratch, sections 3 and 5), and the
+overlap of reads and decoding on two threads in the chunked case.
 
 The provenance table sees no free: a range that was freed and given to another decode is replaced when that decode
 records; until then a lookup returns the old entry, whose fingerprint (the decoded bytes' first and last 4 KB) tells the
