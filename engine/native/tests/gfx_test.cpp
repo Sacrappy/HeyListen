@@ -531,10 +531,58 @@ void the_preparation_decides_its_route_in_order() {
     in.applied_material_state = 7;
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::Cached);
 
+    // (another program with the interface applied: bound alone, the block told)
     in = cached_inputs();
     in.applied_program = 0x5678;
+    in.context = 0x9000;
+    in.program_object = 0xabc, in.program_stages = 0x11;
     out = gfx::Prepare::decide(in);
-    CHECK(out.route == gfx::PrepareRoute::ProgramChanged && !gfx::Prepare::native(out.route) && !out.call_list);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBound && gfx::Prepare::native(out.route) && out.call_list);
+    CHECK(out.program_bound && out.program == 0x1234 && out.binder == 0x9188 && out.mode_written && out.mode_bits == 0x8);
+    CHECK(!out.id_written[0] && !out.id_written[1] && !out.id_written[2] && !out.mask_cleared && !out.binding_written);
+    // (the defaults: bit 12 and 13 follow the program's bits 7 and 8; a part skipped when both say defaults)
+    in.program_flags = 0x180;
+    in.mode_bits = 0x8 | 0x1000;
+    in.interface_id[0] = 5;   // (not read: skipped)
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBound && out.mode_bits == (0x8 | 0x1000 | 0x2000) && !out.id_written[0]);
+    // (a new first id with the same words: recorded and the applied bits cleared; the third word differs: no bind,
+    // the per-drawable block's word and entry rewritten)
+    in = cached_inputs();
+    in.applied_program = 0x5678;
+    in.interface_id[0] = 5;
+    in.words[2] = 0x33;
+    in.pending = 1, in.applied_mask = 1;   // (cleared by the program step: the pending bit is then left)
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::Masked);
+    in.pending = 0;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBound && out.id_written[0] && out.ids[0] == 5 && out.mask_cleared);
+    CHECK(out.binding_written && out.block_binding == 0x33);
+    in.view_blocks = true;   // (the entry is now 0xff and the word not -1: the block is bound by the translation)
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::DrawableBlock);
+    in.view_blocks = false;
+    in.words[1] = 2;   // (a bind)
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramChanged && !gfx::Prepare::native(out.route) && !out.program_bound);
+    // (the second part, then the textures: a new id with slots binds them, unless bit 15)
+    in = cached_inputs();
+    in.applied_program = 0x5678;
+    in.interface_id[1] = 9;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBound && out.id_written[1] && out.mask_cleared);
+    in.words[4] = 1;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in = cached_inputs();
+    in.applied_program = 0x5678;
+    in.interface_id[2] = 4;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBound && out.id_written[2] && !out.mask_cleared);
+    in.texture_mask = 0x40000000;   // (above the 30 slots: nothing to bind)
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramBound);
+    in.texture_mask = 1;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in.mode_bits |= 0x8000;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramBound);
 
     // (pending bits: less the drawable's; all applied already: written back, else left)
     in = cached_inputs();
@@ -646,11 +694,51 @@ void the_prepare_bridge_reads_in_the_functions_order() {
     CHECK(std::memcmp(expected, actual, sizeof actual) == 0);
     CHECK(rt.get<uint16_t>(block + 0xb2) == 0x0c && rt.get<uint8_t>(cb + 0x10) == 1 && rt.writes.size() == 2);
 
-    // (the reads stop where the call leaves the path: another program, and nothing past it is read)
+    // (another program: its parts read, the block's copies; the textures' part not read under mode bit 15)
+    const uint64_t program = 0x1234, part0 = 0xb00000, part1 = 0xb10000, part2 = 0xb20000;
     rt.put<uint64_t>(block + 0xd8, 0x9999);
+    rt.put<uint64_t>(block + 0xd0, 0x7777);
+    rt.put<uint16_t>(block + 0xb0, 0);   // (no pending bits: the new id clears the applied ones)
+    rt.put<uint64_t>(program, part0);
+    rt.put<uint64_t>(program + 8, part1);
+    rt.put<uint64_t>(program + 0x10, part2);
+    rt.put<uint64_t>(program + 0x20, 0xabc);
+    rt.put<uint32_t>(program + 0x28, 0x1f);
+    rt.put<uint16_t>(program + 0x30, 0x100);   // (the second part's words are the defaults)
+    rt.put<uint32_t>(part0, 21);
+    rt.put<uint32_t>(part0 + 4, 0x10), rt.put<uint32_t>(part0 + 8, 0x11), rt.put<uint32_t>(part0 + 12, 0x12);
+    rt.put<uint32_t>(part1, 22);
+    rt.put<uint32_t>(bridge::guest::kDefaultWordsB, 0x20), rt.put<uint32_t>(bridge::guest::kDefaultWordsB + 4, 0x21);
+    rt.put<uint32_t>(part2, 23);
+    rt.put<uint32_t>(part2 + 4, 0);
+    rt.put<uint32_t>(block + 0x78, 0x10), rt.put<uint32_t>(block + 0x7c, 0x11), rt.put<uint32_t>(block + 0x80, 0x12);
+    rt.put<uint32_t>(block + 0x84, 0x20), rt.put<uint32_t>(block + 0x88, 0x21);
+    rt.put<uint32_t>(block + 0x90, 1), rt.put<uint32_t>(block + 0x94, 2), rt.put<uint32_t>(block + 0x8c, 3);
     pb.read(block, drawable, in, at);
-    CHECK(in.applied_program == 0x9999 && in.pending == 0 && in.list_flags == 0 && at.command_buffer == 0);
-    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    CHECK(in.applied_program == 0x9999 && in.context == context && in.program_object == 0xabc && in.program_stages == 0x1f);
+    CHECK(in.interface_id[0] == 21 && in.interface_id[1] == 22 && in.interface_id[2] == 23 && in.texture_mask == 0);
+    CHECK(in.words[2] == 0x12 && in.words[3] == 0x20 && in.applied_words[4] == 0x21 && in.applied_interface_id[2] == 3);
+    CHECK(in.pending == 0 && in.applied_mask == 0x0c && in.list_flags == 3);
+    gfx::PrepareOutputs pout = gfx::Prepare::decide(in);
+    CHECK(pout.route == gfx::PrepareRoute::ProgramBound && pout.mask_cleared && !pout.mask_written);
+    pb.snapshot(block, at.command_buffer, expected);
+    bridge::PrepareBridge::expect(expected, pout);
+    pb.write(block, at, pout);
+    pb.snapshot(block, at.command_buffer, actual);
+    CHECK(std::memcmp(expected, actual, sizeof actual) == 0);
+    CHECK(rt.get<uint64_t>(block + 0xd8) == program && rt.get<uint64_t>(block + 0xd0) == 0);
+    CHECK(rt.get<uint32_t>(block + 0x90) == 21 && rt.get<uint32_t>(block + 0x94) == 22 && rt.get<uint32_t>(block + 0x8c) == 23);
+    CHECK(rt.get<uint32_t>(block + 0x5c) == (0x9 | 0x2000) && rt.get<uint16_t>(block + 0xb2) == 0);
+    Recorder pr;
+    gfx::Prepare::emit(pout, at, pr);
+    CHECK(pr.calls.size() == 2 && pr.calls[0].op == (uint32_t)gfx::Proc::CommandBufferBindProgram);
+    CHECK(pr.calls[0].x[0] == context + 0x188 && pr.calls[0].x[1] == 0xabc && pr.calls[0].x[2] == 0x1f);
+    // (with bit 15 the texture part is not read)
+    rt.put<uint64_t>(block + 0xd8, 0x9999);
+    rt.put<uint32_t>(block + 0x5c, 0x8009);
+    pb.read(block, drawable, in, at);
+    CHECK(in.interface_id[2] == 0 && in.texture_mask == 0);
+    rt.put<uint32_t>(block + 0x5c, 0x9);
     rt.put<uint64_t>(block + 0xd8, 0x1234);
     // (the per-drawable blocks' table present and the entry changed with a binding: left)
     rt.put<uint64_t>(material + 0x518, 0xdead);

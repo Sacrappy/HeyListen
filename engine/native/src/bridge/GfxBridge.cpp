@@ -29,6 +29,8 @@ GuestAddr proc_global(uint32_t proc) {
         // (read from the sub-mesh submission and its draw helpers)
         0x84d67d90, 0x84d67c10, 0x84d67d98,   // geometry processing mode, call commands, mesh tasks
         0x84d674a8, 0x84d67d68,               // buffer address, indexed instanced draw
+        // (read from the shared preparation)
+        0x84d67c60,                           // bind program
     };
     return proc < gfx::kProcCount ? kGlobals[proc] : 0;
 }
@@ -303,22 +305,16 @@ void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs
     }
     in.program = e.program;
     in.applied_program = b.program;
-    if (in.program != in.applied_program) return;
+    if (in.program != in.applied_program) read_program(block, in);
+    // (the block's and the drawable's own fields whatever the route; the material's table as the function reads it at
+    // every call that gets this far)
     in.pending = b.pending;
-    if (in.pending) {
-        in.drawable_mask = d.pending_mask;
-        in.applied_mask = b.applied_bits;
-        if (((uint32_t)in.pending & ~(uint32_t)in.drawable_mask) & ~(uint32_t)in.applied_mask) return;
-    }
+    in.drawable_mask = d.pending_mask;
+    in.applied_mask = b.applied_bits;
     in.view_blocks = at<guest::Material>(runtime_, b.material).drawable_blocks != 0;
-    if (in.view_blocks) {
-        in.drawable_block = d.block_entry;
-        in.applied_drawable_block = b.drawable_block;
-        if (in.drawable_block != in.applied_drawable_block) {
-            in.block_binding = b.block_binding;
-            if (in.block_binding != 0xffffffffu) return;
-        }
-    }
+    in.drawable_block = d.block_entry;
+    in.applied_drawable_block = b.drawable_block;
+    in.block_binding = b.block_binding;
     // (the function reads the list selector before it tests the mode bit)
     const uint32_t list = u16(runtime_, d.lists + guest::kListsSelector) & 3;
     if (!(in.mode_bits & 8)) return;
@@ -337,7 +333,59 @@ void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs
     }
 }
 
+void PrepareBridge::read_program(GuestAddr block, gfx::PrepareInputs& in) const {
+    const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
+    const guest::Program& p = at<guest::Program>(runtime_, in.program);
+    in.context = b.renderer;
+    in.program_object = p.object;
+    in.program_stages = p.stages;
+    in.program_flags = p.flags;
+    in.applied_interface_id[0] = b.interface_id_a;
+    in.applied_interface_id[1] = b.interface_id_b;
+    in.applied_interface_id[2] = b.texture_id;
+    in.applied_words[0] = b.words_a[0], in.applied_words[1] = b.words_a[1], in.applied_words[2] = b.block_binding;
+    in.applied_words[3] = b.words_b[0], in.applied_words[4] = b.words_b[1];
+    const uint32_t mode = b.mode_bits;
+    const bool defaults1 = p.flags & 0x80, defaults2 = p.flags & 0x100;
+    // (a part the function skips is not read: the block already uses the defaults and the program does too)
+    if (!((mode & 0x1000) && defaults1)) {
+        in.interface_id[0] = u32(runtime_, p.part[0]);
+        const GuestAddr w = defaults1 ? guest::kDefaultWordsA : p.part[0] + 4;
+        for (int i = 0; i < 3; i++) in.words[i] = u32(runtime_, w + 4 * i);
+    }
+    if (!((mode & 0x2000) && defaults2)) {
+        in.interface_id[1] = u32(runtime_, p.part[1]);
+        const GuestAddr w = defaults2 ? guest::kDefaultWordsB : p.part[1] + 0x28;
+        for (int i = 0; i < 2; i++) in.words[3 + i] = u32(runtime_, w + 4 * i);
+    }
+    if (!(mode & 0x8000)) {
+        in.interface_id[2] = u32(runtime_, p.part[2]);
+        in.texture_mask = u32(runtime_, p.part[2] + 4);
+    }
+}
+
+namespace {
+// (the program step's writes, in the function's order, on the block's bytes)
+void put_program(guest::RenderStateBlock& b, const gfx::PrepareOutputs& out) {
+    if (!out.program_bound) return;
+    b.program_aux = 0;
+    b.program = out.program;
+    if (out.id_written[0]) b.interface_id_a = out.ids[0];
+    if (out.mode_written) b.mode_bits = out.mode_bits;
+    if (out.binding_written) b.block_binding = out.block_binding, b.drawable_block = 0xff;
+    if (out.id_written[1]) b.interface_id_b = out.ids[1];
+    if (out.mask_cleared) b.applied_bits = 0;
+    if (out.id_written[2]) b.texture_id = out.ids[2];
+}
+}   // namespace
+
 void PrepareBridge::write(GuestAddr block, const gfx::PrepareHandles& h, const gfx::PrepareOutputs& out) const {
+    if (out.program_bound) {
+        put_program(*static_cast<guest::RenderStateBlock*>(runtime_.ptr(block)), out);
+        // (the fields the step may write: +0x5c to +0xdf)
+        runtime_.written(block + offsetof(guest::RenderStateBlock, mode_bits),
+                         offsetof(guest::RenderStateBlock, program) + 8 - offsetof(guest::RenderStateBlock, mode_bits));
+    }
     if (out.mask_written) {
         static_cast<guest::RenderStateBlock*>(runtime_.ptr(block))->applied_bits = out.applied_mask;
         runtime_.written(block + offsetof(guest::RenderStateBlock, applied_bits), 2);
@@ -353,6 +401,12 @@ void PrepareBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t*
 }
 
 void PrepareBridge::expect(uint8_t* bytes, const gfx::PrepareOutputs& out) {
+    if (out.program_bound) {
+        guest::RenderStateBlock b;
+        std::memcpy(&b, bytes, sizeof b);
+        put_program(b, out);
+        std::memcpy(bytes, &b, sizeof b);
+    }
     if (out.mask_written) std::memcpy(bytes + offsetof(guest::RenderStateBlock, applied_bits), &out.applied_mask, 2);
     if (out.marked) bytes[sizeof(guest::RenderStateBlock)] = 1;
 }

@@ -53,15 +53,20 @@ struct RenderStateBlock {
     int8_t offset_slot_base;
     uint8_t _65[11];
     uint32_t channel_masks_in;
-    uint8_t _74[12];
-    uint32_t block_binding;      ///< the per-drawable uniform block's binding word (-1: none)
-    uint8_t _84[20];
+    uint8_t _74[4];
+    uint32_t words_a[2];         ///< the program interface's first part's binding words applied (the preparation)
+    uint32_t block_binding;      ///< its third: the per-drawable uniform block's binding word (-1: none)
+    uint32_t words_b[2];         ///< the second part's binding words applied
+    uint32_t texture_id;         ///< the texture part's id applied
+    uint32_t interface_id_a;     ///< the first part's id applied
+    uint32_t interface_id_b;     ///< the second part's id applied
     uint32_t done;           ///< (the material state the preparation applied last: the render-state function resets it)
     uint8_t _9c[4];
     uint64_t blend_color_in[2];
     uint16_t pending;            ///< bits the preparation still has to apply
     uint16_t applied_bits;
-    uint8_t _b4[36];
+    uint8_t _b4[28];
+    uint64_t program_aux;        ///< cleared when the preparation binds a program (not read by it)
     GuestAddr program;           ///< the program the preparation bound last
     uint8_t _e0[16];
     uint8_t depth_test;
@@ -94,7 +99,13 @@ static_assert(offsetof(RenderStateBlock, depth_mode) == 57);
 static_assert(offsetof(RenderStateBlock, state_key_applied) == 0x59);
 static_assert(offsetof(RenderStateBlock, drawable_block) == 0x60);
 static_assert(offsetof(RenderStateBlock, pass_slot) == 0x62);
+static_assert(offsetof(RenderStateBlock, words_a) == 0x78);
 static_assert(offsetof(RenderStateBlock, block_binding) == 0x80);
+static_assert(offsetof(RenderStateBlock, words_b) == 0x84);
+static_assert(offsetof(RenderStateBlock, texture_id) == 0x8c);
+static_assert(offsetof(RenderStateBlock, interface_id_a) == 0x90);
+static_assert(offsetof(RenderStateBlock, interface_id_b) == 0x94);
+static_assert(offsetof(RenderStateBlock, done) == 0x98);
 static_assert(offsetof(RenderStateBlock, pending) == 0xb0);
 static_assert(offsetof(RenderStateBlock, applied_bits) == 0xb2);
 static_assert(offsetof(RenderStateBlock, program) == 0xd8);
@@ -209,6 +220,24 @@ struct MaterialEntry {
     } lists[4];
 };
 static_assert(offsetof(MaterialEntry, program) == 8);
+
+/// A program object (the material entry's program): its interface in three parts (each part's first word an id;
+/// the first part's binding words at +4 / +8 / +0xc, the second's at +0x28 / +0x2c, the texture part's slot mask at
+/// +4), its NVN program and stages, and flags (bits 7, 8: the first, second part's words are the game's defaults).
+struct Program {
+    GuestAddr part[3];
+    uint8_t _18[8];
+    GuestAddr object;
+    uint32_t stages;
+    uint8_t _2c[4];
+    uint16_t flags;
+};
+static_assert(offsetof(Program, part) == 0);
+static_assert(offsetof(Program, object) == 0x20);
+static_assert(offsetof(Program, stages) == 0x28);
+static_assert(offsetof(Program, flags) == 0x30);
+/// The game's default binding words (globals): the first part's three, then the second part's two.
+inline constexpr uint64_t kDefaultWordsA = 0x84ea2848, kDefaultWordsB = 0x84ea2854;
 static_assert(offsetof(MaterialEntry, lists) == 0x10);
 static_assert(offsetof(MaterialEntry::List, flags) == 8);
 static_assert(sizeof(MaterialEntry::List) == 16);
@@ -421,6 +450,8 @@ public:
     static void expect(uint8_t* bytes, const gfx::PrepareOutputs& out);
 
 private:
+    /// The program step's inputs (the program differs), each part read only where the function reads it.
+    void read_program(GuestAddr block, gfx::PrepareInputs& in) const;
     GuestRuntime& runtime_;
 };
 
