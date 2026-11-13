@@ -101,14 +101,16 @@ void log_tables() {
          (long long)c.bind_end, (long long)c.end_sub, (long long)c.sub_replay, (long long)c.unknown, (long long)c.updated,
          (long long)c.unread, (long long)c.again_equal, (long long)c.again_diff, (long long)updates_into_bound);
     std::string s;
-    for (int st = 0; st < kNvnStages; st++)
+    for (int st = 0; st < kNvnStages; st++) {   // (a line a stage: the log's lines have a length limit)
+        s.clear();
         for (int i = 0; i < 16; i++)
             if (by_slot[st][i].binds) {
                 char n[16];
-                snprintf(n, sizeof n, "s%d/%d", st, i);
+                snprintf(n, sizeof n, "%d", i);
                 s += line_of(n, by_slot[st][i]);
             }
-    logf("hl ubo check by stage/slot (binds/equal/different):%s", s.c_str());
+        if (!s.empty()) logf("hl ubo check stage %d by slot (binds/equal/different):%s", st, s.c_str());
+    }
     s.clear();
     for (int k = 0; k < 7; k++)
         if (by_size[k].binds) s += line_of(size_names[k], by_size[k]);
