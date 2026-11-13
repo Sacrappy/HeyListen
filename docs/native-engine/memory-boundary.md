@@ -65,7 +65,41 @@ brackets):
 VRAM by kind, same ticket: textures 1.27 GB (1.6-1.7), render targets 1.0-1.1 GB (0.96-2.2), buffer-pool mirrors 1.52-1.54
 GB (1.7), write-back shadows 224 MB, BC scratch 160 MB, staging 76-140 MB and streams 96 MB in BAR VRAM, free inside VMA
 blocks 0.4-1.9 GB, the driver's other ~1.03 GB. TICK-051 adds ~900 MB of system memory held by the BC cache on a castle walk
-(PC 3050). **Not measured**: how the 7.75 GB of resident guest memory splits between heaps, pools, resources and the rest.
+(PC 3050).
+
+### How the game's memory in RAM splits (measured 2026-11-13)
+
+`HOS_MEM_SPLIT=<seconds>` (`host/hos_memsplit.c`) counts the resident pages of the guest window once, by part of the
+window, and those inside an NVN memory pool with storage, by the pool's flags. Castle scene, 95 s after the start, main
+PC, with the heap committed on first touch (`HOS_LAZY_COMMIT`, the default since that day: the process's commit went
+from 24.9 GB to 21.9 GB, the working set stayed at 13.9-14.0 GB):
+
+| Part | Committed | In RAM | Of which inside GPU pools |
+|---|---:|---:|---:|
+| heap | 3943 MB | 3810 MB | 2932 MB |
+| address regions | 4468 MB | 4332 MB | 1645 MB |
+| image, system region | 192 MB | 97 MB | 0 |
+| **the game's memory** | | **8240 MB** | **4578 MB** in 4,542 pools; 3662 MB outside |
+
+| Pool flags | Meaning (NVN's flag bits) | Pools | Storage | In RAM |
+|---|---|---:|---:|---:|
+| `0x024` | CPU cached, GPU cached | 3,225 | 3896 MB | 3350 MB |
+| `0x0a1` | no CPU access, GPU cached, compressible | 70 | 547 MB | 417 MB |
+| `0x064` | CPU cached, GPU cached, shader code | 195 | 315 MB | 315 MB |
+| `0x021` | no CPU access, GPU cached | 80 | 293 MB | 247 MB |
+| `0x022` | CPU uncached, GPU cached | 949 | 175 MB | 104 MB |
+| `0x18c` | CPU cached, no GPU access, compressible, physical | 1 | 512 MB | 96 MB |
+| others | | 22 | 91 MB | 44 MB |
+
+What it says:
+- **More than half of the game's RAM (4.6 of 8.2 GB) is the CPU-side storage of GPU data**, which also exists in VRAM.
+  This is the Switch's shared memory seen from a PC: one copy there, two here.
+- **664 MB are in pools the game declared "no CPU access"** (`0x0a1`, `0x021`): by NVN's contract the game's code never
+  reads or writes them. They are in RAM only because this engine's back end writes there (GPU results written back, and
+  the pool's storage read for the mirror). That is the first saving to take: it depends on the back end alone.
+- 3.35 GB are CPU-cached pools (`0x024`): the game may read them; dropping those pages after upload needs the proof by
+  page trap described in section 4.
+- 3.66 GB are outside any pool: the game's own heaps (actors, resources' CPU side, the allocator's 36 MB).
 
 ## 2. The game's heap system
 

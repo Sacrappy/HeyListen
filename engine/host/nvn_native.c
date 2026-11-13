@@ -309,6 +309,7 @@ NV(nvnMemoryPoolInitialize) {
     hos_gpu_track(o->gpu, o->size, 1);   /* (the CPU's writes to it reach the renderer through write watch) */
     rx_nvn_pool_flags(o->gpu, o->size, o->flags);   /* (TICK-015, host/rx_backend.c) */
     rx_nvn_pool_created(o->gpu, o->size);
+    { void hos_memsplit_pool(uint64_t, uint64_t, uint32_t, int); hos_memsplit_pool(o->gpu, o->size, o->flags, 1); }   /* (HOS_MEM_SPLIT) */
     OLOG("pool %#llx size %#llx flags %#x", (unsigned long long)o->gpu, (unsigned long long)o->size, o->flags);
     RET(1);
 }
@@ -346,6 +347,7 @@ NV(nvnMemoryPoolFinalize) {
         ReleaseSRWLockExclusive(&vmap_lock);
     } else if (o->mem) {
         hos_gpu_track(o->gpu, o->size, 0);
+        { void hos_memsplit_pool(uint64_t, uint64_t, uint32_t, int); hos_memsplit_pool(o->gpu, o->size, o->flags, 0); }
     }
     o->magic = 0;
 }

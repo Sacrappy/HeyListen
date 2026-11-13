@@ -229,6 +229,7 @@ void hos_commit_init(void) {
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
+    { void hos_memsplit_init(void); hos_memsplit_init(); }   /* (HOS_MEM_SPLIT, hos_memsplit.c) */
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */
