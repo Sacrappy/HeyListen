@@ -144,8 +144,12 @@ static void discard_pages(uint64_t addr, uint64_t size) {
     }
     /* (HOS_GUEST_PAGES: over dropped or restored granules, piece by piece; dropped ones wholly inside are forgotten) */
     if (hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo))) hos_gp_reset(GP(lo), (size_t)(hi - lo));
-    else if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
-        VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
+    else {
+        hos_gp_hold(1);   /* (not while a drop splits the reservation: nothing when off) */
+        if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
+            VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
+        hos_gp_hold(0);
+    }
 #elif !defined(__EMSCRIPTEN__)
     extern int hos_posix_guest_discard(void *p, size_t n);   /* (hos_main.c: MADV_REMOVE on the memfd window) */
     extern int rx_guest_imported(uint64_t lo, uint64_t hi);
@@ -338,7 +342,7 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
         if (hi > lo && rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
 #if defined(_WIN32)
         else if (hi > lo && hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo))) hos_gp_decommit(GP(lo), (size_t)(hi - lo));
-        else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
+        else if (hi > lo) hos_gp_hold(1), VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT), hos_gp_hold(0);
 #else
         else if (hi > lo) {   /* (linux: kept mapped, the pages read as zero; MADV_REMOVE on the memfd window) */
             extern int hos_posix_guest_discard(void *p, size_t n);

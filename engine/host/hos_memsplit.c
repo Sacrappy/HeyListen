@@ -685,6 +685,7 @@ static DWORD WINAPI discard_main(void *unused) {
                 AcquireSRWLockExclusive(&discard_lock);
                 AcquireSRWLockShared(&pools_lock);
                 if (pool_still(snap[i].addr, snap[i].size, snap[i].flags)) {
+                    BOOL ok;
                     for (int k = 0; k < m;) {   /* (runs of resident zero pages, outside anything imported) */
                         if (!(info[k].attr & 1) || !page_is_zero(info[k].va)) { k++; continue; }
                         int e = k + 1;
@@ -692,7 +693,8 @@ static DWORD WINAPI discard_main(void *unused) {
                         const uint64_t a = (q + k) << 12, b = (q + e) << 12;
                         if (!ever_imported(a, b) && (hos_gp_ready() && hos_gp_touches(GP(a), (size_t)(b - a))
                                                          ? hos_gp_decommit(GP(a), (size_t)(b - a))
-                                                         : VirtualFree(GP(a), (SIZE_T)(b - a), MEM_DECOMMIT)))
+                                                         : (hos_gp_hold(1), ok = VirtualFree(GP(a), (SIZE_T)(b - a), MEM_DECOMMIT),
+                                                            hos_gp_hold(0), ok)))
                             got += e - k;
                         k = e;
                     }

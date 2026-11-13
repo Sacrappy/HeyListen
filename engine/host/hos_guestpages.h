@@ -79,6 +79,13 @@ int  hos_gp_touches(const void *p, size_t n);
 int  hos_gp_commit(void *p, size_t n);
 int  hos_gp_decommit(void *p, size_t n);
 int  hos_gp_reset(void *p, size_t n);
+/* around any other VirtualAlloc(MEM_COMMIT) or VirtualFree(MEM_DECOMMIT) of the heap and the address regions (1 begin,
+   0 end; nothing when off): a drop splits the reservation, and a commit in the same allocation meanwhile fails. Not held
+   while asking the owner for anything */
+#ifdef _WIN32
+__declspec(dllexport)   /* (the Vulkan back end finds it by name, around its commit before an import) */
+#endif
+void hos_gp_hold(int begin);
 /* the back end imports [p, p + n): its granules are never dropped from now on (and dropped ones are restored first) */
 void hos_gp_imported(void *p, size_t n);
 /* the counters, as one line (0 when off) */

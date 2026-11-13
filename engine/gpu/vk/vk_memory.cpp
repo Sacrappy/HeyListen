@@ -381,6 +381,11 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     // ponytail: add new watch switches here; query the host if watches stop requiring a startup switch.
     static const bool page_watches = getenv("RX_NVN_WATCH_TEX") || getenv("RX_NVN_WATCH_TEXELS_SRC") ||
                                      getenv("RX_VK_WATCH_CPU") || getenv("RX_VK_VERIFY_DIM");
+    // (HOS_GUEST_PAGES, host/hos_guestpages.c: not while a drop splits the window's reservation, which fails commits in it
+    // meanwhile. An exe without the export, or the switch off: nothing)
+    using Hold = void (*)(int);
+    static const Hold hold = (Hold)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gp_hold");
+    if (hold) hold(1);
     if (page_watches || VirtualAlloc(ptr, (SIZE_T)bytes, MEM_COMMIT, PAGE_READWRITE) != ptr)
         for (uint8_t* q = ptr; q < ptr + bytes;) {
             MEMORY_BASIC_INFORMATION mi{};
@@ -389,6 +394,7 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
             if (mi.State == MEM_RESERVE) VirtualAlloc(q, (size_t)(end - q), MEM_COMMIT, PAGE_READWRITE);
             q = end;
         }
+    if (hold) hold(0);
 #ifdef __linux__
     if (import_dma_buf(lo, hi, p)) {
         t1 = t2 = t3 = t4 = clk::now();

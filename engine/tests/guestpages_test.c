@@ -101,6 +101,19 @@ static DWORD WINAPI restorer(void *arg) {
     return 0;
 }
 
+/* page by page commits of a reserved range, held as the OS layer holds them (hos_gp_hold) */
+typedef struct { uint8_t *p; size_t n; volatile LONG *go; LONG failed; } Committer;
+static DWORD WINAPI committer(void *arg) {
+    Committer *c = (Committer *)arg;
+    while (!*c->go) YieldProcessor();
+    for (size_t k = 0; k < c->n; k += 0x1000) {
+        hos_gp_hold(1);
+        if (!VirtualAlloc(c->p + k, 0x1000, MEM_COMMIT, PAGE_READWRITE)) c->failed++;
+        hos_gp_hold(0);
+    }
+    return 0;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* a free place for the window */
@@ -269,6 +282,24 @@ int main(void) {
         WaitForMultipleObjects(4, th, TRUE, INFINITE);
         for (int i = 0; i < 4; i++) {
             CHECK(rd[i].bad == 0, "round %d: %ld words wrong", round, rd[i].bad);
+            CloseHandle(th[i]);
+        }
+    }
+    printf("9. commits held around drops that split the reservation (unheld, Windows fails some of them meanwhile)\n");
+    {
+        uint8_t *d = win + (128 << 20);
+        CHECK(VirtualAlloc(d, 32 << 20, MEM_COMMIT, PAGE_READWRITE) == d, "commit");
+        go = 0;
+        Committer cm[2];
+        for (int i = 0; i < 2; i++) {
+            cm[i] = (Committer){win + (192 << 20) + (size_t)i * (32 << 20), 32 << 20, &go, 0};
+            th[i] = CreateThread(NULL, 0, committer, &cm[i], 0, NULL);
+        }
+        InterlockedExchange(&go, 1);
+        for (int i = 0; i < 256; i++) CHECK(hos_gp_drop(d + (size_t)i * 2 * GRAN, GRAN) == 0, "drop %d", i);
+        WaitForMultipleObjects(2, th, TRUE, INFINITE);
+        for (int i = 0; i < 2; i++) {
+            CHECK(cm[i].failed == 0, "%ld held commits failed", cm[i].failed);
             CloseHandle(th[i]);
         }
     }
