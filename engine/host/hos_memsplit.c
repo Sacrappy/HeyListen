@@ -191,6 +191,11 @@ static volatile LONG64 trap_count[16][TC_N][2];   /* (pages, by flag index, clas
 static volatile LONG64 trap_armed_pages[16], trap_armed_imported[16], trap_new_resident[16], trap_new_pages[16];
 static volatile LONG64 trap_faults, trap_races;
 static uintptr_t trap_exe_lo, trap_exe_hi, trap_vk_lo, trap_vk_hi;
+/* (HeyListen) HOS_POOL_TRAP_RANGE=<lo>:<hi> (hex guest addresses), with HOS_POOL_TRAP: the resident pages of that range that
+   lie in no GPU pool are trapped too, at the same times, and counted under flag index 15 ("no pool"): who writes the heap
+   memory between the pools that the capture copied (docs/native-engine/direct-emission.md section 10) */
+static uint64_t trap_range_lo, trap_range_hi;
+enum { TRAP_NO_POOL = 15 };
 
 static int split_no_read(void) { return trap_mode != 0; }
 int hos_pool_trap_active(void) { return trap_mode != 0; }
@@ -348,7 +353,7 @@ static LONG CALLBACK trap_handler(EXCEPTION_POINTERS *info) {
            pool is ours either way) */
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || mbi.Protect != PAGE_NOACCESS ||
-            trap_flags_of(guest) < 0) {
+            (trap_flags_of(guest) < 0 && !(guest >= trap_range_lo && guest < trap_range_hi))) {
             inside = 0;
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -491,6 +496,17 @@ static void trap_report(int full) {
             hos_log("pooltrap: flags %#05x: %lld MB of pools made, %lld MB of their pages in RAM when made", trap_flag_list[f],
                     (long long)(trap_new_pages[f] >> 8), (long long)(trap_new_resident[f] >> 8));
     }
+    if (trap_range_hi > trap_range_lo) {
+        int64_t touched = 0;
+        for (int c = 0; c < TC_N; c++) touched += trap_count[TRAP_NO_POOL][c][0] + trap_count[TRAP_NO_POOL][c][1];
+        hos_log("pooltrap: no pool in %#llx-%#llx: %lld pages trapped, touched: guest read %lld write %lld, host read %lld write %lld, "
+                "kernel %lld; untouched %lld", (unsigned long long)trap_range_lo, (unsigned long long)trap_range_hi,
+                (long long)trap_armed_pages[TRAP_NO_POOL], (long long)trap_count[TRAP_NO_POOL][TC_GUEST][0],
+                (long long)trap_count[TRAP_NO_POOL][TC_GUEST][1], (long long)trap_count[TRAP_NO_POOL][TC_HOST][0],
+                (long long)trap_count[TRAP_NO_POOL][TC_HOST][1],
+                (long long)(trap_count[TRAP_NO_POOL][TC_KERNEL][0] + trap_count[TRAP_NO_POOL][TC_KERNEL][1]),
+                (long long)(trap_armed_pages[TRAP_NO_POOL] - touched));
+    }
     hos_log("pooltrap: %lld first touches, %lld races, %d places", (long long)trap_faults, (long long)trap_races, trap_nsites);
     hos_log_flush();
     if (full) trap_dump();
@@ -530,6 +546,31 @@ static void trap_arm(void) {
                 k = e;
             }
         }
+    }
+    if (trap_range_hi > trap_range_lo) {   /* (HOS_POOL_TRAP_RANGE: its resident pages in no pool) */
+        static uint64_t span[16384][2];
+        int ns = 0;
+        for (int i = 0; i < n; i++)
+            if (snap[i].addr < trap_range_hi && snap[i].addr + snap[i].size > trap_range_lo) span[ns][0] = snap[i].addr, span[ns][1] = snap[i].addr + snap[i].size, ns++;
+        int64_t got_range = 0;
+        for (uint64_t q = trap_range_lo >> 12; q < trap_range_hi >> 12;) {
+            int m = 0;
+            const uint64_t first = q;
+            for (; m < BATCH && q < trap_range_hi >> 12; m++, q++) info[m].va = GP(q << 12), info[m].attr = 0;
+            if (!query(GetCurrentProcess(), info, (DWORD)(m * sizeof(WsInfo)))) continue;
+            for (int k = 0; k < m; k++) {
+                const uint64_t g = (first + k) << 12;
+                if (!(info[k].attr & 1) || trap_test(first + k)) continue;
+                int in_pool = 0;
+                for (int s = 0; s < ns && !in_pool; s++) in_pool = g >= span[s][0] && g < span[s][1];
+                if (in_pool) continue;
+                got_range += trap_run(first + k, 1);
+            }
+        }
+        InterlockedAdd64(&trap_armed_pages[TRAP_NO_POOL], got_range);
+        armed += got_range;
+        hos_log("pooltrap: %lld resident pages in no pool of %#llx-%#llx trapped", (long long)got_range,
+                (unsigned long long)trap_range_lo, (unsigned long long)trap_range_hi);
     }
     hos_log("pooltrap: %lld MB of resident pool pages trapped (%.0f ms)", (long long)(armed >> 8), (hos_now_ns() - t0) / 1e6);
     hos_log_flush();
@@ -573,8 +614,13 @@ static void trap_init(void) {
         trap_flag_list[trap_nflags++] = (uint32_t)v;
         s = *end == ',' ? end + 1 : end;
     }
+    {
+        const char *r = getenv("HOS_POOL_TRAP_RANGE");
+        unsigned long long lo = 0, hi = 0;
+        if (r && sscanf(r, "%llx:%llx", &lo, &hi) == 2 && hi > lo && hi <= HOS_GUEST_SPACE) trap_range_lo = lo, trap_range_hi = hi;
+    }
     trap_t0 = hos_now_ns();
-    trap_bits = (uint64_t *)calloc((size_t)(HOS_GUEST_SPACE >> 12) / 64, sizeof(uint64_t));
+    trap_bits =(uint64_t *)calloc((size_t)(HOS_GUEST_SPACE >> 12) / 64, sizeof(uint64_t));
     if (!trap_bits) return;
     trap_module_ranges();
     AddVectoredExceptionHandler(1, trap_handler);   /* (first: ahead of commit_on_touch) */
