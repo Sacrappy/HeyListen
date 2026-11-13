@@ -1,0 +1,278 @@
+How the lifted code is compiled: three exact experiments of sprint 5, session 6. NOT merged: none moved the game's job chain.
+
+1. The capture tracking limit of the hot pieces (RX_HOT_CAPTURE=1000000; the build has 5000): the context is a noalias,
+   nocapture pointer and the hot functions use it 10,000-64,000 times, so past the limit clang gives the nocapture up and
+   every store to guest memory ends the guest registers' lives.
+2. The loop polls' call without the context (-DA64_POLL_CUR: the same poll at the same places, a64_poll_cur()).
+3. The lifted functions' calling convention (A64_FAST_CC=1 at lift time, RX_FAST_CC=1 preserve_none / 2 System V): no
+   Windows x64 register saves in every lifted function; host calls through stubs (hos_hostcall.c).
+Also here: HOS_FP_FTZ (a measurement for the FP tests' ceiling).
+
+Static effect on f_8008fc00 (18,942 instructions): context loads 2,134 -> 328, stores 2,940 -> 824 with 1 + 2.
+In the game (castle-move, 3 interleaved rounds, job traces): the main thread's job wait a frame 6.94 / 7.29 (reference;
+one disturbed run 8.56), 7.61 / 6.90 / 7.03 (1 + 2), 6.98 / 6.89 / 6.99 (1 + 2 + preserve_none), 6.86 / 6.91 / 7.25
+(1 + 2 + System V); fps 81.6 / 82.2 / 84.3 / 82.8. Picture and speed right in every variant. The job chain is not held by
+this overhead. docs/tickets/SPRINT-5.md, session 6.
+
+diff --git a/engine/host/hos_hostcall.c b/engine/host/hos_hostcall.c
+index 0a93f163..7397a6ff 100644
+--- a/engine/host/hos_hostcall.c
++++ b/engine/host/hos_hostcall.c
+@@ -49,6 +49,21 @@ const char *hos_hostcall_name(uint64_t addr) {
+    such handlers do not read, is then whatever the register holds). Not with HOS_HOSTCALL_STATS or tracing (they count
+    in a64_call_miss) or HOS_HOSTCALL_SLOW=1. Not on the web: wasm checks an indirect call's type, and a HostFn
+    (two parameters) called as an A64Fn (one) traps with "function signature mismatch". */
++#if defined(A64_FAST_CC) && defined(__clang__) && defined(__x86_64__)
++/* (HeyListen, sprint 5) A64_FAST_CC: a host call's handler keeps the platform's calling convention and the lifted call sites
++   call with the lifted functions' own (rt/a64.h A64_CC), so a handler cannot be handed to them as it is. Each of the first
++   1024 host calls (every NVN proc is among them) has a stub of the lifted convention that calls its handler. */
++#define HC_STUB(i) static A64_CC void hc_stub_##i(Ctx *c) { calls[i].fn(c, calls[i].user); }
++#define HC_NAME(i) hc_stub_##i,
++#define HC_16(m, p) m(p##0) m(p##1) m(p##2) m(p##3) m(p##4) m(p##5) m(p##6) m(p##7) m(p##8) m(p##9) m(p##a) m(p##b) m(p##c) m(p##d) m(p##e) m(p##f)
++#define HC_256(m, p) HC_16(m, p##0) HC_16(m, p##1) HC_16(m, p##2) HC_16(m, p##3) HC_16(m, p##4) HC_16(m, p##5) HC_16(m, p##6) HC_16(m, p##7) \
++                     HC_16(m, p##8) HC_16(m, p##9) HC_16(m, p##a) HC_16(m, p##b) HC_16(m, p##c) HC_16(m, p##d) HC_16(m, p##e) HC_16(m, p##f)
++HC_256(HC_STUB, 0x0) HC_256(HC_STUB, 0x1) HC_256(HC_STUB, 0x2) HC_256(HC_STUB, 0x3)
++static const A64Fn hc_stubs[1024] = { HC_256(HC_NAME, 0x0) HC_256(HC_NAME, 0x1) HC_256(HC_NAME, 0x2) HC_256(HC_NAME, 0x3) };
++#define HC_FAST(i) ((i) < 1024 ? hc_stubs[i] : NULL)
++#else
++#define HC_FAST(i) ((A64Fn)(void *)calls[i].fn)
++#endif
+ A64Fn a64_lookup_host(uint64_t addr) {
+ #ifdef __EMSCRIPTEN__
+     (void)addr;
+@@ -59,7 +74,7 @@ A64Fn a64_lookup_host(uint64_t addr) {
+     if (i >= (uint64_t)ncalls || calls[i].user) return NULL;
+     static int slow = -1;
+     if (slow < 0) slow = getenv("HOS_HOSTCALL_STATS") != NULL || hos_trace || getenv("HOS_HOSTCALL_SLOW") != NULL;
+-    return slow ? NULL : (A64Fn)(void *)calls[i].fn;
++    return slow ? NULL : HC_FAST(i);
+ }
+ 
+ /* The last host calls, for HOS_HOSTCALL_STATS: what a stalled thread was doing. */
+diff --git a/engine/host/hos_thread.c b/engine/host/hos_thread.c
+index a16b2f17..524330d5 100644
+--- a/engine/host/hos_thread.c
++++ b/engine/host/hos_thread.c
+@@ -436,6 +436,7 @@ HosThread *hos_thread_of(uint64_t guest_tt) {
+ }
+ 
+ Ctx *hos_boot_main_thread(uint64_t stack_size) {
++    if (getenv("HOS_FP_FTZ")) _mm_setcsr(_mm_getcsr() | 0x8040u);   /* (thread_main's, for the main thread) */
+     HosThread *t = (HosThread *)calloc(1, sizeof *t);
+     t->guest_tt = hos_sys_alloc(0x400, 0x10);      /* a ThreadType for the main thread; the SDK never made one */
+     t->stack_size = stack_size;
+@@ -460,6 +461,10 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
+ static DWORD WINAPI thread_main(void *p) {
+     HosThread *t = (HosThread *)p;
+     cur = t;
++    /* (HeyListen, sprint 5: a measurement, with a lift built -DA64_FP_NOTEST) HOS_FP_FTZ=1: the guest threads run with the
++       host's flush-to-zero and denormals-are-zero on, as the game's FPCR.FZ asks of the Arm FPU. Not exact with the
++       shipped lift: its fast paths are proved for IEEE host arithmetic. */
++    if (getenv("HOS_FP_FTZ")) _mm_setcsr(_mm_getcsr() | 0x8040u);
+     Ctx *c = &t->ctx;
+     c->x[0] = t->arg;
+     c->x[30] = 0;
+diff --git a/engine/nx2/build.py b/engine/nx2/build.py
+index 3c9542b7..e7e6994a 100644
+--- a/engine/nx2/build.py
++++ b/engine/nx2/build.py
+@@ -500,6 +500,11 @@ def ffmpeg_version_key():
+ # instead of Windows' write watch (GetWriteWatch over the 6 GB MKW's GPU sees took ~20 ms a scan, in one thread or
+ # four: the race's replay waited ~12 ms a frame for it). RX_SOFT_WRITE_WATCH=0: Windows' write watch (a full rebuild)
+ WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WRITE_TRACK"]
++# (HeyListen, sprint 5) RX_FAST_CC=1: the lifted functions and the runtime's indirect calls with clang's preserve_none (rt/a64.h
++# A64_FAST_CC), for a lift made with A64_FAST_CC=1 (a64_lift.py writes A64_CC on its functions). The flag goes wherever the write
++# track's does: the lifted code, the runtime and the host all see one A64Fn.
++if os.environ.get("RX_FAST_CC") in ("1", "2"):   # (2: the System V convention, a measurement)
++    WRITE_TRACK = WRITE_TRACK + ["-DA64_FAST_CC=" + os.environ["RX_FAST_CC"]]
+ if WRITE_TRACK and os.environ.get("A64_GRAN") == "1":   # (HeyListen, sprint 5: a write mark per 512 bytes too, nx2/rtgen.py)
+     WRITE_TRACK = WRITE_TRACK + ["-DA64_GRAN"]
+ 
+@@ -769,6 +774,13 @@ def main():
+     # (HeyListen, sprint 5) RX_HOT_FLAGS=<flags, space separated>: more compiler flags for the hot pieces alone (a measurement:
+     # a tuning target, inlining thresholds); they are in the objects' keys like the others
+     hot_fl = hot_fl + os.environ.get("RX_HOT_FLAGS", "").split()
++    # (HeyListen, sprint 5) RX_HOT_CAPTURE=<n>: the hot pieces' capture tracking limit (flags(): 5000 uses). The lifted functions take
++    # their context as a noalias, nocapture pointer, which is what lets the optimiser keep guest registers in host registers across
++    # the stores to guest memory; past the limit it gives up on the nocapture and every such store ends the registers' lives. The
++    # hot functions have up to tens of thousands of uses of the context (f_8008fc00: 10,783; 8.5% fewer instructions at 1000000).
++    if os.environ.get("RX_HOT_CAPTURE"):
++        hot_fl = [("-capture-tracking-max-uses-to-explore=" + os.environ["RX_HOT_CAPTURE"]) if f.startswith("-capture-tracking-max-uses-to-explore=") else f
++                  for f in hot_fl]
+     # (hookshot) RX_PGO=gen: code_hot.c counts its branches (host/pgo_rt.c writes them; -O1 builds much sooner, and the counters are
+     # placed before the optimiser, so a profile from it fits the -O2 build). RX_PGO=<merged .prof>: built with that profile
+     if PGO == "gen":
+diff --git a/engine/nx2/rtgen.py b/engine/nx2/rtgen.py
+index 0788d3e5..2f16a7bb 100644
+--- a/engine/nx2/rtgen.py
++++ b/engine/nx2/rtgen.py
+@@ -18,7 +18,14 @@ import kit
+ POLL_DECL = r"""
+ /* (nx2/poll.py) loop-header interrupt polls: A64_POLLING builds call a64_poll, the backend's, when c->poll is set */
+ void a64_poll(Ctx *A64_NOESC c);
+-#if defined(A64_POLLING)
++#if defined(A64_POLLING) && defined(A64_POLL_CUR)
++/* (HeyListen, sprint 5; -DA64_POLL_CUR) the same poll at the same places, its call without the context: a64_poll(c) clears
++   c->poll and calls a64_poll_cur(); done here, the compiler knows the call leaves the context alone and keeps guest
++   registers in host registers across a loop header (with the capture tracking limit that lets it see that at all) */
++void a64_poll_cur(void);
++#define A64_POLL(c) do { if (__builtin_expect(__atomic_load_n(&(c)->poll, __ATOMIC_RELAXED) != 0, 0)) { \
++    __atomic_store_n(&(c)->poll, 0, __ATOMIC_RELAXED); a64_poll_cur(); } } while (0)
++#elif defined(A64_POLLING)
+ #define A64_POLL(c) do { if (__builtin_expect(__atomic_load_n(&(c)->poll, __ATOMIC_RELAXED) != 0, 0)) a64_poll(c); } while (0)
+ #else
+ #define A64_POLL(c) ((void)0)
+diff --git a/engine/third_party/a64-kit/lift/a64_lift.py b/engine/third_party/a64-kit/lift/a64_lift.py
+index a4e23e02..53b78a5b 100644
+--- a/engine/third_party/a64-kit/lift/a64_lift.py
++++ b/engine/third_party/a64-kit/lift/a64_lift.py
+@@ -1187,6 +1187,18 @@ def lift_opt(name):
+     return os.environ.get(name, "0") == "1"
+ 
+ 
++# (HeyListen, sprint 5) A64_FAST_CC=1 at lift time: the lifted functions take the calling convention rt/a64.h names A64_CC (clang's
++# preserve_none where the build has -DA64_FAST_CC, nothing elsewhere). Their text stays as it is, which every pass and patch that
++# finds a function by its head relies on: one line after a file's own declarations makes each `void` after it carry the convention
++# (the lifted prototypes and definitions; on a cast or an object type the attribute is ignored). A hooked address's stub calls its
++# host function, which keeps the platform's convention, instead of jumping to it (A64_HOSTTAIL).
++FAST_CC_LINE = "#define void A64_CC void   /* (a64_lift.py, A64_FAST_CC: the lifted functions' convention, rt/a64.h) */\n"
++
++
++def fast_cc_line():
++    return FAST_CC_LINE if lift_opt("A64_FAST_CC") else ""
++
++
+ def hot_text(text):
+     """a hot function's text: its FPX helper calls go through the copies with the fast path inline"""
+     text = HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
+@@ -2277,6 +2289,7 @@ class Lifter:
+                 text = "".join(chunk)
+                 if "recomp_sj_setjmp(" in text:
+                     f.write("__attribute__((returns_twice)) int recomp_sj_setjmp(void **slot);\n")
++                f.write(fast_cc_line())
+                 f.write("".join("void %s(Ctx *A64_NOESC);\n" % d for d in sorted(decls)))
+                 f.write(text)
+             files.append(path)
+@@ -2311,6 +2324,7 @@ class Lifter:
+                 text = "".join(hot_chunk)
+                 if "recomp_sj_setjmp(" in text:
+                     f.write("__attribute__((returns_twice)) int recomp_sj_setjmp(void **slot);\n")
++                f.write(fast_cc_line())
+                 f.write("".join("void %s(Ctx *A64_NOESC);\n" % d for d in sorted(hot_decls)))
+                 f.write(text)
+             files.append(path)
+@@ -2334,6 +2348,7 @@ class Lifter:
+         fns = sorted(set(self.funcs) | set(self.hooks))
+         with open(os.path.join(out_dir, "a64_table.c"), "w", newline="\n") as f:
+             f.write('#include "a64.h"\n')
++            f.write(fast_cc_line())
+             f.write("".join("void %s(Ctx *A64_NOESC);\n" % self.fname(a) for a in fns))
+             f.write("const uint32_t a64_fn_count = %d;\n" % len(fns))
+             f.write("const uint32_t a64_fn_addr[] = {\n%s};\n" % "".join("0x%08x,\n" % a for a in fns))
+@@ -2342,7 +2357,9 @@ class Lifter:
+             f.write("/* Hooked guest addresses: f_<address> is the host function (an HLE or a generated stub). */\n")
+             f.write('#include "a64.h"\n')
+             f.write("".join("void %s(Ctx *A64_NOESC);\n" % n for n in sorted(set(self.hooks.values()))))
+-            f.write("".join("void f_%08x(Ctx *A64_NOESC c) { TAILCALL(%s); }\n" % (a, n) for a, n in sorted(self.hooks.items())))
++            f.write(fast_cc_line())   # (after the host functions' declarations: those keep the platform's convention)
++            tail = "A64_HOSTTAIL" if lift_opt("A64_FAST_CC") else "TAILCALL"
++            f.write("".join("void f_%08x(Ctx *A64_NOESC c) { %s(%s); }\n" % (a, tail, n) for a, n in sorted(self.hooks.items())))
+ 
+     def report(self):
+         nins = sum(len(b) for b, _ in self.funcs.values())
+diff --git a/engine/third_party/a64-kit/rt/a64.h b/engine/third_party/a64-kit/rt/a64.h
+index 8eddbda4..9c8a38dc 100644
+--- a/engine/third_party/a64-kit/rt/a64.h
++++ b/engine/third_party/a64-kit/rt/a64.h
+@@ -120,9 +120,27 @@ A64_INLINE void recomp_stp64(GuestContext *c, uint64_t a, uint64_t v0, uint64_t
+ #endif
+ 
+ /* ---- the lifter's runtime (rt/a64_rt.c) ------------------------------------------------------------- */
+-typedef void (*A64Fn)(Ctx *A64_NOESC);
++/* (HeyListen, sprint 5) A64_FAST_CC: the lifted functions, and the runtime's indirect calls between them, keep no register
++   for their caller (clang's preserve_none; x86-64). A lifted function's state is the context, in memory: under the Windows
++   convention each one still saved and restored up to eight general registers and ten XMM registers it used (8-12% of the
++   game threads' samples lay in those prologues and epilogues). A64_CC is on every lifted function (the lift writes it:
++   a64_lift.py), on A64Fn and on the four dispatchers below; host functions keep the platform's convention, so a hooked
++   address's stub calls its host function instead of jumping to it (A64_HOSTTAIL), and a host call reached through a
++   call site goes through a stub of its own (host/hos_hostcall.c). Off: nothing changes. */
++#if defined(A64_FAST_CC) && defined(__clang__) && defined(__x86_64__)
++#if A64_FAST_CC == 2   /* (a measurement: the System V convention, six general registers kept and no XMM register) */
++#define A64_CC __attribute__((sysv_abi))
++#else
++#define A64_CC __attribute__((preserve_none))
++#endif
++#define A64_HOSTTAIL(f) do { f(c); return; } while (0)
++#else
++#define A64_CC
++#define A64_HOSTTAIL(f) TAILCALL(f)
++#endif
++typedef void (A64_CC *A64Fn)(Ctx *A64_NOESC);
+ A64Fn a64_lookup(uint64_t addr);                    /* function at a guest address, or NULL */
+-void a64_icall(Ctx *A64_NOESC c, uint64_t target);            /* BLR: indirect call */
++A64_CC void a64_icall(Ctx *A64_NOESC c, uint64_t target);            /* BLR: indirect call */
+ /* (hookshot) setjmp in lifted code: a call of a function that calls __setjmp is wrapped in a host __builtin_setjmp
+    on a slot (pushed per thread with that function's setjmp return addresses, popped after the call); the guest
+    longjmp's final BR to one of them comes back to the newest such slot through the host's a64_call_miss
+@@ -130,14 +148,14 @@ void a64_icall(Ctx *A64_NOESC c, uint64_t target);            /* BLR: indirect c
+ void **recomp_sj_push(Ctx *A64_NOESC c, uint64_t r0, uint64_t r1, uint64_t r2, uint64_t r3);
+ uint64_t recomp_sj_target(void **slot);
+ void recomp_sj_pop(void **slot);
+-void a64_ijump(Ctx *A64_NOESC c, uint64_t target);            /* BR that is not a jump table: indirect tail call */
++A64_CC void a64_ijump(Ctx *A64_NOESC c, uint64_t target);            /* BR that is not a jump table: indirect tail call */
+ /* The lifted BLR / BR: a cache per call site, filled by its first target (the guest address in the top 32 bits, the
+    function as an offset from a64_lookup in the low 32). A site calling that target again reads no shared table and
+    has an indirect branch of its own to predict; other targets go through a64_icall_site / a64_ijump_site, which try
+    the site's second slot (its second target) and else look them up as a64_icall does. A64_NO_SITE_CACHE: the plain
+    calls. */
+-void a64_icall_site(Ctx *A64_NOESC c, uint64_t target, uint64_t *site);
+-void a64_ijump_site(Ctx *A64_NOESC c, uint64_t target, uint64_t *site);
++A64_CC void a64_icall_site(Ctx *A64_NOESC c, uint64_t target, uint64_t *site);
++A64_CC void a64_ijump_site(Ctx *A64_NOESC c, uint64_t target, uint64_t *site);
+ #ifdef A64_NO_SITE_CACHE
+ #define A64_ICALL(c, t) a64_icall(c, t)
+ #define A64_IJUMP(c, t) a64_ijump(c, t)
+diff --git a/engine/third_party/a64-kit/rt/a64_rt.c b/engine/third_party/a64-kit/rt/a64_rt.c
+index fb7a01ab..b6f6a217 100644
+--- a/engine/third_party/a64-kit/rt/a64_rt.c
++++ b/engine/third_party/a64-kit/rt/a64_rt.c
+@@ -84,7 +84,7 @@ A64_WEAK int a64_call_miss(Ctx *c, uint64_t target) { (void)c; (void)target; ret
+    call that entry (it does not return when it is one). Targets it takes are never cached at the site. */
+ A64_WEAK void a64_ijump_hook(Ctx *c, uint64_t target) { (void)c; (void)target; }
+ 
+-void a64_icall(Ctx *c, uint64_t target) {
++A64_CC void a64_icall(Ctx *c, uint64_t target) {
+     A64Fn f = a64_lookup(target);
+     if (!f) {
+         if (a64_call_miss(c, target)) return;
+@@ -96,7 +96,7 @@ void a64_icall(Ctx *c, uint64_t target) {
+     f(c);
+ }
+ 
+-void a64_ijump(Ctx *c, uint64_t target) {
++A64_CC void a64_ijump(Ctx *c, uint64_t target) {
+     a64_ijump_hook(c, target);
+     A64Fn f = a64_lookup(target);
+     if (!f) {
+@@ -177,7 +177,7 @@ static int site_profiling(void) {
+ /* A64_ICALL / A64_IJUMP (a64.h) when the site's first slot does not hold the target: its second slot, else looked
+    up and remembered in a free slot (only the first two targets: a site calling many would otherwise keep rewriting a
+    line other threads read) */
+-static void site_call(Ctx *c, uint64_t target, uint64_t *site, int call, const char *why) {
++static A64_CC void site_call(Ctx *c, uint64_t target, uint64_t *site, int call, const char *why) {
+     if (site_prof_on && site_profiling()) {   /* (A64_SITE_PROFILE: nothing remembered, every call counted) */
+         if (call) {   /* (a BR's x30 is not its site) */
+             site_prof_count(c->x[30] - 4, target);
+@@ -206,10 +206,10 @@ static void site_call(Ctx *c, uint64_t target, uint64_t *site, int call, const c
+     }
+     f(c);
+ }
+-void a64_icall_site(Ctx *c, uint64_t target, uint64_t *site) {
++A64_CC void a64_icall_site(Ctx *c, uint64_t target, uint64_t *site) {
+     site_call(c, target, site, 1, "indirect call to an address with no function");
+ }
+-void a64_ijump_site(Ctx *c, uint64_t target, uint64_t *site) {
++A64_CC void a64_ijump_site(Ctx *c, uint64_t target, uint64_t *site) {
+     a64_ijump_hook(c, target);
+     site_call(c, target, site, 0, "indirect jump to an address with no function");
+ }

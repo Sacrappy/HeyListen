@@ -170,6 +170,47 @@ recording, the game's code: a wider job system then the lifter). The job system 
   right in the three scenes; tests 255 passed, 1 failed as before. The day's figures are 2-5 fps under session 4's for the same
   build (85.0, and 90.0 / 89.3 / 85.5 in single runs): only runs of the same hour compare.
 
+## Session 6 (2026-11-12, night): the lifted code's compiler flags, the FP tests' ceiling, and what the compiler cannot see
+
+The user's direction after v0.3.0: when the engine's switches are used up, go at the game's engine and at large parts of
+this one. What was measured first (castle-move, 3 interleaved rounds each; the day's reference 80.6-82.5):
+- **Compiler flags on the hot pieces** (`RX_HOT_FLAGS`, `RX_HOT_OPT`): `-mtune=znver4` 80.8, `-march=znver4` 81.8, inlining
+  thresholds (`-hot-callsite-threshold=9000 -inline-threshold=450`) 82.7, `-O3` 81.8, against 82.2. Nothing.
+- **The FP tests' ceiling** (not exact, a measurement: the generated headers patched so that every keep test answers "keep"):
+  the blocks' lane tests alone left out 82.4 / 87.1 / 81.8 = 83.8; every FPX test left out, with the host's FTZ and DAZ on
+  (`HOS_FP_FTZ=1`) 81.8 / 82.1 / 84.6 = 82.8; reference 80.3 / 78.9 / 82.7 = 80.6. So the whole cost of exactness is 2-3 fps:
+  a rewrite of the FP lowering around MXCSR flags (designed: the host's FTZ / DAZ mirroring FPCR.FZ, one flag read a block,
+  NaN and subnormal tests on a block's inputs only) could return half of that at best. Not done. Facts kept for it: FPSR
+  is read at 8 places of the game (libm's fenv functions); x86 with FTZ flushes exact tiny results too and raises UE; a sum
+  of normal operands is exact when tiny, so only products need the "rounded up to the smallest normal" test.
+- **Where the time is not** (the main thread's samples in play): it waits 70% of the frame and runs ~1.8 ms of guest code;
+  the six executors run ~22.7 ms of guest code a frame, three at a time on average over 7.5 ms.
+- **What the compiler cannot see in the big functions.** A lifted function takes its context as a `noalias`, `nocapture`
+  pointer, which is what lets clang keep guest registers in host registers across stores to guest memory. The build caps
+  the capture tracking at 5000 uses of the context (`-capture-tracking-max-uses-to-explore`), and the hot functions have
+  10,000 to 64,000: past the cap every store to guest memory may be the context, and every guest register is written
+  through and read back (f_8008fc00, 7,135 lines: 2,134 loads and 2,940 stores of context registers in 18,942
+  instructions). At 1,000,000: 8.5% fewer instructions there, at no compile time. The loop polls end the registers' lives
+  as well: `a64_poll(c)` hands the context to a call at every loop header; with the call made without it (`A64_POLL_CUR`,
+  the same poll at the same places) and the cap raised, that function's context loads go 2,134 -> 328 and its stores
+  2,940 -> 824. The FP kernels do not move (f_81b8c000: 1.07 M instructions either way).
+- **The calling convention.** Each lifted function saves and restores up to eight general registers and ten XMM registers
+  for its caller (Windows x64), and its state is the context in memory. `A64_FAST_CC=1` at lift time + `RX_FAST_CC=1|2` in
+  the build give every lifted function and the runtime's indirect calls clang's `preserve_none` (1) or the System V
+  convention (2); a hooked address's stub calls its host function, and host calls get stubs of the lifted convention
+  (`hos_hostcall.c`). In a function of many calls `preserve_none` trades the prologue for spills around the calls.
+- **Measured together** (castle-move, 3 interleaved rounds with a job trace in each run; the main thread's job wait a frame,
+  then fps): reference 6.94 / 7.29 ms (a disturbed run 8.56), 81.6 fps; the cap and the polls 7.61 / 6.90 / 7.03, 82.2;
+  with `preserve_none` 6.98 / 6.89 / 6.99, 84.3; with System V 6.86 / 6.91 / 7.25, 82.8. Picture and speed right in each.
+  **The job chain does not move**: what holds it is not the translation's overhead. None adopted; the three are kept as
+  `docs/research/codegen-experiments.patch`, the lifter is as it was.
+- For the record, `RX_VK_MIRROR=0` (the GPU reading the game's memory where it is, no copy): 5.5 fps, 143 ms of GPU time a
+  frame on the RTX 5070.
+
+**Direction changed by the user (2026-11-13)**: no more work on the lifter or on the generated code. The lifted binary stays
+as the functional reference and for the gameplay; the engine's infrastructure is to be replaced by native x64 subsystems,
+one at a time. The plan, the inventory and the boundary are in `docs/native-engine/`.
+
 ## Where this leaves the 120 fps goal (2026-11-12)
 
 Target since 2026-11-12 07:00: 120 fps average in Kokiri Forest, Hyrule Field and the castle town, no drop under 110 while
