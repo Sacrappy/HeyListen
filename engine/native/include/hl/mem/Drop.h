@@ -183,6 +183,7 @@ private:
     // (returns false when the range has nothing left to try: it stops being a candidate)
     bool decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uint64_t& looked, uint64_t& dropped);
     static int fill(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size);   // (a restore's bytes: the spill, else a decode)
+    bool decide_one(Range& r, uint32_t i, const uint8_t* src, int64_t& slot, int64_t now, uint64_t& looked, bool& waiting);
     void free_slot(Range& r, uint32_t k);
 
     Config config_;
