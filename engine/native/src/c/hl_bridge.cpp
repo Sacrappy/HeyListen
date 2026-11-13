@@ -50,6 +50,11 @@ extern "C" uint64_t hl_bridge_worker_message_address(void) { return hl::bridge::
 
 extern "C" void hl_bridge_worker_message(uint64_t worker, uint64_t message) { g_bridge->on_worker_message(worker, message); }
 
+extern "C" int hl_bridge_dispatch_gate(uint64_t scheduler, uint64_t context) {
+    if (!g_dispatcher || !g_dispatcher->options().native) return 0;
+    return g_dispatcher->gated(g_runtime->current(), scheduler, context);
+}
+
 extern "C" int hl_bridge_report(char* out, size_t cap) {
     if (!g_bridge || !cap) return 0;
     const hl::bridge::JobBridge::Stats& b = g_bridge->stats();

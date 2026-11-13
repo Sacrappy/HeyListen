@@ -52,6 +52,9 @@ struct JobFrame {
 };
 static_assert(sizeof(JobFrame) == 24);
 
+// Set while this host thread calls the translated dispatcher on purpose: its entry gate lets that one call through.
+thread_local bool t_bypass = false;
+
 }   // namespace
 
 Dispatcher::Dispatcher(GuestRuntime& runtime, Options options) : runtime_(runtime), options_(options) {}
@@ -76,12 +79,25 @@ void Dispatcher::dispatch(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
     const uint8_t* guard = at<uint8_t>(kPollTicksGuard);
     if (!options_.native || !(ld_acquire(guard) & 1)) {
         if (options_.native) stats_.translated.fetch_add(1, std::memory_order_relaxed);
+        t_bypass = true;   // (when the translated dispatcher has an entry gate, the call reaches the gate first)
         runtime_.call(as, kDispatcher, s_at, c_at);
+        t_bypass = false;
         if (options_.check && (ld(&at<guest::Scheduler>(s_at)->flags) & kStageOver)) check_stage_end(s_at);
         return;
     }
     stats_.stages.fetch_add(1, std::memory_order_relaxed);
     run_native(as, s_at, c_at);
+}
+
+bool Dispatcher::gated(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
+    stats_.gated.fetch_add(1, std::memory_order_relaxed);
+    if (t_bypass) {
+        t_bypass = false;
+        stats_.bypassed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    dispatch(as, s_at, c_at);
+    return true;
 }
 
 void Dispatcher::run_native(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
@@ -524,10 +540,12 @@ int Dispatcher::report(char* out, size_t cap) const {
     const Stats& s = stats_;
     auto v = [](const std::atomic<uint64_t>& a) { return (unsigned long long)a.load(std::memory_order_relaxed); };
     int n = std::snprintf(out, cap,
-                          "dispatch %s: stages %llu (translated %llu); pops A %llu B %llu, handed %llu, runs %llu (from pops %llu), "
-                          "finishes %llu, completes %llu, readied %llu (hook %llu), forwards %llu, drops %llu, requeues %llu, "
-                          "full %llu; sleeps %llu, polls %llu, wakes %llu, address waits %llu, stage ends %llu",
-                          options_.native ? "native" : "translated", v(s.stages), v(s.translated), v(s.pops_a), v(s.pops_b),
+                          "dispatch %s: stages %llu (translated %llu; through the gate %llu, let through %llu); pops A %llu B %llu, "
+                          "handed %llu, runs %llu (from pops %llu), finishes %llu, completes %llu, readied %llu (hook %llu), "
+                          "forwards %llu, drops %llu, requeues %llu, full %llu; sleeps %llu, polls %llu, wakes %llu, address "
+                          "waits %llu, stage ends %llu",
+                          options_.native ? "native" : "translated", v(s.stages), v(s.translated), v(s.gated), v(s.bypassed),
+                          v(s.pops_a), v(s.pops_b),
                           v(s.handed), v(s.runs), v(s.runs_from_pops), v(s.finishes), v(s.completes), v(s.readied),
                           v(s.hook_pushes), v(s.forwards), v(s.drops), v(s.requeues), v(s.full), v(s.sleeps), v(s.polls),
                           v(s.wakes), v(s.waits), v(s.stage_ends));

@@ -3,8 +3,10 @@
 // Written from a reading of the guest's dispatcher (docs/native-engine/jobs-boundary.md, "The dispatcher's protocol"):
 // nothing here is game code. It takes the jobs of a stage from the scheduler's ring queues, runs them, finishes them and
 // makes their dependents ready, wakes and sleeps dispatch contexts, and leaves when the stage is over, with the same
-// atomic operations on the same words as the translated dispatcher, so that both serve one scheduler at once (the stage's
-// owner and nested calls still run the translated one). What is the game's own stays the game's: job bodies, events, the
+// atomic operations on the same words as the translated dispatcher, so that both serve one scheduler at once. It is
+// reached from a worker's stage message (the job bridge) and, with an entry gate on the translated dispatcher, from every
+// other caller: the stage's owner taking part on its worker set's own context, the frame's last stage, and a job body
+// that waits for a stage (gated()). What is the game's own stays the game's: job bodies, events, the
 // mutex, forwarding to an executor, the timed sleep and the C++ library's table of address waiters are called as guest
 // functions on the worker's guest context (guest::* in JobBridge.h has the structures).
 //
@@ -53,8 +55,11 @@ public:
     //   double_run: a one-runner job run by two native contexts at once
     //   at the end of a stage: jobs left in the rings, contexts asleep with jobs queued (also counted after the translated
     //   dispatcher, for comparison)
+    // With the entry gate on, every context's pops and runs are counted here except those of the `translated` dispatches
+    // (the first call of the process, before the guest made the constant it needs), so the first two are complete.
     struct Stats {
         std::atomic<uint64_t> stages{0}, translated{0};   ///< native dispatches; dispatches left to the translated one
+        std::atomic<uint64_t> gated{0}, bypassed{0};      ///< calls that came through the entry gate; of them, let through
         std::atomic<uint64_t> pops_a{0}, pops_b{0}, handed{0}, runs{0}, runs_from_pops{0}, finishes{0}, completes{0};
         std::atomic<uint64_t> forwards{0}, drops{0}, requeues{0}, full{0}, readied{0}, hook_pushes{0};
         std::atomic<uint64_t> sleeps{0}, polls{0}, wakes{0}, waits{0}, stage_ends{0};
@@ -67,6 +72,11 @@ public:
     /// Runs a stage's work for dispatch context `context` of scheduler `scheduler`, as guest thread `as` (the caller holds
     /// its lane): natively, or by calling the translated dispatcher.
     void dispatch(GuestThread as, GuestAddr scheduler, GuestAddr context);
+    /// The entry gate of the translated dispatcher, called with its two arguments on the calling thread (`as`, its own
+    /// guest context): runs the stage natively and returns true; or returns false, to let the translated body run, when
+    /// this host thread's bypass is set (dispatch() sets it to call the translated dispatcher through its own gate; the
+    /// gate takes it, so calls nested in that translated call are native again).
+    bool gated(GuestThread as, GuestAddr scheduler, GuestAddr context);
     /// The guest's push, natively (a job with a pre-push hook goes to the guest's own push).
     void push(GuestThread as, GuestAddr scheduler, GuestAddr job);
 

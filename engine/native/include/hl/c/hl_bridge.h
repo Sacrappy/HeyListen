@@ -43,6 +43,11 @@ int hl_bridge_start(const hl_guest_host *host, int mode, unsigned workers, int d
 uint64_t hl_bridge_worker_message_address(void);
 void hl_bridge_worker_message(uint64_t worker, uint64_t message);
 
+/* The entry gate of the game's dispatcher (hl::bridge::kDispatcher), with its two arguments, on the calling thread's own
+   guest context: 1 when the native dispatcher ran the stage, 0 to let the translated body run (no native dispatcher, or
+   the dispatcher itself is calling the translated one). */
+int hl_bridge_dispatch_gate(uint64_t scheduler, uint64_t context);
+
 /* One line of counters for the log. Returns the length written. */
 int hl_bridge_report(char *out, size_t cap);
 
