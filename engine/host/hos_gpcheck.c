@@ -28,7 +28,7 @@ typedef struct { uint8_t *at; uint8_t *bytes; uint64_t hash; } Saved;
 static Saved saved[SLOTS];
 static SRWLOCK saved_lock = SRWLOCK_INIT;
 static int64_t saved_now, saved_cap;
-static volatile LONG64 t_drops, t_restored, t_mismatch, t_missing, t_refused, t_skipped_written, t_waits;
+static volatile LONG64 t_drops, t_restored, t_mismatch, t_missing, t_refused, t_refused_imported, t_waits;
 static uint8_t *volatile sealing;   /* (the granule being saved and dropped: a write to it waits) */
 
 static uint64_t hash64(const uint8_t *p) {
@@ -141,7 +141,7 @@ static int take(uint8_t *g, QueryWsFn query) {
     Saved *s = slot(g, 1);
     if (s) s->at = g, s->bytes = bytes, s->hash = h, saved_now += (int64_t)GRAN;
     ReleaseSRWLockExclusive(&saved_lock);
-    int dropped = s && hos_gp_drop(g, GRAN) == 0;
+    const int rc = s ? hos_gp_drop(g, GRAN) : -1, dropped = rc == 0;
     if (!dropped) {
         VirtualProtect(g, GRAN, PAGE_READWRITE, &old);
         if (s) {   /* (looked up again: a restore meanwhile may have moved it) */
@@ -151,7 +151,7 @@ static int take(uint8_t *g, QueryWsFn query) {
             ReleaseSRWLockExclusive(&saved_lock);
         }
         free(bytes);
-        InterlockedIncrement64(&t_refused);
+        InterlockedIncrement64(rc == -2 ? &t_refused_imported : &t_refused);
     } else
         InterlockedIncrement64(&t_drops);
     sealing = NULL;
@@ -188,9 +188,9 @@ static DWORD WINAPI check_main(void *arg) {
             if (hos_gp_report(line, sizeof line)) hos_log("mem: guest pages: %s", line);
             if (test)
                 hos_log("mem: guest pages test: dropped %lld granules, restored %lld, saved now %lld MB; hash mismatches %lld, "
-                        "restores refused %lld, drops refused %lld, writers held during a drop %lld",
+                        "restores refused %lld, drops refused %lld (imported %lld), writers held during a drop %lld",
                         (long long)t_drops, (long long)t_restored, (long long)(saved_now >> 20), (long long)t_mismatch,
-                        (long long)t_missing, (long long)t_refused, (long long)t_waits);
+                        (long long)t_missing, (long long)t_refused, (long long)t_refused_imported, (long long)t_waits);
             next_report = hos_now_ns() + 10000000000LL;
         }
     }

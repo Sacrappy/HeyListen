@@ -40,6 +40,11 @@ static int fill_pattern(void *user, void *buf, void *p, size_t size) {
     return 0;
 }
 static int fill_fails(void *user, void *buf, void *p, size_t size) { (void)user, (void)buf, (void)p, (void)size; return 7; }
+static volatile LONG forget_calls;
+static void *forget_at;
+static size_t forget_size;
+static void on_forget(void *p, size_t size) { InterlockedIncrement(&forget_calls); forget_at = p, forget_size = size; }
+
 static int owner(void *p, size_t size, int write) {
     (void)write;
     InterlockedIncrement(&owner_calls);
@@ -107,6 +112,7 @@ int main(void) {
     CHECK(hos_gp_ready() && hos_gp_granule() == GRAN, "not ready after the reservation");
     AddVectoredExceptionHandler(1, handler);
     hos_gp_set_owner(owner);
+    hos_gp_set_on_forget(on_forget);
 
     /* 32 MB committed in one call (one reservation), the pattern written */
     CHECK(VirtualAlloc(win, 32 << 20, MEM_COMMIT, PAGE_READWRITE) == win, "commit of 32 MB");
@@ -185,7 +191,7 @@ int main(void) {
     CHECK(hos_gp_is_dropped(r5), "dropped no more after a failed fill");
     CHECK(all_expected(r5, GRAN), "touch after a failed fill");
     hos_gp_imported(win + 0x500000, 2 * GRAN);
-    CHECK(hos_gp_drop(win + 0x500000, GRAN) != 0, "an imported granule was dropped");
+    CHECK(hos_gp_drop(win + 0x500000, GRAN) == -2, "an imported granule was dropped, or refused for another reason");
     CHECK(!hos_gp_is_dropped(win + 0x500000), "an imported granule is marked dropped");
     CHECK(hos_gp_drop(win + 0x600000 + 0x1000, GRAN) != 0, "an unaligned drop was taken");
     CHECK(hos_gp_restore(win + 0x700000, GRAN, fill_pattern, NULL) == 0 && all_expected(win + 0x700000, GRAN),
@@ -242,6 +248,8 @@ int main(void) {
     calls = owner_calls;
     CHECK(hos_gp_decommit(r7, 4 << 20), "decommit of the region");
     CHECK(owner_calls == calls, "the owner was asked during the decommit of whole granules");
+    CHECK(forget_calls == 2 && forget_at == r7 && forget_size == (4 << 20), "the forget hook was not told of the region (%ld calls)",
+          forget_calls);
     CHECK(all_zero(r7, 4 << 20), "the region does not read as zero");
     CHECK(hos_gp_commit(r7, 4 << 20), "commit of the region");
     pattern(r7, 4 << 20);

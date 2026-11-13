@@ -35,9 +35,9 @@ void   hos_gp_set_owner(hos_gp_on_touch cb);
 int    hos_gp_is_dropped(const void *p);     /* cheap: a bitmap, one bit per granule */
 
 /* ---- what the rules above mean in detail ----------------------------------------------------------------------
-   - hos_gp_drop refuses (returns -1, nothing dropped) a range outside the substrate's part of the window, not granule
-     aligned, or with a granule the Vulkan back end ever imported (the driver locks those pages: giving them back would
-     leave the GPU on other pages than the CPU). Granules already dropped are left as they are.
+   - hos_gp_drop refuses (nothing dropped) a range outside the substrate's part of the window or not granule aligned
+     (returns -1), or with a granule the Vulkan back end ever imported (returns -2: the driver locks those pages, and
+     giving them back would leave the GPU on other pages than the CPU). Granules already dropped are left as they are.
    - hos_gp_restore restores the granules of the range that are dropped and leaves the others as they are (their bytes
      in `buf` are not used); a range with nothing dropped returns 0 at once without calling `fill`. Two restores or a
      restore and a drop that overlap run one after the other: a touch of a granule being restored waits for it.
@@ -50,7 +50,13 @@ int    hos_gp_is_dropped(const void *p);     /* cheap: a bitmap, one bit per gra
      (hos_noaccess_import) ask the owner first. A dropped granule the owner declines, or with no owner, is a crash.
    - A range the game gives up (its memory unmapped, decommitted or freed: hos_mem.c, hos_svc.c) forgets the dropped
      granules wholly inside it: they become reserved memory again, read as zero after the next touch, and the owner is
-     not asked for them (dropped granules cut by the range's ends are restored first, then cut). */
+     not asked for them (dropped granules cut by the range's ends are restored first, then cut); the forget hook below
+     is told of the range afterwards. */
+/* (an addition to the fixed interface) told, after the OS layer gave up [p, p + size) (an unmap, decommit or discard of
+   the game's memory), that dropped granules inside it were forgotten; called with no lock of the substrate held. One at a
+   time; NULL for none */
+typedef void (*hos_gp_on_forget)(void *p, size_t size);
+void   hos_gp_set_on_forget(hos_gp_on_forget cb);
 
 /* ---- the OS layer's side (mkw_glue.c, hos_mem.c, hos_svc.c, hos_memsplit.c) ----------------------------------- */
 int  hos_gp_wanted(void);                    /* HOS_GUEST_PAGES=1 (read once) */
