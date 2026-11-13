@@ -48,6 +48,19 @@ void hl_bridge_worker_message(uint64_t worker, uint64_t message);
    the dispatcher itself is calling the translated one). */
 int hl_bridge_dispatch_gate(uint64_t scheduler, uint64_t context);
 
+enum { HL_STAGES_NATIVE = 1, HL_STAGES_CHECK = 2 };
+
+/* After hl_bridge_start: the stage protocol answered natively (hl::bridge::Stages) with HL_STAGES_* bits. Returns 1 when
+   it is (the bridge started and HL_STAGES_NATIVE given). */
+int hl_bridge_stages_start(int stages);
+
+/* The entry gates of the registration (hl::bridge::kStageRegister), the stage wait (kStageWait) and the last stage
+   (kLastStage), with their arguments, on the calling thread's own guest context. The registration's returns 1 when it
+   answered, 0 to let the translated body run (its own check is calling it); the two others always answer. */
+int hl_bridge_stage_register(uint64_t set, uint64_t send);
+void hl_bridge_stage_wait(uint64_t set);
+void hl_bridge_stage_last(uint64_t manager);
+
 /* One line of counters for the log. Returns the length written. */
 int hl_bridge_report(char *out, size_t cap);
 

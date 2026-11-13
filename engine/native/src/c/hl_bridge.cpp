@@ -7,6 +7,7 @@
 
 #include "hl/bridge/Dispatcher.h"
 #include "hl/bridge/JobBridge.h"
+#include "hl/bridge/Stages.h"
 #include "hl/jobs/JobSystem.h"
 
 namespace {
@@ -23,6 +24,7 @@ HostRuntime* g_runtime;
 hl::jobs::JobSystem* g_jobs;
 hl::bridge::Dispatcher* g_dispatcher;
 hl::bridge::JobBridge* g_bridge;
+hl::bridge::Stages* g_stages;
 
 }   // namespace
 
@@ -55,6 +57,21 @@ extern "C" int hl_bridge_dispatch_gate(uint64_t scheduler, uint64_t context) {
     return g_dispatcher->gated(g_runtime->current(), scheduler, context);
 }
 
+extern "C" int hl_bridge_stages_start(int stages) {
+    if (g_stages) return 1;
+    if (!g_bridge || !(stages & HL_STAGES_NATIVE)) return 0;
+    g_stages = new hl::bridge::Stages(*g_runtime, g_dispatcher, {.check = (stages & HL_STAGES_CHECK) != 0});
+    return 1;
+}
+
+extern "C" int hl_bridge_stage_register(uint64_t set, uint64_t send) {
+    return g_stages && g_stages->register_gate(g_runtime->current(), set, send);
+}
+
+extern "C" void hl_bridge_stage_wait(uint64_t set) { g_stages->wait(g_runtime->current(), set); }
+
+extern "C" void hl_bridge_stage_last(uint64_t manager) { g_stages->last_stage(g_runtime->current(), manager); }
+
 extern "C" int hl_bridge_report(char* out, size_t cap) {
     if (!g_bridge || !cap) return 0;
     const hl::bridge::JobBridge::Stats& b = g_bridge->stats();
@@ -69,8 +86,15 @@ extern "C" int hl_bridge_report(char* out, size_t cap) {
                                 (unsigned long long)j.guest_on_workers, j.most_lanes_at_once);
     if (n < 0) return 0;
     if ((size_t)n >= cap) return (int)cap - 1;
-    if (!g_dispatcher || (size_t)n + 2 >= cap) return n;
-    out[n++] = ';';
-    out[n++] = ' ';
-    return n + g_dispatcher->report(out + n, cap - (size_t)n);
+    if (g_dispatcher && (size_t)n + 2 < cap) {
+        out[n++] = ';';
+        out[n++] = ' ';
+        n += g_dispatcher->report(out + n, cap - (size_t)n);
+    }
+    if (g_stages && (size_t)n + 2 < cap) {
+        out[n++] = ';';
+        out[n++] = ' ';
+        n += g_stages->report(out + n, cap - (size_t)n);
+    }
+    return n;
 }
