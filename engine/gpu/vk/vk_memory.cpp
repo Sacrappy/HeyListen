@@ -970,7 +970,7 @@ uint64_t cap_now_ms() {
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
     FreeBuf old[12];
     int n_old = 0;
-    const uint64_t now = cap_spare_ms() ? cap_now_ms() : 0;
+    const uint64_t now = cap_now_ms();
     {
         std::lock_guard lk(cap_free_mu);
         if (const uint64_t ms = cap_spare_ms())
@@ -993,11 +993,13 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
                 } else {
                     i++;
                 }
-        if (cap_fit() && cap_free.size() >= 12 && size <= (64ull << 20)) {   // (RX_VK_CAP_FIT: a smaller one takes the largest's place)
-            size_t big = 0;
-            for (size_t i = 1; i < cap_free.size(); i++)
-                if (cap_free[i].size > cap_free[big].size) big = i;
-            if (cap_free[big].size > size && n_old < 12) {
+        // (RX_VK_CAP_FIT: a smaller one takes the place of the largest spare left untaken for 2 s. Not any largest: a castle walk's
+        // ~50 MB capture a frame lost its spare to the small ones and made a buffer every frame, ~1000 in a run)
+        if (cap_fit() && cap_free.size() >= 12 && size <= (64ull << 20)) {
+            size_t big = cap_free.size();
+            for (size_t i = 0; i < cap_free.size(); i++)
+                if (now - cap_free[i].ms > 2000 && (big == cap_free.size() || cap_free[i].size > cap_free[big].size)) big = i;
+            if (big < cap_free.size() && cap_free[big].size > size && n_old < 12) {
                 old[n_old++] = cap_free[big];
                 cap_free_bytes -= cap_free[big].size;
                 cap_free.erase(cap_free.begin() + (ptrdiff_t)big);
