@@ -133,7 +133,7 @@ progress fields in the descriptor; it was not done.
 | Piece | Where |
 |---|---|
 | The path a request takes, decided before anything is done for it (`hl::stream::choose`), the counters | `engine/native/include/hl/stream/Decode.h`, `src/stream/Decode.cpp` |
-| The provenance table: destination range -> file name (the per-file heap's), file object, compressed and decompressed sizes, dictionary id, chunked or not, a fingerprint of the decoded bytes; lookup by address; a new decode drops the ranges it overlaps; at most 65,536 ranges, oldest dropped | `engine/native/include/hl/stream/Provenance.h`, `src/stream/Provenance.cpp` |
+| The provenance table: destination range -> file name (the per-file heap's), file object, compressed size (0 for a chunked file, whose later chunks the native side does not see) and decompressed size, dictionary id, chunked or not, a fingerprint of the decoded bytes; lookup by address; a new decode drops the ranges it overlaps; at most 65,536 ranges, oldest dropped | `engine/native/include/hl/stream/Provenance.h`, `src/stream/Provenance.cpp` |
 | The C surface | `engine/native/include/hl/c/hl_stream.h`, `src/c/hl_stream.cpp` |
 | The answer of `0x80108da0` (and of `0x80115bf0` for the check), the native function, the dictionaries, the zstd calls | `engine/host/hl_stream.c` |
 | zstd's decoder in the game's executable (the vendored `third_party/zstd`, decoder only) | `engine/nx2/build.py` |

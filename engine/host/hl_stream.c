@@ -463,13 +463,17 @@ static void hl_decode_file(Ctx *A64_NOESC c) {
     if (csize >= chunk) {
         /* the chunked case: closed here, and the request given to the translated function, which opens and reads the
            file again and hands its chunks to the decoding thread (stream-boundary.md section 5) */
+        ZSTD_frameHeader first;   /* (for the provenance table: the first chunk holds the frame header) */
+        const int known = ZSTD_getFrameHeader(&first, GP(src), csize) == 0 && first.frameType == ZSTD_frame &&
+                          first.frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN;
         s64_sp(c, holder, holder_class + 16);
         gcall(c, F_CLOSE, 2, file, holder, 0, 0, 0);
         c->x[31] = sp0;
         c->x[0] = obj, c->x[1] = req, c->x[2] = actx, c->x[3] = a3, c->x[4] = a4, c->x[5] = a5;
-        const uint64_t out_size = a3;
         translated_file(c);
-        hl_stream_count(HL_STREAM_CHUNKED, c->x[0] && out_size ? l32(out_size) : 0);
+        const uint64_t got = c->x[0];
+        hl_stream_count(HL_STREAM_CHUNKED, got && known ? first.frameContentSize : 0);
+        if (got && known) record(req, got, first.frameContentSize, 0, first.dictID, 1);
         if (log_on) report(0);
         return;
     }
