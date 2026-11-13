@@ -1109,6 +1109,18 @@ uint64_t bcc_cap() {
     static const uint64_t v = (uint64_t)(getenv("RX_VK_BC_CACHE_MB") ? std::max(0, atoi(getenv("RX_VK_BC_CACHE_MB"))) : 1024) << 20;
     return v;
 }
+// (HeyListen, 2026-11-14) RX_VK_BC_CACHE_LAZY=1 (the default; 0: every transcode stored, as before): blocks are stored only for
+// bytes transcoded before (bcc_seen), or once the budget has evicted an ASTC texture uploaded from memory (bcc_evicting: from then
+// on every transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the three scenes stored 1016-1308
+// textures, 756-890 MB of host-cached memory, and served 0. The cost where it does serve: one transcode more for a texture made
+// again before the first such eviction (counted: st_bcc_again, transcodes of bytes transcoded before)
+bool bcc_lazy() {
+    static const bool v = !getenv("RX_VK_BC_CACHE_LAZY") || atoi(getenv("RX_VK_BC_CACHE_LAZY")) != 0;
+    return v;
+}
+std::atomic<bool> bcc_evicting{false};
+std::unordered_set<uint64_t> bcc_seen;   // (bcc_mu: the keys transcoded so far; cleared past 262,144, a bound)
+std::atomic<int64_t> st_bcc_again{0}, st_bcc_skipped{0};
 uint64_t bcc_fold(uint64_t h, uint64_t v) { return msync_diff::fmix64((h ^ v) + 0x9E3779B97F4A7C15ull); }
 uint64_t bcc_bytes_hash(uint64_t h, const uint8_t* p, uint64_t n) {
     uint64_t i = 0;
@@ -1192,6 +1204,12 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 it->second.tick = ++bcc_tick;
                 it->second.last_value = std::max(it->second.last_value, rec_value);
                 hit = it->second;
+            } else {   // (a transcode follows: of bytes transcoded before, or not)
+                if (bcc_seen.size() >= 262144) bcc_seen.clear();
+                const bool again = !bcc_seen.insert(cache_key).second;
+                if (again) st_bcc_again.fetch_add(1, std::memory_order_relaxed);
+                if (bcc_lazy() && !again && !bcc_evicting.load(std::memory_order_relaxed))
+                    cache_key = 0, st_bcc_skipped.fetch_add(1, std::memory_order_relaxed);   // (not stored: RX_VK_BC_CACHE_LAZY)
             }
         }
         if (hit.buf) {
@@ -4029,9 +4047,12 @@ void texture_frame(uint64_t completed) {
         bcc_free_done(completed);
         if (frame_no % 600 == 0) {
             std::lock_guard lk(bcc_mu);
-            logf("vk: BC cache (RX_VK_BC_CACHE_MB): %zu entries, %llu MB; %lld textures from it (%llu MB copied), %lld stored, so far",
+            logf("vk: BC cache (RX_VK_BC_CACHE_MB): %zu entries, %llu MB; %lld textures from it (%llu MB copied), %lld stored, so far; "
+                 "transcodes of bytes transcoded before %lld; not stored %lld (RX_VK_BC_CACHE_LAZY %d, storing all: %s)",
                  bcc.size(), (unsigned long long)(bcc_bytes >> 20), (long long)st_bcc_hits.load(),
-                 (unsigned long long)(st_bcc_hit_bytes.load() >> 20), (long long)st_bcc_stores.load());
+                 (unsigned long long)(st_bcc_hit_bytes.load() >> 20), (long long)st_bcc_stores.load(),
+                 (long long)st_bcc_again.load(), (long long)st_bcc_skipped.load(), bcc_lazy() ? 1 : 0,
+                 !bcc_lazy() || bcc_evicting.load() ? "yes" : "no");
         }
     }
     frame_upload_ns.store(0, std::memory_order_relaxed);
@@ -4681,6 +4702,11 @@ void texture_frame(uint64_t completed) {
         Texture* tex = e.tex;
         if (e.shifted) n_dead++, b_dead += tex->bytes;
         watch_tex(tex, "evicted");
+        if (tex->bc && !tex->gpu_written && tex->uploaded && !bcc_evicting.load(std::memory_order_relaxed)) {
+            bcc_evicting.store(true, std::memory_order_relaxed);   // (RX_VK_BC_CACHE_LAZY: the BC cache stores from now on)
+            logf("vk: BC cache: an ASTC texture uploaded from memory evicted (#%u %ux%u): its transcodes stored from now on", tex->id,
+                 tex->width, tex->height);
+        }
         if (!tex->gpu_written && tex->uploaded && !remade_skip_old()) {   // (above: made again, it is uploaded from memory)
             std::lock_guard lk(from_memory_mu);
             if (evicted_from_memory.size() > 50000) evicted_from_memory.clear();   // (a bound)
