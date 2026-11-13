@@ -44,6 +44,25 @@ bool oriented_box_box(const PreciseTransform& a, const float q[4][4], float radi
 // multiply-adds, half extents' = |m0| ex + |m1| ey + |m2| ez; out = centre' -/+ extents'.
 bool affine_box(const float centre_extents[6], const float m[4][4], Box& out);
 
+// A model's bounding sphere record: centre (4 lanes), radius, and 12 bytes the guest copies along when a sphere replaces
+// the record whole (from its own stack: the kernel is given them).
+struct SphereRecord {
+    float centre[4];
+    float radius;
+    uint8_t tail[12];
+};
+static_assert(sizeof(SphereRecord) == 32);
+
+// The bounding sphere of n >= 1 local spheres (centre x, y, z, radius: 16 bytes each), sphere i under the matrix
+// palette[bone[i]] (four float4 columns): its centre transformed as in affine_box, its radius times the largest column
+// length (squares summed as (z + x) + (w + y), square roots, the largest by compares). The first sphere is the record;
+// each next one grows it in order: when the distance squared between the centres is under max((r - R)^2, 1e-4), the
+// larger of the two spheres is kept (the new one whole, with `stale` as the tail, unless the record's radius is the
+// larger); otherwise the record moves towards the new centre and grows to cover both. `out` is read for its tail and
+// written whole.
+bool model_sphere(const float (*spheres)[4], const uint16_t* bone, int n, const float (*palette)[4][4],
+                  const uint8_t stale[12], SphereRecord& out);
+
 }   // namespace hl::math
 
 #endif

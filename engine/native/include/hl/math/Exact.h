@@ -20,6 +20,7 @@
 #define HL_MATH_EXACT_H
 
 #include <bit>
+#include <cmath>
 #include <cstdint>
 
 #if defined(__clang__)
@@ -73,6 +74,17 @@ struct Guard {
         const float t = (float)s;
         ok &= big(t) || (is_zero(t) && (is_zero(a) || is_zero(b)) && is_zero(w));
         return t;
+    }
+    // FDIV: a zero only as the quotient of a zero by a non-zero
+    float div(float a, float b) {
+        const float t = a / b;
+        ok &= big(t) || (is_zero(t) && is_zero(a) && !is_zero(b));
+        return t;
+    }
+    // FSQRT (correctly rounded on both): of a zero or a positive normal
+    float sqrt(float a) {
+        ok &= is_zero(a) || (big(a) && !(bits(a) & 0x80000000u));
+        return std::sqrt(a);
     }
     // FCVT double -> single, to nearest: a zero is fine (Arm with or without FZ gives the same signed zero)
     float narrow(double d) { const float t = (float)d; ok &= big(t) || is_zero(t); return t; }

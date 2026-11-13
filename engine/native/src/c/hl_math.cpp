@@ -34,6 +34,23 @@ extern "C" int hl_math_oriented_box_box(const void* body, const void* xf, const 
                                           static_cast<const bridge::HavokBoxBias*>(bias)->bias, box), box, out);
 }
 
+extern "C" int hl_math_model_sphere(const hl_guest_host* host, uint64_t bounds, uint64_t holder, uint64_t sp, void* out) {
+    auto at = [host](uint64_t guest) { return host->ptr(host->user, guest); };
+    const auto* b = static_cast<const bridge::ModelBounds*>(at(bounds));
+    if (!b->sphere_out) return 0;
+    const auto* d = static_cast<const bridge::ModelBoundsDesc*>(at(b->desc));
+    const auto* palette = static_cast<const float(*)[4][4]>(at(static_cast<const bridge::BonePalette*>(at(holder))->matrices));
+    const auto* spheres = static_cast<const float(*)[4]>(at(d->spheres));
+    const uint16_t* bone = d->multi ? static_cast<const uint16_t*>(at(d->bones)) : &d->bone;
+    const int n = d->multi && d->count >= 2 ? d->count : 1;
+    math::SphereRecord rec;
+    std::memcpy(&rec, out, sizeof rec);
+    const auto* stale = static_cast<const uint8_t*>(at(sp - bridge::kSphereStaleBelowSp));
+    if (!math::model_sphere(spheres, bone, n, palette, stale, rec)) return 0;
+    std::memcpy(out, &rec, sizeof rec);
+    return 1;
+}
+
 extern "C" int hl_math_affine_box(const void* box_in, const void* m, void* out) {
     const auto* ce = static_cast<const bridge::CentreExtents*>(box_in);
     const float v[6] = {ce->centre[0], ce->centre[1], ce->centre[2], ce->extents[0], ce->extents[1], ce->extents[2]};

@@ -239,6 +239,62 @@ math::Box ref_affine_box(const float ce[6], const float m[4][4]) {
     return b;
 }
 
+math::SphereRecord ref_model_sphere(const float (*s)[4], const uint16_t* bone, int n, const float (*pal)[4][4],
+                                    const uint8_t stale[12], math::SphereRecord rec) {
+    for (int i = 0; i < n; i++) {
+        const float (*m)[4] = pal[bone[i]];
+        float c[4];
+        for (int k = 0; k < 4; k++) {
+            const float a = m[0][k] * s[i][0];
+            const float b = std::fmaf(m[1][k], s[i][1], a);
+            const float d = std::fmaf(m[2][k], s[i][2], b);
+            c[k] = d + m[3][k];
+        }
+        float big = 0;
+        for (int j = 0; j < 3; j++) {
+            const float x = m[j][0] * m[j][0], y = m[j][1] * m[j][1], z = m[j][2] * m[j][2], w = m[j][3] * m[j][3];
+            const float zx = z + x, wy = w + y;
+            const float len = std::sqrt(zx + wy);
+            if (j == 0 || big < len) big = len;
+        }
+        const float r = s[i][3] * big;
+        if (i == 0) {
+            std::memcpy(rec.centre, c, 16);
+            rec.radius = r;
+            continue;
+        }
+        float d[4], d2 = 0;
+        for (int k = 0; k < 4; k++) d[k] = c[k] - rec.centre[k];
+        const float z2 = d[2] * d[2], x2 = d[0] * d[0], w2 = d[3] * d[3], y2 = d[1] * d[1];
+        const float a = z2 + x2, b = w2 + y2;
+        d2 = a + b;
+        const float gap0 = r - rec.radius;
+        float gap = gap0 * gap0;
+        if (gap < 1e-4f) gap = 1e-4f;
+        if (d2 < gap) {
+            if (rec.radius <= r) {
+                std::memcpy(rec.centre, c, 16);
+                rec.radius = r;
+                std::memcpy(rec.tail, stale, 12);
+            }
+            continue;
+        }
+        const float inv = 1.0f / std::sqrt(d2);
+        const float q = d2 * inv;
+        const float both = r + rec.radius;
+        const float sum = q + both;
+        const float grown = sum * 0.5f;
+        const float diff = grown - rec.radius;
+        const float t = diff / q;
+        rec.radius = grown;
+        for (int k = 0; k < 4; k++) {
+            const float step = d[k] * t;
+            rec.centre[k] = rec.centre[k] + step;
+        }
+    }
+    return rec;
+}
+
 bool same(const math::Box& a, const math::Box& b) { return std::memcmp(&a, &b, sizeof a) == 0; }
 
 struct Rng {
@@ -338,6 +394,99 @@ void affine_box_matches_the_specification() {
     CHECK(taken > 190000);
 }
 
+void model_sphere_matches_the_specification() {
+    Rng r;
+    float pal[6][4][4];
+    float s[12][4];
+    uint16_t bone[12];
+    uint8_t stale[12];
+    for (int k = 0; k < 12; k++) stale[k] = (uint8_t)(0xa0 + k);
+    int taken = 0, kept = 0, grown = 0;
+    for (int it = 0; it < 30000; it++) {
+        for (auto& m : pal) {
+            for (int c = 0; c < 3; c++)
+                for (int k = 0; k < 3; k++) m[c][k] = r.pick(-1.5f, 1.5f);
+            for (int k = 0; k < 3; k++) m[3][k] = r.uniform(-30.0f, 30.0f);
+            m[0][3] = m[1][3] = m[2][3] = 0.0f;
+            m[3][3] = 1.0f;
+        }
+        const int n = 1 + (int)(r.next() % 12);
+        for (int i = 0; i < n; i++) {
+            for (int k = 0; k < 3; k++) s[i][k] = r.uniform(-2.0f, 2.0f);
+            s[i][3] = r.uniform(0.0f, r.next() % 4 ? 0.5f : 20.0f);
+            bone[i] = (uint16_t)(r.next() % 6);
+        }
+        math::SphereRecord got, start;
+        std::memset(&start, 0x5c, sizeof start);
+        got = start;
+        if (!math::model_sphere(s, bone, n, pal, stale, got)) continue;
+        const math::SphereRecord want = ref_model_sphere(s, bone, n, pal, stale, start);
+        CHECK(std::memcmp(&got, &want, sizeof got) == 0);
+        taken++;
+        if (got.tail[0] == stale[0]) kept++;
+        if (n > 1) grown++;
+    }
+    CHECK(taken > 28000 && kept > 100 && grown > 20000);
+    float none[1][4] = {{1, 2, 3, 1}};
+    math::SphereRecord out = {};
+    CHECK(!math::model_sphere(none, bone, 0, pal, stale, out));
+}
+
+// a guest memory of 4 KB at guest address 0x10000 for the C surface's reads through the host's callback
+struct Arena {
+    alignas(16) uint8_t mem[4096] = {};
+    static void* ptr(void* user, uint64_t guest) { return static_cast<Arena*>(user)->mem + (guest - 0x10000); }
+    hl_guest_host host() { return hl_guest_host{this, ptr, nullptr, nullptr, nullptr, nullptr}; }
+    template <class T> void put(uint64_t at, const T& v) { std::memcpy(mem + (at - 0x10000), &v, sizeof v); }
+};
+
+void the_c_surface_reads_the_model_bounds() {
+    Arena a;
+    const hl_guest_host host = a.host();
+    // bounds object at 0x10000 -> descriptor 0x10100, record 0x10200; holder 0x10300 -> palette 0x10400 (2 matrices);
+    // spheres 0x10600, bones 0x10700; the caller's stack pointer 0x10f00
+    bridge::ModelBounds b = {};
+    b.desc = 0x10100;
+    b.sphere_out = 0x10200;
+    a.put(0x10000, b);
+    bridge::ModelBoundsDesc d = {};
+    d.bones = 0x10700;
+    d.spheres = 0x10600;
+    d.bone = 1;
+    d.count = 2;
+    d.multi = 1;
+    a.put(0x10100, d);
+    bridge::BonePalette h = {};
+    h.matrices = 0x10400;
+    a.put(0x10300, h);
+    float pal[2][4][4] = {};
+    for (int m = 0; m < 2; m++)
+        for (int k = 0; k < 4; k++) pal[m][k][k] = 1.0f;
+    pal[1][3][0] = 100.0f;   // matrix 1 moves by 100 in x
+    a.put(0x10400, pal);
+    const float spheres[2][4] = {{0, 0, 0, 1}, {10, 0, 0, 1}};
+    a.put(0x10600, spheres);
+    const uint16_t bones[2] = {0, 1};
+    a.put(0x10700, bones);
+    uint8_t out[32];
+    std::memset(out, 0x11, sizeof out);
+    CHECK(hl_math_model_sphere(&host, 0x10000, 0x10300, 0x10f00, out) == 1);
+    math::SphereRecord rec;
+    std::memcpy(&rec, out, sizeof rec);
+    CHECK(rec.radius > 55.0f && rec.radius < 56.5f && rec.centre[0] > 54.0f && rec.centre[0] < 56.0f && rec.tail[0] == 0x11);
+    // single: one sphere under the descriptor's own index
+    d.multi = 0;
+    a.put(0x10100, d);
+    std::memset(out, 0x11, sizeof out);
+    CHECK(hl_math_model_sphere(&host, 0x10000, 0x10300, 0x10f00, out) == 1);
+    std::memcpy(&rec, out, sizeof rec);
+    CHECK(rec.centre[0] == 100.0f && rec.radius == 1.0f && rec.centre[3] == 1.0f);
+    // no record: nothing to answer
+    b.sphere_out = 0;
+    a.put(0x10000, b);
+    CHECK(hl_math_model_sphere(&host, 0x10000, 0x10300, 0x10f00, out) == 0);
+}
+
 // The C surface reads the guest's layouts: a vertex array placed by its relative offset, a body at its offsets.
 void the_c_surface_reads_the_layouts() {
     alignas(16) uint8_t mem[512] = {};
@@ -385,6 +534,8 @@ int main() {
     oriented_box_box_matches_the_specification();
     affine_box_matches_the_specification();
     the_c_surface_reads_the_layouts();
+    model_sphere_matches_the_specification();
+    the_c_surface_reads_the_model_bounds();
     std::puts("math: ok");
     return 0;
 }

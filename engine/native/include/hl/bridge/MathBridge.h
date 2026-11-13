@@ -48,6 +48,39 @@ struct AffineColumns {
 };
 static_assert(sizeof(AffineColumns) == 64);
 
+// 0x800a8400's model bounds: x0 is the bounds object (its descriptor, its output sphere record), x1 the object holding
+// the bone matrix palette (64-byte matrices). Guest pointers are 64-bit guest addresses.
+struct ModelBounds {
+    uint64_t desc;
+    uint8_t before_out[48];
+    uint64_t sphere_out;   // 0: nothing to do
+};
+static_assert(offsetof(ModelBounds, sphere_out) == 56);
+struct ModelBoundsDesc {
+    uint8_t before_bones[32];
+    uint64_t bones;        // 16-bit palette index a sphere (multi)
+    uint8_t before_spheres[24];
+    uint64_t spheres;      // 16-byte local spheres
+    uint8_t before_bone[12];
+    uint16_t bone;         // the one palette index (single)
+    uint8_t before_count[2];
+    uint16_t count;        // spheres (multi; the first is used whatever the count)
+    uint8_t multi;
+};
+static_assert(offsetof(ModelBoundsDesc, bones) == 32);
+static_assert(offsetof(ModelBoundsDesc, spheres) == 64);
+static_assert(offsetof(ModelBoundsDesc, bone) == 84);
+static_assert(offsetof(ModelBoundsDesc, count) == 88);
+static_assert(offsetof(ModelBoundsDesc, multi) == 90);
+struct BonePalette {
+    uint8_t before[32];
+    uint64_t matrices;
+};
+static_assert(offsetof(BonePalette, matrices) == 32);
+// (0x800a8400's frame: 144 bytes; when a sphere replaces the record whole it copies 32 bytes from its frame, the last 12
+// of which it never wrote: they are what lay at the caller's stack pointer - 28 at the call)
+constexpr uint64_t kSphereStaleBelowSp = 28;
+
 static_assert(offsetof(math::PreciseTransform, hi) == 48);
 static_assert(offsetof(math::PreciseTransform, lo) == 64);
 

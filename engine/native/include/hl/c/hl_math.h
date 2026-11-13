@@ -5,6 +5,8 @@
 #ifndef HL_C_MATH_H
 #define HL_C_MATH_H
 
+#include "hl/c/hl_bridge.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -16,6 +18,10 @@ int hl_math_vertex_set_box(const void *array, const void *xf, const void *start,
 int hl_math_oriented_box_box(const void *body, const void *xf, const void *bias, void *out);
 /* 0x80ba6d80: box = centre and half extents, m = the matrix's four columns, out = the box */
 int hl_math_affine_box(const void *box, const void *m, void *out);
+/* 0x800a8400, with its arguments as guest addresses (bounds = x0, holder = x1, sp = the stack pointer at the call) read
+   through host->ptr: out = the 32-byte sphere record, holding the guest's record on entry, written whole on 1. Returns 0
+   also when the bounds object has no record to write (the translated function then does nothing). */
+int hl_math_model_sphere(const hl_guest_host *host, uint64_t bounds, uint64_t holder, uint64_t sp, void *out);
 
 #ifdef __cplusplus
 }

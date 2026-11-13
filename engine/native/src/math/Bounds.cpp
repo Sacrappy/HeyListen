@@ -139,4 +139,68 @@ bool affine_box(const float ce[6], const float m[4][4], Box& out) {
     return true;
 }
 
+// 0x800a8400
+bool model_sphere(const float (*s)[4], const uint16_t* bone, int n, const float (*palette)[4][4], const uint8_t stale[12],
+                  SphereRecord& out) {
+    const float kMinGap = f32(0x38d1b717u);   // (1e-4 as the guest builds it)
+    Guard g;
+    if (n < 1) return false;
+    SphereRecord rec = out;
+    for (int i = 0; i < n; i++) {
+        const float (*m)[4] = palette[bone[i]];
+        if (!inputs_ordinary(g, s[i], 4) || !inputs_ordinary(g, &m[0][0], 16)) return false;
+        float ci[4];
+        for (int k = 0; k < 4; k++) {
+            float c = g.mul(m[0][k], s[i][0]);
+            c = g.fma(c, m[1][k], s[i][1]);
+            c = g.fma(c, m[2][k], s[i][2]);
+            ci[k] = g.add(c, m[3][k]);
+        }
+        float len[3];
+        for (int j = 0; j < 3; j++) {
+            float sq[4];
+            for (int k = 0; k < 4; k++) sq[k] = g.mul(m[j][k], m[j][k]);
+            len[j] = g.sqrt(g.add(g.add(sq[2], sq[0]), g.add(sq[3], sq[1])));
+        }
+        float scale = len[0];
+        if (scale < len[1]) scale = len[1];
+        if (scale < len[2]) scale = len[2];
+        const float ri = g.mul(s[i][3], scale);
+        if (!g.ok) return false;
+        if (i == 0) {
+            for (int k = 0; k < 4; k++) rec.centre[k] = ci[k];
+            rec.radius = ri;
+            continue;
+        }
+        const float R = rec.radius;
+        float d[4], dd[4];
+        for (int k = 0; k < 4; k++) {
+            d[k] = g.sub(ci[k], rec.centre[k]);
+            dd[k] = g.mul(d[k], d[k]);
+        }
+        const float d2 = g.add(g.add(dd[2], dd[0]), g.add(dd[3], dd[1]));
+        float gap = g.sub(ri, R);
+        gap = g.mul(gap, gap);
+        if (gap < kMinGap) gap = kMinGap;
+        if (!g.ok) return false;
+        if (d2 < gap) {   // one inside the other: the larger stays
+            if (!(R > ri)) {
+                for (int k = 0; k < 4; k++) rec.centre[k] = ci[k];
+                rec.radius = ri;
+                for (int k = 0; k < 12; k++) rec.tail[k] = stale[k];
+            }
+            continue;
+        }
+        const float dist = g.sqrt(d2);
+        const float q = g.mul(d2, g.div(1.0f, dist));
+        const float grown = g.mul(g.add(q, g.add(ri, R)), 0.5f);
+        const float t = g.div(g.sub(grown, R), q);
+        rec.radius = grown;
+        for (int k = 0; k < 4; k++) rec.centre[k] = g.add(rec.centre[k], g.mul(d[k], t));
+        if (!g.ok) return false;
+    }
+    out = rec;
+    return true;
+}
+
 }   // namespace hl::math

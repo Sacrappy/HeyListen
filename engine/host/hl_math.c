@@ -6,6 +6,7 @@
      u2      0x81a040bc  a body's world box from its oriented box (with 0x8170341c), reached through a pointer: HL_ANSWER
      affine  0x80ba6d80  a centre / half-extents box under a 3x4 matrix, called directly: HL_GATE
      u1      0x81746440  the box of a convex vertex set under a precise transform, called directly: HL_GATE
+     sphere  0x800a8400  a model's bounding sphere over its bones' spheres, called directly: HL_GATE
    A call takes the native path only when the thread's guest FPCR has no bit but FZ set and the kernel finds every value
    ordinary (hl/math/Exact.h); otherwise ("declined") the translated function runs, as before.
 
@@ -33,7 +34,7 @@
 #define FPSR_IXC 0x10ull
 #define BOX_BIAS_PTR 0x84ca4680ULL   /* (a global pointer: 0x81a040bc adds the two floats at its +80 to every extent) */
 #define VERTEX_START 0x83eb0c20ULL   /* (the starting bound 0x81746440 loads: Havok's large float in four lanes) */
-enum { LOG_FIRST = 10, SNAP = 512 };
+enum { LOG_FIRST = 10, SNAP = 512, SPANS = 6 };
 
 typedef struct { uint64_t at; uint32_t n; } Span;   /* guest bytes a call reads, logged with a mismatch */
 
@@ -43,7 +44,7 @@ typedef struct {
     int validated;                        /* native under HL_MATH=1: zero mismatches over full runs in the three scenes */
     int (*native)(const Ctx *c, void *out);   /* the 32-byte answer into out: 1, or 0 when the kernel declines */
     uint64_t (*out_at)(const Ctx *c);      /* where the function writes its 32 bytes */
-    int (*inputs)(const Ctx *c, Span *s);  /* what it reads (at most 4 ranges) */
+    int (*inputs)(const Ctx *c, Span *s);  /* what it reads (at most SPANS ranges) */
     volatile int *gate;                    /* its gate's switch; NULL: answered through the pointer */
     A64Fn translated;
     int native_on, check_on;
@@ -83,14 +84,29 @@ static int u1_inputs(const Ctx *c, Span *s) {
     return 4;
 }
 
-extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440;
-enum { U2, AFFINE, U1, UNITS };
+static int sphere_native(const Ctx *c, void *out) { return hl_math_model_sphere(hl_host(), c->x[0], c->x[1], c->x[31], out); }
+static uint64_t sphere_out(const Ctx *c) { return G64(c->x[0] + 56); }
+static int sphere_inputs(const Ctx *c, Span *s) {
+    const uint64_t d = G64(c->x[0]);
+    s[0] = (Span){c->x[0], 64};
+    s[1] = (Span){d, 96};
+    s[2] = (Span){G64(d + 64), 8 * 16};
+    s[3] = (Span){G64(c->x[0] + 56), 32};
+    s[4] = (Span){c->x[31] - 28, 12};
+    s[5] = (Span){c->x[1] + 32, 8};
+    return 6;
+}
+
+extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400;
+enum { U2, AFFINE, U1, SPHERE, UNITS };
 static Unit units[UNITS] = {
     [U2] = {.name = "u2", .guest = 0x81a040bcULL, .native = u2_native, .out_at = u2_out, .inputs = u2_inputs},
     [AFFINE] = {.name = "affine", .guest = 0x80ba6d80ULL, .native = affine_native, .out_at = affine_out,
                 .inputs = affine_inputs, .gate = &hl_gate_on_80ba6d80},
     [U1] = {.name = "u1", .guest = 0x81746440ULL, .native = u1_native, .out_at = u1_out, .inputs = u1_inputs,
             .gate = &hl_gate_on_81746440},
+    [SPHERE] = {.name = "sphere", .guest = 0x800a8400ULL, .native = sphere_native, .out_at = sphere_out,
+                .inputs = sphere_inputs, .gate = &hl_gate_on_800a8400},
 };
 
 /* ---- switches ---- */
@@ -177,10 +193,9 @@ static void hex(char *to, size_t cap, const uint8_t *p, size_t n) {
 /* ---- one call ---- */
 static _Thread_local int bypass;   /* the check is running the translated function on this thread: its gate says 0 */
 
-/* The check: native answer computed (mine), the translated function run for real, the 32 bytes compared. */
-static void compare(Unit *u, Ctx *c, const uint8_t mine[32]) {
-    const uint64_t out = u->out_at(c);
-    Span s[4];
+/* The check: native answer computed (mine), the translated function run for real, the 32 bytes at out compared. */
+static void compare(Unit *u, Ctx *c, uint64_t out, const uint8_t mine[32]) {
+    Span s[SPANS];
     uint8_t in[SNAP];
     int ns = 0;
     size_t used = 0;
@@ -225,15 +240,17 @@ static int run(Unit *u, Ctx *c) {
     InterlockedIncrement64(&u->calls);
     InterlockedOr(&u->fpcr_or, (LONG)c->fpcr);
     InterlockedAnd(&u->fpcr_and, (LONG)c->fpcr);
+    /* (the scratch starts as the guest's 32 bytes: a kernel that writes part of them leaves the rest as they are) */
+    const uint64_t out = u->out_at(c);
     uint8_t mine[32];
     int answered = 0;
     if (c->fpcr & ~FPCR_FZ) InterlockedIncrement64(&u->declined_fpcr);
-    else if (!u->native(c, mine)) InterlockedIncrement64(&u->declined_inputs);
+    else if (!out || (memcpy(mine, GP(out), 32), !u->native(c, mine))) InterlockedIncrement64(&u->declined_inputs);
     else if (u->check_on) {
-        compare(u, c, mine);
+        compare(u, c, out, mine);
         answered = 1;
     } else {
-        memcpy(GP(u->out_at(c)), mine, 32);
+        memcpy(GP(out), mine, 32);
         c->fpsr |= FPSR_IXC;   /* (sticky, and the translation sets it on any inexact operation: keeps its fast path open) */
         InterlockedIncrement64(&u->answered);
         answered = 1;
@@ -257,3 +274,4 @@ HL_ANSWER(0x81a040bcULL, u2_answer, u2_on, "a body's world box from its oriented
 
 HL_GATE(80ba6d80, "fc814e67d0dad1eb") { return run(&units[AFFINE], c); }
 HL_GATE(81746440, "851bc99bf31be697") { return run(&units[U1], c); }
+HL_GATE(800a8400, "42b7877d24ec9c57") { return run(&units[SPHERE], c); }
