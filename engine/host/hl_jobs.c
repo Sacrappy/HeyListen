@@ -19,7 +19,7 @@
    only the worker message path is native, as before.
    HL_DISPATCH_CHECK=1: its invariants are counted (and, with HL_DISPATCH=0, those that can be read after the translated
    dispatcher), and the counters are logged every 10 s.
-   HL_STAGES=1 (with HL_JOBS on): the stage protocol around the dispatcher is native (hl/bridge/Stages.h;
+   HL_STAGES=1 (the default, with HL_JOBS on): the stage protocol around the dispatcher is native (hl/bridge/Stages.h;
    docs/native-engine/jobs-boundary.md, "The stages' protocol"): entry gates on the registration 0x806b0260, the stage
    wait 0x806afc40 and the frame's last stage 0x83acfb90, together (they share the registered mask and count). The
    worker sets, the scheduler's list, the workers' words and the guest's events stay in place. HL_STAGES=0: the
@@ -34,7 +34,7 @@
 #define HL_JOBS_DEFAULT HL_JOBS_THROUGH
 #define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
 #define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
-#define HL_STAGES_DEFAULT 0
+#define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;
