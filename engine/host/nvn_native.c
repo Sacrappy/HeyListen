@@ -3293,6 +3293,7 @@ static void unimplemented(Ctx *c, void *name) {
     ReleaseSRWLockExclusive(&lock);
     RET(strstr((const char *)name, "Initialize") ? 1 : 0);
 }
+void hl_gfx_nvn_proc(const char *name, void (**fn)(Ctx *, void *), void **user);   /* host/hl_gfx.c */
 static int cmp_impl(const void *a, const void *b) { return strcmp(((const nvn_impl *)a)->name, ((const nvn_impl *)b)->name); }
 uint64_t nvn_native_proc(const char *name) {
     static nvn_impl *sorted;
@@ -3312,7 +3313,12 @@ uint64_t nvn_native_proc(const char *name) {
     uint64_t a;
     if (f) {
         const size_t i = (size_t)(f - sorted);
-        if (!addr[i]) addr[i] = hos_hostcall(f->name, f->fn, NULL);
+        if (!addr[i]) {
+            void (*fn)(Ctx *, void *) = f->fn;
+            void *user = NULL;
+            hl_gfx_nvn_proc(f->name, &fn, &user);   /* (HL_GFX_CHECK's tap, host/hl_gfx.c; else left as it is) */
+            addr[i] = hos_hostcall(f->name, fn, user);
+        }
         a = addr[i];
     } else {   /* asked for, maybe never called: it stops the game only when called */
         static struct { char *name; uint64_t a; } *un;

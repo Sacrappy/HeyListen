@@ -24,6 +24,10 @@ void hl_answer(uint64_t guest, A64Fn fn, HlOn on, const char *what);
    when the module's switch is on and hl_supported_build() says 1. */
 #define HL_GATE(addr, hash) volatile int hl_gate_on_##addr; int hl_gate_##addr(Ctx *c)
 
+/* The translated function at a guest address (the lifted table's, whatever answers the address now); NULL when there is
+   none. For a module that runs the translation itself, beside its native answer (a check, a fallback). */
+A64Fn hl_translated(uint64_t guest);
+
 /* 1 when the game is the build the native engine's guest addresses are of. Any other game or update runs as before. */
 int hl_supported_build(void);
 

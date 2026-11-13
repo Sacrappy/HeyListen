@@ -301,6 +301,93 @@ FP-exactness and indirect-call overheads, `hot-functions.md`), and should be rep
 The chain only shortens by as much as the next bound allows: the executors' jobs and the culling job are the other
 branches of the same phase.
 
+## 7. Brick 2.1 as built: the native pass and its check
+
+### What is native and how the game reaches it
+
+| Piece | Where | What it does |
+|---|---|---|
+| `hl::gfx::RecordPass` | `engine/native/{include,src}/hl/gfx/RecordPass.*` | the listener's own level: reads the mode, runs the scene pass (mode 0) or the second pass (mode 1), nothing for any other mode, returns 1 to the walk |
+| `hl::bridge::GfxBridge` | `engine/native/{include,src}/hl/bridge/GfxBridge.*` | the addresses (`0x806602e0`, `0x80660320`, `0x8065fe30`), the argument block read in place (mode at +28), the phases run through the guest runtime on the calling thread's own context |
+| The seam | `hl/gfx/Commands.h` | `Command` (a procedure of the OS layer's NVN table, x0..x5, s0..s3) and `CommandSink`: the one way output leaves the module. Its only user today is the check's recording; a native part will emit into it (NVN first, the Vulkan back end later) |
+| The check | `hl/gfx/PassCheck.h` | below |
+| C surface, OS layer | `hl/c/hl_gfx.h`, `engine/host/hl_gfx.c`; a hook in `nvn_native.c` (`nvn_native_proc`) | `HL_ANSWER(0x806602e0)`: no lifted code changes. The phases are the translated `0x80660320` / `0x8065fe30`, called with the listener's two arguments (both read x0 and x1 only, read in the lifted text) |
+
+Switches: `HL_GFX=1` the native pass (the default since its validation; `HL_GFX=0`: the answer is not installed, the translation runs as before),
+`HL_GFX_CHECK=1` the check (`=2` its control), `HL_GFX_LOG=1` the counters every 10 s.
+
+### The check (step 1)
+
+With `HL_GFX_CHECK=1` the OS layer hands the game a tap instead of each NVN procedure (decided when the game asks for its
+first procedure; without the switch the procedures are untouched). While a pass runs on a thread, the tap adds every
+NVN call of that thread to the pass's recording (procedure, x0..x5, s0..s3). Each pass takes the native or the
+translated path at random (a fixed pseudo-random sequence, so passes that come in a fixed order in a frame are seen on
+both paths). The check compares, inside one process, scene and minutes:
+
+- the **shapes** of the streams (the sequence of procedures, by mode): how many passes of each path recorded a shape the
+  other path never recorded;
+- the **calls a pass of each procedure** called at least once a pass: the largest relative difference between paths.
+
+What it proves: the native path records the same kinds of stream as the translated one, at the same rates, procedure by
+procedure. What it does not prove: that a given pass would have recorded the same arguments on the other path (a pass
+cannot be run twice: it advances the slot table's generation and records GPU events), nor anything about the pass's
+writes to the game's own structures. For the shell this is enough, since the shell calls the same translated phases
+with the same registers; for a native hot part (step 3) it is not: that needs a call-by-call comparison inside one pass,
+the native part run first into a recording sink with its writes kept aside, then the translated part for real under the
+tap (an entry gate can run its translated body itself), comparing calls with their arguments and the bytes written.
+
+`HL_GFX_CHECK=2` is the check's control: the passes drawn for the native path run the translated pass too, so what it
+shows between the two paths is the check's own noise. Measured on the main PC (110 s runs, all passes mode 0; mode 1 was
+never seen in these scenes):
+
+| Run | Scene | Passes (translated / native) | NVN calls a pass (translated / native) | Unmatched passes (translated / native) | Largest difference of a procedure's calls a pass (of 91 compared) |
+|---|---|---|---|---|---|
+| `HL_GFX=1 HL_GFX_CHECK=1` | kokiri-idle | 14,668 / 14,803 | 1,578 / 1,628 | 17.9% / 18.7% | 5.8% (`DrawElementsInstanced`) |
+| | castle-move | 13,553 / 13,678 | 1,304 / 1,345 | 18.9% / 19.7% | 5.8% (`DrawElementsInstanced`) |
+| | hyrule-walk | 17,317 / 17,324 | 1,473 / 1,501 | 18.5% / 19.0% | 4.4% (`DrawElementsInstanced`) |
+| control, `HL_GFX_CHECK=2` | kokiri-idle | 15,658 / 15,742 | 1,597 / 1,635 | 17.6% / 18.2% | 4.7% (`DrawElementsInstanced`) |
+| | castle-move | 17,616 / 17,595 | 1,411 / 1,437 | 18.2% / 18.8% | 4.6% (`DrawElementsInstanced`) |
+
+Read: shapes vary from pass to pass even standing still (about one pass in six has a shape seen nowhere else), and the
+fixed sequence of draws gives the "native" side a few percent more calls a pass and one huge pass (~41,000 calls, at
+the start of a scene) in every run, the control included. The native shell's differences are of the control's size:
+the check sees no difference between the shell and the translated listener. It would see a native part that changes
+which procedures a pass calls, or how many, by more than ~5% for any procedure called once a pass or more; smaller or
+argument-only differences need the call-by-call check described above.
+
+### Validation (main PC, `build/s5/valid.sh`, 110 s a scene)
+
+| Run | Scene | Ran | Game speed ratio | Native passes | Shots |
+|---|---|---|---|---|---|
+| `HL_GFX=1` | kokiri-idle | to the end, no crash | 59.74 | 34,731 | right (compared with `refshots-kokiri-idle`) |
+| | castle-move | to the end, no crash | 59.71 | 35,531 | right |
+| | hyrule-walk | to the end, no crash | 62.96 | 35,751 | right |
+| `HL_GFX=1 HL_GFX_CHECK=1` | the three | to the end, no crash | 59.59 / 59.97 / 59.90 | half of the passes | right |
+
+Memory with `HL_GFX=1` (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 7,780 / 4,143 / 13,455 /
+19,759 / 5,732; castle-move 7,816 / 4,155 / 13,814 / 21,451 / 6,812; hyrule-walk 7,818 / 4,171 / 13,666 / 20,654 /
+6,274. The shell changes no memory: these are the game's figures.
+
+### Where the pass's time is, and what step 3 should take first
+
+Re-aggregated from `build/hotfn` (castle-move, three sampled runs, ms of CPU a frame under `0x80660320`, total 1.92):
+
+| Under `0x80660320` | ms | Note |
+|---|---:|---|
+| slot scan `0x80364080` | 0.92 | 0.83 of it `LockMutex`, 0.69 of that `obj_lookup`: gone since the OS layer's mutex fix, ~0.2 ms left, nearly all host lock calls |
+| draw loop `0x80255be0` | 0.34 | render state `0x80681320` 0.15 (guest 0.074, `check_handle` 0.03), viewport / scissor `0x802640a0` 0.12 (guest 0.097), own 0.04 |
+| ~30 other callees | 0.01-0.06 each | barriers and small draws (`0x8028ca00` 0.06, `0x8028b110` 0.06, `0x8027a310` 0.06, `0x8066bec0` 0.05, `0x802867f0` 0.04, ...), most of their time in shared container helpers (`0x8005ed00`, `0x8028a2a0`, `0x8027bfe0`) |
+| own code | 0.07 | |
+
+Leaf kinds: guest code 0.74, host lock lookup 0.69 (now gone), the rest host NVN recording and runtime. After the mutex
+fix the pass is about 1.2 ms and has no dominant part: the draw loop's two leaves are the largest native candidates.
+Recommendation for step 3: **render state `0x80681320` first** (the NVN-heavy part: 87 of its 99 indirect calls are NVN
+procedures, so it is the seam's natural first producer), behind an entry gate (5 call sites in 4 functions) and the
+call-by-call check above; before writing it, read its callee `0x80078fc0` (3,159 lifted lines, 21 callees: what it is
+decides whether the unit is small) and the two counters around it (`0x80078b10` / `0x80077d60`, 250+ callers each).
+Then viewport / scissor `0x802640a0`. The slot scan is not worth a native rewrite for time now; it is for the mutex the
+pass runs under (section 4).
+
 ## Not read yet
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
