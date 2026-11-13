@@ -808,3 +808,64 @@ game. It stays as the record kind and descriptor path brick D will use for block
   only through a known table) rather than by record. Second, for the per-draw uniform blocks: find the ring writer that fills
   them after `EndRecording` (a write watch on one `0x22` ring pool between a recording's end and its submit), which brick D must
   replace for an inline of those blocks to be right.
+
+## 10. The capture's unread pages: heap memory inside imported chunks (`RX_VK_CAP_ONLY_GPU`, measured)
+
+### What the region is
+
+- **Host side**: `0x1050000000`-`0x1060000000` is in the guest heap (`svcSetHeapSize`, `HOS_HEAP_BASE` `0x1000000000`,
+  `host/hos_mem.c`), 1.25-1.5 GB into it; no address region, no GPU mapping of its own.
+- **Guest heap** (`HOS_HEAP_SPLIT=80` with arena addresses, run `s8heap-castle`): ModuleSystem -> `Actor` (free-list, at
+  `0x104ddc2200`, 398.7 MB) -> `ActorInstanceHeap` (at `0x104e290810`, 325 MB, ~1,150 small per-actor heaps under it): the
+  actors' instance memory. The game makes small NVN pools inside it (8 KB pools of flags `0x24`, scattered through the region:
+  the write-back lines of the log name dozens).
+- **Why the capture took its pages**: not as a pool, a texture or a small pool, but as part of a **mirrored import**
+  (`cap_ranges`, `publish_cap_ranges`): the back end imports guest memory in 16 MB chunks around what is bound
+  (`import_chunk`), and the capture scanned every import whole. A chunk around one 8 KB pool covers 16 MB of actor heap, which
+  the game writes every frame. The other left-out ranges are the same kind: 1,630-1,810 ranges, 640-770 MB of import outside
+  every pool and texture storage (the largest 80 MB at `0x1072000000`, others in the address regions near `0x7f..`).
+- **Who writes it** (`HOS_POOL_TRAP=60 HOS_POOL_TRAP_EVERY=10 HOS_POOL_TRAP_RANGE=1050000000:1060000000`, a new option of
+  `host/hos_memsplit.c` trapping the range's resident pages in no pool; run `s8trap-castle`, resolved with
+  `tools/bench/pooltrap.py`): 123,449 pages trapped; first touches by game code 229 MB read and 19 MB write, on the actor
+  threads (BaseProcExecutor0-4, BaseProcCreateAndDeleteThread) and the module workers (`f_8008fc00`, `f_800f08a0`,
+  `f_8009bb80`, `f_800c2800`, `f_80833760`, `f_8572f300`, `f_814f3500`, ...): ordinary actor and module work. Besides them only
+  the capture's copy (33 MB) and the driver's import (15 MB).
+- **Can the GPU read it**: by NVN's rule a GPU address below 1 TB is valid only inside a memory pool, and the GPU reads guest
+  memory only through the mirrors at bindings (TICK-019). Checked in the game: with `RX_VK_CAP_ONLY_GPU` 1 or 2 every buffer
+  binding (`gpu_buffer_bind`: vertex, index, uniform and storage buffers, indirect arguments, the ranges the programs reach
+  through pointers that the descriptor build binds), every replay read as submitted and every texture upload is tested against
+  the left-out ranges: **0 in all six runs**. Section 9 had found no record naming those pages either.
+
+### The rule and the switch
+
+`RX_VK_CAP_ONLY_GPU` (`gpu/vk/vk_memory.cpp`; default 0, the previous behaviour):
+- **1**: the capture's ranges are the mirrored imports **clipped to the game's pools** (every pool below 1 TB from
+  `host->gpu_pools`, any size), plus the texture storage and the small pools as before (`capture_union_locked`, used by the
+  capture, the pre-copy and `capture_ranges_merged`). The replay's own collection (`memory_collect_written`, whose host ranges
+  merge pools less than 16 MB apart) leaves those pages unstamped too, so no mirror sync copies them. The mirror's bytes there
+  go stale; nothing reads them.
+- **2**: a check: captured as before, the pages 1 leaves out counted.
+- With 1 or 2: the reads and bindings into the left-out ranges counted, the first 20 logged; a line every 10 s:
+  `vk: capture (RX_VK_CAP_ONLY_GPU=...), a frame over the last 10 s ...`.
+
+### Before and after (main PC, `valid.sh s8g2 ... =2` and `valid.sh s8g1 ... =1`, 110 s a scene)
+
+| Scene | Pages a frame before (MB) | of them left out by the rule | Pages a frame after (MB) | Reads into the left-out ranges | Kept capture buffers |
+|---|---:|---:|---:|---:|---|
+| kokiri-idle | 10,287 (40.2) | 8,917 (87%) | **1,292 (5.0)** | 0 | 234 -> 118 MB |
+| castle-move | 10,010 (39.1) | 8,636 (86%) | **1,409 (5.5)** | 0 | 194 -> 114 MB |
+| hyrule-walk | 10,918 (42.6) | 9,448 (87%) | **1,445 (5.6)** | 0 | 245 -> 129 MB |
+
+(The last 10 s line of each run; captures 6.1-6.6 a frame.) Function and picture with 1: the three scenes ran to the end, no
+crash line, game speed ratio 59.96 / 60.09 / 59.78; shots looked at (the last two of each scene): complete and right, the same
+market scenes as the reference, no flicker or missing objects. Memory (game RAM / pools / process RAM / commit / VRAM, MB), with
+2 then 1: kokiri 3,135 / 1,595 / 7,271 / 18,600 / 5,381 -> 2,935 / 1,518 / 6,772 / 18,040 / 5,165; castle 3,392 / 1,770 /
+7,646 / 20,112 / 6,659 -> 2,861 / 1,532 / 7,036 / 19,829 / 6,891; hyrule 2,953 / 1,627 / 7,511 / 19,187 / 5,869 -> 3,254 /
+1,637 / 7,566 / 19,638 / 6,495 (one run each: these move between runs by hundreds of MB; the kept capture buffers above are the
+part this change owns).
+
+### Not verified
+
+The PC 3050; long sessions and scene changes (a pool made inside an import after the clip was built is added at the next pool
+list refresh, every pool-map change or 64 captures, as the small pools always were); a game whose shaders read memory outside
+its pools (NVN does not allow it; the check would count it). The switch stays 0 by default as asked; the runs above are clean.
