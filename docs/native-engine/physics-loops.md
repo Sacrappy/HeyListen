@@ -571,3 +571,59 @@ in the run, e.g. castle-move: u2 384,334, affine 11,894,740, u1 904,874, sphere 
 look right (no black, missing geometry or tint); what they show differs from the reference shots as the reference runs
 differ among themselves (the scenes' timing moves the characters). Memory: game RAM 2.8 / 3.2 / 3.3 GB, process RAM
 7.1 / 8.2 / 7.7 GB (kokiri-idle / castle-move / hyrule-walk): these kernels allocate nothing.
+
+### 8.1 Second session: u3, the fused-sum midpoint, what is declined
+
+**u3, `0x817d9d80`** (the per-body box update, specification 6.3; `hl/math/BodyBox.h`, `src/math/BodyBox.cpp`, the body
+and the other layouts in `hl/bridge/MathBridge.h`, the C surface `hl_math_body_box`, the OS layer's `run_body` in
+`engine/host/hl_math.c`). Reached by a gate on the lifted function (`HL_GATE(817d9d80, ...)`, its one caller
+`0x8182dc20`). The native side reads copies of everything the function reads and returns a plan: the body's 192 bytes
+as the function leaves them with the bytes it stores, and the records it appends to the thread's stream blocks (block,
+offset, record, the header word afterwards). The native run writes the stored bytes and the records (and marks them
+for the write watch); the check runs the translation for real and compares the whole 192-byte body, the moved-bodies
+block's header word, and each planned record and header. The shape's box is answered for the four functions that make
+96% of the calls: the convex vertex set (`0x8173e2ac` -> u1), the oriented box (u2), and a segment's box `0x8174bb00`
+(two vertices plus the radius, single precision: `segment_box` in `Bounds.cpp`); declined, the translated function
+runs: the shapes `0x81a011b0` and `0x818556f0` (3.5%), the swept cast `0x817d8c90` (0.1%), no thread context, a full
+stream block, and values outside the rules (0.2%: squares of velocities near 1e-20 that underflow, which Arm flushes
+under FZ). Its only caller sets every register and the flags it reads after the call (read at `0x8182ecb8` .. and
+both branch targets), so what a native answer leaves in caller-saved registers is not seen.
+
+**The fused sum's midpoint rule, widened exactly.** The decline histogram (`hl math: <unit>: declined by rule: ...` in
+the log, from the `Guard`'s first failure, `hl::math::Why`) showed that every declined affine call (3%) and all but
+13 of 1.5 M sphere calls declined (4%) were on the binary32-midpoint rule of the fused multiply-add, with operands of
+short mantissas whose binary64 sum is exact (e.g. a product of -1.5 units of the addend's last place). Rounding twice
+differs from rounding once only when the binary64 sum was inexact; the `Guard` now gives up only then (exactness
+tested by Knuth's two-sum: a zero error). After it: affine declines 0 to 2 calls a run, sphere 13 to 25 (products
+that underflow, which Arm flushes under FZ: not widened, rare).
+
+Check, main PC, build of `2f924ae` (`HL_MATH_CHECK=1`, every unit checked), full runs, the last report of each run:
+
+| scene | u3 compared (declined) | u2 | affine (declined) | u1 | sphere (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|---:|
+| castle-move | 246,611 (9,994) | 401,414 | 12,484,265 (0) | 976,964 | 912,770 (13) | 0 |
+| kokiri-idle | 404,355 (33,863) | 761,782 | 23,947,254 (2) | 1,634,748 | 1,647,810 (25) | 0 |
+| hyrule-walk | 360,135 (15,742) | 648,559 | 21,404,529 (0) | 1,525,367 | 1,524,230 (13) | 0 |
+
+u3's declines by reason (castle-move / kokiri-idle / hyrule-walk): shape 8,673 / 32,957 / 14,728, cast 338 / 250 /
+317, values 983 / 656 / 697; none for FPCR (every u3 call ran with FZ set and nothing else). An earlier check build
+(before the segment shape) compared 150,959 u3 calls in castle-move with no mismatch. FPSR: in 3 to 5 u3 calls a run
+the translation raised a flag beyond IXC (as u1's, 8: not read back by the game).
+
+Calls whose output overlaps their inputs: every C surface reads all it needs before writing (tested in
+`math_test.cpp`, `outputs_over_inputs`: the same box with the output written over the inputs); u3 works on copies.
+Whether the translated functions are ever called that way in the game is what the check covers: no mismatch.
+
+**Switches**: as before (`HL_MATH`, `HL_MATH_UNITS`, `HL_MATH_CHECK`, `HL_MATH_LOG`); `u3` is a unit name, validated,
+native by default with the four others.
+
+**Validation with the five units native** (main PC, `build/s5/valid.sh`, tag `s7bv`, build of `fa783dc`): the three
+scenes ran to the end (112 s), no crash, game speed ratio 60.17 (kokiri-idle), 59.76 (castle-move), 59.99
+(hyrule-walk); u3 answered 365,279 / 395,701 / 360,936 calls natively (95%). The last shots of each scene look right
+(complete geometry, no black, tint or flicker), differing from the reference shots only as the reference runs differ
+among themselves. Memory: game RAM 2.4 / 3.2 / 3.1 GB, process RAM 6.9 / 7.7 / 7.7 GB (kokiri-idle / castle-move /
+hyrule-walk): u3 allocates nothing (its plan is a per-thread buffer).
+
+**Not done in this session**: `subIntegrateLastStep` `0x8182dc20` (1,591 insns, 7 indirect calls, Havok's block
+allocator and profiler calls) and `solveJacobians` `0x8177b2a0` (3,969 insns, 48 calls, 7 indirect) were not read
+beyond their call lists; no specification of them is written yet, and `BuildJacobians` was not started.
