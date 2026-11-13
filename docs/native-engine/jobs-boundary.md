@@ -454,3 +454,31 @@ core, so a check switch can compute them both ways before any message is sent an
 stage write only flags and counts that the same check can read after each call. A later step takes the twins and the
 module system's group `0x8007fe60` (a second dispatcher of the same shape, to be read like `0x8004ab40`); only then can
 the events themselves become the native side's own.
+
+### The stages natively (`HL_STAGES`, brick 3.4)
+
+`hl::bridge::Stages` (`engine/native/include/hl/bridge/Stages.h`, `src/bridge/Stages.cpp`) answers the registration
+`0x806b0260`, the stage wait `0x806afc40` and the last stage `0x83acfb90` together, through three entry gates
+(`HL_GATE` in `engine/host/hl_jobs.c`, switched on together by `HL_STAGES=1` once the job bridge has started). It writes
+every word above in place with the guest's operations in the guest's order (plain stores where the guest has plain
+stores, the same atomic operations, the full barriers around each worker's reset), calls the guest's own functions for
+the thread-local core, the events (clear, wait), the message queue and a worker's message function when it is not the
+usual one, and runs the owner's part of a stage (the set's own context, in the wait or in the last stage) with the native
+dispatcher. The hand-off policy is three functions with counters: `start` (a registered worker's message),
+`await_done` (a wait for a worker's done event, the lane given up around it), `dispatch` (the owner's part). The module
+system's twins stay translated and keep working on the same objects.
+
+`HL_STAGES_CHECK=1` counts the protocol's invariants, logged every 10 s with the dispatcher's counters: each registration
+is first made by the translated function on the same set (without the message: its gate lets that one call through) and
+its writes read back (the scheduler's list, count and flags, the set's mask, count and own context, each worker's
+context state, flags and scheduler), then made natively over it and read back again, and the two compared; a set is not
+registered again before its stage is over; every registered worker is started once (by the registration's message or by
+its core's last stage) and waited for once; after its done event a worker's context no longer says it is inside its
+dispatcher; at a wait's end, and when the last stage's count reaches zero, the scheduler's stage is over and (for a wait)
+the registered mask and count are still the registration's; the last stage never lowers the count below zero.
+Observations beside them: stages of sets registered before the gates were on (`untracked`), and the owner's lane byte
+after its wait against before its registration (`lane drift`, which the guest's floor at 0 makes legitimate for an owner
+not counted in its lane). `tests/stages_test.cpp` runs it on a model with no game: stages in a row with the message and
+the wait (the OS core read when the thread-local one is 0, an owner inside a job of its lane), an owner that takes part
+(its own context listed first, its core's worker left out and told not to run), the last stage on six threads at once
+with and without the own context, no stage, no stage cores, another message function, a worker not running.
