@@ -117,7 +117,7 @@ bool body_box_update(const BodyUpdateIn& in, BodyUpdateOut& out, BodyDecline& wh
             d[k] = g.sub(p4, p5);
             e[k] = g.add(p1, p0);
         }
-        const float dp[4] = {d[3], d[1], d[0], d[2]};
+        const float dp[4] = {d[3], d[2], d[1], d[0]};
         float qn[4];
         for (int k = 0; k < 4; k++) qn[k] = g.sub(dp[k], e[k]);
         for (int k = 0; k < 3; k++) qn[k] = f32(bits(qn[k]) ^ 0x80000000u);

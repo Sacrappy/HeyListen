@@ -528,6 +528,277 @@ void the_c_surface_reads_the_layouts() {
     CHECK(out.min[1] == 101.5f && out.max[1] == 102.5f && out.min[3] == 1.0f && out.max[3] == 1.0f);
 }
 
+// ---- u3, 0x817d9d80: the body box update through its C surface, on a guest memory laid out as the game's ----
+struct BodyWorld {
+    Arena a;
+    hl_guest_host host;
+    hl_math_body_args args;
+    // guest addresses (Arena: 4 KB from 0x10000)
+    static constexpr uint64_t kBody = 0x10000, kShape = 0x10100, kMotion = 0x10200, kRecord = 0x10280,
+                              kPrev = 0x102f0, kState = 0x10310, kGlobal = 0x10400, kStart = 0x106a0,
+                              kBlock = 0x10700, kHolder = 0x10800, kEntries = 0x10900, kWriter = 0x10960,
+                              kBlock2 = 0x10b00;
+    uint8_t ctx_mem[2048] = {};
+    BodyWorld() {
+        host = a.host();
+        args = {};
+        args.ctx = 0x20000;   // (the context lives in ctx_mem: see at())
+        args.motion = kMotion;
+        args.record = kRecord;
+        args.prev = kPrev;
+        args.body = kBody;
+        args.state = kState;
+        args.global = kGlobal;
+        args.start = kStart;
+        args.shape_kind = 2;
+        host.user = this;
+        host.ptr = at;
+        math::Body b = {};
+        b.xf.row[0][0] = b.xf.row[1][1] = b.xf.row[2][2] = 1.0f;
+        b.xf.hi[0] = 100.0f;
+        b.xf.hi[1] = -20.0f;
+        b.xf.hi[2] = 7.0f;
+        b.xf.hi[3] = 0.25f;   // (the w lane: the margin's base)
+        b.id = 0x1234;
+        b.shape = kShape;
+        b.scale154 = 0x4000;  // 2.0
+        b.b156 = 51;
+        b.at176 = 0xfeedfacecafebeefull;
+        a.put(kBody, b);
+        // an oriented box shape: radius, frame with half extents 1, 2, 3, centre 0
+        bridge::HavokBodyBox sh = {};
+        sh.convex_radius = 0.05f;
+        for (int k = 0; k < 3; k++) sh.frame[k][k] = 1.0f, sh.frame[k][3] = 1.0f + k;
+        a.put(kShape, sh);
+        bridge::HavokMotion m = {};
+        m.f48[0] = 0.5f, m.f48[1] = 0.25f;
+        m.f64[0] = 30.0f, m.f64[1] = 30.0f;
+        m.f96[0] = 1.0f, m.f96[1] = 1.0f;
+        m.f104[0] = 0.5f, m.f104[1] = 0.5f;
+        m.f120[0] = 0.016f, m.f120[1] = 0.016f;
+        a.put(kMotion, m);
+        bridge::HavokSolverRecord r = {};
+        r.f76 = 0.01f;
+        a.put(kRecord, r);
+        const float prev[8] = {500, 500, 500, 0, 600, 600, 600, 0};   // far away: no overlap
+        a.put(kPrev, prev);
+        bridge::HavokPhysicsGlobals g = {};
+        g.f80[0] = 0.02f, g.f80[1] = 0.03f;
+        g.f96[0] = g.f96[1] = 10.0f;
+        g.f336[0] = 0.1f, g.f336[1] = 0.2f;
+        g.f512[0] = g.f512[1] = 0.0625f;
+        g.f640[0] = g.f640[1] = 0.5f;
+        a.put(kGlobal, g);
+        const float big[4] = {f32(0x7f7fffeeu), f32(0x7f7fffeeu), f32(0x7f7fffeeu), f32(0x7f7fffeeu)};
+        a.put(kStart, big);
+        bridge::HavokMotionState s = {};
+        s.orient[3] = 1.0f;
+        s.com[0] = 100.0, s.com[1] = -20.0, s.com[2] = 7.0;
+        a.put(kState, s);
+        const uint32_t header = 0x00020020u;   // two records, 32 bytes used
+        a.put(kBlock, header);
+        const uint32_t header2 = 0x00000000u;
+        a.put(kBlock2, header2);
+        put_ctx(1568, kBlock);
+        put_ctx(1888, kHolder);
+        put_ctx(1896, kEntries);
+        const int8_t index = 1;
+        a.put(kHolder + 677 - 0x200, index);   // (kHolder + 677 lies past the arena's 4 KB: moved below, see at())
+        a.put(kEntries + 80 + 32, kWriter);
+        a.put(kWriter, kBlock2);
+    }
+    void put_ctx(size_t off, uint64_t v) { std::memcpy(ctx_mem + off, &v, 8); }
+    static void* at(void* user, uint64_t guest) {
+        BodyWorld* w = static_cast<BodyWorld*>(user);
+        if (guest >= 0x20000) return w->ctx_mem + (guest - 0x20000);
+        if (guest == kHolder + 677) return w->a.mem + (kHolder + 677 - 0x200 - 0x10000);
+        return w->a.mem + (guest - 0x10000);
+    }
+    math::Body body() const { math::Body b; std::memcpy(&b, a.mem + (kBody - 0x10000), sizeof b); return b; }
+    template <class T> T get(uint64_t at) const { T v; std::memcpy(&v, a.mem + (at - 0x10000), sizeof v); return v; }
+};
+
+void body_box_still_box_shape() {
+    BodyWorld w;
+    hl_math_body_plan plan;
+    CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 1);
+    math::Body after;
+    std::memcpy(&after, plan.body, sizeof after);
+    const math::Body before = w.body();
+    // not moving: the quantised speeds cleared, the transform kept
+    CHECK(after.q76 == 0 && after.q78 == 0 && after.q94 == 0 && plan.written[76] && plan.written[94]);
+    CHECK(std::memcmp(&after.xf, &before.xf, sizeof after.xf) == 0 && !plan.written[0]);
+    // the box: the oriented box's (u2) grown by the margin max(max(0.25 - m48 g336, m48 g336), r76)
+    bridge::HavokBodyBox sh = w.get<bridge::HavokBodyBox>(BodyWorld::kShape);
+    const float bias[2] = {0.02f, 0.03f};
+    const math::Box box = ref_oriented_box_box(before.xf, sh.frame, sh.convex_radius, bias);
+    float f[2];
+    const float m48[2] = {0.5f, 0.25f}, g336[2] = {0.1f, 0.2f};
+    for (int k = 0; k < 2; k++) {
+        const float t = m48[k] * g336[k];
+        const float d = 0.25f - t;
+        f[k] = std::fmax(std::fmax(d, t), 0.01f);
+    }
+    for (int k = 0; k < 3; k++) CHECK(after.box_hi[k] == f[k & 1] + box.max[k]);
+    CHECK(after.box_hi[3] == box.min[2] - f[0] && after.box_lo[0] == box.min[0] - f[0] && after.box_lo[1] == box.min[1] - f[1]);
+    CHECK((after.flags & 0x10) && plan.written[92] && plan.written[96] && plan.written[119] && !plan.written[120]);
+    // B148 / B150: the margin times m64, toward zero, saturated to 16 bits
+    CHECK(after.q148 == (uint16_t)(int)((0.0f + f[0]) * 30.0f) && after.q150 == (uint16_t)(int)(f[0] * 30.0f));
+    // both appends: the old box (zero) does not hold the new one; the prev box is far away
+    CHECK(plan.appends == 2);
+    CHECK(plan.add[0].block == BodyWorld::kBlock && plan.add[0].at == 32 + 0x20 && plan.add[0].header == 0x00030030u);
+    uint32_t id;
+    std::memcpy(&id, plan.add[0].rec + 8, 4);
+    CHECK(id == 0x1234 && plan.add[0].len == 12 && plan.add[0].rec[0] == 0x10 && plan.add[0].rec[3] == 0x03);
+    uint64_t tail;
+    std::memcpy(&tail, plan.add[1].rec + 8, 8);
+    CHECK(plan.add[1].block == BodyWorld::kBlock2 && plan.add[1].at == 32 && plan.add[1].header == 0x00010010u &&
+          tail == 0xfeedfacecafebeefull && plan.add[1].len == 16);
+    // the guest's memory is not written by the plan
+    CHECK(std::memcmp(&before, w.a.mem, sizeof before) == 0);
+
+    // the same box stored already, still: nothing stored, no flag
+    math::Body same = after;
+    same.flags = before.flags;
+    w.a.put(BodyWorld::kBody, same);
+    CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 1);
+    CHECK(!plan.written[92] && !plan.written[96]);
+    // and inside the prev box: no second append
+    const float around[8] = {-1000, -1000, -1000, 0, 1000, 1000, 1000, 0};
+    w.a.put(BodyWorld::kPrev, around);
+    CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 1 && plan.appends == 0);
+}
+
+void body_box_declines() {
+    {   // a shape whose box function is not native
+        BodyWorld w;
+        w.args.shape_kind = 0;
+        hl_math_body_plan plan;
+        CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 0 && plan.decline == (int)math::BodyDecline::shape);
+    }
+    {   // no thread context
+        BodyWorld w;
+        w.args.ctx = 0;
+        hl_math_body_plan plan;
+        CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 0 && plan.decline == (int)math::BodyDecline::no_ctx);
+    }
+    {   // the block full
+        BodyWorld w;
+        const uint32_t full = 0x00fd0fd0u;
+        w.a.put(BodyWorld::kBlock, full);
+        hl_math_body_plan plan;
+        CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 0 && plan.decline == (int)math::BodyDecline::block_full);
+    }
+    {   // a NaN in the state's velocities
+        BodyWorld w;
+        bridge::HavokMotionState s = w.get<bridge::HavokMotionState>(BodyWorld::kState);
+        s.f40[6] = f32(kQNaN);
+        w.a.put(BodyWorld::kState, s);
+        hl_math_body_plan plan;
+        CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 0 && plan.decline == (int)math::BodyDecline::values);
+        uint64_t v[3];
+        CHECK(hl_math_last_why(v) == (int)math::Why::in_nan_inf && v[0] == kQNaN);
+        CHECK(hl_math_last_why(v) == 0);
+    }
+    {   // fast enough for the swept cast (record flag bit 17, |v|^2 above the threshold)
+        BodyWorld w;
+        bridge::HavokMotionState s = w.get<bridge::HavokMotionState>(BodyWorld::kState);
+        s.f40[6] = 50.0f;
+        w.a.put(BodyWorld::kState, s);
+        bridge::HavokSolverRecord r = w.get<bridge::HavokSolverRecord>(BodyWorld::kRecord);
+        r.flags = 0x20000;
+        w.a.put(BodyWorld::kRecord, r);
+        hl_math_body_plan plan;
+        CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 0 && plan.decline == (int)math::BodyDecline::cast);
+        r.flags = 0;   // without the flag: answered, the box grown along the motion
+        w.a.put(BodyWorld::kRecord, r);
+        CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 1);
+    }
+}
+
+// a moving body: the transform rebuilt from the motion's orientation and the body's own, the position from the
+// centre of mass in binary64 (high + low parts), the quantised speeds
+void body_box_moving() {
+    BodyWorld w;
+    math::Body b = w.body();
+    b.flags = 0x400;
+    b.xf.row[0][3] = 0.5f;   // the local centre of mass (the rows' w lanes)
+    b.xf.row[1][3] = -0.25f;
+    b.xf.row[2][3] = 0.125f;
+    b.orient[3] = 1.0f;      // (the body's own orientation: identity)
+    w.a.put(BodyWorld::kBody, b);
+    bridge::HavokMotionState s = w.get<bridge::HavokMotionState>(BodyWorld::kState);
+    const float h = std::sqrt(0.5f);
+    s.orient[0] = 0, s.orient[1] = 0, s.orient[2] = h, s.orient[3] = h;   // 90 degrees about z
+    s.com[0] = 1000.123456789, s.com[1] = -2.5, s.com[2] = 3.0;
+    for (int k = 0; k < 6; k++) s.f40[k] = 0.1f * (float)(k + 1);
+    w.a.put(BodyWorld::kState, s);
+    hl_math_body_plan plan;
+    CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 1);
+    math::Body after;
+    std::memcpy(&after, plan.body, sizeof after);
+    // rows of the quarter turn about z (to rounding), w lanes kept
+    CHECK(std::fabs(after.xf.row[0][1] - 1.0f) < 1e-6f && std::fabs(after.xf.row[1][0] + 1.0f) < 1e-6f &&
+          std::fabs(after.xf.row[2][2] - 1.0f) < 1e-6f && std::fabs(after.xf.row[0][0]) < 1e-6f);
+    CHECK(after.xf.row[0][3] == 0.5f && after.xf.row[1][3] == -0.25f && after.xf.row[2][3] == 0.125f);
+    // position = com - R c, as high + low
+    for (int k = 0; k < 3; k++) {
+        const double c = (double)after.xf.row[0][k] * 0.5 + (double)after.xf.row[1][k] * -0.25 + (double)after.xf.row[2][k] * 0.125;
+        const double p = (double)after.xf.hi[k] + (double)after.xf.lo[k];
+        CHECK(std::fabs(p - (s.com[k] - c)) < 1e-6);
+        CHECK((double)after.xf.hi[k] == (double)(float)(s.com[k] - c) || std::fabs(after.xf.lo[k]) < 1e-3f);
+    }
+    CHECK(plan.written[0] && plan.written[11] && !plan.written[12] && plan.written[48] && !plan.written[60] &&
+          plan.written[72] && !plan.written[76 + 12]);
+    // speeds: lane 0 of the guest's sums, plus about 0.999, toward zero
+    const float a0 = 0.1f * 1.0f, a1 = 0.2f * 1.0f, a2 = 0.3f * 1.0f;
+    const float l = std::sqrt((a0 * a0 + a1 * a1) + a2 * a2);
+    const float mn = l < 10.0f ? l : 10.0f;
+    float sc = (float)51 * f32(0x3b808081u);
+    sc = (sc + 0.0f) * 2.0f;
+    const float v4 = mn * sc;
+    CHECK(after.q78 == (uint16_t)(int)(30.0f * v4 + f32(0x3f7fbe77u)));
+    CHECK(after.q94 == (uint16_t)((int)(f32(0x4722f8e0u) * mn + f32(0x3f7fbe77u)) < 0xffff ? (int)(f32(0x4722f8e0u) * mn + f32(0x3f7fbe77u)) : 0xffff));
+}
+
+// the inline path: the quantised local box (bytes times the global scale times the body's), rotated, around the
+// precise position plus the rotated centre of mass, rounded outward
+void body_box_inline() {
+    BodyWorld w;
+    math::Body b = w.body();
+    b.flags140 = 8;
+    b.ext157[0] = 10, b.ext157[1] = 20, b.ext157[2] = 30;
+    b.xf.row[0][3] = 0.5f;
+    b.xf.lo[0] = 1e-5f;
+    w.a.put(BodyWorld::kBody, b);
+    w.args.shape_kind = 0;   // (not asked on this path)
+    hl_math_body_plan plan;
+    CHECK(hl_math_body_box(&w.host, &w.args, &plan) == 1);
+    math::Body after;
+    std::memcpy(&after, plan.body, sizeof after);
+    const float s154 = 2.0f, g = 0.0625f;
+    const float e[3] = {g * s154 * 10, g * s154 * 20, g * s154 * 30};
+    float mn[3], mx[3];
+    for (int k = 0; k < 3; k++) {
+        float ext = std::fabs(b.xf.row[2][k] * e[2]) + (std::fabs(b.xf.row[0][k] * e[0]) + std::fabs(b.xf.row[1][k] * e[1]));
+        if (ext > s154) ext = s154;
+        const float c = b.xf.row[2][k] * b.xf.row[2][3] + (b.xf.row[0][k] * b.xf.row[0][3] + b.xf.row[1][k] * b.xf.row[1][3]);
+        const double p = ((double)b.xf.hi[k] + (double)b.xf.lo[k]) + (double)c;
+        mn[k] = ref_narrow_min(p + (double)-ext);
+        mx[k] = ref_narrow_max(p + (double)ext);
+    }
+    float f0;
+    {
+        const float t = 0.5f * 0.1f;
+        f0 = std::fmax(std::fmax(0.25f - t, t), 0.01f);
+    }
+    const float f1 = std::fmax(std::fmax(0.25f - 0.25f * 0.2f, 0.25f * 0.2f), 0.01f);
+    const float f[3] = {f0, f1, f0};
+    for (int k = 0; k < 3; k++) CHECK(after.box_hi[k] == f[k] + mx[k]);
+    CHECK(after.box_lo[0] == mn[0] - f0 && after.box_lo[1] == mn[1] - f1 && after.box_hi[3] == mn[2] - f0);
+    CHECK(mx[0] - mn[0] == 2 * s154 || mx[0] - mn[0] > 2 * 1.25f);   // (x clamped to the body's scale: 1.25 < 2)
+}
+
 }   // namespace
 
 int main() {
@@ -541,6 +812,10 @@ int main() {
     the_c_surface_reads_the_layouts();
     model_sphere_matches_the_specification();
     the_c_surface_reads_the_model_bounds();
+    body_box_still_box_shape();
+    body_box_declines();
+    body_box_moving();
+    body_box_inline();
     std::puts("math: ok");
     return 0;
 }
