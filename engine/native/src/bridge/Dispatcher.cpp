@@ -531,15 +531,18 @@ int Dispatcher::report(char* out, size_t cap) const {
                           v(s.handed), v(s.runs), v(s.runs_from_pops), v(s.finishes), v(s.completes), v(s.readied),
                           v(s.hook_pushes), v(s.forwards), v(s.drops), v(s.requeues), v(s.full), v(s.sleeps), v(s.polls),
                           v(s.wakes), v(s.waits), v(s.stage_ends));
-    if (n < 0 || (size_t)n >= cap || !options_.check) return n < 0 ? 0 : n;
+    if (n < 0) return 0;
+    if ((size_t)n >= cap) return (int)cap - 1;
+    if (!options_.check) return n;
     const long long unaccounted = (long long)(v(s.pops_a) + v(s.pops_b)) - (long long)(v(s.runs_from_pops) + v(s.forwards) + v(s.drops));
-    const long long unfinished = (long long)v(s.runs) + (long long)v(s.handed) * 0 - (long long)v(s.finishes);
+    const long long unfinished = (long long)v(s.runs) - (long long)v(s.finishes);
     const int m = std::snprintf(out + n, cap - (size_t)n,
                                 "; CHECK: pops not run %lld, runs not finished %lld, bad finishes %llu, bad counts %llu, "
                                 "double runs %llu; stage ends checked %llu: with jobs left %llu, contexts asleep then %llu",
                                 unaccounted, unfinished, v(s.bad_finish), v(s.bad_count), v(s.double_run), v(s.end_checks),
                                 v(s.end_left), v(s.end_asleep));
-    return m < 0 ? n : n + m;
+    if (m < 0) return n;
+    return (size_t)(n + m) >= cap ? (int)cap - 1 : n + m;
 }
 
 }   // namespace hl::bridge

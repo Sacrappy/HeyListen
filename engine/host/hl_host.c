@@ -71,9 +71,33 @@ uint64_t hl_guest_call(HosThread *as, uint64_t fn, uint64_t a0, uint64_t a1) {
     if (as) hos_thread_act_as(before);
     return r;
 }
-static void cb_call(void *user, void *as, uint64_t fn, uint64_t a0, uint64_t a1) {
+static uint64_t cb_call(void *user, void *as, uint64_t fn, uint64_t a0, uint64_t a1) {
     (void)user;
-    hl_guest_call((HosThread *)as, fn, a0, a1);
+    return hl_guest_call((HosThread *)as, fn, a0, a1);
+}
+/* (a frame goes on the guest stack below where the thread stands, and the stack pointer comes back after the call) */
+static uint64_t cb_call_with(void *user, void *as, uint64_t fn, const uint64_t *args, unsigned nargs, const void *frame,
+                             unsigned frame_size) {
+    (void)user;
+    HosThread *before = as ? hos_thread_act_as((HosThread *)as) : NULL;
+    Ctx *c = hos_ctx();
+    const uint64_t sp = c->x[31];
+    for (unsigned i = 0; i < nargs && i < 4; i++) c->x[i] = args[i];
+    if (frame_size) {
+        const uint64_t at = (sp - frame_size) & ~(uint64_t)15;
+        memcpy(GP(at), frame, frame_size);
+        c->x[31] = at;
+        c->x[nargs] = at;
+    }
+    a64_icall(c, fn);
+    const uint64_t r = c->x[0];
+    c->x[31] = sp;
+    if (as) hos_thread_act_as(before);
+    return r;
+}
+static void cb_log(void *user, const char *line) {
+    (void)user;
+    hos_log("%s", line);
 }
 
 typedef struct { void (*entry)(void *); void *arg; } Start;
@@ -103,6 +127,6 @@ static void cb_thread_join(void *user, void *handle) {
 }
 
 const hl_guest_host *hl_host(void) {
-    static const hl_guest_host host = {NULL, cb_ptr, cb_current, cb_call, cb_thread_start, cb_thread_join};
+    static const hl_guest_host host = {NULL, cb_ptr, cb_current, cb_call, cb_call_with, cb_log, cb_thread_start, cb_thread_join};
     return &host;
 }
