@@ -32,7 +32,8 @@
    What a walk can miscount: blocks taken or given back while it ran (missed or counted twice; the free total and the free
    block count then differ from the heap's own count, which is logged beside them), never memory outside the heap. Heaps
    made or ended during the enumeration may be missed; a heap object is taken only with a heap vtable (in the image, with the
-   heap base's function 0x809dfe30 in slot 29) and an arena in the window. Residency is counted by page: a page goes to the smallest heap whose range holds its start. GPU pools are the
+   heap base's function 0x809dfe30 in slot 29) and an arena in the window. Residency is counted by page: a page goes to the deepest heap whose range holds it (from the root down,
+   through the child whose range holds it). GPU pools are the
    ranges the host's GPU mapping list keeps (nvdrv.c hos_gpu_pools: the NVN pools with storage), merged. */
 #include "hos.h"
 #include <stdio.h>
@@ -50,11 +51,20 @@ typedef struct { void *va; ULONG_PTR attr; } WsInfo;   /* PSAPI_WORKING_SET_EX_I
 typedef BOOL(WINAPI *QueryWsFn)(HANDLE, PVOID, DWORD);
 static QueryWsFn query_ws;
 
-/* ---- reads of guest memory that cannot fault: only inside a committed, readable region (the last one seen is kept) */
+/* ---- reads of guest memory that cannot fault: only inside a committed, readable region. The last 64 regions seen are
+   kept (a VirtualQuery in the fragmented window costs tens of microseconds), and forgotten every 256 heaps: memory given
+   back meanwhile is looked up again */
+typedef struct { uint64_t lo, hi; } OkRange;
+enum { NCACHE = 64 };
+static OkRange cache[NCACHE];
+static unsigned cache_next;
 static uint64_t ok_lo, ok_hi;
+static void readable_forget(void) { memset(cache, 0, sizeof cache), ok_lo = ok_hi = 0; }
 static int readable(uint64_t a, uint64_t n) {
     if (a < HOS_SYSTEM_BASE || a >= HOS_GUEST_SPACE || n > HOS_GUEST_SPACE - a) return 0;
     if (a >= ok_lo && a + n <= ok_hi) return 1;
+    for (int i = 0; i < NCACHE; i++)
+        if (a >= cache[i].lo && a + n <= cache[i].hi) { ok_lo = cache[i].lo, ok_hi = cache[i].hi; return 1; }
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(GP(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
         return 0;
@@ -63,6 +73,7 @@ static int readable(uint64_t a, uint64_t n) {
         return 0;
     ok_lo = (uint64_t)((uint8_t *)mbi.BaseAddress - (uint8_t *)GP(0));
     ok_hi = ok_lo + mbi.RegionSize;
+    cache[cache_next++ & (NCACHE - 1)] = (OkRange){ok_lo, ok_hi};
     return a + n <= ok_hi;
 }
 static int rd64(uint64_t a, uint64_t *v) {
@@ -94,8 +105,8 @@ enum { NCLASSES = sizeof classes / sizeof classes[0] };
 typedef struct {
     uint64_t obj, vt, start, size;
     int parent, depth, cls;   /* (cls: index in classes, -1 not known) */
-    int first_child, next_sibling;
-    char name[56];
+    int first_child, next_sibling, last_child;
+    char name[96];
     int64_t free;   /* (by the heap's own bookkeeping; -1 not known) */
     uint32_t used_count, free_count;   /* (free-list: the heap's counts) */
     int64_t walked_free, largest_free;   /* (free-list: free blocks found by the walk, the largest one's size) */
@@ -103,13 +114,13 @@ typedef struct {
     uint64_t res_own, res_pool, res_incl, res_free;   /* (pages) */
     uint64_t cold_out, cold_back;   /* (pages taken out of the working set, back after the window) */
 } Heap;
-enum { MAX_HEAPS = 16384, MAX_DEPTH = 32 };
+enum { MAX_HEAPS = 65536, MAX_DEPTH = 32 };   /* (castle: ~16,000, most of them one a resource file) */
 static Heap *heaps;
 static int nheaps;
 static int64_t torn_walks;
 
 static uint64_t *seen;   /* (open addressing set of heap objects: no heap twice, no cycle) */
-enum { SEEN_SLOTS = 65536 };
+enum { SEEN_SLOTS = 262144 };
 static int seen_add(uint64_t obj) {
     uint64_t h = (obj >> 3) * 0x9E3779B97F4A7C15ull;
     for (int i = 0; i < SEEN_SLOTS; i++) {
@@ -219,7 +230,7 @@ static void own_free(Heap *h, int idx) {
 
 static int add_heap(uint64_t obj, int parent, int depth) {
     uint64_t vt, start, size, namep, slot29;
-    ok_hi = 0;   /* (the readable region is looked up again for each heap: memory may have been given back meanwhile) */
+    if (!(nheaps & 255)) readable_forget();
     /* (a heap's vtable has the heap base's own function in slot 29, 0x809dfe30, in all thirteen classes: a list node that
        moved under the walk leads to some other object, whose vtable does not) */
     if (nheaps >= MAX_HEAPS || depth >= MAX_DEPTH || (obj & 7) || !rd64(obj, &vt) || vt < hos_image_base ||
@@ -239,16 +250,17 @@ static int add_heap(uint64_t obj, int parent, int depth) {
     Heap *h = &heaps[idx];
     memset(h, 0, sizeof *h);
     h->obj = obj, h->vt = vt, h->start = start, h->size = size, h->parent = parent, h->depth = depth;
-    h->first_child = h->next_sibling = -1;
+    h->first_child = h->next_sibling = h->last_child = -1;
     h->cls = -1;
     for (int i = 0; i < NCLASSES; i++)
         if (classes[i].vt == vt) h->cls = i;
     if (rd64(obj + 32, &namep)) read_name(namep, h->name, sizeof h->name);
     if (!h->name[0]) snprintf(h->name, sizeof h->name, "(heap %#llx)", (unsigned long long)obj);
     if (parent >= 0) {   /* (children kept in list order) */
-        int *at = &heaps[parent].first_child;
-        while (*at >= 0) at = &heaps[*at].next_sibling;
-        *at = idx;
+        Heap *p = &heaps[parent];
+        if (p->last_child >= 0) heaps[p->last_child].next_sibling = idx;
+        else p->first_child = idx;
+        p->last_child = idx;
     }
     own_free(h, idx);
     /* its child heaps: the list at +64 (the walk of 0x80503f00, which finds the heap that holds an address) */
@@ -330,6 +342,49 @@ static int in_pool(uint64_t a) {   /* (pools sorted, merged) */
     return 0;
 }
 
+/* (the heap that owns a page: from the root holding it down through the child holding it, children sorted by start) */
+static int *kids, *kid_at, *kid_n;
+static uint64_t page_lo(int i) { return heaps[i].start & ~0xFFFull; }
+static uint64_t page_hi(int i) { return (heaps[i].start + heaps[i].size) & ~0xFFFull; }
+static int by_start(const void *a, const void *b) {
+    const uint64_t x = heaps[*(const int *)a].start, y = heaps[*(const int *)b].start;
+    return x < y ? -1 : x > y;
+}
+static int build_kids(void) {
+    kid_at = (int *)calloc((size_t)nheaps + 1, sizeof *kid_at);
+    kid_n = (int *)calloc((size_t)nheaps + 1, sizeof *kid_n);
+    kids = (int *)calloc((size_t)nheaps + 1, sizeof *kids);
+    if (!kid_at || !kid_n || !kids) return 0;
+    for (int i = 0; i < nheaps; i++)
+        if (heaps[i].parent >= 0) kid_n[heaps[i].parent]++;
+    for (int i = 0, at = 0; i < nheaps; i++) kid_at[i] = at, at += kid_n[i];
+    int *fill = (int *)calloc((size_t)nheaps + 1, sizeof *fill);
+    if (!fill) return 0;
+    for (int i = 0; i < nheaps; i++)
+        if (heaps[i].parent >= 0) kids[kid_at[heaps[i].parent] + fill[heaps[i].parent]++] = i;
+    free(fill);
+    for (int i = 0; i < nheaps; i++)
+        if (kid_n[i] > 1) qsort(kids + kid_at[i], (size_t)kid_n[i], sizeof *kids, by_start);
+    return 1;
+}
+static int owner_of(uint64_t a) {
+    int cur = -1;
+    for (int i = 0; i < nheaps; i++)   /* (the roots: a handful) */
+        if (heaps[i].parent < 0 && a >= page_lo(i) && a < page_hi(i) && (cur < 0 || heaps[i].size < heaps[cur].size)) cur = i;
+    for (int depth = 0; cur >= 0 && depth < MAX_DEPTH; depth++) {
+        const int *k = kids + kid_at[cur];
+        int l = 0, r = kid_n[cur] - 1, found = -1;
+        while (l <= r) {   /* (the last child starting at or before a) */
+            const int m = (l + r) / 2;
+            if (page_lo(k[m]) <= a) found = m, l = m + 1;
+            else r = m - 1;
+        }
+        if (found < 0 || a >= page_hi(k[found])) break;
+        cur = k[found];
+    }
+    return cur;
+}
+
 #define MB(p) ((double)(p) / 256.0)   /* (pages to MB) */
 #define BMB(b) ((double)(b) / 1048576.0)   /* (bytes to MB) */
 
@@ -385,7 +440,7 @@ static int by_res(const void *a, const void *b) {
 }
 
 /* (heaps grouped by name with digits taken out: actor instance heaps and the like) */
-typedef struct { char name[56]; int count; uint64_t size, own, pool, free_ram, cold_out, cold_back; int64_t freeb; } Group;
+typedef struct { char name[96]; int count; uint64_t size, own, pool, free_ram, cold_out, cold_back; int64_t freeb; } Group;
 static int by_group(const void *a, const void *b) {
     const Group *x = (const Group *)a, *y = (const Group *)b;
     const uint64_t p = x->own + x->pool, q = y->own + y->pool;
@@ -452,6 +507,7 @@ static DWORD WINAPI heapsplit_main(void *p) {
 
     /* 3. the pieces between consecutive heap and pool edges: each belongs to the smallest heap that holds it (or none), and is
        inside a pool or not */
+    if (!build_kids()) return 0;
     const int nb_max = 2 * nheaps + 2 * npools;
     uint64_t *edges = (uint64_t *)malloc((size_t)(nb_max ? nb_max : 1) * sizeof *edges);
     if (!edges) return 0;
@@ -463,11 +519,7 @@ static DWORD WINAPI heapsplit_main(void *p) {
     for (int e = 0; e + 1 < nb; e++) {
         const uint64_t lo = edges[e], hi = edges[e + 1];
         if (hi <= lo) continue;
-        int owner = -1;
-        for (int i = 0; i < nheaps; i++) {
-            const uint64_t hl = heaps[i].start & ~0xFFFull, hh = (heaps[i].start + heaps[i].size) & ~0xFFFull;
-            if (lo >= hl && lo < hh && (owner < 0 || heaps[i].size < heaps[owner].size)) owner = i;
-        }
+        const int owner = owner_of(lo);
         const int pool = in_pool(lo);
         if (owner < 0 && !pool) continue;
         const uint64_t got = resident_in(lo, hi, cold && owner >= 0 && !pool ? owner : -2);
@@ -625,12 +677,17 @@ static DWORD WINAPI heapsplit_main(void *p) {
     Group *groups = (Group *)calloc(4096, sizeof *groups);
     int ngroups = 0;
     for (int i = 0; groups && i < nheaps; i++) {
-        char key[56];
+        char key[96];
         size_t k = 0;
-        for (const char *s = heaps[i].name; *s && k + 1 < sizeof key; s++)
-            if (!(*s >= '0' && *s <= '9')) key[k++] = *s;
-            else if (!k || key[k - 1] != '#') key[k++] = '#';
-        key[k] = 0;
+        const char *slash = strchr(heaps[i].name, '/'), *dot = strrchr(heaps[i].name, '.');
+        if (slash && dot && dot > slash)   /* (a resource file's heap: by its folder and its kind, "Model/ *.bfres", one group) */
+            snprintf(key, sizeof key, "%.*s/*%s", (int)(slash - heaps[i].name), heaps[i].name, dot);
+        else {
+            for (const char *s = heaps[i].name; *s && k + 1 < sizeof key; s++)
+                if (!(*s >= '0' && *s <= '9')) key[k++] = *s;
+                else if (!k || key[k - 1] != '#') key[k++] = '#';
+            key[k] = 0;
+        }
         int g = 0;
         while (g < ngroups && strcmp(groups[g].name, key)) g++;
         if (g == ngroups) {
