@@ -89,9 +89,12 @@ static_assert(sizeof(DispatchContext) == 232);
 
 /// A worker: a thread object of the game's.
 struct Worker {
-    uint8_t _0[40];
-    uint8_t queue[132];   ///< its message queue
-    uint32_t state;
+    GuestAddr vtable;   ///< +0x10: its message function (worker, message, 1)
+    uint8_t _8[32];
+    uint8_t queue[120];   ///< its message queue
+    uint64_t last_message;   ///< a message equal to it is not queued again
+    uint8_t _a8[4];
+    uint32_t state;       ///< 3 or 4: not running (no message is queued)
     uint32_t core_mask;
     uint8_t _b4[36];
     DispatchContext context;
@@ -102,6 +105,7 @@ struct Worker {
     GuestAddr scheduler;   ///< the scheduler it serves in the stage; 0: none
 };
 static_assert(offsetof(Worker, queue) == 40);
+static_assert(offsetof(Worker, last_message) == 0xa0);
 static_assert(offsetof(Worker, state) == 172);
 static_assert(offsetof(Worker, core_mask) == 176);
 static_assert(offsetof(Worker, context) == 216);
@@ -119,8 +123,8 @@ struct WorkerSet {
     uint32_t stage_cores;                    ///< mask
     std::atomic<uint32_t> registered_count;  ///< workers registered and not yet done
     uint32_t registered_mask;
-    uint32_t flags;   ///< bit 0: the owner takes part with the set's own context
-    GuestAddr scheduler;
+    uint32_t flags;   ///< bit 0: the owner takes part with the set's own context; bit 1: its lane kept when already right
+    GuestAddr scheduler;   ///< the stage's; 0: no stage
 };
 static_assert(offsetof(WorkerSet, workers) == 8);
 static_assert(offsetof(WorkerSet, own_context) == 16);

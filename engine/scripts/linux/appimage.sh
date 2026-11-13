@@ -41,7 +41,7 @@ T=$APPDIR/usr/share/hookshot
 L=$APPDIR/usr/lib/hookshot
 
 # ---- the tools (the sources the player's build compiles, and the scripts) ----
-cp -a nx2 host LICENSE readme.md assets "$T/"
+cp -a nx2 host native LICENSE readme.md assets "$T/"   # (native: the native engine, compiled into the game by nx2/build.py)
 printf '%s
 ' "$VERSION" > "$T/VERSION"   # (no git history in here: nx2/version.py reads the release name from it)
 mkdir -p "$T/builder" "$T/gpu/render" "$T/gpu/vk" "$T/third_party"
@@ -52,7 +52,9 @@ cp -a gpu/render/*.h "$T/gpu/render/"
 for h in $(grep -rhoE 'gpu/vk/[A-Za-z0-9_]+[.]h' host | sort -u); do if [ -f "$h" ]; then cp -a "$h" "$T/gpu/vk/"; fi; done
 cp -a third_party/opus "$T/third_party/"
 cp -a third_party/kenney_input "$T/third_party/"
-mkdir -p "$T/third_party/zbic" "$T/third_party/a64-kit"
+# (zstd's decoder: nx2/build.py compiles it into the game for host/hl_stream.c)
+mkdir -p "$T/third_party/zbic" "$T/third_party/a64-kit" "$T/third_party/zstd"
+cp -a third_party/zstd/lib "$T/third_party/zstd/"
 cp -a third_party/zbic/zbic.so third_party/zbic/LICENSE third_party/zbic/PROVENANCE.md "$T/third_party/zbic/"
 cp -a third_party/a64-kit/* "$T/third_party/a64-kit/"
 rm -f "$T/third_party/a64-kit/tools/lld-link.exe"

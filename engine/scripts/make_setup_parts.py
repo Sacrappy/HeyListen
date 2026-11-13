@@ -1,5 +1,5 @@
 """(HeyListen: the setup is released as HeyListenBuilder.exe, its list is heylisten-setup.txt, its new parts
-HeyListenBuilder-<part>-<sha>.zip; parts reused from upstream keep their names and URLs.)
+HeyListenBuilder-<part>-<sha>.zip; parts first made upstream keep their names and are served from this repository too.)
 
 The parts HookshotBuilder-Setup.exe downloads (builder/setup/setup.c), from a Hookshot Builder package folder.
 
@@ -103,7 +103,9 @@ def main():
                 fn = w[6].rsplit("/", 1)[-1] if len(w) == 7 else ""
                 prefix = next((x for x in PART_PREFIXES if fn.startswith(x)), None)
                 if w and w[0] == "part" and prefix:
-                    reuse[fn[len(prefix):].rsplit("-", 1)[0]] = line
+                    # (HeyListen v0.3.1: served from this repository's builder-parts release, which mirrors them under the same
+                    # names and checksums. Upstream's repository went offline on 2026-11-13 and every install failed on its links)
+                    reuse[fn[len(prefix):].rsplit("-", 1)[0]] = " ".join(w[:6] + ["%s/%s" % (base, fn)])
     lines = ["tag %s" % a.tag]
     for name in ("app", "dotnet") + TOOLS_PARTS:
         if not parts.get(name):

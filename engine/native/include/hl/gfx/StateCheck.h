@@ -32,16 +32,21 @@ public:
     /// Where the first mismatches are written in full, one line each.
     using Log = void (*)(void* user, const char* line);
 
-    StateCheck(Log log, void* user, uint32_t most_logged = 8) : log_(log), user_(user), most_logged_(most_logged) {}
+    /// `name` begins every line it logs ("render state").
+    StateCheck(const char* name, Log log, void* user, uint32_t most_logged = 8)
+        : name_(name), log_(log), user_(user), most_logged_(most_logged) {}
 
     /// One call: the native version's commands and the block it would leave (expected), the translated body's commands
-    /// and the block it left (actual). Returns true when they are the same.
+    /// and the block it left (actual). Returns true when they are the same. `path_differs`: the native version's
+    /// decision of which way the call goes no longer holds (a mismatch of the calls whatever they are).
     bool compare(uint64_t block, uint32_t key, const std::vector<Command>& native,
-                 const std::vector<Command>& translated, const uint8_t* expected, const uint8_t* actual, size_t size);
+                 const std::vector<Command>& translated, const uint8_t* expected, const uint8_t* actual, size_t size,
+                 bool path_differs = false);
     void deferred() { deferred_.fetch_add(1, std::memory_order_relaxed); }
     Report report() const;
 
 private:
+    const char* name_;
     Log log_;
     void* user_;
     uint32_t most_logged_;

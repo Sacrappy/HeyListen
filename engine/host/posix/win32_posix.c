@@ -14,6 +14,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <ucontext.h>
 
 /* the guest window (third_party/a64-kit/rt/a64.h A64_HOST_BASE, host/hos.h HOS_GUEST_SPACE): one mapping, all of it
@@ -255,6 +256,18 @@ DWORD GetThreadId(HANDLE h) {
     return (DWORD)t->tid;
 }
 DWORD GetProcessId(HANDLE p) { (void)p; return (DWORD)getpid(); }
+/* (host/hl_stream.c's page check) the kernel copies, so a page that is not mapped fails with EFAULT instead of faulting */
+BOOL ReadProcessMemory(HANDLE p, LPCVOID from, void *to, SIZE_T n, SIZE_T *got) {
+    (void)p;
+    struct iovec local = {to, n}, remote = {(void *)from, n};
+    const ssize_t r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (got) *got = r > 0 ? (SIZE_T)r : 0;
+    if (r != (ssize_t)n) {
+        last_error = error_of(r < 0 ? errno : EFAULT);
+        return FALSE;
+    }
+    return TRUE;
+}
 HANDLE OpenThread(DWORD access, BOOL inherit, DWORD id) {
     (void)access, (void)inherit, (void)id;
     last_error = ERROR_NOT_SUPPORTED;

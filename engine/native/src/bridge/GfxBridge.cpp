@@ -26,6 +26,9 @@ GuestAddr proc_global(uint32_t proc) {
         0x84d67c20, 0x84d67c30, 0x84d67ea0, 0x84d67c28, 0x84d67c48,               // command buffer: binds, blend color
         0x84d67e88, 0x84d67e90, 0x84d67e98,                                       // stencil values
         0x84d67c40, 0x84d67eb8, 0x84d67ed8,                                       // polygon state, offset clamp, depth clamp
+        // (read from the sub-mesh submission and its draw helpers)
+        0x84d67d90, 0x84d67c10, 0x84d67d98,   // geometry processing mode, call commands, mesh tasks
+        0x84d674a8, 0x84d67d68,               // buffer address, indexed instanced draw
     };
     return proc < gfx::kProcCount ? kGlobals[proc] : 0;
 }
@@ -130,5 +133,124 @@ void StateBridge::expect(uint8_t* bytes, const gfx::StateOutputs& out) {
 }
 
 void StateBridge::copy(GuestAddr block, uint8_t* bytes) const { std::memcpy(bytes, runtime_.ptr(block), kBlockSize); }
+
+// ---- the sub-mesh submission ----
+
+namespace {
+uint32_t u32(const GuestRuntime& rt, GuestAddr a) {
+    uint32_t v;
+    std::memcpy(&v, rt.ptr(a), 4);
+    return v;
+}
+}   // namespace
+
+SubmitRoute DrawBridge::route(GuestAddr drawable, uint32_t mask) const {
+    const uint32_t flags = at<guest::Drawable>(runtime_, drawable).flags, kinds = flags & mask;
+    if (kinds & 8) return SubmitRoute::Query;
+    if (flags & 0x20) return SubmitRoute::Callback;
+    if (kinds & 0x51) return SubmitRoute::Clusters;
+    if (u32(runtime_, u64(runtime_, kInlineCallSwitchSlot))) return SubmitRoute::Inline;
+    return SubmitRoute::Direct;
+}
+
+void DrawBridge::read_prologue(GuestAddr drawable, GuestAddr block, uint32_t sub_mesh, gfx::PrologueInputs& in,
+                               GuestAddr& context) const {
+    const guest::Drawable& d = at<guest::Drawable>(runtime_, drawable);
+    const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
+    in.sub_mesh = (int32_t)sub_mesh;
+    in.sub_meshes = (d.counts >> 4) & 0xf;
+    in.applied_mode = b.geometry_mode;
+    in.mode_bits = b.mode_bits;
+    context = b.renderer;
+    // (the model is read only past the range check, as the function does)
+    in.geometry_mode = in.sub_mesh < (int32_t)in.sub_meshes ? at<guest::Model>(runtime_, d.model).geometry_mode : 0;
+}
+
+GuestAddr DrawBridge::command_buffer(GuestAddr context) const {
+    return context ? at<guest::Renderer>(runtime_, context).command_buffer : 0;
+}
+
+void DrawBridge::write_prologue(GuestAddr block, const gfx::PrologueOutputs& out) const {
+    if (!out.mode_changed) return;
+    guest::RenderStateBlock& b = *static_cast<guest::RenderStateBlock*>(runtime_.ptr(block));
+    b.geometry_mode = out.applied_mode;
+    b.mode_bits = out.mode_bits;
+    runtime_.written(block + offsetof(guest::RenderStateBlock, geometry_mode), 1);
+    runtime_.written(block + offsetof(guest::RenderStateBlock, mode_bits), 4);
+}
+
+namespace {
+GuestAddr record_of(const guest::Model& m, uint32_t sub_mesh) {
+    return m.records + (uint64_t)((int64_t)(int32_t)sub_mesh * (int64_t)sizeof(guest::SubmeshRecord));
+}
+}   // namespace
+
+void DrawBridge::read_submit(GuestAddr drawable, GuestAddr block, uint32_t sub_mesh, uint64_t prepared,
+                             GuestAddr context, gfx::SubmitInputs& in, gfx::SubmitHandles& h) const {
+    in = gfx::SubmitInputs{};
+    h = gfx::SubmitHandles{};
+    in.prepared = prepared;
+    if (!(prepared & 1)) return;
+    const guest::Drawable& d = at<guest::Drawable>(runtime_, drawable);
+    const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
+    const guest::Model& m = at<guest::Model>(runtime_, d.model);
+    const GuestAddr record = record_of(m, sub_mesh);
+    const guest::SubmeshRecord& r = at<guest::SubmeshRecord>(runtime_, record);
+    in.instances = d.instances;
+    in.recorded = r.flags;
+    in.mode_bits = b.mode_bits;
+    in.mesh_kind = m.mesh_kind;
+    in.mesh_tasks = m.mesh_tasks;
+    in.triangles = b.triangles;
+    in.sub_mesh_triangles = r.triangles;
+    h.command_list = record + offsetof(guest::SubmeshRecord, command_list);
+    // (the command buffer is read on every path that records; the one that records nothing reads it harmlessly)
+    h.command_buffer = command_buffer(context);
+}
+
+void DrawBridge::read_indexed(GuestAddr drawable, uint32_t sub_mesh, gfx::IndexedInputs& in) const {
+    const guest::Model& m = at<guest::Model>(runtime_, at<guest::Drawable>(runtime_, drawable).model);
+    const GuestAddr desc = at<guest::Mesh>(runtime_, m.mesh).descriptors +
+                           (uint64_t)((int64_t)(int32_t)sub_mesh * (int64_t)sizeof(guest::SubmeshDescriptor));
+    const guest::SubmeshDescriptor& s = at<guest::SubmeshDescriptor>(runtime_, desc);
+    // (the first range, and the last of range_count from it: 8-byte entries, a byte offset then a count)
+    in.first_offset = u32(runtime_, s.ranges);
+    const GuestAddr last = s.ranges + (uint64_t)((int64_t)(int32_t)s.range_count * 8) - 8;
+    in.last_offset = u32(runtime_, last);
+    in.last_count = u32(runtime_, last + 4);
+    in.index_shift = s.index_type;
+    in.mode = u32(runtime_, kPrimitiveTable + 4ull * s.primitive);
+    in.type = u32(runtime_, kIndexTypeTable + 4ull * s.index_type);
+    in.base_vertex = s.base_vertex;
+    in.buffer = at<guest::IndexHolder>(runtime_, s.index_holder).buffer;
+}
+
+void DrawBridge::write_submit(GuestAddr block, const gfx::SubmitHandles& h, const gfx::SubmitOutputs& out) const {
+    if (out.marked) {
+        *static_cast<uint8_t*>(runtime_.ptr(h.command_buffer + guest::kCommandBufferMark)) = 1;
+        runtime_.written(h.command_buffer + guest::kCommandBufferMark, 1);
+    }
+    if (out.counted) {
+        static_cast<guest::RenderStateBlock*>(runtime_.ptr(block))->triangles = out.triangles;
+        runtime_.written(block + offsetof(guest::RenderStateBlock, triangles), 4);
+    }
+}
+
+void DrawBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const {
+    std::memcpy(bytes, runtime_.ptr(block), sizeof(guest::RenderStateBlock));
+    bytes[sizeof(guest::RenderStateBlock)] =
+        command_buffer ? *static_cast<const uint8_t*>(runtime_.ptr(command_buffer + guest::kCommandBufferMark)) : 0;
+}
+
+void DrawBridge::expect_prologue(uint8_t* bytes, const gfx::PrologueOutputs& out) {
+    if (!out.mode_changed) return;
+    bytes[offsetof(guest::RenderStateBlock, geometry_mode)] = out.applied_mode;
+    std::memcpy(bytes + offsetof(guest::RenderStateBlock, mode_bits), &out.mode_bits, 4);
+}
+
+void DrawBridge::expect_submit(uint8_t* bytes, const gfx::SubmitOutputs& out) {
+    if (out.marked) bytes[sizeof(guest::RenderStateBlock)] = 1;
+    if (out.counted) std::memcpy(bytes + offsetof(guest::RenderStateBlock, triangles), &out.triangles, 4);
+}
 
 }   // namespace hl::bridge

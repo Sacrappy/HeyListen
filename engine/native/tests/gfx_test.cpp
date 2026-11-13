@@ -14,6 +14,7 @@
 #include "hl/gfx/RecordPass.h"
 #include "hl/gfx/RenderState.h"
 #include "hl/gfx/StateCheck.h"
+#include "hl/gfx/SubmeshDraw.h"
 
 using namespace hl;
 
@@ -270,8 +271,9 @@ void the_nvn_sink_passes_each_procedures_arguments() {
     struct Seen { uint32_t proc, nx, nf; uint64_t x0; uint32_t f2; };
     static std::vector<Seen> seen;
     gfx::NvnEntryPoints nvn;
-    nvn.call = [](void*, uint32_t proc, const uint64_t* x, uint32_t nx, const uint32_t* f, uint32_t nf) {
+    nvn.call = [](void*, uint32_t proc, const uint64_t* x, uint32_t nx, const uint32_t* f, uint32_t nf) -> uint64_t {
         seen.push_back({proc, nx, nf, x[0], nf > 2 ? f[2] : 0});
+        return 0x5000 + proc;
     };
     gfx::NvnSink sink(nvn);
     gfx::Command c = gfx::command(gfx::Proc::CommandBufferSetPolygonOffsetClamp, 0x99);
@@ -280,13 +282,20 @@ void the_nvn_sink_passes_each_procedures_arguments() {
     sink.emit(gfx::command(gfx::Proc::ChannelMaskStateSetChannelMask, 0x77, 1, 1, 1, 1, 1));
     CHECK(seen.size() == 2 && seen[0].nx == 1 && seen[0].nf == 3 && seen[0].x0 == 0x99 && seen[0].f2 == 0x3f800000);
     CHECK(seen[1].proc == (uint32_t)gfx::Proc::ChannelMaskStateSetChannelMask && seen[1].nx == 6 && seen[1].nf == 0);
+    // (a query is answered by asking, and not sent again by the sink; the indexed draw passes all eight registers)
+    const gfx::Command q = gfx::command(gfx::Proc::BufferGetAddress, 0x42);
+    CHECK(nvn.ask(q) == 0x5000 + (uint32_t)gfx::Proc::BufferGetAddress && seen.size() == 3 && seen[2].nx == 1);
+    sink.emit(q);
+    CHECK(seen.size() == 3);
+    sink.emit(gfx::command(gfx::Proc::CommandBufferDrawElementsInstanced, 1, 2, 3, 4, 5, 6, 7, 8));
+    CHECK(seen.size() == 4 && seen[3].nx == 8);
     for (uint32_t p = 0; p < gfx::kProcCount; p++) CHECK(gfx::proc_name(p) && std::strncmp(gfx::proc_name(p), "nvn", 3) == 0);
     CHECK(!gfx::proc_name(gfx::kProcCount));
 }
 
 void the_state_check_compares_calls_and_bytes() {
     static std::vector<std::string> lines;
-    gfx::StateCheck check([](void*, const char* line) { lines.push_back(line); }, nullptr, 1);
+    gfx::StateCheck check("render state", [](void*, const char* line) { lines.push_back(line); }, nullptr, 1);
     std::vector<gfx::Command> a = {gfx::command(gfx::Proc::ColorStateSetLogicOp, 0x10, 3),
                                    gfx::command(gfx::Proc::CommandBufferBindColorState, 0xcb, 0x10)};
     std::vector<gfx::Command> b = a;
@@ -306,6 +315,182 @@ void the_state_check_compares_calls_and_bytes() {
     CHECK(r.block_mismatches == 1 && r.deferred == 1);
     // (only the first mismatch in full, with its differing call)
     CHECK(lines.size() == 2 && lines[1].find("nvnCommandBufferBindColorState(0xcb, 0x10)") != std::string::npos);
+    CHECK(lines[0].rfind("render state: mismatch", 0) == 0);
+    // (a path that changed is a mismatch of the calls even when the lists agree)
+    CHECK(!check.compare(0x100, 4, a, a, x, x, sizeof x, true));
+    CHECK(check.report().command_mismatches == 3);
+}
+
+// ---- the sub-mesh submission ----
+
+void the_prologue_sets_the_geometry_mode_when_it_changes() {
+    gfx::PrologueInputs in;
+    in.sub_mesh = 2;
+    in.sub_meshes = 2;
+    CHECK(!gfx::SubmeshDraw::prologue(in).in_range);
+    in.sub_mesh = -1;   // (a signed comparison, as the game's)
+    CHECK(gfx::SubmeshDraw::prologue(in).in_range);
+    in.sub_mesh = 1;
+    in.geometry_mode = 1;
+    in.applied_mode = 1;
+    in.mode_bits = 0x20;
+    gfx::PrologueOutputs out = gfx::SubmeshDraw::prologue(in);
+    CHECK(out.in_range && !out.mode_changed && out.mode_bits == 0x20);
+    Recorder r;
+    gfx::SubmeshDraw::emit_prologue(out, 0xcb, r);
+    CHECK(r.calls.empty());
+    in.applied_mode = 0;
+    out = gfx::SubmeshDraw::prologue(in);
+    CHECK(out.mode_changed && out.applied_mode == 1 && out.mode_bits == 0x4020);
+    gfx::SubmeshDraw::emit_prologue(out, 0xcb, r);
+    CHECK(r.calls.size() == 1 && r.calls[0].op == (uint32_t)gfx::Proc::CommandBufferSetGeometryProcessingMode);
+    CHECK(r.calls[0].x[0] == 0xcb && r.calls[0].x[1] == 1);
+    in.geometry_mode = 2;
+    in.mode_bits = 0x4021;
+    out = gfx::SubmeshDraw::prologue(in);
+    CHECK(out.mode_changed && out.applied_mode == 2 && out.mode_bits == 0x21);
+}
+
+void the_submission_picks_its_path_and_counts() {
+    gfx::SubmitInputs in;
+    in.prepared = 2;   // (bit 0 clear: nothing at all)
+    CHECK(gfx::SubmeshDraw::decide(in, nullptr).how == gfx::Submit::None && !gfx::SubmeshDraw::decide(in, nullptr).counted);
+    in.prepared = 1;
+    in.recorded = 1;
+    in.mode_bits = 0x20;
+    in.instances = 1;
+    in.triangles = 0xfffffff0;
+    in.sub_mesh_triangles = 0x20;   // (32-bit counter)
+    gfx::SubmitOutputs out = gfx::SubmeshDraw::decide(in, nullptr);
+    CHECK(out.how == gfx::Submit::CallCommands && out.marked && out.counted && out.triangles == 0x10);
+    gfx::SubmitHandles at{0xcb, 0x9050};
+    Recorder r;
+    gfx::SubmeshDraw::emit(out, nullptr, 0, at, r);
+    CHECK(r.calls.size() == 1 && r.calls[0].op == (uint32_t)gfx::Proc::CommandBufferCallCommands);
+    CHECK(r.calls[0].x[0] == 0xcb && r.calls[0].x[1] == 1 && r.calls[0].x[2] == 0x9050);
+    // (more than one instance, no list, or lists not allowed: by the mesh kind)
+    in.instances = 3;
+    CHECK(gfx::SubmeshDraw::path(in) == gfx::Submit::Elements);
+    in.instances = 0;
+    in.mode_bits = 0;
+    gfx::IndexedInputs ix;
+    ix.first_offset = 0x100;
+    ix.last_offset = 0x40;   // (a negative span shifts arithmetically, as the game's)
+    ix.last_count = 100;
+    ix.index_shift = 1;
+    ix.mode = 4, ix.type = 2, ix.base_vertex = 7, ix.buffer = 0xb0;
+    out = gfx::SubmeshDraw::decide(in, &ix);
+    CHECK(out.how == gfx::Submit::Elements && !out.marked && out.instances == 1 && out.count == 100u - 0x60u);
+    r.calls.clear();
+    gfx::SubmeshDraw::emit(out, &ix, 0x10000, at, r);
+    CHECK(r.calls.size() == 2 && r.calls[0].op == (uint32_t)gfx::Proc::BufferGetAddress && r.calls[0].x[0] == 0xb0);
+    const gfx::Command& d = r.calls[1];
+    CHECK(d.op == (uint32_t)gfx::Proc::CommandBufferDrawElementsInstanced && d.x[0] == 0xcb && d.x[1] == 4 && d.x[2] == 2);
+    CHECK(d.x[3] == 100u - 0x60u && d.x[4] == 0x10100 && d.x[5] == 7 && d.x[6] == 0 && d.x[7] == 1);
+    in.mesh_kind = 2;
+    in.mesh_tasks = 65;
+    out = gfx::SubmeshDraw::decide(in, nullptr);
+    CHECK(out.how == gfx::Submit::MeshTasks && out.tasks == 3);
+    in.mesh_kind = 1;
+    CHECK(gfx::SubmeshDraw::decide(in, nullptr).tasks == 65);
+    r.calls.clear();
+    gfx::SubmeshDraw::emit(gfx::SubmeshDraw::decide(in, nullptr), nullptr, 0, at, r);
+    CHECK(r.calls.size() == 1 && r.calls[0].op == (uint32_t)gfx::Proc::CommandBufferDrawMeshTasks && r.calls[0].x[1] == 0 &&
+          r.calls[0].x[2] == 65);
+    in.mesh_kind = 3;   // (draws nothing, still counted)
+    out = gfx::SubmeshDraw::decide(in, nullptr);
+    CHECK(out.how == gfx::Submit::None && out.counted);
+}
+
+void the_draw_bridge_reads_and_writes_in_place() {
+    SparseRuntime rt;
+    const uint64_t drawable = 0x100000, block = 0x200000, context = 0x300000, cb = 0x310000, model = 0x400000,
+                   mesh = 0x500000, descs = 0x600000, records = 0x700000, ranges = 0x800000, holder = 0x900000;
+    rt.put<uint64_t>(bridge::kInlineCallSwitchSlot, 0xa00000);
+    rt.put<uint32_t>(0xa00000, 0);
+    rt.put<uint16_t>(drawable + 0x1e, 3 << 4);
+    rt.put<uint32_t>(drawable + 0x54, 0x80);
+    rt.put<uint16_t>(drawable + 0x5c, 2);
+    rt.put<uint64_t>(drawable + 0x68, model);
+    rt.put<uint64_t>(block + 0x28, context);
+    rt.put<uint8_t>(block + 0x3b, 0);
+    rt.put<uint32_t>(block + 0x50, 10);
+    rt.put<uint32_t>(block + 0x5c, 0x20);
+    rt.put<uint64_t>(context + 0xd8, cb);
+    rt.put<uint64_t>(model + 0x8, mesh);
+    rt.put<uint64_t>(model + 0x638, records);
+    rt.put<uint8_t>(model + 0x69e, 1);
+    rt.put<uint8_t>(model + 0x69f, 0);
+    rt.put<uint64_t>(mesh + 0x18, descs);
+    const uint64_t desc = descs + 2 * 0x38, record = records + 2 * 0x270;
+    rt.put<uint64_t>(desc, ranges);
+    rt.put<uint64_t>(desc + 0x10, holder);
+    rt.put<uint64_t>(holder + 8, 0xbbbb);
+    rt.put<uint32_t>(desc + 0x24, 3);
+    rt.put<uint32_t>(desc + 0x28, 1);
+    rt.put<uint32_t>(desc + 0x30, 9);
+    rt.put<uint16_t>(desc + 0x34, 2);
+    rt.put<uint32_t>(ranges, 0x20);
+    rt.put<uint32_t>(ranges + 8, 0x60);
+    rt.put<uint32_t>(ranges + 12, 5);
+    rt.put<uint32_t>(bridge::kPrimitiveTable + 12, 0x44);
+    rt.put<uint32_t>(bridge::kIndexTypeTable + 4, 0x55);
+    rt.put<uint8_t>(record + 0x58, 1);
+    rt.put<uint32_t>(record + 0x268, 7);
+    bridge::DrawBridge db(rt);
+    // (the route: by the flags, the mask and the switch)
+    CHECK(db.route(drawable, 0) == bridge::SubmitRoute::Direct);
+    CHECK(db.route(drawable, 0x80) == bridge::SubmitRoute::Direct);   // (bit 7 alone is not a path of its own)
+    rt.put<uint32_t>(drawable + 0x54, 0x81);
+    CHECK(db.route(drawable, 0x01) == bridge::SubmitRoute::Clusters && db.route(drawable, 0x80) == bridge::SubmitRoute::Direct);
+    rt.put<uint32_t>(drawable + 0x54, 0x28);
+    CHECK(db.route(drawable, 8) == bridge::SubmitRoute::Query && db.route(drawable, 0) == bridge::SubmitRoute::Callback);
+    rt.put<uint32_t>(drawable + 0x54, 0);
+    rt.put<uint32_t>(0xa00000, 1);
+    CHECK(db.route(drawable, 0) == bridge::SubmitRoute::Inline);
+    rt.put<uint32_t>(0xa00000, 0);
+
+    gfx::PrologueInputs pin;
+    uint64_t ctx = 0;
+    db.read_prologue(drawable, block, 2, pin, ctx);
+    CHECK(ctx == context && pin.sub_meshes == 3 && pin.geometry_mode == 1 && pin.applied_mode == 0 && pin.mode_bits == 0x20);
+    const gfx::PrologueOutputs pout = gfx::SubmeshDraw::prologue(pin);
+    uint8_t expected[bridge::DrawBridge::kSnapshotSize], actual[bridge::DrawBridge::kSnapshotSize];
+    db.snapshot(block, cb, expected);
+    bridge::DrawBridge::expect_prologue(expected, pout);
+    db.write_prologue(block, pout);
+    db.snapshot(block, cb, actual);
+    CHECK(std::memcmp(expected, actual, sizeof actual) == 0);
+    CHECK(rt.get<uint8_t>(block + 0x3b) == 1 && rt.get<uint32_t>(block + 0x5c) == 0x4020 && db.command_buffer(ctx) == cb);
+
+    // (two instances: the indexed draw)
+    gfx::SubmitInputs in;
+    gfx::SubmitHandles at;
+    db.read_submit(drawable, block, 2, 1, ctx, in, at);
+    CHECK(in.instances == 2 && in.recorded == 1 && in.triangles == 10 && in.sub_mesh_triangles == 7);
+    CHECK(at.command_buffer == cb && at.command_list == record + 0x50);
+    CHECK(gfx::SubmeshDraw::path(in) == gfx::Submit::Elements);
+    gfx::IndexedInputs ix;
+    db.read_indexed(drawable, 2, ix);
+    CHECK(ix.first_offset == 0x20 && ix.last_offset == 0x60 && ix.last_count == 5 && ix.index_shift == 1);
+    CHECK(ix.mode == 0x44 && ix.type == 0x55 && ix.base_vertex == 9 && ix.buffer == 0xbbbb);
+    gfx::SubmitOutputs out = gfx::SubmeshDraw::decide(in, &ix);
+    CHECK(out.count == 5 + 0x20 && out.instances == 2);
+    // (one instance: the pre-recorded list, the command buffer marked)
+    rt.put<uint16_t>(drawable + 0x5c, 1);
+    db.read_submit(drawable, block, 2, 1, ctx, in, at);
+    out = gfx::SubmeshDraw::decide(in, nullptr);
+    CHECK(out.how == gfx::Submit::CallCommands);
+    db.snapshot(block, cb, expected);
+    bridge::DrawBridge::expect_submit(expected, out);
+    rt.writes.clear();
+    db.write_submit(block, at, out);
+    db.snapshot(block, cb, actual);
+    CHECK(std::memcmp(expected, actual, sizeof actual) == 0);
+    CHECK(rt.get<uint8_t>(cb + 0x10) == 1 && rt.get<uint32_t>(block + 0x50) == 17 && rt.writes.size() == 2);
+    // (not prepared: nothing read past the result)
+    db.read_submit(drawable, block, 2, 0, ctx, in, at);
+    CHECK(in.prepared == 0 && at.command_buffer == 0);
 }
 
 }   // namespace
@@ -319,6 +504,9 @@ int main() {
     the_bridge_reads_and_writes_the_block_in_place();
     the_nvn_sink_passes_each_procedures_arguments();
     the_state_check_compares_calls_and_bytes();
+    the_prologue_sets_the_geometry_mode_when_it_changes();
+    the_submission_picks_its_path_and_counts();
+    the_draw_bridge_reads_and_writes_in_place();
     std::printf("gfx: ok\n");
     return 0;
 }

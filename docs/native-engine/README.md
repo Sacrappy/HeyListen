@@ -111,43 +111,55 @@ table is read against them, not to argue with the goal.
   multiply-adds, NaN rules of min and max, flush-to-zero, ARM's reciprocal square root estimate), or the game's
   simulation diverges from the console's. Each replacement is compared on live inputs before it is switched on.
 
-## State of the hybrid engine (kept current; last update 2026-11-13, afternoon)
+## State of the hybrid engine (kept current; last update 2026-11-13, evening)
 
-What is native and switched on in the game today (each brick validated in the three scenes by function and picture;
-speed is not being measured for now, by the owner's instruction: it comes back when the physics loops are touched):
+Every one of the five subsystems of the hybrid scope has native code switched on in the game. Each brick is validated in
+the three scenes by function and picture, and by its own check (invariants or bit-for-bit comparison with the
+translated code); speed is not being measured for now, by the owner's instruction.
 
 | Subsystem | Brick | Switch (default) | What it does today | What is still the game's |
 |---|---|---|---|---|
-| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | stage begin, registration and wait, the job group, the main loop |
-| Jobs | `hl::bridge::Dispatcher` | `HL_DISPATCH` (1) | the stage's jobs are picked and run by the native dispatcher, in place on the game's scheduler (its invariants clean in 18 runs) | the stage owner's and nested calls still run the translated dispatcher beside it (being moved: `HL_DISPATCH_ALL`) |
+| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | the main loop |
+| Jobs | `hl::bridge::Dispatcher` | `HL_DISPATCH` (1), `HL_DISPATCH_ALL` (1) | every caller of the dispatcher runs the native one, in place on the game's scheduler (invariants clean in 32 runs); Havok's tasks are among the jobs it runs | - |
+| Jobs | `hl::bridge::Stages` | `HL_STAGES` (1) | the stage registration, the stage wait and the frame's last stage are answered natively, together (invariants clean in 15 runs; each registration compared with the translated one in check mode) | the stages' begin forms, the module system's twins of the registration and the wait |
+| Jobs | `hl::bridge::JobGroup` | `HL_JOBGROUP` (1) | the module system's job group `0x8007fe60` (the main thread's long wait and the five module workers' loop) runs natively over the dispatcher's loop with a heap policy (invariants clean in 11 checked runs of 12, pictures right) | its twins `0x800711c0` / `0x80070b20` |
 | Memory | no-access GPU pools out of RAM | `HOS_NOACCESS_RAM` (1) | 0.4 GB of RAM | - |
-| Memory | `hl::mem::ColdPages`, pools and heaps | `HL_MEM_COLD` (1), `HL_MEM_COLD_HEAPS` (1) | cold pages of CPU-cached GPU pools and of the game's heaps leave the working set: 4 to 4.5 GB of RAM (commit unchanged: page-file-backed) | true decommit with restore from the game's files (specified: `memory-boundary.md` 9) |
+| Memory | `hl::mem::ColdPages`, pools and heaps | `HL_MEM_COLD` (1), `HL_MEM_COLD_HEAPS` (1) | cold pages of GPU pools and of the game's heaps leave the working set: 4 to 4.5 GB of RAM (commit unchanged) | giving the pages back for good (the restore from the game's files is proven; the decommit is not built: `stream-boundary.md` 9) |
 | Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |
-| Memory | the back end's caches | `RX_VK_BC_CACHE_LAZY` (on above 9.5 GB of VRAM), `RX_VK_CAP_FIT` (1) | Vulkan memory in system memory 1.5 GB -> 0.5 GB | the driver's own arenas |
-| Rendering | `hl::gfx::RecordPass` | `HL_GFX` (1) | the recording pass's listener is native and runs the pass's two phases | the phases themselves (translated); the first native producer of NVN calls is being written (`HL_GFX_STATE`); direct emission to Vulkan |
-| Streaming | `hl::stream` (`host/hl_stream.c`) | `HL_STREAM` (1) | the decode of a resource file (`0x80108da0`) is native for files that fit one read (95% of the files, 40% of the bytes): zstd's own decoder with the game's dictionaries, byte-identical over 24,000 files; where each decoded range came from is recorded (`hl::stream::Provenance`) | the chunked case (the large files: 60% of the bytes), the file reads, the resource manager around it (`stream-boundary.md`) |
-| Physics loops | - | - | being written: the first kernels, bit-exact, through gates (`HL_MATH`) | everything; specified in `physics-loops.md` |
+| Memory | the back end's caches | `RX_VK_BC_CACHE_LAZY`, `RX_VK_CAP_FIT` | Vulkan memory in system memory 1.5 GB -> 0.5 GB | the driver's own arenas |
+| Rendering | `hl::gfx::RecordPass` | `HL_GFX` (1) | the recording pass's listener is native and runs the pass's two phases | the phases themselves |
+| Rendering | `hl::gfx::RenderState` | `HL_GFX_STATE` (1) | the state of every draw (about 33 NVN calls) is derived and emitted by native code through the `CommandSink` seam; exact check: 0 mismatches over 4.2 million NVN calls | the shared draw preparation `0x8008fc00` (mapped, being written: `HL_GFX_PREP`), the draw function and its variants, the draw loop |
+| Rendering | `hl::gfx::SubmeshDraw` | `HL_GFX_DRAW` (1) | the sub-mesh submission `0x80078fc0` is native on its direct paths, exact check at 0 mismatches | its cluster paths |
+| Rendering | `hl::gfx::Records` | `HL_GFX_REC` (1) | the native render state writes the back end's records itself, with no NVN procedure call in between (`HL_GFX_REC_CHECK`: byte-identical records) | uniform data in the records (measured: `direct-emission.md` 9), the flatten copy |
+| Streaming | `hl::stream` | `HL_STREAM` (1) | every resource file's decompression is native, the chunked case included: zstd's own decoder with the game's dictionaries, byte-identical over 27,000 files; provenance of each decoded range recorded | the file reads' scheduling, the resource manager around it |
+| Physics loops | `hl::math` | `HL_MATH` (1) | five units native and bit-exact (0 mismatches over tens of millions of compared calls on two machines): four box and sphere kernels and the per-body box update of the solver's last step | the solver's integration and contact loops (being written), the narrow phase, cloth |
 | OS layer | a mutex finds its host object from itself | `HOS_NO_MUTEX_IX` unset | 0.5 ms a frame of lookups gone from the chain | - |
 
-Measured with the memory bricks above on (main PC, validation runs of main at `458ee6af`, MB):
+Measured with all of it on (main PC, validation runs of main at `74223127` and later, MB):
 
 | | Game's memory in RAM | Process RAM | Process commit | VRAM |
 |---|---:|---:|---:|---:|
 | at the start of the day | 8,200 | 14,100 | 24,900 | 6,600-7,300 |
-| now | 3,050-3,620 | 7,060-8,080 | 19,300-20,500 | 6,000-6,900 |
+| now | 3,280-3,350 | 7,470-8,080 | 19,000-20,600 | 5,900-7,100 |
 
 The game's own memory is under the 4 GB aimed at, as RAM occupied; the commit charge is not, because cold pages are left
-to the system rather than given back (giving them back needs a restore source: the game's files, through the native
-streaming module). The process holds about 4 GB beyond the game's memory (the GPU driver's arenas, this engine's
-objects and caches, the executable).
+to the system rather than given back. The process holds about 4 GB beyond the game's memory (the GPU driver's arenas,
+this engine's objects and caches, the executable).
 
-Tools that measure it: `HOS_MEM_SPLIT` (RAM by part and by GPU pool flags), `HOS_HEAP_SPLIT[_COLD]` (the heaps as a tree,
-their RAM and coldness), `HOS_POOL_TRAP` (who touches GPU pool pages), `RX_VK_RES_LOG` (the process and VRAM),
-`tools/bench/steptable.py` (the table of a set of runs).
+Tools that measure it: `HOS_MEM_SPLIT`, `HOS_HEAP_SPLIT[_COLD]`, `HOS_POOL_TRAP`, `HL_STREAM_PAGES`, `RX_VK_RES_LOG`,
+`tools/bench/steptable.py`. Checks that prove a brick: `HL_DISPATCH_CHECK`, `HL_GFX_CHECK`, `HL_STREAM_CHECK`,
+`HL_MATH_CHECK`.
 
-To look at when speed is measured again: the cold-pages thread sees up to a few hundred MB come back within 10 s while
-a scene streams (the castle walk), and single validation runs have shown low frame counts that were not reproduced by
-their repeats (other streams' tests were running on the PC): neither is established as a cost of a brick.
+To look at when speed is measured again: single validation runs sometimes show a scene at half its usual frame rate
+or a few seconds at a crawl; repeats of the same build and scene have never reproduced it, and it has happened on
+builds without the bricks suspected (several streams' tests run on the same PC): it is not established as a cost of
+any brick, and it is not ruled out either.
+
+Reviewed whole on 2026-11-13 (`review-2026-11-13.md`): the defects that a player could meet are fixed and merged; left
+open are the first-touch commit's protection of already committed pages (B7), the Linux build of the C++ tree (the
+AppImage's toolchain has no C++20: the tree is to be prebuilt as a static library, as the Vulkan back end is) and
+hygiene items. Player releases are cut from the branch `release/0.3.x` (v0.3.0's engine) until this engine is declared
+stable.
 
 ## Rules
 

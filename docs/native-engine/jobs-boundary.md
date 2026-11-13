@@ -101,7 +101,8 @@ module system's job group and the main loop do not go through the native side.
 - The bridge keeps the identity table's "current actor" of a lane and the lane status word as the gameplay code reads
   them.
 
-Not read yet: the job group of the module system (`0x8007fe60`) in the same detail as the actors' stages.
+The job group of the module system (`0x8007fe60`) is read whole below ("The module system's job group"), in the same
+detail as the actors' dispatcher.
 
 ## The dispatcher's protocol (`0x8004ab40`, read whole for brick 3.1)
 
@@ -301,7 +302,8 @@ the registration in one), and the module system's twins `0x800711c0` / `0x80070b
 ### More of the objects
 
 **The current core** is read the way rule 2 says: a thread-local value holding the core plus one (`0x83c61cf0` is the
-thread-local read), and when it is 0 the OS's current core (`0x83c61f60`). Every function below reads it this way.
+thread-local read, its key the 32-bit word at `0x84e9f7ac`), and when it is 0 the OS's current core (`0x83c61f60`, used
+as it is). Every function below reads it this way (the registration twice, the same value both times).
 
 **A stage's holder** P (the actor manager M has it at `M + 0x80`): `+0x08` the scheduler, `+0x10` the worker set, `+0x68`
 who waits for the stage (a field of the current thread's object, stored by the begin forms around the wait, 0 after).
@@ -350,7 +352,10 @@ first (`0x806b08a0`; the second form expects it made). Then, with S the holder's
   (`send` 0) and no wait when the call's last argument says so: the workers are then started by the last stage.
 
 `0x806afa20` is the common tail of the first form; `0x8389aef0` and `0x8389af40` are the seed and the registration with
-`send` 1 and 0, for callers that made the graph themselves.
+`send` 1 and 0, for callers that made the graph themselves. `0x83afff70` (read for brick 3.4) is the begin of the frame's
+last stage: the stage cores, M's state byte 2, the graph, then the seed and the registration without the message
+(through `0x8389af40`, or directly, with W's scheduler set to 0 when the graph has no job); the job `0x83b001c0` then
+calls the last stage on every core.
 
 ### The registration `0x806b0260` (W, send)
 
@@ -363,23 +368,35 @@ first (`0x806b08a0`; the second form expects it made). Then, with S the holder's
    its context appended to S's list, its bit set in the registered mask, the registered count up by one.
 4. Each registered worker, between two full barriers: its context's state word and flags set to 0, its wake event and its
    done event cleared, its scheduler set to S.
-5. With `send`: each registered worker's context gets bit 0 of its flags ("sent its message"), and the worker is sent
-   message 1 (its message function; when it is the usual one, inlined: the message is queued unless the worker is not
-   running, see the worker's run state).
+5. With `send` (its bit 0): each registered worker's context gets bit 0 of its flags ("sent its message"), and the worker
+   is sent message 1 (its message function, `+0x10` of its virtual table, called with (worker, 1, 1); when it is the
+   usual one, `0x801c5ea0`, whose address the guest reads from `0x84cab408`, inlined: the message is queued on the
+   worker's queue `+0x28` by `0x83c62d20` unless `+0xac` is 3 or 4 or `+0xa0` already equals the message).
+
+The writes of steps 1 to 3 are plain stores but the registered count's increments and the scheduler's flag bit 2, which
+are atomic; the mask's bits are set by plain read-modify-write (only the owner writes it).
 
 ### The stage wait `0x806afc40` (W)
 
 Returns at once when W has no scheduler. Otherwise, with c the owner's core:
 
-1. When the owner takes part: every worker whose core is c gets bit 1 of its context's flags ("not to run"), the own
-   context's lane is set to c, and the dispatcher runs on S with the
-   own context, on the owner's thread.
+1. When the owner takes part: every worker whose core is c, registered or not, gets bit 1 of its context's flags ("not to
+   run"), the own context's lane is set to c (the store is skipped when W's flags have bit 1 and the lane already is c),
+   and the dispatcher runs on S with the own context, on the owner's thread.
 2. For each registered worker in index order: its done event is waited for; when W has a lane status word and c is not 0,
    the low four bits of lane c's byte go down by one before the wait and up by one after it (staying within 0..15), as the
    dispatcher's own sleep does.
 
 The owner does not wait for the stage's end itself: the workers leave their dispatcher when the end job completes, and
 each one's done event is signalled by its message function after it leaves (`0x8004aae0`: the dispatcher, then the event).
+
+**Nothing lowers the registered count of a stage that is waited for**: neither the wait nor the worker message touch W's
+`+0xfc` or `+0x100`; both keep the registration's values until the next registration empties them. Only the last stage
+lowers the count. (Brick 3.4's brief asked for "the owner's wait returns only when the registered count is back to zero":
+that is not the game's protocol; the check counts instead that every registered worker was started and waited for once,
+and that the mask and the count are unchanged at the wait's end.) The lane status is changed on the owner's lane c
+whether or not the owner is counted in it: an owner that is not (not inside a job of its lane) leaves its lane's count
+one higher for each worker waited for, the floor at 0 absorbing the decrement.
 
 ### The frame's last stage `0x83acfb90` (M)
 
@@ -389,9 +406,10 @@ is negative. With W = P's set
 and S its scheduler (registered without the message, above), on the calling thread's core c:
 
 - When W has no scheduler: M's state word's low byte set to 0, return.
-- When a registered worker of core c has not been sent its message (flags bit 0 clear): its flags get bit 0, it is sent
-  message 1, the lane status of W's own lane (not c) goes down by one around the wait for its done event, then W's
-  registered count goes down by one.
+- When a registered worker of core c has not been sent its message (flags bit 0 clear; W's worker count, registered mask
+  and array are read once before the search): its flags get bit 0, it is sent message 1 (as the registration sends
+  it), the lane status of W's own lane (not c) goes down by one around the wait for its done event (the word's address
+  and the lane read again after the wait, nothing done when either is 0), then W's registered count goes down by one.
 - Otherwise, when the owner takes part, the own context has not been sent its message and its lane is c: its flags get
   bit 0 and the dispatcher runs on S with it, on this thread; then the registered count goes down by one.
 - Otherwise (another thread already took this core): return.
@@ -437,3 +455,226 @@ core, so a check switch can compute them both ways before any message is sent an
 stage write only flags and counts that the same check can read after each call. A later step takes the twins and the
 module system's group `0x8007fe60` (a second dispatcher of the same shape, to be read like `0x8004ab40`); only then can
 the events themselves become the native side's own.
+
+### The stages natively (`HL_STAGES`, brick 3.4)
+
+`hl::bridge::Stages` (`engine/native/include/hl/bridge/Stages.h`, `src/bridge/Stages.cpp`) answers the registration
+`0x806b0260`, the stage wait `0x806afc40` and the last stage `0x83acfb90` together, through three entry gates
+(`HL_GATE` in `engine/host/hl_jobs.c`, switched on together by `HL_STAGES=1` once the job bridge has started). It writes
+every word above in place with the guest's operations in the guest's order (plain stores where the guest has plain
+stores, the same atomic operations, the full barriers around each worker's reset), calls the guest's own functions for
+the thread-local core, the events (clear, wait), the message queue and a worker's message function when it is not the
+usual one, and runs the owner's part of a stage (the set's own context, in the wait or in the last stage) with the native
+dispatcher. The hand-off policy is three functions with counters: `start` (a registered worker's message),
+`await_done` (a wait for a worker's done event, the lane given up around it), `dispatch` (the owner's part). The module
+system's twins stay translated and keep working on the same objects.
+
+`HL_STAGES_CHECK=1` counts the protocol's invariants, logged every 10 s with the dispatcher's counters: each registration
+is first made by the translated function on the same set (without the message: its gate lets that one call through) and
+its writes read back (the scheduler's list, count and flags, the set's mask, count and own context, each worker's
+context state, flags and scheduler), then made natively over it and read back again, and the two compared; a set is not
+registered again before its stage is over; every registered worker is started once (by the registration's message or by
+its core's last stage) and waited for once; after its done event a worker's context no longer says it is inside its
+dispatcher; at a wait's end, and when the last stage's count reaches zero, the scheduler's stage is over and (for a wait)
+the registered mask and count are still the registration's; the last stage never lowers the count below zero.
+Observations beside them: stages of sets registered before the gates were on (`untracked`), and the owner's lane byte
+after its wait against before its registration (`lane drift`, which the guest's floor at 0 makes legitimate for an owner
+not counted in its lane). `tests/stages_test.cpp` runs it on a model with no game: stages in a row with the message and
+the wait (the OS core read when the thread-local one is 0, an owner inside a job of its lane), an owner that takes part
+(its own context listed first, its core's worker left out and told not to run), the last stage on six threads at once
+with and without the own context, no stage, no stage cores, another message function, a worker not running.
+
+Validated 2026-11-13 (function and picture; no speed measured), `HL_STAGES=1 HL_STAGES_CHECK=1 HL_DISPATCH_CHECK=1`:
+on the main PC the three scenes with shots (pictures right), castle-move 3 more times and hyrule-walk once more (shots
+right), and one castle-move run of the default-on build with no `HL_STAGES` set (shots right); on the PC 3050
+castle-move 3 times, hyrule-walk twice, kokiri-idle once, and one hyrule-walk run of the default-on build (shots right):
+15 runs. Every run went to the end with the game speed ratio 58-63; in every run every count above read 0
+(a main-PC castle run: about 57,000 registrations, each compared with the translated one, about 340,000 workers started
+and waited for, 38,000 waits and 19,000 last stages ended), and the dispatcher's invariants stayed 0. What the scenes
+exercise: every registration has stage cores and an owner that does not take part (own context registered 0 times,
+owner's part run 0 times), every worker message is the usual one and is queued, no lane drift: the owner's path through
+the set's own context, the other message function and the not-running worker are covered by the model test only.
+In two of the three hyrule-walk runs with shots the walk ends in a town girl's dialogue, where the reference shots end
+by the fountain; the walk's end point already differs from one reference run to another, so this is noted, not
+attributed. `HL_STAGES=1` is the default (with `HL_JOBS` on); `HL_STAGES=0` leaves the three gates off (the translated functions).
+
+## The module system's job group (`0x8007fe60`, read whole for brick 3.5)
+
+Read from the guest instructions of `0x8007fe60` (3,388 instructions), its push `0x80083350`, the heap's erase
+`0x811c4160` with its sifts `0x811c41f0` (up) and `0x811c4290` (down), the module workers' message `0x8007fe10`, the
+graph's making `0x80070ea0`, the registration twin `0x800711c0` (which also seeds the heap) and the wait twin
+`0x80070b20`. Of the group's 3,388 instructions about 900 are the protocol below; the rest are job bodies and observer
+methods inlined behind a check that the object's virtual function is the one the compiler knew (as in `0x8004ab40`):
+calling the virtual function instead does the same thing. The graphics module's list of recording items handed out by an
+atomic counter (`gfx-record-job.md`, kinds 1 to 3) is one of those inlined bodies: it is inside one job object's run
+function, not part of the group's protocol, and a native group that calls the run function runs it unchanged.
+`engine/native/src/bridge/JobGroup.cpp` is written from this section.
+
+### Who calls it
+
+Two direct callers, no address taken: the module workers' message function `0x8007fe10` (reached through a pointer;
+message 1: a full barrier, then, when the worker's scheduler `+0x200` is set, the group on the worker's context `+0xd8`,
+then the worker's done event `+0x1e8` signalled; the same shape as the actors' `0x8004aae0`), and the wait twin
+`0x80070b20` (the main thread: when its worker set's owner takes part, the workers of the owner's core are told not to
+run, the set's own context gets the owner's core as its lane, and the group runs on it; then the owner waits for each
+registered worker's done event, its lane status down by one around each wait). The main thread's frame `0x80706be0` and
+`0x80070d30`, `0x839fbe40`, `0x83b7b130` call the wait twin, after `0x80070ea0` has made the graph and the twin
+registration has seeded it. The main thread's call differs from a worker's only by its context (the set's own, lane the
+owner's core); the group's code is the same for both.
+
+### The objects
+
+**Group scheduler** G (the first argument): `+0x08` room for job records, `+0x10` their array (64 bytes each), `+0x18`
+room for dependents' nodes, `+0x20` their array (24 bytes each), `+0x28` jobs in the graph, `+0x2c` room, `+0x30` their
+list, `+0x38` contexts in its list (int), `+0x3c` room, `+0x40` the list, `+0x48` **the ready heap** (`+0x48` its items,
+an array of job addresses; `+0x50` its room; `+0x54` its size), `+0x58` **the group's mutex**, `+0x78` nodes used,
+`+0x80` the **end job** (a job record embedded in G), `+0xc0` the **polling lane**, `+0xc4` flags (bit 0: the graph is
+made; bit 1: the group is over; bit 2: the owner takes part and polls, written by the twin registration), `+0xc8` **the
+take count** (32-bit signed: jobs that may be taken from the heap).
+
+**Group job record** (64 bytes): `+0x00` the job's object (bit 0 set: tagged), `+0x08` its index, `+0x0c` its
+**priority** (16-bit, unsigned), `+0x0e` **cancel flag** (1: the first runner to finish cancels the runners not started
+yet), `+0x0f` its kind for the lane status word (0: low four bits, else high four), `+0x10` the lane it must run on (0x21:
+any), `+0x14` an identifier for the observer, `+0x18` a hook called before it is pushed (0: none), `+0x20` its list of
+dependents (a circular list whose head node sits at `+0x20`: `+0x20` last node, `+0x28` first node; `+0x30` its count;
+`+0x34` the offset of the node in a list element), `+0x38` the **runner word** (32-bit: low 16 bits the runners still to
+start, high 16 bits the runners running), `+0x3c` the count of jobs it still waits for (-1 once complete). A node is
+`+0` the previous node, `+8` the next; the element it is in starts at the node minus the offset, and the element's
+first word is the dependent job. The actors' record (above) differs: a 16-bit runner word of three fields, the kind at
+`+0x0e`, the dependents' list at `+0x28` / `+0x30`.
+
+**Dispatch context** C: the actors' layout exactly (state word, flags, the handed queue under its mutex, wake event,
+observer, lane, lane status word's address).
+
+### The heap and the take count
+
+Every change to the heap is made under G's mutex: the seed (`0x800711c0`), the push (whose callers hold the mutex), a
+take, a cancel. It is a binary heap of job addresses by priority, largest first, ties not moved:
+
+- **Up** (a push, and the seed): the job at the end; while its parent's priority is below its own (strictly), the parent
+  moves down into its place. Then the take count goes up by one. When the heap is full (size equal to room) the job is not
+  put in **but the take count still goes up by one**.
+- **Down** (the top taken): size lowered by one; when that leaves none, nothing is moved; otherwise the last item takes the
+  top's place and sinks: its child is the left one, or the right one when there is one and the left's priority is below
+  the right's; while its priority is below that child's, the child moves up into its place.
+- **Erase** (a cancel, `0x811c4160` with re-heaping): the item's position must be in the heap; size lowered by one (none
+  left: done); when the item was not the last, the last takes its place, goes up, and when it did not move goes down.
+
+**The take count** (`+0xc8`) is handed out before the mutex is taken: a context reads it; below 1, nothing to take;
+otherwise it lowers it by one with a compare-and-swap, retrying with the value read while that is above 0. With a unit in
+hand it takes the mutex. Every push raises the count by one, every last runner taken from the heap keeps its unit, every
+other runner taken gives its unit back, and a cancel that removes a job lowers it by one **without the floor at 0**: a
+context holding a unit for a job that a cancel removes meanwhile finds the heap empty and gives its unit back, so the count
+can be -1 for that moment. After a group, with every job complete, the heap and the count are both 0.
+
+### The push (`0x80083350`, group and job; its callers hold the mutex)
+
+When the job has a hook, the hook's first virtual function is called with the job's object; its answer's low 16 bits
+become the runner word (runners to start, none running) and its bit 16 the cancel flag; with no runner the job is
+complete at once (each dependent's waiting count lowered, those reaching 0 pushed, the job's waiting count set to -1, its
+list emptied: the completion below without its locking) and nothing is pushed or counted. Then (and directly for a job
+with no hook) it goes up into the heap, and the take count goes up by one. It wakes nobody: waking is the taker's.
+The seed in the twin registration does the same for every job of the graph that waits for none, except that a hook's
+answer with no runner gives the job one runner (it is never complete at once there).
+
+### The group (G, C)
+
+1. **Enter**: the lane status of C's lane goes up by one (low four bits; saturating, only when the lane and the word's
+   address are not 0, exactly as the actors' dispatcher).
+2. **Loop** (with the job J just run, none the first time):
+   - **Finish J**. When J's cancel flag is 1 and its runner word still has runners to start: under the mutex, the runners
+     to start are cleared (an atomic clear of the low half); when there were some and the heap is not empty, J is looked
+     for in the heap from its first item; found, the take count goes down by one and J is erased. Then (every job) the
+     runner word loses one running runner (an atomic add of -0x10000); when the word was exactly 0x10000 (the last running
+     one, none to start) J is **complete**: under the mutex, each dependent's waiting count goes down by one and a
+     dependent whose count was 1 is pushed; after the mutex is released J's waiting count is set to -1, each node of its
+     list has its two words cleared, the list's count is set to 0 and its head points to itself. When J is the end job
+     (G + 0x80) the **group is over**: under the mutex, G's flags get bit 1, and every context of G's list whose state is
+     1 is set to 0 (compare-and-swap) and every context's wake event is signalled.
+   - **Leave** when C's flags have bit 1 ("not to run"; read only here, after a job) or G's flags have bit 1.
+   - **A handed job**: when C's state word holds a job (2 or more), as in the actors' dispatcher: under C's mutex the next
+     job of C's own queue (or 0) takes its place; the handed job is run, after waking others for the take count read then.
+   - **Take**: a unit of the take count (above), then the mutex. Under it: when G is over, the unit is given back, the mutex
+     released and the context leaves. When the heap is empty (size 0, or no items array), the unit is given back, the
+     mutex released, and it is "nothing found". Otherwise the top job T gets one more running runner and one fewer to
+     start (an atomic add of 0xffff to its runner word), and by the runners it had to start:
+     - **not exactly 1** (more runners left, it stays the top): the unit is given back (the count up by one), the mutex
+       released, T is run after waking up to n contexts, n the take count this context read when it took its unit;
+     - **1** (its last runner): T is taken down from the heap (above). When T's lane is "any" (0x21) or C's lane, the
+       mutex is released and T is run after waking up to n contexts, n the take count read minus one. Otherwise T is
+       **forwarded**, still under G's mutex, to the context of G's list with that lane (the first one in the list's order):
+       dropped when there is none or it is "not to run"; else its state word is set to T by compare-and-swap when it holds
+       0 or 1, and its wake event signalled when it held 1; when it holds a job, under that context's mutex (the state read
+       again: back to the compare-and-swap if it no longer holds a job) T goes to the end of its own queue (the queue's
+       count raised first, then the slot written), dropped when the queue is full. Then G's mutex is released and the loop
+       goes on without a job (back to the check of G's flags).
+   - **Wake others** before running: for each context of G's list in order while n is above 0: skipped when "not to run";
+     when its state is 1, a compare-and-swap from 1 to 0 (retried while it reads 1), and on success its wake event
+     signalled and n lowered.
+   - **Run**: no job: leave. A job whose object word is 0 is finished at once (the end job). Otherwise the lane status goes
+     up by one in the four bits of the job's kind (`+0x0f`); the observer, if any, is shown the job (`+0xc8` the object
+     word, `+0xd4` 1, `+0xd0` the identifier) and its first virtual function called with C + 0xc8; the job's object's third
+     virtual function is called: untagged with the object alone; tagged with the object (bit 0 cleared) and the address
+     of a frame of three words on the stack: G, the job record, **0** (the actors' frame has 1 there); then the observer
+     is shown the end (`+0xd4` 0) and called again; the lane status goes down in the same four bits.
+   - **Nothing found**: when G's polling lane is C's lane, sleep a timed span and go round. The span is a static of the
+     function made on this path the first time: under the guest's guard (`0x83c61ca0` acquire, `0x83c61cb0` release, guard
+     byte `0x84e9f4f8`), the tick frequency (`0x80e5a5c0`) divided by 10,000 (about 100 microseconds) is stored at
+     `0x84e9f4f0`; then the ticks become a span (`0x83c623e0`) and the thread sleeps (`0x83c62de0`). Otherwise C's state is
+     set from 0 to 1 by compare-and-swap (a handed job found there instead is taken as above). Then, when the take count is
+     1 or more, C's state is set back from 1 to 0 and the loop goes round at once (when another context has already set it
+     to 0 it will signal: C consumes that signal by waiting on its event, its lane status down by one around the wait); with
+     no count, the lane status goes down by one, C waits on its wake event, the lane status goes up by one, and the loop goes
+     round. (Unlike the actors' dispatcher there is no count of idle rounds and no timed sleep after nine of them.)
+3. **Leave**: a full barrier, C's flags lose bit 0, the lane status of C's lane goes down by one, return.
+
+### How a group ends, and what the native side must keep
+
+The graph (`0x80070ea0`) gives the end job one runner to start and makes every job of the description one of its waits;
+the twin registration seeds the heap with the jobs that wait for none; the group's contexts take, run and finish jobs
+until the end job is pushed (its last wait done), taken and finished: then G is over and every context is woken to
+leave. The owner's wait twin returns once each registered worker has signalled its done event (after leaving the
+group). Shared with translated code that stays: the heap and the take count (the seed, under the mutex), the contexts'
+state words and wake events (the twin registration resets them; the wake loops of both systems use the same protocol), the
+lane status word. The native group therefore keeps every word in place, takes the guest's mutex for every heap change,
+and calls the guest's functions for the mutexes, the events, the timed sleep and its guard, a hook's push and the job
+bodies.
+
+### The group natively (`HL_JOBGROUP`, brick 3.5)
+
+`hl::bridge::JobGroup` (`engine/native/include/hl/bridge/JobGroup.h`, `src/bridge/JobGroup.cpp`) answers `0x8007fe60`
+through an entry gate (`HL_GATE` in `engine/host/hl_jobs.c`), which both callers reach: the module workers' message and
+the main thread's wait twin. The native dispatcher is now one loop over a queue policy (`src/bridge/DispatchLoop.h`):
+entry and leave, the lane status, handed jobs, the sleep and wake protocol and the run of a job's body with its observer
+are written once; the actors' rings (`Dispatcher::Rings`, behaviour and tests unchanged) and the group's heap
+(`JobGroup::Heap`) are its two policies, each with its take, finish, completion, end and constants (the idle rounds
+before a timed sleep: 9 for the rings, none for the heap; the job record's kind byte; the tagged frame's third word).
+Every heap change is made under the guest's mutex with the guest's order (the same sifts, ties not moved, a full heap
+counted but not filled); the take count is handed out and given back with the guest's atomic operations; a job tied to
+another lane is handed over under the mutex as the guest does it; the timed sleep's constant is made on the polling path
+with the guest's own guard functions, so no first call has to be left to the translated function. Job bodies, a hook's
+push, the mutexes, the events and the sleep are the game's functions, called on the thread's guest context.
+
+`HL_JOBGROUP_CHECK=1` counts, every 10 s in the log: takes not run (every runner taken is run, handed to its lane's
+context or dropped), passed not run (every job handed over is run by its receiver), runs not finished, finishes with no
+runner running, dependents' waiting counts below 0, jobs completed twice, one-runner jobs run by two contexts at once, the
+heap's order checked after every change, and at each group's end (under the mutex) a heap not empty, a take count not 0,
+contexts asleep with jobs left; observations beside them: the take count read below 0 (legitimate for a moment, above),
+and a context's lane byte changed between its entry and its leave (lane drift). `tests/jobgroup_test.cpp` runs it with no
+game: the heap's order against a reference heap written from this document (ties, jobs of several runners staying on
+top), the push (a full heap, a hook's push), a cancel, and six contexts (the owner's and five workers') over 30 groups of
+500 jobs with priorities, dependencies, several runners, cancels, tied jobs (by the state word and by the queue) and a
+polling lane.
+
+Validated 2026-11-13 (function and picture; no speed measured), `HL_JOBGROUP=1 HL_JOBGROUP_CHECK=1 HL_DISPATCH_CHECK=1`:
+on the main PC the three scenes with shots (31, 30 and 24 shots; four or five looked at in each, spread over the run,
+right against the reference shots), castle-move twice more with shots (right), and one hyrule-walk run of the default-on
+build with no switch set (shots right); on the PC 3050 castle-move three times, hyrule-walk twice, kokiri-idle once: 12
+runs. Every run went to the end, game speed ratio about 60 once in the scene; in every checked run every invariant above
+read 0 (a main-PC castle run: about 470,000 calls of the group, 105,000 groups ended, 3.9 million runners taken and run,
+100,000 jobs handed to their lane's context by the state word, none by the queue, none dropped; 0 cancels, 0 polls, 0
+full heaps: those paths are covered by the model test only). The take count was never read below 0. **Lane drift** is
+counted 200 to 700 times a run: every logged case is a module worker whose lane byte was 1, 2 or 0x11 at its entry and 0
+at its leave (the lane status word is shared by the module set's contexts and other threads of the same core, and the
+guest's floor at 0 absorbs decrements, as for the stage owner above); the lane was idle at the leave in every logged
+case. `HL_JOBGROUP=1` is the default (with `HL_JOBS` on); `HL_JOBGROUP=0` leaves the gate off (the translated function).

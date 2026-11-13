@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "gfx_rec.h"
 #include "host_runtime.h"
 
 #include "hl/bridge/GfxBridge.h"
@@ -138,13 +139,24 @@ extern "C" const char* hl_gfx_nvn_name(uint32_t proc) { return hl::gfx::proc_nam
 extern "C" uint64_t hl_gfx_nvn_global(uint32_t proc) { return hl::bridge::proc_global(proc); }
 extern "C" uint64_t hl_gfx_state_address(void) { return hl::bridge::kApplyRenderState; }
 
+namespace {
+// (the OS layer's NVN entry points and callbacks: the same for every native producer, set by the first to start)
+std::once_flag g_gfx_once;
+bool gfx_host(const hl_guest_host* host, const hl_gfx_host* gfx) {
+    if (!gfx || !gfx->nvn || !runtime(host)) return false;
+    std::call_once(g_gfx_once, [gfx] {
+        g_runtime->gfx = *gfx;
+        g_nvn.user = gfx->user;
+        g_nvn.call = gfx->nvn;
+    });
+    return true;
+}
+}   // namespace
+
 extern "C" int hl_gfx_state_start(const hl_guest_host* host, const hl_gfx_host* gfx, int check) {
     if (g_state) return 1;
-    if (!gfx || !gfx->nvn || !runtime(host)) return 0;
-    g_runtime->gfx = *gfx;
-    g_nvn.user = gfx->user;
-    g_nvn.call = gfx->nvn;
-    if (check) g_state_check = new hl::gfx::StateCheck(state_log, &g_runtime->gfx);
+    if (!gfx_host(host, gfx)) return 0;
+    if (check) g_state_check = new hl::gfx::StateCheck("render state", state_log, &g_runtime->gfx);
     g_state = new hl::bridge::StateBridge(*g_runtime);
     return 1;
 }
@@ -159,8 +171,7 @@ extern "C" int hl_gfx_state_apply(uint64_t block, uint64_t key, uint64_t sp) {
     const hl::gfx::StateOutputs out = hl::gfx::RenderState::decide(in, g_state->offsets(block));
     // (the block first: the blend color call reads it from there)
     g_state->write(block, out);
-    hl::gfx::NvnSink sink(g_nvn);
-    hl::gfx::RenderState::emit(in, out, at, sink);
+    hl::c::gfx_rec_emit(in, out, at, g_nvn);   // (the NVN procedures, or the records directly: hl_gfx_rec.cpp)
     g_state_answered.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
@@ -197,6 +208,184 @@ extern "C" void hl_gfx_state_check_end(void) {
     uint8_t actual[hl::bridge::StateBridge::kBlockSize];
     g_state->copy(t.block, actual);
     g_state_check->compare(t.block, t.key, t.native.calls(), t.translated.calls(), t.expected, actual, sizeof actual);
+}
+
+// ---- the sub-mesh submission ----
+
+namespace {
+using hl::bridge::DrawBridge;
+using hl::bridge::SubmitRoute;
+using hl::gfx::Submit;
+
+DrawBridge* g_draw;
+hl::gfx::StateCheck* g_draw_check_prologue;
+hl::gfx::StateCheck* g_draw_check_submit;
+// (native: answered by way; check: compared by way. Left to the translation: by route)
+std::atomic<uint64_t> g_draw_by[4], g_draw_unprepared{0}, g_draw_out_of_range{0}, g_draw_left[5];
+
+struct DrawCall {
+    uint64_t drawable = 0, block = 0;
+    uint32_t sub_mesh = 0, mask = 0;
+    hl::bridge::GuestAddr context = 0, command_buffer = 0;
+    bool in_range = false, reached = false, path_differs = false;
+    hl::gfx::PassRecording native, translated;
+    uint8_t expected[DrawBridge::kSnapshotSize];
+};
+thread_local DrawCall t_draw;
+
+// The submission: decided on what the preparation left (the index buffer's address asked through the NVN entry points),
+// written when `write`, its commands into `sink`; `expected`: the bytes it should leave, from those there now.
+void submit(DrawCall& t, uint64_t prepared, hl::gfx::CommandSink& sink, bool write, uint8_t* expected) {
+    hl::gfx::SubmitInputs in;
+    hl::gfx::SubmitHandles at;
+    g_draw->read_submit(t.drawable, t.block, t.sub_mesh, prepared, t.context, in, at);
+    hl::gfx::IndexedInputs indexed;
+    const bool elements = hl::gfx::SubmeshDraw::path(in) == Submit::Elements && (prepared & 1);
+    if (elements) g_draw->read_indexed(t.drawable, t.sub_mesh, indexed);
+    const hl::gfx::SubmitOutputs out = hl::gfx::SubmeshDraw::decide(in, elements ? &indexed : nullptr);
+    uint64_t address = 0;
+    if (elements) address = g_nvn.ask(hl::gfx::command(hl::gfx::Proc::BufferGetAddress, indexed.buffer));
+    if (!(prepared & 1)) g_draw_unprepared.fetch_add(1, std::memory_order_relaxed);
+    else g_draw_by[(int)out.how].fetch_add(1, std::memory_order_relaxed);
+    t.command_buffer = at.command_buffer;
+    if (expected) {
+        g_draw->snapshot(t.block, t.command_buffer, expected);
+        DrawBridge::expect_submit(expected, out);
+    }
+    if (write) g_draw->write_submit(t.block, at, out);
+    hl::gfx::SubmeshDraw::emit(out, elements ? &indexed : nullptr, address, at, sink);
+}
+}   // namespace
+
+extern "C" uint64_t hl_gfx_draw_address(void) { return hl::bridge::kSubmitSubmesh; }
+extern "C" uint64_t hl_gfx_draw_prepare_address(void) { return hl::bridge::kPrepareSubmesh; }
+extern "C" uint64_t hl_gfx_draw_prepare_return(void) { return hl::bridge::kPrepareReturn; }
+extern "C" uint64_t hl_gfx_draw_frame(void) { return hl::bridge::kSubmitFrame; }
+
+extern "C" int hl_gfx_draw_start(const hl_guest_host* host, const hl_gfx_host* gfx, int check) {
+    if (g_draw) return 1;
+    if (!gfx_host(host, gfx)) return 0;
+    if (check) {
+        g_draw_check_prologue = new hl::gfx::StateCheck("draw prologue", state_log, &g_runtime->gfx);
+        g_draw_check_submit = new hl::gfx::StateCheck("draw submission", state_log, &g_runtime->gfx);
+    }
+    g_draw = new DrawBridge(*g_runtime);
+    return 1;
+}
+
+extern "C" int hl_gfx_draw_begin(uint64_t drawable, uint64_t block, uint32_t sub_mesh, uint32_t mask) {
+    const SubmitRoute route = g_draw->route(drawable, mask);
+    if (route != SubmitRoute::Direct) {
+        g_draw_left[(int)route].fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    DrawCall& t = t_draw;
+    t.drawable = drawable, t.block = block, t.sub_mesh = sub_mesh, t.mask = mask;
+    hl::gfx::PrologueInputs in;
+    g_draw->read_prologue(drawable, block, sub_mesh, in, t.context);
+    const hl::gfx::PrologueOutputs out = hl::gfx::SubmeshDraw::prologue(in);
+    if (!out.in_range) {
+        g_draw_out_of_range.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+    // (the block first: the function writes it before the call)
+    g_draw->write_prologue(block, out);
+    hl::gfx::NvnSink sink(g_nvn);
+    hl::gfx::SubmeshDraw::emit_prologue(out, out.mode_changed ? g_draw->command_buffer(t.context) : 0, sink);
+    return 2;
+}
+
+extern "C" void hl_gfx_draw_end(uint64_t prepared) {
+    hl::gfx::NvnSink sink(g_nvn);
+    submit(t_draw, prepared, sink, true, nullptr);
+}
+
+extern "C" int hl_gfx_draw_check_begin(uint64_t drawable, uint64_t block, uint32_t sub_mesh, uint32_t mask) {
+    const SubmitRoute route = g_draw->route(drawable, mask);
+    if (route != SubmitRoute::Direct) {
+        g_draw_left[(int)route].fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    DrawCall& t = t_draw;
+    t.drawable = drawable, t.block = block, t.sub_mesh = sub_mesh, t.mask = mask;
+    t.reached = t.path_differs = false;
+    hl::gfx::PrologueInputs in;
+    g_draw->read_prologue(drawable, block, sub_mesh, in, t.context);
+    const hl::gfx::PrologueOutputs out = hl::gfx::SubmeshDraw::prologue(in);
+    t.in_range = out.in_range;
+    if (!out.in_range) g_draw_out_of_range.fetch_add(1, std::memory_order_relaxed);
+    t.command_buffer = out.mode_changed ? g_draw->command_buffer(t.context) : 0;
+    t.native.clear();
+    t.translated.clear();
+    hl::gfx::SubmeshDraw::emit_prologue(out, t.command_buffer, t.native);
+    g_draw->snapshot(block, t.command_buffer, t.expected);
+    DrawBridge::expect_prologue(t.expected, out);
+    return 1;
+}
+
+namespace {
+void compare(hl::gfx::StateCheck* check, DrawCall& t, bool path_differs) {
+    uint8_t actual[DrawBridge::kSnapshotSize];
+    g_draw->snapshot(t.block, t.command_buffer, actual);
+    check->compare(t.block, t.sub_mesh, t.native.calls(), t.translated.calls(), t.expected, actual, sizeof actual,
+                   path_differs);
+}
+}   // namespace
+
+extern "C" void hl_gfx_draw_check_segment(void) {
+    DrawCall& t = t_draw;
+    // (the body reached its preparation: the prologue's segment is over, and the sub-mesh must have been in range)
+    compare(g_draw_check_prologue, t, !t.in_range);
+    t.native.clear();
+    t.translated.clear();
+}
+
+extern "C" void hl_gfx_draw_check_prepared(uint64_t prepared) {
+    DrawCall& t = t_draw;
+    t.reached = true;
+    // (the way decided at the entry must still hold on what the preparation left)
+    t.path_differs = g_draw->route(t.drawable, t.mask) != SubmitRoute::Direct;
+    submit(t, prepared, t.native, false, t.expected);
+}
+
+extern "C" void hl_gfx_draw_check_call(uint32_t proc, const uint64_t* x, const uint32_t* f) {
+    hl::gfx::Command c;
+    c.op = proc;
+    std::memcpy(c.x, x, sizeof c.x);
+    std::memcpy(c.f, f, sizeof c.f);
+    t_draw.translated.emit(c);
+}
+
+extern "C" void hl_gfx_draw_check_end(void) {
+    DrawCall& t = t_draw;
+    if (t.reached) compare(g_draw_check_submit, t, t.path_differs);
+    else compare(g_draw_check_prologue, t, t.in_range);   // (an in-range sub-mesh must reach the preparation)
+}
+
+extern "C" int hl_gfx_draw_report(char* out, size_t cap) {
+    if (!g_draw || !cap) return 0;
+    auto v = [](const std::atomic<uint64_t>& a) { return (unsigned long long)a.load(std::memory_order_relaxed); };
+    int n = std::snprintf(out, cap,
+                          "draw: %s pre-recorded %llu, indexed %llu, mesh tasks %llu, nothing %llu, not prepared %llu, "
+                          "out of range %llu; left to the translation: query %llu, callback %llu, clusters %llu, "
+                          "inline %llu",
+                          g_draw_check_submit ? "compared" : "native", v(g_draw_by[(int)Submit::CallCommands]),
+                          v(g_draw_by[(int)Submit::Elements]), v(g_draw_by[(int)Submit::MeshTasks]),
+                          v(g_draw_by[(int)Submit::None]), v(g_draw_unprepared), v(g_draw_out_of_range),
+                          v(g_draw_left[(int)SubmitRoute::Query]), v(g_draw_left[(int)SubmitRoute::Callback]),
+                          v(g_draw_left[(int)SubmitRoute::Clusters]), v(g_draw_left[(int)SubmitRoute::Inline]));
+    const hl::gfx::StateCheck* checks[2] = {g_draw_check_prologue, g_draw_check_submit};
+    const char* names[2] = {"prologue", "submission"};
+    for (int i = 0; i < 2 && checks[i] && n > 0 && (size_t)n < cap; i++) {
+        const hl::gfx::StateCheck::Report r = checks[i]->report();
+        n += std::snprintf(out + n, cap - n,
+                           "; check %s: calls compared %llu, NVN calls compared %llu, mismatched calls %llu (NVN calls "
+                           "%llu, bytes %llu)",
+                           names[i], (unsigned long long)r.calls, (unsigned long long)r.commands,
+                           (unsigned long long)r.mismatched_calls, (unsigned long long)r.command_mismatches,
+                           (unsigned long long)r.block_mismatches);
+    }
+    return n < 0 ? 0 : ((size_t)n < cap ? n : (int)cap - 1);
 }
 
 extern "C" int hl_gfx_state_report(char* out, size_t cap) {

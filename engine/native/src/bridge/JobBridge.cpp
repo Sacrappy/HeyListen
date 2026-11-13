@@ -14,16 +14,16 @@ constexpr GuestEntry kEntries[] = {
     {0x806af9d0, EntryRole::Stage, false, "a stage begun on a set of cores"},
     {0x806afae0, EntryRole::Stage, false, "a stage begun on a set of cores (second form)"},
     {0x806afe70, EntryRole::Stage, false, "a stage begun on a set of cores (third form)"},
-    {0x806b0260, EntryRole::Stage, false, "the stage's workers registered with its scheduler and sent their message"},
-    {0x806afc40, EntryRole::Stage, false, "the stage waited for, its owner running jobs meanwhile"},
-    {0x83acfb90, EntryRole::Stage, false, "the frame's last stage: each owner thread starts the executor of its core and waits"},
+    {0x806b0260, EntryRole::Stage, true, "the stage's workers registered with its scheduler and sent their message"},
+    {0x806afc40, EntryRole::Stage, true, "the stage waited for, its owner running jobs meanwhile"},
+    {0x83acfb90, EntryRole::Stage, true, "the frame's last stage: each owner thread starts the executor of its core and waits"},
     {kWorkerMessage, EntryRole::Worker, true, "a worker's message: run the dispatcher, then signal the end"},
     {0x80df2680, EntryRole::Worker, false, "a job thread's loop (message to job)"},
     {0x80df25c0, EntryRole::Worker, false, "a job thread's loop (inner)"},
     {0x834a2e50, EntryRole::Worker, false, "a job thread's loop (outer)"},
     {kDispatcher, EntryRole::Dispatch, false, "the dispatcher: takes jobs from a scheduler's queues and runs them"},
     {0x8004fa40, EntryRole::Dispatch, false, "a job pushed to a scheduler"},
-    {0x8007fe60, EntryRole::Group, false, "a job group run and waited for (the main thread's long wait of the frame)"},
+    {0x8007fe60, EntryRole::Group, true, "a job group run and waited for (the main thread's long wait of the frame)"},
     {0x80706be0, EntryRole::Frame, false, "the frame's time step read"},
     {0x8022e220, EntryRole::Consumer, false, "an actor link followed: reads the identity table (one of hundreds of inlined readers)"},
 };
@@ -90,8 +90,8 @@ Readiness ready(const JobBridge* bridge) {
     return {on, native, (unsigned)(sizeof kEntries / sizeof kEntries[0]),
             "the game's jobs are not native jobs one by one: the native dispatcher (HL_DISPATCH=1) runs them from the game's queues\n"
             "the stage owner's wait and nested waits run the native dispatcher only with HL_DISPATCH_ALL=1 (its entry gate)\n"
-            "the stages' begin, registration and wait, and the worker sets' making, are the game's own functions\n"
-            "the module system's job group (the main thread's long wait) does not go through the native job system\n"
+            "the stages' begin forms and graph, and the worker sets' making, are the game's own functions (registration, wait and last stage: HL_STAGES)\n"
+            "the module system's job group (the main thread's long wait) runs natively (HL_JOBGROUP), but its twins of the registration and the wait are the game's\n"
             "the identity table and the lane status word are written by the game's functions, not by the native side\n"
             "the main loop is the game's own"};
 }

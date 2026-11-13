@@ -18,7 +18,18 @@
    stage wait 0x806afc40, the frame's last stage 0x83acfb90, and so every job body that waits for a stage. HL_DISPATCH_ALL=0:
    only the worker message path is native, as before.
    HL_DISPATCH_CHECK=1: its invariants are counted (and, with HL_DISPATCH=0, those that can be read after the translated
-   dispatcher), and the counters are logged every 10 s. */
+   dispatcher), and the counters are logged every 10 s.
+   HL_STAGES=1 (the default, with HL_JOBS on): the stage protocol around the dispatcher is native (hl/bridge/Stages.h;
+   docs/native-engine/jobs-boundary.md, "The stages' protocol"): entry gates on the registration 0x806b0260, the stage
+   wait 0x806afc40 and the frame's last stage 0x83acfb90, together (they share the registered mask and count). The
+   worker sets, the scheduler's list, the workers' words and the guest's events stay in place. HL_STAGES=0: the
+   translated functions, as before. HL_STAGES_CHECK=1: the protocol's invariants are counted, each registration is
+   compared with the translated one on the same set, and the counters are logged every 10 s.
+   HL_JOBGROUP=1 (the default, with HL_JOBS on): the module system's job group 0x8007fe60 is native
+   (hl/bridge/JobGroup.h; docs/native-engine/jobs-boundary.md, "The module system's job group"): an entry gate on it, which
+   both of its callers reach (the module workers' message and the main thread's stage wait twin). The group scheduler, its
+   heap, mutex and take count, the contexts' words and the guest's events stay in place. HL_JOBGROUP=0: the translated
+   function, as before. HL_JOBGROUP_CHECK=1: its invariants are counted and the counters logged every 10 s. */
 #include "hl_host.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +39,8 @@
 #define HL_JOBS_DEFAULT HL_JOBS_THROUGH
 #define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
 #define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
+#define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 15 runs over the three scenes, two PCs) */
+#define HL_JOBGROUP_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 11 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;
@@ -38,6 +51,8 @@ static void hl_report(void) {
     if (now - was < 10000000000LL || InterlockedCompareExchange64(&last, now, was) != was) return;
     char line[2048];
     if (hl_bridge_report(line, sizeof line)) hos_log("hl jobs: %s", line);
+    if (hl_bridge_stages_report(line, sizeof line)) hos_log("hl %s", line);
+    if (hl_bridge_jobgroup_report(line, sizeof line)) hos_log("hl %s", line);
 }
 
 static void hl_worker_message(Ctx *c) {
@@ -57,6 +72,44 @@ HL_GATE(8004ab40, "4f17bc2e2e505f0f") {
     return hl_bridge_dispatch_gate(c->x[0], c->x[1]);
 }
 
+/* The stage protocol's three functions (HL_STAGES), on the thread's own context as the dispatcher's gate. */
+static int hl_stage_ctx(Ctx *c) {
+    if (c == hos_ctx()) return 1;
+    static volatile LONG told;
+    if (!InterlockedExchange(&told, 1)) hos_log("hl jobs: a stage gate was given another context than the thread's: translated");
+    return 0;
+}
+
+HL_GATE(806b0260, "fbe1ec275809759d") {   /* the registration (worker set, send) */
+    if (!hl_stage_ctx(c)) return 0;
+    const int answered = hl_bridge_stage_register(c->x[0], c->x[1]);
+    if (answered && hl_log_on) hl_report();
+    return answered;
+}
+
+HL_GATE(806afc40, "8a578d7d69ee8980") {   /* the stage wait (worker set) */
+    if (!hl_stage_ctx(c)) return 0;
+    hl_bridge_stage_wait(c->x[0]);
+    return 1;
+}
+
+HL_GATE(83acfb90, "e9b61c73cec382d7") {   /* the frame's last stage (actor manager) */
+    if (!hl_stage_ctx(c)) return 0;
+    hl_bridge_stage_last(c->x[0]);
+    return 1;
+}
+
+HL_GATE(8007fe60, "677afe69100ea461") {   /* the module system's job group (group, context) */
+    if (c != hos_ctx()) {
+        static volatile LONG told;
+        if (!InterlockedExchange(&told, 1)) hos_log("hl jobs: the job group's gate was given another context than the thread's: translated");
+        return 0;
+    }
+    hl_bridge_jobgroup(c->x[0], c->x[1]);
+    if (hl_log_on) hl_report();
+    return 1;
+}
+
 /* 1 when the native job system answers the game's worker message (asked once, at the function's first lookup) */
 static int hl_jobs_on(void) {
     const char *e = getenv("HL_JOBS"), *w = getenv("HL_JOBS_WORKERS");
@@ -74,14 +127,29 @@ static int hl_jobs_on(void) {
     const int check = dc && dc[0] == '1';
     const int on = hl_bridge_start(hl_host(), mode, w ? (unsigned)atoi(w) : 0,
                                    (native ? HL_DISPATCH_NATIVE : 0) | (check ? HL_DISPATCH_CHECK : 0));
-    hl_log_on = getenv("HL_JOBS_LOG") != NULL || check;
     const char *a = getenv("HL_DISPATCH_ALL");
     const int all = on && native && (a && a[0] ? atoi(a) == 1 : HL_DISPATCH_ALL_DEFAULT);
     hl_gate_on_8004ab40 = all;
+    const char *sg = getenv("HL_STAGES"), *sc = getenv("HL_STAGES_CHECK");
+    const int stage_check = sc && sc[0] == '1';
+    const int stages = on && (sg && sg[0] ? atoi(sg) == 1 : HL_STAGES_DEFAULT) &&
+                       hl_bridge_stages_start(HL_STAGES_NATIVE | (stage_check ? HL_STAGES_CHECK : 0));
+    const char *jg = getenv("HL_JOBGROUP"), *jc = getenv("HL_JOBGROUP_CHECK");
+    const int group_check = jc && jc[0] == '1';
+    const int group = on && (jg && jg[0] ? atoi(jg) == 1 : HL_JOBGROUP_DEFAULT) &&
+                      hl_bridge_jobgroup_start(HL_JOBGROUP_NATIVE | (group_check ? HL_JOBGROUP_CHECK : 0));
+    hl_log_on = getenv("HL_JOBS_LOG") != NULL || check || (stages && stage_check) || (group && group_check);
+    /* (the registration's gate last: a registration answered natively is waited for natively) */
+    hl_gate_on_806afc40 = stages;
+    hl_gate_on_83acfb90 = stages;
+    hl_gate_on_806b0260 = stages;
+    hl_gate_on_8007fe60 = group;
     char line[2048];
     hl_bridge_report(line, sizeof line);
-    hos_log("hl jobs: %s%s: %s", on ? "on" : "not started",
-            all ? ", every caller of the dispatcher native (HL_DISPATCH_ALL=1)" : "", line);
+    hos_log("hl jobs: %s%s%s%s: %s", on ? "on" : "not started",
+            all ? ", every caller of the dispatcher native (HL_DISPATCH_ALL=1)" : "",
+            stages ? ", the stages native (HL_STAGES=1)" : "",
+            group ? ", the module system's job group native (HL_JOBGROUP=1)" : "", line);
     return on;
 }
 
