@@ -5919,8 +5919,8 @@ bool mirror_make(Pool& pool) {
                     vkCmdCopyBuffer(upload_command_buffer(), buf, p->mirror, (uint32_t)rs.size(), rs.data());
             }
         }
-        p->mstate = Pool::MIRROR_ON;
         trace_gpu(MKWVK_TRACE_MIRROR_MADE, p->lo, p->hi - p->lo, p->lo, mem_rec_value);
+        p->mstate = Pool::MIRROR_ON;
         p->mirror_id = ++diff_mirror_ids;   // (TICK-048: the diff's hashes of another mirror do not hold for this one)
         if (!p->mirror_id) p->mirror_id = ++diff_mirror_ids;
         pools_gen.fetch_add(1, std::memory_order_relaxed);   // (the binding's buffer changes: guest memory, then this mirror)

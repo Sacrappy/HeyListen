@@ -49,6 +49,8 @@ void vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, con
 namespace mkwvk {
 constexpr uint64_t kPageShift = 12;
 void logf(const char*, ...) {}
+enum { MKWVK_TRACE_READBACK = 7 };
+void trace_gpu(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t) {}   // (HL_TRACE's record: none here)
 struct GprofSpan {
     int items = 0;
     uint64_t bytes = 0;
