@@ -24,6 +24,7 @@
      and the dictionary is the host's own copy, made at the decode and kept.
      HL_MEM_DROP=0  off (the default): nothing here runs, as before    HL_MEM_DROP=1  on
      HL_MEM_DROP_AGE=<seconds>  a range is looked at that long after its decode (default 30)
+     HL_MEM_DROP_MAX_MB=<MB>  larger decodes are left out (default 32, 0: any): a touch decodes the whole file
      HL_MEM_DROP_CHECK=1  a hash of each granule at its drop, compared at its restore (counted)
      HL_MEM_DROP_LOG=1  the counters every 10 s */
 #include "hos.h"
