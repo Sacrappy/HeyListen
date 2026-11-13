@@ -68,6 +68,32 @@ bool vertex_set_box(const float* vertices, int32_t n, const PreciseTransform& t,
     return true;
 }
 
+// 0x8174bb00
+bool segment_box(const float v[6], const PreciseTransform& t, float radius, Box& out) {
+    Guard g;
+    g.in(radius);
+    if (!inputs_ordinary(g, &t.row[0][0], 19) || !inputs_ordinary(g, v, 6)) return false;
+    const float lo[4] = {t.lo[0], t.lo[1], t.lo[2], t.lo[2]};
+    Box r;
+    for (int k = 0; k < 4; k++) {
+        const float a = g.mul(t.row[0][k], v[0]);
+        const float b = g.mul(t.row[1][k], v[1]);
+        const float c0 = g.mul(t.row[0][k], v[3]);
+        const float c1 = g.mul(t.row[1][k], v[4]);
+        const float e = g.mul(t.row[2][k], v[2]);
+        const float f = g.mul(t.row[2][k], v[5]);
+        const float p0 = g.add(e, g.add(a, b));
+        const float q0 = g.add(g.add(c0, c1), f);
+        const float p = g.add(t.hi[k], g.add(p0, lo[k]));
+        const float q = g.add(t.hi[k], g.add(lo[k], q0));
+        r.min[k] = g.sub(fmin(p, q), radius);
+        r.max[k] = g.add(fmax(p, q), radius);
+    }
+    if (!g.ok) return false;
+    out = r;
+    return true;
+}
+
 // 0x81a040bc, with 0x8170341c (the composition of the body's frame with A)
 bool oriented_box_box(const PreciseTransform& a, const float q[4][4], float radius, const float gx[2], Box& out) {
     Guard g;

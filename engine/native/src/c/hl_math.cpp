@@ -87,7 +87,14 @@ extern "C" int hl_math_body_box(const hl_guest_host* host, const hl_math_body_ar
     const uint64_t shape = in.body.shape;
     if (!(in.body.flags140 & 8) && a->shape_kind) {
         const auto* sh = static_cast<const bridge::HavokShape*>(at(shape));
-        if (a->shape_kind == 1) {
+        if (a->shape_kind == 3) {   // (the segment's two vertices are read whatever the array's count)
+            if (sh->vertices.offset == 0) {
+                plan->decline = (int)math::BodyDecline::shape;
+                return 0;
+            }
+            in.vertices = static_cast<const float*>(at(shape + 56 + (int64_t)sh->vertices.offset));
+            in.convex_radius = sh->radius;
+        } else if (a->shape_kind == 1) {
             // (an offset of 0 means no array: only a count of 0 is answered, as hl_math_vertex_set_box)
             if (sh->vertices.offset == 0 && sh->vertices.count != 0) {
                 plan->decline = (int)math::BodyDecline::shape;

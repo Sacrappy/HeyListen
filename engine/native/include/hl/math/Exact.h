@@ -127,10 +127,17 @@ struct Guard {
             fail((bits(t) & 0x7f800000u) == 0x7f800000u ? Why::mul_overflow : Why::mul_underflow, bits(a), bits(b), bits(t));
         return t;
     }
-    // FMLA / FMADD: w + a * b rounded once (through binary64; a binary32 midpoint there is given up)
+    // FMLA / FMADD: w + a * b rounded once, through binary64: the product is exact there, and the sum's one rounding
+    // differs from Arm's single rounding only when the binary64 sum was inexact and fell on a binary32 midpoint. A
+    // midpoint the sum reached exactly (its rounding error, by Knuth's two-sum, is zero) rounds to nearest-even as
+    // Arm's does: every one of the 3% of the affine box's calls and 4% of the sphere's that the midpoint rule alone
+    // declined in castle-move (2026-11-14) was such (products of values with short mantissas).
     float fma(float w, float a, float b) {
-        const double s = (double)a * (double)b + (double)w;
-        if ((bits(s) & 0x1fffffffull) == 0x10000000ull) fail(Why::fma_midpoint, bits(a), bits(b), bits(w));
+        const double p = (double)a * (double)b, s = p + (double)w;
+        if ((bits(s) & 0x1fffffffull) == 0x10000000ull) {
+            const double back = s - p;
+            if ((p - (s - back)) + ((double)w - back) != 0.0) fail(Why::fma_midpoint, bits(a), bits(b), bits(w));
+        }
         const float t = (float)s;
         if (!(big(t) || (is_zero(t) && (is_zero(a) || is_zero(b)) && is_zero(w))))
             fail(Why::fma_range, bits(a), bits(b), bits(w));

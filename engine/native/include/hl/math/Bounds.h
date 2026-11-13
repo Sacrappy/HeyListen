@@ -32,6 +32,12 @@ static_assert(sizeof(Box) == 32);
 // then the translation added in binary64 and rounded outward to binary32.
 bool vertex_set_box(const float* vertices, int32_t n, const PreciseTransform& t, const float start[4], Box& out);
 
+// Box of a segment (two vertices, packed xyz) under a precise transform, then grown by a radius, all in binary32 (guest
+// 0x8174bb00, a capsule's box): each end rotated as (row2 z + (row0 x + row1 y)) for the first and ((row0 x + row1 y)
+// + row2 z) for the second, the low then the high translation added, Arm FMIN / FMAX of the two ends, minus / plus
+// the radius.
+bool segment_box(const float v[6], const PreciseTransform& t, float radius, Box& out);
+
 // Box of a body's oriented box under a precise transform A. q: the body's four float4 at its +128 (its local frame: the
 // rows' w lanes hold the half extents, q[3] the centre); radius: its convex radius; g: two floats added to the extents
 // (lanes x, y, x, y). The body's frame is composed with A (rows, then the precise translation in two parts), the

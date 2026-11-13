@@ -166,6 +166,8 @@ bool body_box_update(const BodyUpdateIn& in, BodyUpdateOut& out, BodyDecline& wh
             std::memcpy(frame, in.box_frame, sizeof frame);
             const float bias[2] = {in.g80[0], in.g80[1]};
             if (!oriented_box_box(b.xf, frame, in.box_radius, bias, box)) return values();
+        } else if (in.shape_kind == 3) {   // 0x8174bb00
+            if (!segment_box(in.vertices, b.xf, in.convex_radius, box)) return values();
         } else {
             return decline(BodyDecline::shape);
         }

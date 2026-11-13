@@ -53,11 +53,12 @@ struct BodyUpdateIn {
     double com[3];                                          // state +16, +24, +32
     float s40[12];                                          // state +40 .. +84
     float g80[4], g96[2], g336[2], g512[2], g640[2];        // G
-    // shape box of the table path: kind 1 convex vertex set (0x8173e2ac), 2 oriented box (0x81a040bc), 0 other
+    // shape box of the table path: kind 1 convex vertex set (0x8173e2ac), 2 oriented box (0x81a040bc), 3 segment
+    // (0x8174bb00), 0 other
     int shape_kind;
-    const float* vertices;     // convex: packed xyz
+    const float* vertices;     // convex, segment: packed xyz (a segment: two)
     int32_t vertex_count;
-    float convex_radius;       // convex: shape +104
+    float convex_radius;       // convex, segment: shape +104
     uint16_t radius_scale;     // convex: shape +108
     const float* box_frame;    // box: shape +128, four float4
     float box_radius;          // box: shape +104

@@ -145,6 +145,31 @@ void fma_is_rounded_once() {
     math::Guard h;
     h.fma(w, b, c);
     CHECK(!h.ok);
+    // a midpoint reached exactly in binary64 is rounded as Arm's single rounding (a case seen in the game: w + a b
+    // with a b = -1.5 units in w's last place)
+    {
+        const float w2 = f32(0x30c3f2efu), a2 = f32(0xb3c00000u), b2 = f32(0x31000000u);
+        math::Guard k;
+        CHECK(bits(k.fma(w2, a2, b2)) == bits(std::fmaf(a2, b2, w2)) && k.ok);
+        const double s = (double)a2 * (double)b2 + (double)w2;
+        CHECK((bits(s) & 0x1fffffffull) == 0x10000000ull);   // (it is a midpoint)
+    }
+    // exact midpoints in bulk: values with short mantissas
+    uint64_t r = 0x123456789abcdefull;
+    int exact = 0;
+    for (int i = 0; i < 2000000; i++) {
+        r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+        const float w3 = f32(0x30000000u | ((uint32_t)r & 0x00ffffffu));
+        const float a3 = f32(((uint32_t)(r >> 24) & 0x80000000u) | (0x33000000u + ((uint32_t)(r >> 32) & 0x01e00000u)));
+        const float b3 = f32(0x31000000u | ((uint32_t)(r >> 40) & 0x00600000u));
+        math::Guard k;
+        const float t = k.fma(w3, a3, b3);
+        if (!k.ok) continue;
+        CHECK(bits(t) == bits(std::fmaf(a3, b3, w3)));
+        const double s = (double)a3 * (double)b3 + (double)w3;
+        if ((bits(s) & 0x1fffffffull) == 0x10000000ull) exact++;
+    }
+    CHECK(exact > 100);
 }
 
 // ---- references written from the specifications, without the guard ----
@@ -528,6 +553,32 @@ void the_c_surface_reads_the_layouts() {
     CHECK(out.min[1] == 101.5f && out.max[1] == 102.5f && out.min[3] == 1.0f && out.max[3] == 1.0f);
 }
 
+void segment_box_matches_the_specification() {
+    Rng r;
+    int taken = 0;
+    for (int i = 0; i < 100000; i++) {
+        const math::PreciseTransform t = random_transform(r);
+        float v[6];
+        for (float& f : v) f = r.pick(-3.0f, 3.0f);
+        const float radius = r.uniform(0.0f, 0.5f);
+        math::Box got;
+        if (!math::segment_box(v, t, radius, got)) continue;
+        const float L[4] = {t.lo[0], t.lo[1], t.lo[2], t.lo[2]};
+        for (int k = 0; k < 4; k++) {
+            const float a = t.row[0][k] * v[0], b = t.row[1][k] * v[1], e = t.row[2][k] * v[2];
+            const float c0 = t.row[0][k] * v[3], c1 = t.row[1][k] * v[4], f = t.row[2][k] * v[5];
+            const float ab = a + b, c01 = c0 + c1;
+            const float p0 = e + ab, q0 = c01 + f;
+            const float pl = p0 + L[k], ql = L[k] + q0;
+            const float p = t.hi[k] + pl, q = t.hi[k] + ql;
+            const float mn = ref_min(p, q), mx = ref_max(p, q);
+            CHECK(bits(got.min[k]) == bits(mn - radius) && bits(got.max[k]) == bits(mx + radius));
+        }
+        taken++;
+    }
+    CHECK(taken > 95000);
+}
+
 // ---- u3, 0x817d9d80: the body box update through its C surface, on a guest memory laid out as the game's ----
 struct BodyWorld {
     Arena a;
@@ -812,6 +863,7 @@ int main() {
     the_c_surface_reads_the_layouts();
     model_sphere_matches_the_specification();
     the_c_surface_reads_the_model_bounds();
+    segment_box_matches_the_specification();
     body_box_still_box_shape();
     body_box_declines();
     body_box_moving();

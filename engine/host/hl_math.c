@@ -313,12 +313,14 @@ static int run(Unit *u, Ctx *c) {
    box functions are native (u1's convex vertex set through 0x8173e2ac, and u2) and declines the others. */
 #define SHAPE_TABLE_PTR 0x84ca78c8ULL   /* (a pointer to the pointer to the shape-type table: 512-byte entries, box function at +24) */
 #define CONVEX_BOX_FN 0x8173e2acULL
+#define SEGMENT_BOX_FN 0x8174bb00ULL   /* (a two-vertex convex: the box of the segment plus the radius) */
 static int shape_kind(Unit *u, uint64_t body) {
     if ((*(uint8_t *)GP(body + 140)) & 8) return 0;   /* (the inline path: no table) */
     const uint64_t shape = G64(body + 120);
     const uint64_t fn = G64(G64(G64(SHAPE_TABLE_PTR)) + ((uint64_t)(*(uint8_t *)GP(shape + 24)) << 9) + 24);
     if (fn == CONVEX_BOX_FN) return 1;
     if (fn == units[U2].guest) return 2;
+    if (fn == SEGMENT_BOX_FN) return 3;
     for (int k = 0; k < OTHER_SHAPES; k++) {   /* (counted for the log: which functions the native unit leaves) */
         const LONG64 was = InterlockedCompareExchange64(&u->other_fn[k][0], (LONG64)fn, 0);
         if (was == 0 || (uint64_t)was == fn) {

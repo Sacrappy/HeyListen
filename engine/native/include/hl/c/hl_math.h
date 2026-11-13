@@ -26,7 +26,7 @@ int hl_math_model_sphere(const hl_guest_host *host, uint64_t bounds, uint64_t ho
 /* 0x817d9d80, the per-body box update (hl/math/BodyBox.h), with its arguments as guest addresses read through host->ptr:
    ctx = x0 (0: none), motion = x1, record = x2, prev = x3, body = x4, state = x5; global = the physics module's global
    object, start = the starting bound of 0x81746440; shape_kind = what the shape-type table gives for the body's shape:
-   1 the convex vertex set's function, 2 the oriented box's, 0 another. Nothing is written to the game: the plan says
+   1 the convex vertex set's function, 2 the oriented box's, 3 the segment's (0x8174bb00), 0 another. Nothing is written to the game: the plan says
    what the function would leave (the body's 192 bytes and which it stores, and the records it appends to the thread's
    stream blocks); the OS layer writes it, or compares it after running the translation. Returns 1, or 0 with the
    reason in plan->decline (hl::math::BodyDecline). */
