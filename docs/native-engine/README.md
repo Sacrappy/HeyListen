@@ -118,8 +118,9 @@ speed is not being measured for now, by the owner's instruction: it comes back w
 
 | Subsystem | Brick | Switch (default) | What it does today | What is still the game's |
 |---|---|---|---|---|
-| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | stage begin, registration and wait, the job group, the main loop |
-| Jobs | `hl::bridge::Dispatcher` | `HL_DISPATCH` (1) | the stage's jobs are picked and run by the native dispatcher, in place on the game's scheduler (its invariants clean in 18 runs) | the stage owner's and nested calls still run the translated dispatcher beside it (being moved: `HL_DISPATCH_ALL`) |
+| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | stage begin forms and graph, the job group, the main loop |
+| Jobs | `hl::bridge::Dispatcher` | `HL_DISPATCH` (1), `HL_DISPATCH_ALL` (1) | the stage's jobs are picked and run by the native dispatcher, in place on the game's scheduler, for every caller (an entry gate) | the module system's job group `0x8007fe60` (a heap, not rings: `jobs-boundary.md`) |
+| Jobs | `hl::bridge::Stages` | `HL_STAGES` (1) | the stage registration, the owner's wait and the frame's last stage are native (three entry gates), on the game's worker sets and events, each registration checked against the translated one: 0 differences and clean invariants in 14 runs | the guest's events stay the medium; the module system's twins of the registration and the wait |
 | Memory | no-access GPU pools out of RAM | `HOS_NOACCESS_RAM` (1) | 0.4 GB of RAM | - |
 | Memory | `hl::mem::ColdPages`, pools and heaps | `HL_MEM_COLD` (1), `HL_MEM_COLD_HEAPS` (1) | cold pages of CPU-cached GPU pools and of the game's heaps leave the working set: 4 to 4.5 GB of RAM (commit unchanged: page-file-backed) | true decommit with restore from the game's files (specified: `memory-boundary.md` 9) |
 | Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |

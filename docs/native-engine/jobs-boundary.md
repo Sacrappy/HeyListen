@@ -101,7 +101,8 @@ module system's job group and the main loop do not go through the native side.
 - The bridge keeps the identity table's "current actor" of a lane and the lane status word as the gameplay code reads
   them.
 
-Not read yet: the job group of the module system (`0x8007fe60`) in the same detail as the actors' stages.
+The job group of the module system (`0x8007fe60`) has a first reading below ("The module system's job group"), not yet
+in the same detail as the actors' dispatcher.
 
 ## The dispatcher's protocol (`0x8004ab40`, read whole for brick 3.1)
 
@@ -482,3 +483,51 @@ not counted in its lane). `tests/stages_test.cpp` runs it on a model with no gam
 the wait (the OS core read when the thread-local one is 0, an owner inside a job of its lane), an owner that takes part
 (its own context listed first, its core's worker left out and told not to run), the last stage on six threads at once
 with and without the own context, no stage, no stage cores, another message function, a worker not running.
+
+Validated 2026-11-13 (function and picture; no speed measured), `HL_STAGES=1 HL_STAGES_CHECK=1 HL_DISPATCH_CHECK=1`:
+on the main PC the three scenes with shots (pictures right), castle-move 4 more times and hyrule-walk once more, and one
+castle-move run of the default-on build with no `HL_STAGES` set; on the PC 3050 castle-move 3 times, hyrule-walk twice
+and kokiri-idle once. Every run went to the end with the game speed ratio 58-63; in every run every count above read 0
+(a main-PC castle run: about 57,000 registrations, each compared with the translated one, about 340,000 workers started
+and waited for, 38,000 waits and 19,000 last stages ended), and the dispatcher's invariants stayed 0. What the scenes
+exercise: every registration has stage cores and an owner that does not take part (own context registered 0 times,
+owner's part run 0 times), every worker message is the usual one and is queued, no lane drift: the owner's path through
+the set's own context, the other message function and the not-running worker are covered by the model test only.
+`HL_STAGES=1` is the default (with `HL_JOBS` on); `HL_STAGES=0` leaves the three gates off (the translated functions).
+
+## The module system's job group (`0x8007fe60`, a first reading)
+
+Read for brick 3.4's follow-up from the guest instructions of `0x8007fe60` (3,388 instructions) and its wait
+`0x80070b20`; not read whole: the protocol below is what the parts read show, and the job bodies inlined behind
+devirtualisation checks (as in `0x8004ab40`) were not followed.
+
+**Same as the actors' dispatcher.** The signature (scheduler G, dispatch context C) and the context's layout are the
+same (`+0x08` state word with handed jobs, `+0x10` flags, `+0x18` the handed queue under the mutex `+0x70`, `+0xb0` wake
+event, `+0xc0` observer, `+0xd8` lane, `+0xe0` lane status word); the lane status goes up on entry and down on leaving,
+with the same saturating compare-and-swap; a context with nothing to do sets its state from 0 to 1, looks once more,
+and sleeps on its wake event with its lane given up; a polling lane sleeps a timed span instead (its own constant, at
+`0x84e9f4f0`, guard `0x84e9f4f8`); a job tied to another lane is handed to the context of that lane (inlined: state word
+when 0 or 1, waking it when it was 1, else its queue under its mutex); waking others is the same loop over G's list
+(skip "not to run", compare-and-swap 1 to 0, signal); leaving clears bit 0 of C's flags after a full barrier. The wait
+twin `0x80070b20` is `0x806afc40` with `0x8007fe60` in place of `0x8004ab40`.
+
+**What differs.** G's layout: `+0x38` contexts in its list, `+0x40` the list, `+0x48` the ready jobs as a binary heap
+ordered by the job's 16-bit priority at `+0x0c` (largest first), `+0x54` the heap's size, `+0x58` a mutex guarding the
+heap, `+0x80` the end job, `+0xc0` the polling lane, `+0xc4` flags (bit 1: over), `+0xc8` **the count of jobs that may
+be taken**, handed out by compare-and-swap (lowered only while above 0) before the heap's mutex is taken: a context that
+gets a unit pops (or reads) the heap's top under the mutex. The job record: `+0x10` its lane (0x21 any), `+0x20` its
+list of dependents (first node `+0x28`, the node's link at the offset `+0x34` gives), `+0x38` **a 32-bit runner word in
+two halves** (low: runners still to start, high: running; adding 0xffff starts one, adding -0x10000 finishes one; a job
+stays at the heap's top while it has runners to start and is removed when its last one starts), `+0x3c` the count of
+jobs it waits for (set to -1 once complete), `+0x0e` a kind for the lane status. Completion takes G's mutex, lowers each
+dependent's count and pushes those that reach 0 (`0x80083350`: into the heap, `+0xc8` up by one, sleepers woken); the end
+job's completion sets G's bit 1 under the mutex and wakes every sleeping context of the list.
+
+**Can the native dispatcher serve it?** Not as it is with parameters: its queues are lock-free rings and its job
+record has a 16-bit runner word, where the group has a heap under a mutex, a handed-out counter and a two-half runner
+word; those are the core of `Dispatcher::run_native`, `pop`, `finish`. What is shared is everything around the queue
+(entry and leave, the lane status, handed jobs, forwarding, the sleep and wake protocol, the observer, the run of a job's
+body), which is about half of `Dispatcher.cpp`. The way to serve both is one dispatcher loop over two queue policies
+(the rings with their job record, the heap with its record), a template or an interface chosen per scheduler, not a
+second copy; it is the next brick's design question, once `0x8007fe60` is read whole (its completion and push
+`0x80083350`, the heap's sifts, the order of the counter, the mutex and the wakes).
