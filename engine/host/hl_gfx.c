@@ -11,6 +11,8 @@
    at random, and the counters compare the two (hl/gfx/PassCheck.h says what that proves). With HL_GFX=0 every pass is the
    translated one, recorded. The tap is decided when the game asks for its first NVN procedure, so the switch is read
    then; without it the procedures are the NVN layer's own, untouched.
+   HL_GFX_CHECK=2: the check's control: the passes drawn for the native path run the translated pass too, so the
+   differences it then shows between the paths are the check's own noise.
    HL_GFX_LOG=1: the counters every 10 s (always with the check). */
 #include "hl_host.h"
 #include "hl/c/hl_gfx.h"
@@ -29,7 +31,8 @@ static int check_on = -1;   /* HL_GFX_CHECK, read at the first NVN procedure */
 static int check_wanted(void) {
     if (check_on < 0) {
         const char *e = getenv("HL_GFX_CHECK");
-        check_on = e && atoi(e) > 0;
+        check_on = e ? atoi(e) : 0;
+        if (check_on < 0) check_on = 0;
     }
     return check_on;
 }
@@ -82,7 +85,8 @@ static void hl_report(void) {
 
 static void hl_gfx_pass(Ctx *A64_NOESC c) {
     const uint64_t listener = c->x[0], args = c->x[1];
-    int native = check_on ? hl_gfx_check_next_native() : native_on;
+    const int label = check_on ? hl_gfx_check_next_native() : native_on;
+    int native = check_on == 2 ? 0 : label;
     if (native && hos_ctx() != c) {   /* (the guest calls of the native pass run on hos_ctx(): never seen, kept as a guard) */
         InterlockedIncrement64(&other_ctx);
         native = 0;
@@ -95,7 +99,7 @@ static void hl_gfx_pass(Ctx *A64_NOESC c) {
     else translated(c);
     if (check_on) {
         recording = 0;
-        hl_gfx_check_end(native);
+        hl_gfx_check_end(label);
     }
     if (log_on) hl_report();
 }
@@ -117,6 +121,7 @@ static int hl_gfx_on(void) {
     log_on = check || getenv("HL_GFX_LOG") != NULL;
     hos_log("hl gfx: %s (NVN procedures tapped: %ld)",
             !check ? "the native recording pass"
+            : check == 2 ? "the check's control: every pass translated, filed under a path at random"
             : native_on ? "the check: each pass on the native or the translated path at random, recorded"
                         : "the check: the translated recording pass, recorded",
             (long)taps);
