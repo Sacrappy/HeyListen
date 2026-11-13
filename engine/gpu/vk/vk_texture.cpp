@@ -1109,7 +1109,8 @@ uint64_t bcc_cap() {
     static const uint64_t v = (uint64_t)(getenv("RX_VK_BC_CACHE_MB") ? std::max(0, atoi(getenv("RX_VK_BC_CACHE_MB"))) : 1024) << 20;
     return v;
 }
-// (HeyListen, 2026-11-14) RX_VK_BC_CACHE_LAZY=1 (the default; 0: every transcode stored, as before): blocks are stored only for
+// (HeyListen, 2026-11-14) RX_VK_BC_CACHE_LAZY=1 (the default on cards the driver allows more than 9.5 GB of; 0: every
+// transcode stored, as before): blocks are stored only for
 // bytes transcoded before (bcc_seen), or once the textures passed 3/4 of their budget or an ASTC texture uploaded from memory was
 // evicted (bcc_evicting: from then on every transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the
 // three scenes stored 1016-1308 textures, 756-890 MB of host-cached memory, and served 0. The cost where it does serve: one
