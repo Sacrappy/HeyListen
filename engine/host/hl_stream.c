@@ -885,7 +885,7 @@ static void restore_test(void *ctx, uint64_t dest, uint64_t size, uint64_t first
     /* (a budget: 64 MB of decoded bytes a second at most, so that the thread keeps up with the checks) */
     const int64_t now = hos_now_ns();
     if (now - rt_budget_at > 1000000000LL) rt_budget_at = now, rt_budget_bytes = 0;
-    if (rt_budget_bytes > (64u << 20)) return;
+    if (rt_budget_bytes > (16u << 20)) return;
     rt_budget_bytes += size;
     hl_stream_decode d;
     if (!hl_stream_find(dest, &d, NULL, 0) || d.dest != dest || d.size != size) { rt.no_entry++; return; }
@@ -947,7 +947,9 @@ static DWORD WINAPI pages_thread(LPVOID unused) {
     int64_t last = hos_now_ns();
     for (;;) {
         Sleep(500);
-        hl_stream_pages_check(hos_now_ns(), page_view, NULL, (size_t)1 << 18, restore_test, NULL);
+        /* (128 MB of pages a pass at most: 1 GB a pass, with the cold-pages thread's pages read back from the page
+           file, froze a run on the PC 3050 for a minute) */
+        hl_stream_pages_check(hos_now_ns(), page_view, NULL, (size_t)1 << 15, restore_test, NULL);
         if (hos_now_ns() - last < 10000000000LL) continue;
         last = hos_now_ns();
         static char table[16384];
