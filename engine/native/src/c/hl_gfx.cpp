@@ -1,10 +1,12 @@
 // HeyListen native engine: the C surface (hl/c/hl_gfx.h) over the graphics front end and its bridge.
 #include "hl/c/hl_gfx.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 #include "gfx_rec.h"
 #include "host_runtime.h"
@@ -384,6 +386,178 @@ extern "C" int hl_gfx_draw_report(char* out, size_t cap) {
                            names[i], (unsigned long long)r.calls, (unsigned long long)r.commands,
                            (unsigned long long)r.mismatched_calls, (unsigned long long)r.command_mismatches,
                            (unsigned long long)r.block_mismatches);
+    }
+    return n < 0 ? 0 : ((size_t)n < cap ? n : (int)cap - 1);
+}
+
+// ---- the shared preparation ----
+
+namespace {
+using hl::bridge::PrepareBridge;
+using hl::gfx::PrepareRoute;
+
+PrepareBridge* g_prep;
+hl::gfx::StateCheck* g_prep_check;
+// (every call by route; with the check, the translated NVN calls of the calls of each route too)
+std::atomic<uint64_t> g_prep_routes[hl::gfx::kPrepareRoutes], g_prep_nvn[hl::gfx::kPrepareRoutes];
+
+struct PrepCall {
+    uint64_t block = 0, drawable = 0;
+    PrepareRoute route = PrepareRoute::NoMaterial;
+    uint32_t result = 0;
+    hl::gfx::PrepareHandles at;
+    uint32_t groups[HL_GFX_PREP_GROUPS] = {};
+    hl::gfx::PassRecording native, translated;
+    uint8_t expected[PrepareBridge::kSnapshotSize];
+};
+thread_local PrepCall t_prep;
+
+// The paths' histogram: a call's shape is its route, its result and how many NVN calls of each kind the translated body
+// made (each count capped), packed in one word.
+std::mutex g_shapes_lock;
+std::vector<std::pair<uint64_t, uint64_t>> g_shapes;   // (shape, calls), unsorted; a few hundred shapes at most
+
+// (the bits of each kind's count in a shape, by HL_GFX_PREP_GROUP_*: a count is capped at what they hold)
+constexpr uint32_t kShapeBits[HL_GFX_PREP_GROUPS] = {6, 6, 2, 6, 6, 6, 3};
+
+uint64_t shape_of(const PrepCall& t, uint64_t result) {
+    uint64_t s = (uint64_t)t.route | ((result & 1) << 4);
+    uint32_t at = 5;
+    for (int g = 0; g < HL_GFX_PREP_GROUPS; g++) {
+        const uint32_t cap = (1u << kShapeBits[g]) - 1;
+        s |= (uint64_t)(t.groups[g] < cap ? t.groups[g] : cap) << at;
+        at += kShapeBits[g];
+    }
+    return s;
+}
+
+void file_shape(uint64_t s) {
+    std::lock_guard<std::mutex> lock(g_shapes_lock);
+    for (auto& e : g_shapes)
+        if (e.first == s) {
+            e.second++;
+            return;
+        }
+    g_shapes.push_back({s, 1});
+}
+}   // namespace
+
+extern "C" uint64_t hl_gfx_prep_address(void) { return hl::bridge::kPrepareSubmesh; }
+
+extern "C" int hl_gfx_prep_start(const hl_guest_host* host, const hl_gfx_host* gfx, int check) {
+    if (g_prep) return 1;
+    if (!gfx_host(host, gfx)) return 0;
+    if (check) g_prep_check = new hl::gfx::StateCheck("preparation", state_log, &g_runtime->gfx);
+    g_prep = new PrepareBridge(*g_runtime);
+    return 1;
+}
+
+extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t* result) {
+    hl::gfx::PrepareInputs in;
+    hl::gfx::PrepareHandles at;
+    g_prep->read(block, drawable, in, at);
+    const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in);
+    g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
+    if (!hl::gfx::Prepare::native(out.route)) return 0;
+    // (the block and the mark first: the function writes them before its call)
+    g_prep->write(block, at, out);
+    hl::gfx::NvnSink sink(g_nvn);
+    hl::gfx::Prepare::emit(out, at, sink);
+    *result = out.result;
+    return 1;
+}
+
+extern "C" void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable) {
+    PrepCall& t = t_prep;
+    t.block = block, t.drawable = drawable;
+    hl::gfx::PrepareInputs in;
+    g_prep->read(block, drawable, in, t.at);
+    const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in);
+    g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
+    t.route = out.route;
+    t.result = out.result;
+    for (uint32_t& g : t.groups) g = 0;
+    t.native.clear();
+    t.translated.clear();
+    hl::gfx::Prepare::emit(out, t.at, t.native);
+    g_prep->snapshot(block, t.at.command_buffer, t.expected);
+    PrepareBridge::expect(t.expected, out);
+}
+
+extern "C" void hl_gfx_prep_check_call(uint32_t proc, uint32_t group, const uint64_t* x, const uint32_t* f) {
+    PrepCall& t = t_prep;
+    hl::gfx::Command c;
+    c.op = proc;
+    std::memcpy(c.x, x, sizeof c.x);
+    std::memcpy(c.f, f, sizeof c.f);
+    t.translated.emit(c);
+    t.groups[group < HL_GFX_PREP_GROUPS ? group : HL_GFX_PREP_GROUP_OTHER]++;
+}
+
+extern "C" void hl_gfx_prep_check_end(uint64_t result) {
+    PrepCall& t = t_prep;
+    g_prep_nvn[(int)t.route].fetch_add(t.translated.calls().size(), std::memory_order_relaxed);
+    file_shape(shape_of(t, result));
+    if (!hl::gfx::Prepare::native(t.route)) return;
+    uint8_t actual[PrepareBridge::kSnapshotSize];
+    g_prep->snapshot(t.block, t.at.command_buffer, actual);
+    // (the result is the function's w0: a different one is a mismatch whatever the calls and bytes)
+    g_prep_check->compare(t.block, (uint32_t)t.drawable, t.native.calls(), t.translated.calls(), t.expected, actual,
+                          sizeof actual, result != t.result);
+}
+
+extern "C" int hl_gfx_prep_report(char* out, size_t cap) {
+    if (!g_prep || !cap) return 0;
+    int n = std::snprintf(out, cap, "preparation: %s", g_prep_check ? "calls by route" : "native calls by route");
+    for (uint32_t r = 0; r < hl::gfx::kPrepareRoutes && n > 0 && (size_t)n < cap; r++)
+        n += std::snprintf(out + n, cap - n, "%s %s %llu", r ? "," : "", hl::gfx::route_name((PrepareRoute)r),
+                           (unsigned long long)g_prep_routes[r].load(std::memory_order_relaxed));
+    if (g_prep_check && n > 0 && (size_t)n < cap) {
+        n += std::snprintf(out + n, cap - n, "; translated NVN calls by route");
+        for (uint32_t r = 0; r < hl::gfx::kPrepareRoutes && n > 0 && (size_t)n < cap; r++)
+            n += std::snprintf(out + n, cap - n, "%s %llu", r ? "," : "",
+                               (unsigned long long)g_prep_nvn[r].load(std::memory_order_relaxed));
+        const hl::gfx::StateCheck::Report r = g_prep_check->report();
+        if (n > 0 && (size_t)n < cap)
+            n += std::snprintf(out + n, cap - n,
+                               "; check: calls compared %llu, NVN calls compared %llu, mismatched calls %llu (NVN calls "
+                               "%llu, bytes %llu)",
+                               (unsigned long long)r.calls, (unsigned long long)r.commands,
+                               (unsigned long long)r.mismatched_calls, (unsigned long long)r.command_mismatches,
+                               (unsigned long long)r.block_mismatches);
+    }
+    return n < 0 ? 0 : ((size_t)n < cap ? n : (int)cap - 1);
+}
+
+extern "C" int hl_gfx_prep_shapes(char* out, size_t cap) {
+    if (!g_prep_check || !cap) return 0;
+    std::vector<std::pair<uint64_t, uint64_t>> s;
+    {
+        std::lock_guard<std::mutex> lock(g_shapes_lock);
+        s = g_shapes;
+    }
+    if (s.empty()) return 0;
+    std::sort(s.begin(), s.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    // (route/result: state, program, uniform, storage, texture, call, other NVN calls, each count at most its cap)
+    int n = std::snprintf(out, cap, "preparation shapes %zu (route/result: state program uniform storage texture call "
+                                    "other = calls):", s.size());
+    static constexpr int kOrder[HL_GFX_PREP_GROUPS] = {HL_GFX_PREP_GROUP_STATE,   HL_GFX_PREP_GROUP_PROGRAM,
+                                                       HL_GFX_PREP_GROUP_UNIFORM, HL_GFX_PREP_GROUP_STORAGE,
+                                                       HL_GFX_PREP_GROUP_TEXTURE, HL_GFX_PREP_GROUP_CALL,
+                                                       HL_GFX_PREP_GROUP_OTHER};
+    for (size_t i = 0; i < s.size() && i < 16 && n > 0 && (size_t)n < cap; i++) {
+        const uint64_t k = s[i].first;
+        uint32_t count[HL_GFX_PREP_GROUPS];
+        uint32_t at = 5;
+        for (int g = 0; g < HL_GFX_PREP_GROUPS; g++) {
+            count[g] = (uint32_t)((k >> at) & ((1u << kShapeBits[g]) - 1));
+            at += kShapeBits[g];
+        }
+        n += std::snprintf(out + n, cap - n, " %s/%u:", hl::gfx::route_name((PrepareRoute)(k & 15)),
+                           (unsigned)((k >> 4) & 1));
+        for (int g : kOrder)
+            if (n > 0 && (size_t)n < cap) n += std::snprintf(out + n, cap - n, " %u", count[g]);
+        if (n > 0 && (size_t)n < cap) n += std::snprintf(out + n, cap - n, " = %llu;", (unsigned long long)s[i].second);
     }
     return n < 0 ? 0 : ((size_t)n < cap ? n : (int)cap - 1);
 }

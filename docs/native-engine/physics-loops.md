@@ -635,3 +635,260 @@ hyrule-walk): u3 allocates nothing (its plan is a per-thread buffer).
 **Not done in this session**: `subIntegrateLastStep` `0x8182dc20` (1,591 insns, 7 indirect calls, Havok's block
 allocator and profiler calls) and `solveJacobians` `0x8177b2a0` (3,969 insns, 48 calls, 7 indirect) were not read
 beyond their call lists; no specification of them is written yet, and `BuildJacobians` was not started.
+
+## 9. `subIntegrateLastStep` `0x8182dc20` (stream 7, third session)
+
+Read whole from the image's instructions (1,591, every path). Names of fields say what the function does with them;
+the guesses about their meaning are marked. Section 6.3's names for U3's inputs are kept where they meet: what 6.3
+calls the motion M (x1) is the solver step data D below, and its motion state S (x5) is the motion.
+
+### 9.1 Calls and arguments
+
+Three callers: `0x8182f860` (from the solver task `0x819b8e20`, three sites: the one sampled), `0x8182fc40` (a 22-insn
+forwarder) and `0x8182b0a0` (from `0x819bf460`). `0x8182f860` calls it with:
+
+| arg | value |
+|---|---|
+| x0 | the simulation thread context T |
+| x1 | the solver step info I (`0x819b8e20`'s +1880 object) |
+| w2 | the substep (a byte) |
+| w3 | `first` = (I +64)[substep].lo + 1: the first motion slot of the range |
+| w4 | `count` = (I +64)[substep].hi - 1 |
+| w5 | 0 |
+| x6 | a work-range object on the caller's frame, made by `0x81708ba0(obj, 1, count, 1)` |
+| x7 | 0 (with another caller: an array of 48-byte stream-range records, below) |
+| [sp] | a profiler holder P (9th argument) or 0 |
+
+Nothing is returned (the caller reads no register it did not set again: read at `0x8182f958`).
+
+### 9.2 What it walks
+
+- **The motions of the range, in the order a work-range object deals them.** `i` runs from 0 up to the end of the
+  current chunk (object +12); at the end of a chunk `0x8170901c(obj, &chunk)` deals the next one (an atomic add on the
+  object's counter, `0x81708ea0` when it runs dry); it returns a negative value when the range is done. With the
+  caller's own object (`0x8182f860`) one thread takes every chunk in increasing order, so `i` = 0 .. count-1 (likely:
+  `0x81708bc0` was not read; the check of 9.6 verifies it in the game).
+- For each `i`, two 32-byte solver velocity entries: **A** = (I +104)->[first + i] and **B** = (I +128)->[first + i]
+  (pointers at I +0x68 and I +0x80). An entry holds two vectors: **V** in floats +0, +4, +8 and **W** in floats +16,
+  +20, +12 (lanes x, y, z; the vector registers carry `(+0, +4, +8, +12)` and `(+16, +20, +12, +12)`). V turns the
+  orientation (angular velocity), W moves the centre of mass (linear velocity): read from what each integrates. A +24 is
+  a 64-bit value used only as zero / not zero ("A has a modifier", below). B +24 and +26 are two 16-bit packed floats
+  (the half shifted left by 15: `(h << 15)` as a float's bits), **maxW** and **maxV**; B +28 is a word: bits 0-4 a count
+  n, bit 5 and bit 6 flags, bits 8-31 the **motion id**.
+- The motion: 128 bytes at `(*(I +0x50))->+16 [id >> 6] + (id & 63) * 128` (pages of 64). Fields used: +0 orientation
+  quaternion (x, y, z, w), +16, +24, +32 the centre of mass in binary64, +40 .. +60 (V x, y, z, then W z) and +56, +60 (W
+  x, y): the velocities of the previous substep; +64 .. +84 the same layout for the "integration velocities"; +92 a byte,
+  the motion's cell (0xff: none); +93 a byte, a weight; +94 a 16-bit packed float written 0x3f80 (1.0); +96 the first
+  body's id (24 bits); +100 a 16-bit word (bits 0-14: "has integration modifiers"); +102 a half (the high half of a
+  float); +112 four halves (damping, likely); +120 a half; +123 a byte, the motion-properties index; +124 a word, flags
+  tested against the callback lists' masks.
+- D = I +0x10 (pointer): the solver step data. Read: +32 a float, +96 / +100 the step pair t = (t0, t1), +104 a pair,
+  +136 a float s, +144 a pair, +192 and +208 two float4 Q0, Q1.
+- G = `*0x84ca4680` (as in 6.3): +0x50 a pair g50, +0x60 a float4 C (the constant "one", likely 1.0 in every lane: read
+  at run time), +0x150 a pair h, +0x3f0, +0x400, +0x410 three pairs c1, c2, c3 (a polynomial's coefficients).
+- The bodies of each motion: a ring from the motion's first body id through body +0x84 (next id) back to the first;
+  body address `(*(I +0x48))->+32 [id / 42] + (id % 42) * 192`.
+
+### 9.3 Per motion, in the guest's order (single precision, each operation separately rounded, no fused operation)
+
+Notation: `|x|²` of a 3-vector is `z² + (x² + y²)` (the pair sum first; lane order of the guest), `pk(h)` the float whose
+bits are `h << 16`, `rs(x)` the integer step `0x5f375a86 - (bits(x) >> 1)` taken as a float (0 when x's exponent field is
+0): an exact integer operation, not an estimate instruction.
+
+1. `dV = A.V - B.V`, `dW = A.W - B.W` (lane by lane). **Steps 2 to 4 run only when A +24 is not zero** (`0x8182e2e0`:
+   otherwise `cV = dV`, `cW = dW`, `r = C.lo`, straight to step 5). `mV = maxV²`, `mW = maxW²` (the game's maxima are
+   often `0x7f7f0000`, whose square is +inf: harmless, the squares are only compared). `LV = |dV|²`.
+2. **Clamp V.** If `mV >= LV`: `cV = dV`, `k = C.lo`. Otherwise: if any lane of `(dV, A.s12 - B.s12)` is NaN, `cV = 0`,
+   `k = C.lo`; else `k = (LV's exponent field 0 ? 0 : C.lo / sqrt(LV))` (two lanes, the pair C.x, C.y), `cV = dV · (k ·
+   maxV)` (lanes x, z by the first lane of the pair, y by the second); then a **clamp record** is appended (9.4, kind 0),
+   and `r = FMIN(C.lo, k · (D104 · pk(M102)))` (used only by the modifier call).
+3. `LW = |dW|²`. **The n path** (n = B28 & 31 not zero): `n = float(n)`, `e = (n · 2^-10) · n`, `s3 = e · D32`. The
+   threshold pair T: if B28 bit 6 is set and `pk(M120)` is neither 1.0 nor 0: `m = |pk(M120)|`, `T = (m · s3) · rs(m)`
+   with the test value `(m · s3)²`; if it is 0: `T = g50`, test `g50²`; else `T = (s3, s3)`, test `s3²`. If `LW >= test`
+   nothing happens; otherwise `u = D144 · T`, `e2 = (e · (e · 0.75)) + 0.25`, and: if `LW · e2 > u²`: `dW = dW · FMAX(g50,
+   C.lo - rs(LW) · u)` (pair broadcast as above); else `dW = 0`, and `cV = 0` too when `u² > |cV|² · e2` (with `|cV|²` in
+   the order `z² + (x² + y²)`).
+4. **Clamp W** as V, against `mW >= LW` (LW from before step 3), with maxW, on dW as step 3 left it (the NaN test on its
+   four lanes, the factor `C.lo / sqrt(LW)` from the unscaled LW); record kind 1, no `r`. `cW` is the result.
+5. **New velocities.** `nW = (B.W + cW · Q0) · (Q1 · s)`, `nV = (cV · Q0 + B.V) · (Q1 · s)` (4 lanes; the order of each
+   sum as written). If A has a modifier and `M100 & 0x7fff`: the virtual call (9.5, #2) with `r · Q0` and the two new
+   velocities on the stack (it may change them).
+6. **Damping.** `f = C - FMIN(t · pk4(M112), C)` (lanes: t0 · d0, t1 · d1, t0 · d2, t1 · d3); `iW = cW · f2`, `iV = cV ·
+   f3`. If B28 bit 5 (byte) is set: `iW` is kept where `|nW|² > |iW|²`, else `nW` replaces it (the same for V), and the
+   per-body flag value gets 0x1000.
+7. **Callbacks** (9.5, #3, #4) when `(M124 | 2)` meets the masks of the context's two callback lists; they may change
+   `iW, iV, nW, nV` and the moving flag.
+8. **Stores** (always): M +64 = (iV.x, iV.y, iV.z, iW.z), M +80 = (iW.x, iW.y), M +40 = (nV.x, nV.y, nV.z, nW.z), M +56 =
+   (nW.x, nW.y), M +94 = 0x3f80. **Moving** = any of lanes 0-2 of iW, iV, nW, nV not equal to zero (a NaN counts).
+9. **Integration** (moving only): `a = (nV · t) · h` (lanes by t0, t1, t0 and h0, h1, h0), `x = nW · t`. `s = (a.x² + a.y²) +
+   a.z²`; `kq = C.lo + s · (c1 + s · (c2 + s · c3))` (a pair). With q the orientation: `w' = kq0 · q.w - ((a.x q.x + a.y q.y)
+   + a.z q.z)`; for each lane j of x, y, z: `q'_j = (a_j · q.w + c_j) + q_j · kq_(j&1)` where c = (a.z q.y - a.y q.z, a.x q.z -
+   a.z q.x, a.y q.x - a.x q.y) (each the difference of two products). `N = (q'x² + q'y²) + (q'z² + w'²)`, `q'' = q' /
+   sqrt(N)` (4 lanes). Centre of mass: `com_k += (double)x_k` (binary64 add of the widened float), stored +16, +24, +32;
+   then the orientation +0.
+10. **Deactivation** (when the context's +8 object +0xdb8 is set: the bit field at `*(T +0x4b8)`): when A +24 is zero and
+    the motion moves, and the previous W (M +56, +60, +52, read before step 8) and dW (after step 3) are all zero, the byte
+    +11 of the motion's 16-byte deactivation
+    record (`(*(I +0x88))[id >> 6] + (id & 63) · 16`) is cleared; otherwise `0x81830268(record, motion, properties (T +0x30
+    -> + M123 · 68), &previous W, a stack temporary)` (a leaf of 850 lifted lines: reads the motion, writes the record) and,
+    when it returns non-zero, bit `first + i` of the bit field is set (plain read, or, write).
+11. **Cell.** `P = ((float)com.x, (float)com.y, (float)com.z, 0)`; `cell = (I +0x18)->vtable[+0x28](obj, &P, cache)` (9.5,
+    #5; the cache is a 0x130-byte block on the frame, set up on the first motion by vtable[+0x20](obj, substep, count,
+    cache) when its first word is 0xff). If M92 != 0xff and differs from `cell`: a **cell record** (9.4). If `*(T +0x4d8)`
+    (a table of 32-byte cells) is set: the cell's four int64 accumulators get `FCVTZS(lane) · w` (32-bit) sign-extended,
+    lane by lane, for the lanes `(P.x · 128, P.y · 128, P.z · 128, C.x)` (the last not scaled); w = M93 · the byte at I +
+    (A +24 not zero ? 0x98 : 0x99).
+12. **Bodies** of the motion's ring, in ring order: if body +0x8c bit 0 is clear and the listeners' count `(I +0x48) +0x500`
+    is not zero, an atomic OR of `1 << (id & 63)` into word `id >> 6` of each listener bit field; then body +0x5c (16 bits)
+    = (moving << 10 | the 0x1000 of step 6) | ((body +0x5c >> 9) & 0x20); then U3 (`0x817d9d80`, section 6.3) with (T, D,
+    `*(T +0x10)` + body +0x8d · 104, I + 0x20, body, motion); then the body's 32-byte cache entry (`(*(T +0x4e8))[id >> 8] +
+    (id & 255) · 32`) gets +12 (4 bytes) and +16 (8 bytes) zeroed.
+
+### 9.4 Its stream records
+
+All go to the thread's block-stream writer at T +0x520 (its current block's first word: bytes used in the low half,
+records in the high half; records from block +32; a block holds 4,096 bytes). Before each record, while the used bytes
+are 0xfc0 or more, `0x816ef7bc(T +0x520, *(T +0x4e0))` (the block allocator) gives a new block. Each record adds 0x10020
+to the header (one record, 32 bytes) and writes:
+
+| record | +0 | +4 | +8 | +12 | +16 | +17 | not written |
+|---|---|---|---|---|---|---|---|
+| clamp (V: kind 0, W: kind 1) | 0x03000020 | 6 | 0x00ffffff | motion id | kind (32 bits) | | +20 .. +31 |
+| cell | 0x03000020 | 0 | first body id (M96, 32 bits) | motion id | old cell (byte) | new cell (byte) | +18 .. +31 |
+
+The bytes a record leaves unwritten keep what the block held. The writer's own fields (T +0x520 .. +0x538) change only
+through the allocator.
+
+### 9.5 Its calls
+
+| # | call | when | class |
+|---|---|---|---|
+| 1 | `0x800430a0(P, name, name + 0x12)` / `0x800431c8(P, ...)` | P not zero, at entry / exit | profiler (phive timer) |
+| | `0x816e09e0` + monitor-stream records, `0x816e23f0` / `0x816e2558` (string id, stream grow), `0x83c61ca0` / `0x83c61cb0` (static-init guard) | the global profiler byte `*(*0x84cb83b0)` set and P +0x70 not zero | Havok profiler |
+| | `0x8170901c` | end of a chunk | work-range dealer (atomic) |
+| 2 | `(*(T +8) +0xd70)->vtable[+0x28]` | A +24 not zero and M100 & 0x7fff | integration modifier (indirect) |
+| 3, 4 | list 1 at `*(T +0x40)` +0x1210 (mask), entries (mask, object) from +0x1220, count +0x1218: vtable[+0xb8]; list 2 +0x1320 / +0x1330 / +0x1328: vtable[+0xc0] | `(M124 \| 2)` meets the list's mask | motion callbacks (indirect) |
+| 5 | `(I +0x18)->vtable[+0x20]`, `[+0x28]` | first motion; every motion | cell set-up and cell lookup (indirect) |
+| | `0x81830268` | deactivation on and not the zero case | deactivation check (direct, leaf) |
+| | `0x816ef7bc` | a block full | block allocator |
+| | `0x817d9d80` | every body | U3 (native) |
+| 6, 7 | `(*0x84cb8168)->vtable[+0x20]` | the cache's two arrays, when allocated | heap free |
+| | `0x8182fddc`, `0x8182ff20`, `0x8182fc94` | x7 not zero | stream-range records (another caller's path) |
+
+With x7 not zero (not `0x8182f860`'s calls) the function also closes and reopens the writer's current range (T +0x730
+.. +0x73c, the stream array T +0x768 / +0x770 of 80-byte entries) around each chunk and appends a 48-byte record per
+chunk to the x7 array. No lock is taken by the function itself (the listener bits are atomic ORs; "locks" in 2.1's
+summary were these and the dealer's atomic add).
+
+### 9.6 The check of the motions' step, and the paths' histogram (unit `sil`)
+
+The native step of one motion (9.3, steps 1 to 9 and the cell position of step 11) is `hl::math::motion_step`
+(`hl/math/MotionStep.h`, `src/math/MotionStep.cpp`; the layouts in `hl/bridge/MathBridge.h`: the solver step data, the
+velocity entries, the globals' new fields; the C surface `hl_math_motion_step`). It declines on values outside the
+exactness rules and on the modifier's path. Its bridge in `engine/host/hl_math.c` (`run_sil`, gate `0x8182dc20`) is a
+check only: with `HL_MATH_CHECK=1` (unit `sil`) every call from `0x8182f860` (return address `0x8182f958`, x7 = 0) copies
+the motions of slots `first .. first + count - 1` at entry, runs the translated function for real, then compares each
+motion's 128 bytes with the native step's and walks the records the call appended to the writer at T +0x520 (two clamp
+records and a cell record per motion at most, in that order; a cell record's new cell, from the lookup the native side
+does not answer, is taken as written). Motions with a callback (their M124 | 2 meets a list's mask) or a declined step
+are counted and not compared, and the records after them are not walked. Nothing is native: the unit has no native mode
+yet (9.7).
+
+The first run found two mistakes of the first reading, both corrected in 9.3 and the code: steps 2 to 4 run only with A
++24 set, and the maxima's squares overflow. Results after them, PC 3050, build of `a0981ea`, `HL_MATH_CHECK=1
+HL_MATH_UNITS=sil`, full 110 s runs (the last report of each run):
+
+| scene | calls | x7 path (another caller, left) | motions | compared | declined: modifier | declined: values | mismatches (motions / records) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| castle-move | 3,673 | 608 | 173,771 | 159,823 | 13,661 | 287 | 0 / 0 |
+| kokiri-idle | 3,787 | 492 | 180,769 | 168,827 | 11,574 | 368 | 0 / 0 |
+| hyrule-walk | 2,308 | 505 | 93,740 | 84,454 | 8,712 | 574 | 0 / 0 |
+
+(hyrule-walk's last report is from earlier in its run than the others'.) The same check on the main PC (build of
+`48749bd`), full runs:
+
+| scene | calls | x7 path | motions | compared | declined: modifier | declined: values | mismatches (motions / records) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| castle-move | 6,961 | 589 | 341,061 | 313,480 | 27,160 | 421 | 0 / 0 |
+| kokiri-idle | 9,443 | 649 | 431,093 | 393,503 | 35,685 | 1,905 | 0 / 0 |
+| hyrule-walk | 9,071 | 668 | 412,052 | 376,295 | 32,338 | 3,419 | 0 / 0 |
+
+**The paths' histogram** (the same in the three
+scenes): every call has a profiler holder P (so `0x800430a0` / `0x800431c8` run on every call), about one call in six
+comes with x7 (the stream-range path, from the other caller); deactivation and the cell accumulators are on in every
+call; no motion meets a callback list (the masks are 0); A +24 is set on 7-8% of the motions and each of them has the
+integration modifier (`0x818f2b2c`), so **the clamps and the n path were never taken**; 55-72% of the motions move,
+the deactivation's zero case is 40-55%; cell records are rare (about 300 a run, at the start), the writer's block never
+filled. Values declined (0.1-0.8%): squares of velocities near 1e-23 that underflow (Arm flushes them under FZ). FPCR was
+FZ only in every call. The indirect targets seen: cell set-up `0x8190ac00`, lookup `0x8190ad60`, modifier `0x818f2b2c`.
+
+### 9.7 What a native `subIntegrateLastStep` needs (not built)
+
+The check covers each motion's step and the clamp and cell records, byte for byte. A native answer of the whole
+function also writes what the check does not compare yet: the bodies' flags (+0x5c), their cache entries, the listener
+bits, the deactivation bits and records (through `0x81830268`), the cell accumulators, U3's results, and it must call,
+in the guest's order, the profiler hooks (every call has P), the cell set-up and lookup (`0x8190ac00`, `0x8190ad60`,
+every motion), the deactivation check, the modifier for the 8% of motions with one (or decline those calls), the block
+allocator and the frees of the cell cache. Its check therefore has to replay: run the translation for real while gates
+on those callees record their arguments and results, then run the native driver on the entry copies against the
+recording and compare every write. That driver and its check are the next step; until they exist the unit stays a
+check (`validated` 0), nothing of it is native.
+
+The build with the gate (`5fe0855`, defaults: the five validated units native, `sil` off) passed the validation runs on
+the main PC (`build/s5/valid.sh`, tag `s7cv`): the three scenes ran to the end (112 s), no crash, game speed ratio 59.73
+(kokiri-idle), 60.06 (castle-move), 60.06 (hyrule-walk); the last shots of each scene look right. Memory: game RAM 2.6 /
+3.1 / 3.0 GB, process RAM 6.0 / 7.0 / 6.7 GB (kokiri-idle / castle-move / hyrule-walk).
+
+## 10. The contact solver's `solveJacobians` `0x8177b2a0` (stream 7, third session: partial)
+
+Read: the entry, the walk over the Jacobian stream, the record header, the cache of the two bodies' velocities, the
+three forms of the normal rows' loop (0x8177b9e0 .. 0x8177c634); not read: the friction and angular parts after the
+normal rows (0x8177c634 .. 0x8177e0ec), the modifier and "fire modifiers" paths, the tail. Reached through the stream
+contact solver's vtable only (no direct caller).
+
+- **Arguments**: x1 the solver thread context (kept at sp +0x7b8), x2 the step info I (the same object as 9.1's x1:
+  its +0x68 and +0x80 velocity arrays), x3 the solver parameters P (+0 an int, +8 a pair, +16 a flags byte: bit 1, 2, 3
+  choose paths), x4 the first range of the Jacobian stream, x5 a pointer to the impulses' output (the accumulated
+  impulse of each contact point is stored there, 4 bytes a point, in record order), x6 and x7 pointers to two ints,
+  the first slots of the two velocity sets (`(I +0x68) + 32 · *x6` and `+ 32 · *x7`, the same for +0x80): a record's
+  flag bit 0 chooses the set of its first body, the set after it holds its second.
+- **The walk**: a range is (+0 block, +8 16-bit offset of the first record from block +32, +12 record count, +16 the next
+  range, +24 a byte, the stream id, which must stay the one of the first range); records follow one another in the block
+  (their size from their header and point count, not read).
+- **The record header** (read): +0 16-bit flags (bit 0 the velocity set, 0x30 the friction kind, bit 6 "two bodies
+  move" (the rows subtract the second body's velocity), bit 7 a record handled by `0x81785c00` (the "second Jacobian type"
+  of 2.1), 0x300 the form of the normal rows (0, 0x100, 0x200; another value traps), bit 10, 11, 13, bit 14: set bit 5 of
+  both bodies' entry flags word at +28); +2 a byte (bits 0-2: the record and its impulse pointer are appended to one, two or three of
+  the frame's deferred lists, solved later through `0x81785c00`; bit 0 also a path at `0x8177c968`); +4 the number of contact points; +5 a byte (bits 1-3 material scaling of the rows from tables at
+  `*0x84cc1a80` / `*0x84cc1a88`, bit 4 a path at `0x8177ce38`, bit 6 kept); +6 a byte (0xe0 = 0x60 with flag bit 10: a
+  separate path); +7 a byte (a count scaled by I's pair at +0x200); +8 and +12 the two bodies' ids (compared with the
+  previous record's); +16 a float4 (the normal, and in w a factor); +40 and +44 the two velocity slots; +64 on, 32 bytes a
+  point (two float4: the point's angular Jacobians, the w lanes the right-hand side and the effective mass); after the
+  points, the friction rows (+0x9c + 32 · points: a factor; +0xc0 + 32 · points: a float4).
+- **The velocities' cache**: the two bodies' entries (A: V, W as in 9.2, and their packed maxima as floats) are loaded
+  into a frame block at the start of each record (the second body's only with flag bit 6) and written back at its end
+  (V and W.z at +0, W.x, W.y at +16; `0x8177cbd0`). The comparison of a record's body ids (+8, +12) with the previous
+  record's decides only whether the deferred lists are solved (`0x81785c00`, on the previous pair) before the new record:
+  so the deferred records of a pair are solved after all its direct records, and their order is part of the result.
+- **After the normal rows**, with friction (flags 0x30) and P +16 bit 3 clear: the friction rows use integer "magic"
+  steps (`0x7ef504f3`, `0x5f2fed52`, with `0xbf0e425b`, `0x3fc6fa83`: reciprocal and reciprocal square-root
+  approximations by an integer subtraction and a polynomial refinement, exact operations a native version can
+  reproduce), and FMIN / FMAX clamps against the globals' +0x1c0 and +0x260 pairs; not read further.
+- **The normal rows** (each point in record order, Gauss-Seidel: each point's impulse changes the cached velocities
+  before the next point is solved): the relative velocity along the point's Jacobians, `(J.ang0 · V0 + J.ang1 · W0) +
+  n · (W0 - W1)` summed as `z + (x + y)`, plus the point's right-hand side; the impulse `Δ = max(-acc, eff · (rhs - v))` (a
+  pair through FMAX against the accumulated impulse, the guest's operands in that order), the accumulated impulse at
+  `*x5` updated, the velocities changed by `Δ` times the Jacobians and the inverse masses (4-lane products, then sums in
+  the guest's order). The three forms differ in which body moves and in a clamp of the target velocity (`FMIN` with the
+  solver step data's +0 and +0xd0 factors in the 0x100 and 0x200 forms).
+- **Calls** (48 sites): `0x81775920` (set-up of the frame's modifier lists), `0x8169ed90` / `0x8169e414` / `0x8169d98c` /
+  `0x8169e0cc` / `0x8169e1ec` (Havok's monitor / timer helpers, likely: not read), `0x81785c00` (5 sites: the records with
+  bit 7 and the deferred lists, with the frame's cached velocities), `0x8178413c` (6: an array's reserve, when a deferred
+  list is full), `0x81784840`, `0x81784a80`,
+  `0x81784260`, `0x81784460`, `0x81784620` (row kinds of the paths not read), `0x8178d820` / `0x8178d870`, `0x816ef7bc`
+  (the block allocator: an output stream), the profiler set (`0x816e09e0`, `0x800430a0`, `0x800431c8`, `0x816e23f0`,
+  `0x816e2558`, the static-init guards), `0x8017188c` (phive), and 7 indirect calls (the modifiers' callbacks, "fire
+  modifiers": 2.1).
+
+Not yet: the friction and rolling rows' arithmetic, the paths by P's flags, what the output stream receives, the
+records' size rule, the histogram of paths in the game. No native code for it.

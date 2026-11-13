@@ -85,6 +85,8 @@ void pipeline_cache_save(bool force);
 /// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc returns in the
 /// recording's stream (mapped at base), or UINT64_MAX when none overlaps
 uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc);
+/// (HL_UBO_INLINE) those updates copied onto p, the bytes an inline bind carried for [addr, addr + n)
+void ub_overlay_onto(uint64_t addr, uint64_t n, uint8_t* p);
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
 

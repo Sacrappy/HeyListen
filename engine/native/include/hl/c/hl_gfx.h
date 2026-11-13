@@ -110,6 +110,41 @@ void hl_gfx_draw_check_end(void);
 /* One line of the submission's counters. Returns the length written. */
 int hl_gfx_draw_report(char *out, size_t cap);
 
+/* ---- the shared preparation (guest 0x8008fc00: called directly, answered through an entry gate on its cached path) ---- */
+
+/* Starts it (once; the hosts must outlive the process). check: 1 to compare each call instead of answering it. Returns
+   1. */
+int hl_gfx_prep_start(const hl_guest_host *host, const hl_gfx_host *gfx, int check);
+uint64_t hl_gfx_prep_address(void);
+
+/* The native answer, on the thread that runs the call (x0 block, x1 drawable): returns 1 when it answered, with the
+   function's result in *result (the block and the command buffer written, the NVN call made), 0 when the call leaves
+   the cached path: the translated body must run. Every call is counted by the route it takes. */
+int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t *result);
+
+/* The check, per call: begin decides natively into a recording (nothing called, nothing written) and counts the route;
+   the caller then runs the translated body with the tap feeding call (proc: the native numbering; group: the
+   procedure's kind, HL_GFX_PREP_GROUP_*); end compares the calls, the bytes and the result when the native version
+   would have answered, and files the call's shape (its route and how many calls of each kind) in the paths' histogram. */
+enum {
+    HL_GFX_PREP_GROUP_OTHER = 0,
+    HL_GFX_PREP_GROUP_STATE,      /* the render state's setters and binds */
+    HL_GFX_PREP_GROUP_PROGRAM,    /* BindProgram */
+    HL_GFX_PREP_GROUP_UNIFORM,    /* BindUniformBuffer */
+    HL_GFX_PREP_GROUP_STORAGE,    /* BindStorageBuffer */
+    HL_GFX_PREP_GROUP_TEXTURE,    /* BindTexture(s), texture handles and views */
+    HL_GFX_PREP_GROUP_CALL,       /* CallCommands */
+    HL_GFX_PREP_GROUPS
+};
+void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable);
+void hl_gfx_prep_check_call(uint32_t proc, uint32_t group, const uint64_t *x, const uint32_t *f);
+void hl_gfx_prep_check_end(uint64_t result);
+
+/* One line of the preparation's counters (routes, the check), and one line of its histogram's most frequent shapes (0
+   when there is none). Return the length written. */
+int hl_gfx_prep_report(char *out, size_t cap);
+int hl_gfx_prep_shapes(char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

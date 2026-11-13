@@ -7,11 +7,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 
 #include "hl/bridge/MathBridge.h"
 #include "hl/c/hl_math.h"
 #include "hl/math/Bounds.h"
 #include "hl/math/Exact.h"
+#include "hl/math/MotionStep.h"
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -892,6 +894,91 @@ void body_box_inline() {
     CHECK(mx[0] - mn[0] == 2 * s154 || mx[0] - mn[0] > 2 * 1.25f);   // (x clamped to the body's scale: 1.25 < 2)
 }
 
+// ---- 0x8182dc20's step of one motion (physics-loops.md 9.3) ----
+template <class T> T at_off(const uint8_t* m, int off) {
+    T v;
+    std::memcpy(&v, m + off, sizeof v);
+    return v;
+}
+// a motion at rest at (10, 20, 30) with the identity orientation; unit factors; maxima of 65536 (B +24 0x8f00)
+math::MotionStepIn motion_in() {
+    math::MotionStepIn in = {};
+    const float q[4] = {0, 0, 0, 1};
+    const double com[3] = {10, 20, 30};
+    std::memcpy(in.motion, q, 16);
+    std::memcpy(in.motion + 16, com, 24);
+    in.motion[92] = 0xff;
+    in.max_w = in.max_v = 0x8f00;
+    in.d32 = 1;
+    in.d96[0] = in.d96[1] = 0.5f;
+    in.d136 = 1;
+    in.d144[0] = in.d144[1] = 1;
+    for (int k = 0; k < 4; k++) in.q0[k] = in.q1[k] = in.c[k] = 1;
+    in.h[0] = in.h[1] = 0.5f;
+    in.c1[0] = in.c1[1] = -0.5f;
+    return in;
+}
+
+void motion_step_still() {
+    const math::MotionStepIn in = motion_in();
+    math::MotionStepOut out;
+    math::MotionDecline why;
+    CHECK(math::motion_step(in, out, why) && why == math::MotionDecline::none);
+    CHECK(!out.moving && !out.clamp_v && !out.clamp_w && out.n_path == 0 && out.still_record && out.body_flag == 0);
+    CHECK(std::memcmp(out.motion, in.motion, 40) == 0);   // (the orientation and the centre of mass untouched)
+    CHECK(at_off<uint16_t>(out.motion, 94) == 0x3f80);
+    CHECK(out.cell_pos[0] == 10 && out.cell_pos[1] == 20 && out.cell_pos[2] == 30 && out.cell_pos[3] == 0);
+    CHECK(out.acc[0] == 1280 && out.acc[1] == 2560 && out.acc[2] == 3840 && out.acc[3] == 1);
+}
+
+void motion_step_moving() {
+    math::MotionStepIn in = motion_in();
+    in.a[4] = 1, in.a[5] = 2, in.a[3] = 3;   // W = (1, 2, 3): it moves the centre of mass by W t
+    math::MotionStepOut out;
+    math::MotionDecline why;
+    CHECK(math::motion_step(in, out, why));
+    CHECK(out.moving && !out.clamp_w && !out.still_record);
+    CHECK(at_off<double>(out.motion, 16) == 10.5 && at_off<double>(out.motion, 24) == 21 && at_off<double>(out.motion, 32) == 31.5);
+    CHECK(at_off<float>(out.motion, 12) == 1 && at_off<float>(out.motion, 0) == 0);   // (no turn)
+    CHECK(at_off<float>(out.motion, 56) == 1 && at_off<float>(out.motion, 60) == 2 && at_off<float>(out.motion, 52) == 3);
+    CHECK(at_off<float>(out.motion, 80) == 1 && at_off<float>(out.motion, 84) == 2 && at_off<float>(out.motion, 76) == 3);
+    // a turn about z: V = (0, 0, 1) and t h = 1/4 make a = (0, 0, 0.25), s = 1/16, kq = 1 - 1/32
+    in = motion_in();
+    in.a[2] = 1;
+    CHECK(math::motion_step(in, out, why) && out.moving);
+    const float kq = 1.0f + (1.0f / 16) * -0.5f, n = std::sqrt(0.25f * 0.25f + kq * kq);
+    CHECK(at_off<float>(out.motion, 8) == 0.25f / n && at_off<float>(out.motion, 12) == kq / n);
+    // W clamped to 2.5 (B +24 0x8040): (3, 4, 0) is 5 long, so it is halved
+    in = motion_in();
+    in.a[4] = 3, in.a[5] = 4;
+    in.max_w = 0x8040;
+    in.a24 = 1;   // (the clamps and the n path only with A's word at +24 set)
+    CHECK(math::motion_step(in, out, why) && out.clamp_w && !out.clamp_v);
+    CHECK(at_off<float>(out.motion, 56) == 1.5f && at_off<float>(out.motion, 60) == 2);
+    in.a24 = 0;
+    CHECK(math::motion_step(in, out, why) && !out.clamp_w && at_off<float>(out.motion, 56) == 3);
+    // the n path: a slow W under the threshold is zeroed, and V with it
+    in = motion_in();
+    in.a[4] = 0.001f;
+    in.b28 = 4;
+    in.a24 = 1;
+    CHECK(math::motion_step(in, out, why) && out.n_path == 4 && !out.moving);
+}
+
+void motion_step_declines() {
+    math::MotionStepIn in = motion_in();
+    math::MotionStepOut out;
+    math::MotionDecline why;
+    in.a[1] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!math::motion_step(in, out, why) && why == math::MotionDecline::values);
+    in = motion_in();
+    in.a24 = 1;
+    in.motion[100] = 1;
+    CHECK(!math::motion_step(in, out, why) && why == math::MotionDecline::modifier);
+    in.motion[100] = 0;   // (a modifier word with no modifier bit: answered)
+    CHECK(math::motion_step(in, out, why));
+}
+
 }   // namespace
 
 int main() {
@@ -911,6 +998,9 @@ int main() {
     body_box_declines();
     body_box_moving();
     body_box_inline();
+    motion_step_still();
+    motion_step_moving();
+    motion_step_declines();
     std::puts("math: ok");
     return 0;
 }

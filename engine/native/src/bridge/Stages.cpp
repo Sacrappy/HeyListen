@@ -8,9 +8,11 @@
 // ends. The writes are still made in the guest's order, so that nothing depends on that reasoning.
 #include "hl/bridge/Stages.h"
 
+#include <algorithm>
 #include <cstdio>
 
 #include "hl/bridge/Dispatcher.h"
+#include "hl/bridge/JobGroup.h"
 
 namespace hl::bridge {
 
@@ -32,6 +34,8 @@ constexpr uint32_t kStageOver = 2;
 constexpr GuestAddr kOwn = offsetof(guest::WorkerSet, own_context);
 constexpr GuestAddr kContext = offsetof(guest::Worker, context);
 constexpr int kSnapWorkers = 32;
+constexpr int32_t kSnapItems = 512;   // (the check's copy of a group's heap)
+constexpr uint32_t kNotRunning = 3;   // a worker's run state for which no message is queued
 
 // One more or one fewer in the low four bits of `lane`'s byte of a lane status word, staying within 0..15, by
 // compare-and-swap of the whole word (0x806afce4, 0x806afd14; 0x83acfcb0, 0x83acfd04).
@@ -52,7 +56,7 @@ thread_local bool t_bypass = false;
 }   // namespace
 
 // The registration's writes, read back: the scheduler's list and flags, the set's mask and count and own context, the
-// workers' context words and scheduler.
+// workers' context words and scheduler; for a twin also the set's scheduler and the group's heap and take count.
 struct Stages::Snapshot {
     int32_t contexts = 0;
     GuestAddr list[8] = {};
@@ -62,12 +66,23 @@ struct Stages::Snapshot {
     uint64_t state[kSnapWorkers] = {};
     uint32_t flags[kSnapWorkers] = {};
     GuestAddr scheduler[kSnapWorkers] = {};
+    GuestAddr set_scheduler = 0;
+    int32_t heap_size = 0, take_count = 0;
+    GuestAddr items[kSnapItems] = {};
 
     bool operator==(const Snapshot&) const = default;
 };
 
-Stages::Stages(GuestRuntime& runtime, Dispatcher* dispatcher, Options options)
-    : runtime_(runtime), dispatcher_(dispatcher), options_(options) {}
+Stages::Stages(GuestRuntime& runtime, Dispatcher* dispatcher, JobGroup* group, Options options)
+    : runtime_(runtime), dispatcher_(dispatcher), group_(group), options_(options) {}
+
+Stages::ListAt Stages::list_at(GuestAddr s, bool module) {
+    if (module)
+        return {s + offsetof(guest::Group, context_count), s + offsetof(guest::Group, context_room),
+                s + offsetof(guest::Group, contexts), s + offsetof(guest::Group, flags)};
+    return {s + offsetof(guest::Scheduler, context_count), s + offsetof(guest::Scheduler, context_room),
+            s + offsetof(guest::Scheduler, contexts), s + offsetof(guest::Scheduler, flags)};
+}
 
 uint64_t Stages::call(GuestThread as, GuestAddr fn, uint64_t a0, uint64_t a1, uint64_t a2) {
     const uint64_t args[3] = {a0, a1, a2};
@@ -94,13 +109,13 @@ GuestAddr Stages::worker_at(GuestAddr set, int32_t index) const {
     return ld(at<GuestAddr>(ld(at<GuestAddr>(list + (GuestAddr)(int64_t)index * 8)) + 8));
 }
 
-// A context at the end of the scheduler's list, unless the list is full (0x806b0328).
-void Stages::append(GuestAddr s_at, GuestAddr context) {
-    guest::Scheduler* s = at<guest::Scheduler>(s_at);
-    const int32_t n = ld(&s->context_count);
-    if (n >= (int32_t)ld(&s->context_room)) return;
-    st(at<GuestAddr>(ld(&s->contexts) + (GuestAddr)(int64_t)n * 8), context);
-    st(&s->context_count, ld(&s->context_count) + 1);
+// A context at the end of the scheduler's list, unless the list is full (0x806b0328; the twin's 0x80071398, 0x80071438).
+void Stages::append(const ListAt& l, GuestAddr context) {
+    int32_t* count = at<int32_t>(l.count);
+    const int32_t n = ld(count);
+    if (n >= (int32_t)ld(at<uint32_t>(l.room))) return;
+    st(at<GuestAddr>(ld(at<GuestAddr>(l.array)) + (GuestAddr)(int64_t)n * 8), context);
+    st(count, ld(count) + 1);
 }
 
 // ---- the policy ----------------------------------------------------------------------------------------------------------
@@ -149,8 +164,14 @@ void Stages::await_done(GuestThread as, GuestAddr set, GuestAddr worker, int64_t
     if (options_.check) check_done(worker);
 }
 
-// The owner's part of a stage, on the set's own context: the native dispatcher (or the translated one without it).
-void Stages::dispatch(GuestThread as, GuestAddr scheduler, GuestAddr context) {
+// The owner's part of a stage, on the set's own context: the native dispatcher (or the translated one without it); for a
+// twin's stage the native job group.
+void Stages::dispatch(GuestThread as, GuestAddr scheduler, GuestAddr context, bool module) {
+    if (module) {
+        stats_.mod_owner_runs.fetch_add(1, std::memory_order_relaxed);
+        group_->run(as, scheduler, context);
+        return;
+    }
     stats_.owner_dispatches.fetch_add(1, std::memory_order_relaxed);
     if (dispatcher_) dispatcher_->dispatch(as, scheduler, context);
     else runtime_.call(as, kDispatcher, scheduler, context);
@@ -170,7 +191,7 @@ bool Stages::register_gate(GuestThread as, GuestAddr set, uint64_t send) {
 void Stages::register_workers(GuestThread as, GuestAddr set, uint64_t send) {
     stats_.registrations.fetch_add(1, std::memory_order_relaxed);
     if (!options_.check) {
-        write_registration(as, set);
+        write_registration(as, set, false);
     } else {
         // The translated registration first, without the message, on the same set; then the native one over it. Both
         // start from the same words (each sets them all from the set, its scheduler, the workers' cores and the current
@@ -180,17 +201,111 @@ void Stages::register_workers(GuestThread as, GuestAddr set, uint64_t send) {
         t_bypass = true;
         runtime_.call(as, kStageRegister, set, 0);
         t_bypass = false;
-        snapshot(set, translated);
-        write_registration(as, set);
-        snapshot(set, native);
+        snapshot(set, false, translated);
+        write_registration(as, set, false);
+        snapshot(set, false, native);
         stats_.reg_checked.fetch_add(1, std::memory_order_relaxed);
         if (!(translated == native)) {
             stats_.reg_diff.fetch_add(1, std::memory_order_relaxed);
             violation("the registration's writes differ from the translated registration's", set);
         }
-        note_registered(set, send, lanes);
+        note_registered(set, send, lanes, false, false);
     }
     if (send & 1) send_messages(as, set);
+}
+
+bool Stages::register_module_gate(GuestThread as, GuestAddr set, GuestAddr group) {
+    if (t_bypass) {
+        t_bypass = false;
+        return false;
+    }
+    register_module(as, set, group);
+    return true;
+}
+
+void Stages::register_module(GuestThread as, GuestAddr set, GuestAddr g_at) {
+    stats_.mod_registrations.fetch_add(1, std::memory_order_relaxed);
+    guest::WorkerSet* w = at<guest::WorkerSet>(set);
+    guest::Group* g = at<guest::Group>(g_at);
+    // (0x800711d8) a graph that is made and has no job: no stage
+    if ((ld(&g->flags) & 1) && !ld(&g->jobs)) {
+        st(&w->scheduler, (GuestAddr)0);
+        stats_.mod_empty.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool previous_over = options_.check && stage_left(set);
+    Snapshot translated;
+    const bool compared = options_.check && compare_module(as, set, g_at, translated);
+    const uint64_t lanes = options_.check ? lane_byte(as, set) : 0;
+    // (0x800711f4) the set's stage is the group; its roots seeded under the group's mutex; the registration
+    st(&w->scheduler, g_at);
+    uint32_t hooks = 0;
+    stats_.mod_seeded.fetch_add(group_->seed(as, g_at, hooks), std::memory_order_relaxed);
+    stats_.mod_hooks.fetch_add(hooks, std::memory_order_relaxed);
+    write_registration(as, set, true);
+    if (options_.check) {
+        if (compared) {
+            // (the translated twin's send loop has already marked its registered workers "sent its message": the native
+            // one does it below, as it sends)
+            Snapshot native;
+            snapshot(set, true, native);
+            for (int32_t i = 0; i < kSnapWorkers; i++)
+                if ((native.mask >> i) & 1) native.flags[i] |= kSentMessage;
+            stats_.mod_checked.fetch_add(1, std::memory_order_relaxed);
+            if (!(translated == native)) {
+                stats_.mod_diff.fetch_add(1, std::memory_order_relaxed);
+                violation("the twin registration's writes differ from the translated twin's", set);
+            }
+        }
+        note_registered(set, 1, lanes, true, previous_over);
+    }
+    // (0x800714ec) always with the message
+    send_messages(as, set);
+}
+
+// (checking) The translated twin run first on the same set and group, its writes read back, and what the native twin
+// reads undone: the group's heap and take count. Its messages are held back by showing it every worker of the set as not
+// running for the length of the call (its inlined message function then queues nothing), so that no worker starts
+// before the native twin registers it. Not compared (false) when that cannot be done without a side effect.
+bool Stages::compare_module(GuestThread as, GuestAddr set, GuestAddr g_at, Snapshot& translated) {
+    guest::WorkerSet* w = at<guest::WorkerSet>(set);
+    guest::Group* g = at<guest::Group>(g_at);
+    // (the seed writes the heap's items below its size plus the roots: those are kept and put back)
+    const int32_t n = (int32_t)ld(&w->count);
+    const int32_t room = ld(&g->heap.room), size = ld(&g->heap.size), take = ld(&g->take_count);
+    const int32_t jobs = ld(&g->jobs);
+    const int64_t span = std::min<int64_t>(room, (int64_t)size + (jobs > 0 ? jobs : 0));
+    bool comparable = n >= 0 && n <= kSnapWorkers && size >= 0 && span >= 0 && span <= kSnapItems;
+    const GuestAddr usual = ld(at<GuestAddr>(kUsualMessageSlot));
+    for (int32_t i = 0; comparable && i < n; i++)
+        comparable = ld(at<GuestAddr>(ld(&at<guest::Worker>(worker_at(set, i))->vtable) + 0x10)) == usual;
+    const GuestAddr list = ld(&g->job_list);
+    for (int32_t i = 0; comparable && i < jobs; i++) {
+        const guest::GroupJob* j = at<guest::GroupJob>(ld(at<GuestAddr>(list + (GuestAddr)(int64_t)i * 8)));
+        comparable = ld(&j->waiting) != 0 || !ld(&j->hook);
+    }
+    if (!comparable) {
+        stats_.mod_skipped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    GuestAddr* items = span ? at<GuestAddr>(ld(&g->heap.items)) : nullptr;
+    GuestAddr saved_items[kSnapItems];
+    uint32_t saved_state[kSnapWorkers];
+    for (int32_t i = 0; i < (int32_t)span; i++) saved_items[i] = ld(&items[i]);
+    for (int32_t i = 0; i < n; i++) {
+        guest::Worker* k = at<guest::Worker>(worker_at(set, i));
+        saved_state[i] = ld(&k->state);
+        st(&k->state, kNotRunning);
+    }
+    t_bypass = true;
+    runtime_.call(as, kModuleRegister, set, g_at);
+    t_bypass = false;
+    for (int32_t i = 0; i < n; i++) st(&at<guest::Worker>(worker_at(set, i))->state, saved_state[i]);
+    snapshot(set, true, translated);
+    for (int32_t i = 0; i < (int32_t)span; i++) st(&items[i], saved_items[i]);
+    st(&g->heap.size, size);
+    st(&g->take_count, take);
+    return true;
 }
 
 // (checking) The byte of the calling thread's lane in the set's lane status word, with the lane in its top byte; 0 when
@@ -202,13 +317,18 @@ uint64_t Stages::lane_byte(GuestThread as, GuestAddr set) {
     return (uint64_t)(c & 0xff) << 56 | ((ld(at<uint64_t>(word)) >> ((c << 3) & 63)) & 0xff);
 }
 
-void Stages::write_registration(GuestThread as, GuestAddr set) {
+// The registration's writes (the actors' 0x806b0278 to 0x806b03c8; the twin's 0x80071338 to 0x800714dc, the same steps on
+// the group's list, with the current core read twice: the first read is the own context's lane, the second the core
+// whose worker an owner taking part leaves out).
+void Stages::write_registration(GuestThread as, GuestAddr set, bool module) {
     guest::WorkerSet* w = at<guest::WorkerSet>(set);
+    const ListAt l = list_at(ld(&w->scheduler), module);
     // (0x806b0278) the scheduler's list, the registered mask and count emptied
-    st(&at<guest::Scheduler>(ld(&w->scheduler))->context_count, 0);
+    st(at<int32_t>(l.count), 0);
     st(&w->registered_mask, 0u);
     w->registered_count.store(0, std::memory_order_relaxed);
     const uint32_t c = core(as);
+    const uint32_t c_skip = module ? core(as) : c;
     const uint32_t cores = ld(&w->stage_cores);
     if (!cores || (ld(&w->flags) & kOwnerTakesPart)) {
         // (0x806b04a0) the set's own context: on the owner's core, awake, no message, its wake event cleared, listed
@@ -216,25 +336,25 @@ void Stages::write_registration(GuestThread as, GuestAddr set) {
         st(&w->own_context.state, (uint64_t)0);
         st(&w->own_context.flags, 0u);
         call(as, kEventClear, set + kOwn + offsetof(guest::DispatchContext, wake_event));
-        append(ld(&w->scheduler), set + kOwn);
-        uint32_t* sflags = &at<guest::Scheduler>(ld(&w->scheduler))->flags;
+        append(l, set + kOwn);
+        uint32_t* sflags = at<uint32_t>(l.flags);
         if ((ld(&w->flags) & (kOwnerTakesPart | kKeepLane)) == kOwnerTakesPart) __atomic_fetch_or(sflags, kOwnerPolls, __ATOMIC_SEQ_CST);
         else __atomic_fetch_and(sflags, ~kOwnerPolls, __ATOMIC_SEQ_CST);
         w->registered_count.fetch_add(1, std::memory_order_seq_cst);
         stats_.own_registered.fetch_add(1, std::memory_order_relaxed);
         if (!cores) return;
     } else {
-        __atomic_fetch_and(&at<guest::Scheduler>(ld(&w->scheduler))->flags, ~kOwnerPolls, __ATOMIC_SEQ_CST);
+        __atomic_fetch_and(at<uint32_t>(l.flags), ~kOwnerPolls, __ATOMIC_SEQ_CST);
     }
     // (0x806b02d8) the workers of the stage's cores, but the owner's own core's when it takes part
-    const uint32_t own_core = 1u << (c & 31);
+    const uint32_t own_core = 1u << (c_skip & 31);
     const int32_t n = (int32_t)ld(&w->count);
     for (int32_t i = 0; i < n; i++) {
         const GuestAddr k = worker_at(set, i);
         const uint32_t core_mask = ld(&at<guest::Worker>(k)->core_mask);
         if ((ld(&w->flags) & kOwnerTakesPart) && core_mask == own_core) continue;
         if (!(ld(&w->stage_cores) & core_mask)) continue;
-        append(ld(&w->scheduler), k + kContext);
+        append(l, k + kContext);
         st(&w->registered_mask, ld(&w->registered_mask) | (1u << (i & 31)));
         w->registered_count.fetch_add(1, std::memory_order_seq_cst);
         stats_.workers_registered.fetch_add(1, std::memory_order_relaxed);
@@ -270,13 +390,14 @@ void Stages::send_messages(GuestThread as, GuestAddr set) {
 
 // ---- the wait ------------------------------------------------------------------------------------------------------------
 
-void Stages::wait(GuestThread as, GuestAddr set) {
+// The twin 0x80070b20 is the same function step for step, but for the owner's part (the job group 0x8007fe60).
+void Stages::wait(GuestThread as, GuestAddr set, bool module) {
     guest::WorkerSet* w = at<guest::WorkerSet>(set);
     if (!ld(&w->scheduler)) {   // (0x806afc40: no stage)
-        stats_.waits_empty.fetch_add(1, std::memory_order_relaxed);
+        (module ? stats_.mod_waits_empty : stats_.waits_empty).fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    stats_.waits.fetch_add(1, std::memory_order_relaxed);
+    (module ? stats_.mod_waits : stats_.waits).fetch_add(1, std::memory_order_relaxed);
     const uint32_t c = core(as);
     if (ld(&w->flags) & kOwnerTakesPart) {
         // (0x806afdf8) the workers of the owner's core told not to run, the own context put on the owner's core, and the
@@ -289,7 +410,7 @@ void Stages::wait(GuestThread as, GuestAddr set) {
         }
         if (!(ld(&w->flags) & kKeepLane) || (uint32_t)ld(&w->own_context.lane) != c) st(&w->own_context.lane, (int32_t)c);
         if (options_.check && !note_started(set, -1)) violation("the own context started twice in one stage", set);
-        dispatch(as, ld(&w->scheduler), set + kOwn);
+        dispatch(as, ld(&w->scheduler), set + kOwn, module);
     }
     // (0x806afc8c) each registered worker's end waited for, in index order
     const int32_t n = (int32_t)ld(&w->count);
@@ -342,7 +463,7 @@ void Stages::last_stage(GuestThread as, GuestAddr manager) {
         __atomic_fetch_or(&w->own_context.flags, kSentMessage, __ATOMIC_SEQ_CST);
         if (options_.check && !note_started(set, -1)) violation("the own context started twice in one last stage", set);
         stats_.last_own.fetch_add(1, std::memory_order_relaxed);
-        dispatch(as, ld(&w->scheduler), set + kOwn);
+        dispatch(as, ld(&w->scheduler), set + kOwn, false);
     }
     // (0x83acfd44) the one that brings the count to zero ends the stage
     const uint32_t was = w->registered_count.fetch_sub(1, std::memory_order_seq_cst);
@@ -365,12 +486,22 @@ void Stages::end_last_stage(GuestAddr manager) {
 
 // ---- checking ------------------------------------------------------------------------------------------------------------
 
-void Stages::snapshot(GuestAddr set, Snapshot& out) const {
+void Stages::snapshot(GuestAddr set, bool module, Snapshot& out) const {
     const guest::WorkerSet* w = at<guest::WorkerSet>(set);
-    const guest::Scheduler* s = at<guest::Scheduler>(ld(&w->scheduler));
-    out.contexts = ld(&s->context_count);
-    for (int32_t i = 0; i < out.contexts && i < 8; i++) out.list[i] = ld(at<GuestAddr>(ld(&s->contexts) + (GuestAddr)i * 8));
-    out.scheduler_flags = ld(&s->flags);
+    const GuestAddr s = ld(&w->scheduler);
+    const ListAt l = list_at(s, module);
+    out.contexts = ld(at<int32_t>(l.count));
+    for (int32_t i = 0; i < out.contexts && i < 8; i++)
+        out.list[i] = ld(at<GuestAddr>(ld(at<GuestAddr>(l.array)) + (GuestAddr)i * 8));
+    out.scheduler_flags = ld(at<uint32_t>(l.flags));
+    if (module) {
+        const guest::Group* g = at<guest::Group>(s);
+        out.set_scheduler = s;
+        out.heap_size = ld(&g->heap.size);
+        out.take_count = ld(&g->take_count);
+        for (int32_t i = 0; i < out.heap_size && i < kSnapItems; i++)
+            out.items[i] = ld(at<GuestAddr>(ld(&g->heap.items) + (GuestAddr)i * 8));
+    }
     out.mask = ld(&w->registered_mask);
     out.count = w->registered_count.load(std::memory_order_relaxed);
     out.own_lane = ld(&w->own_context.lane);
@@ -385,11 +516,28 @@ void Stages::snapshot(GuestAddr set, Snapshot& out) const {
     }
 }
 
-void Stages::note_registered(GuestAddr set, uint64_t send, uint64_t lanes) {
+// (checking) A twin stage that nobody waited for (the module system starts some stages and never waits for them: their
+// workers end on their own) is over when every worker it started has left the group (a context leaves only once the
+// group is over; the group's own flag cannot tell, the graph's making clears it before the next registration).
+bool Stages::stage_left(GuestAddr set) {
+    std::lock_guard lock(records_mu_);
+    const auto it = records_.find(set);
+    if (it == records_.end() || !it->second.open || !it->second.module) return false;
+    const Record& r = it->second;
+    if (r.own_started && (ld(&at<guest::WorkerSet>(set)->own_context.flags) & kSentMessage)) return false;
+    const int32_t n = (int32_t)ld(&at<guest::WorkerSet>(set)->count);
+    for (int32_t i = 0; i < n && i < 32; i++)
+        if (((r.started >> i) & 1) && (ld(&at<guest::Worker>(worker_at(set, i))->context.flags) & kSentMessage)) return false;
+    return true;
+}
+
+void Stages::note_registered(GuestAddr set, uint64_t send, uint64_t lanes, bool module, bool previous_over) {
     const guest::WorkerSet* w = at<guest::WorkerSet>(set);
     std::lock_guard lock(records_mu_);
     Record& r = records_[set];
-    if (r.open) {
+    if (r.open && previous_over) {
+        stats_.mod_unwaited.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.open) {
         stats_.overlap.fetch_add(1, std::memory_order_relaxed);
         violation("a set registered again before its previous stage was over", set);
     }
@@ -401,6 +549,7 @@ void Stages::note_registered(GuestAddr set, uint64_t send, uint64_t lanes) {
     r.own_started = false;
     r.last = !(send & 1);
     r.open = r.mask || r.own;
+    r.module = module;
     r.lanes = lanes;
 }
 
@@ -440,7 +589,7 @@ void Stages::check_stage_end(GuestAddr set, bool last, uint64_t lanes) {
     }
     Record& r = it->second;
     r.open = false;
-    if (!(ld(&at<guest::Scheduler>(r.scheduler)->flags) & kStageOver)) {
+    if (!(ld(at<uint32_t>(list_at(r.scheduler, r.module).flags)) & kStageOver)) {
         stats_.not_over.fetch_add(1, std::memory_order_relaxed);
         violation("a stage's end with its scheduler's stage not over", set);
     }
@@ -477,13 +626,25 @@ int Stages::report(char* out, size_t cap) const {
                           v(s.last_ends));
     if (n < 0) return 0;
     if ((size_t)n >= cap) return (int)cap - 1;
+    if (group_) {
+        const int k = std::snprintf(out + n, cap - (size_t)n,
+                                    "; module twins: registrations %llu (no job %llu, roots seeded %llu, with a hook %llu), "
+                                    "waits %llu (no stage %llu), owner's part run %llu",
+                                    v(s.mod_registrations), v(s.mod_empty), v(s.mod_seeded), v(s.mod_hooks), v(s.mod_waits),
+                                    v(s.mod_waits_empty), v(s.mod_owner_runs));
+        if (k < 0) return n;
+        if ((size_t)(n + k) >= cap) return (int)cap - 1;
+        n += k;
+    }
     if (!options_.check) return n;
     const int m = std::snprintf(out + n, cap - (size_t)n,
-                                "; CHECK: registrations compared %llu (differ %llu), overlaps %llu, unstarted %llu, double "
-                                "starts %llu, done while in %llu, not over %llu, changed %llu, below zero %llu; untracked %llu, "
-                                "lane drift %llu",
-                                v(s.reg_checked), v(s.reg_diff), v(s.overlap), v(s.unstarted), v(s.double_start), v(s.still_in),
-                                v(s.not_over), v(s.changed), v(s.below_zero), v(s.untracked), v(s.lane_drift));
+                                "; CHECK: registrations compared %llu (differ %llu), twins compared %llu (differ %llu, not "
+                                "compared %llu, stages over and not waited for %llu), overlaps %llu, unstarted %llu, double "
+                                "starts %llu, done while in %llu, not over %llu, changed %llu, below zero %llu; untracked "
+                                "%llu, lane drift %llu",
+                                v(s.reg_checked), v(s.reg_diff), v(s.mod_checked), v(s.mod_diff), v(s.mod_skipped),
+                                v(s.mod_unwaited), v(s.overlap), v(s.unstarted), v(s.double_start), v(s.still_in), v(s.not_over), v(s.changed),
+                                v(s.below_zero), v(s.untracked), v(s.lane_drift));
     if (m < 0) return n;
     return (size_t)(n + m) >= cap ? (int)cap - 1 : n + m;
 }

@@ -1,7 +1,8 @@
 """Game-free: the native engine's entry gates (nx2/hl_gates.py) on lifted code made up here: a gate is put at the head of
 the function a host source asks for when its text hashes as recorded, the hash is the same with and without the gate, a
 second run changes nothing and reads nothing, another hash leaves the function alone, and a gate nobody asks for any more
-is taken out; and the gated file compiles and the gate answers (with a C compiler).
+is taken out; and the gated file compiles, says at start that the gate is in, and the gate answers (with a C compiler).
+And host/hl_jobs.c and hl_mainloop.c switch their modules' gates on all together, only when every one is in the lift.
 
 python -I -B tests/test_hl_gates.py [--cc gcc]
 """
@@ -40,8 +41,12 @@ MAIN = '''#include <stdio.h>
 #include "a64.h"
 void f_80002000(Ctx *);
 extern volatile int hl_gate_on_80002000;
+static unsigned long long present[4];
+static int npresent;
+void hl_gate_present(unsigned long long guest) { if (npresent < 4) present[npresent++] = guest; }
 int main(void) {
     Ctx c = {{0}};
+    if (npresent != 1 || present[0] != 0x80002000ULL) { printf("presence: %d\\n", npresent); return 1; }
     c.x[0] = 5; f_80002000(&c);
     if (c.x[0] != 11) { printf("off: %llu\\n", (unsigned long long)c.x[0]); return 1; }
     hl_gate_on_80002000 = 1;
@@ -76,10 +81,14 @@ def main():
         check(hl_gates.wanted(str(host)) == {"80002000": h}, "the gate read from the host source")
         check(hl_gates.apply(str(gen), str(host), quiet=True) == 1, "one gate in place")
         gated = code.read_text(encoding="utf-8")
-        check(gated.count("/* hl gate 80002000 */") == 1 and "hl gate 80001000" not in gated, "the gate's line, once")
-        check(gated.index("hl gate 80002000") > gated.index("void f_80002000(Ctx *__restrict"), "at the head of its function")
-        check(gated.index("hl gate 80002000") < gated.index("c->x[0] * 2"), "before the function's first statement")
+        check(gated.count("/* hl gate 80002000 */") == 2 and "hl gate 80001000" not in gated, "the gate's two lines, once each")
+        head = gated.index("void f_80002000(Ctx *__restrict")
+        check(gated[:head].endswith(hl_gates.present_line("80002000")), "its presence line right before its function")
+        check(gated.index("hl_gate_on_80002000") > head, "the gate at the head of its function")
+        check(gated.index("hl_gate_on_80002000") < gated.index("c->x[0] * 2"), "before the function's first statement")
         check(hl_gates.text_hash(gated, "80002000") == h, "the hash does not count the gate")
+        check(hl_gates.text_hash(gated, "80001000") == hl_gates.text_hash(CODE, "80001000"),
+              "nor the function before it the presence line in its text")
         # a second run: nothing written, nothing read (the state file answers)
         before = code.stat().st_mtime_ns
         check(hl_gates.apply(str(gen), str(host), quiet=True) == 1 and code.stat().st_mtime_ns == before, "a second run writes nothing")
@@ -100,7 +109,25 @@ def main():
         os.remove(host / "hl_x.c")
         check(hl_gates.apply(str(gen), str(host), quiet=True) == 0, "no gate wanted")
         check(code.read_text(encoding="utf-8") == CODE, "the lifted code is as the lift wrote it")
+    jobs_gates_all_or_nothing()
     print("hl gates: ok")
+
+
+def jobs_gates_all_or_nothing():
+    """host/hl_jobs.c and hl_mainloop.c switch each module's gates on together, and only when all are in the lifted code:
+    every HL_GATE there is in one of its gate lists and every list is asked about (GATES_IN) (review 2026-11-13, B2)."""
+    import re
+    for module in ("hl_jobs.c", "hl_mainloop.c"):
+        src = (ROOT / "host" / module).read_text(encoding="utf-8")
+        gated = set(re.findall(r'^HL_GATE\(([0-9a-f]{8}),', src, re.M))
+        lists = {name: set(re.findall(r"0x([0-9a-f]{8})", body))
+                 for name, body in re.findall(r"static const uint64_t (\w+_gates)\[\] = \{([^}]*)\};", src)}
+        check(gated and lists, "%s's gates and gate lists" % module)
+        listed = set().union(*lists.values())
+        check(gated == listed, "every gate of %s in exactly the gate lists: %s" % (module, sorted(gated ^ listed)))
+        for name in lists:
+            check(re.search(r"GATES_IN\(\"\w+\", %s\)" % name, src), "the list %s of %s asked about" % (name, module))
+        check("hl_gates_in(" in src, "%s asks hl_gates_in" % module)
 
 
 if __name__ == "__main__":
