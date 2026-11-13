@@ -7,6 +7,7 @@
 #include "hl/bridge/MathBridge.h"
 #include "hl/math/Bounds.h"
 #include "hl/math/Exact.h"
+#include "hl/math/MotionStep.h"
 
 using namespace hl;
 
@@ -149,6 +150,50 @@ extern "C" int hl_math_body_box(const hl_guest_host* host, const hl_math_body_ar
     };
     if (out.append1) add(block1, out.add1);
     if (out.append2) add(block2, out.add2);
+    return 1;
+}
+
+extern "C" int hl_math_motion_step(const void* motion, const void* a, const void* b, const void* data, const void* global,
+                                   hl_math_motion_plan* plan) {
+    const auto* va = static_cast<const bridge::HavokSolverVelocity*>(a);
+    const auto* vb = static_cast<const bridge::HavokSolverVelocity*>(b);
+    const auto* d = static_cast<const bridge::HavokSolverStepData*>(data);
+    const auto* g = static_cast<const bridge::HavokPhysicsGlobals*>(global);
+    math::MotionStepIn in;
+    std::memcpy(in.motion, motion, sizeof in.motion);
+    std::memcpy(in.a, va->f, sizeof in.a);
+    std::memcpy(in.b, vb->f, sizeof in.b);
+    std::memcpy(&in.a24, static_cast<const uint8_t*>(a) + bridge::kSolverVelocityWord, 8);
+    in.max_w = vb->max_w;
+    in.max_v = vb->max_v;
+    in.b28 = vb->flags;
+    in.d32 = d->f32;
+    std::memcpy(in.d96, d->f96, 8);
+    std::memcpy(in.d104, d->f104, 8);
+    in.d136 = d->f136;
+    std::memcpy(in.d144, d->f144, 8);
+    std::memcpy(in.q0, d->q0, 16);
+    std::memcpy(in.q1, d->q1, 16);
+    std::memcpy(in.g50, g->f80, 8);
+    std::memcpy(in.c, g->f96, 16);
+    std::memcpy(in.h, g->f336, 8);
+    std::memcpy(in.c1, g->f1008, 8);
+    std::memcpy(in.c2, g->f1024, 8);
+    std::memcpy(in.c3, g->f1040, 8);
+    math::MotionStepOut out;
+    math::MotionDecline why = math::MotionDecline::none;
+    const bool ok = math::motion_step(in, out, why);
+    plan->decline = (int)why;
+    if (!ok) return 0;
+    std::memcpy(plan->motion, out.motion, sizeof plan->motion);
+    plan->clamp_v = out.clamp_v;
+    plan->clamp_w = out.clamp_w;
+    plan->n_path = out.n_path;
+    plan->moving = out.moving;
+    plan->body_flag = out.body_flag;
+    plan->still_record = out.still_record;
+    std::memcpy(plan->cell_pos, out.cell_pos, sizeof plan->cell_pos);
+    std::memcpy(plan->acc, out.acc, sizeof plan->acc);
     return 1;
 }
 

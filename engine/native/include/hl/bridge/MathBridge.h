@@ -139,22 +139,68 @@ struct HavokMotionState {
 static_assert(offsetof(HavokMotionState, com) == 16);
 static_assert(offsetof(HavokMotionState, f40) == 40);
 
-// The physics module's global object (the pointer at a fixed guest address, the OS layer's): the update's constants.
+// The physics module's global object (the pointer at a fixed guest address, the OS layer's): the update's constants
+// (and the last substep's: +96 the float4 C, +336 the pair h, +1008 .. +1040 the integration's polynomial).
 struct HavokPhysicsGlobals {
     uint8_t before80[80];
     float f80[4];
-    float f96[2];
-    uint8_t before336[232];
+    float f96[4];
+    uint8_t before336[224];
     float f336[2];
     uint8_t before512[168];
     float f512[2];
     uint8_t before640[120];
     float f640[2];
+    uint8_t before1008[360];
+    float f1008[2];
+    uint8_t before1024[8];
+    float f1024[2];
+    uint8_t before1040[8];
+    float f1040[2];
 };
 static_assert(offsetof(HavokPhysicsGlobals, f96) == 96);
 static_assert(offsetof(HavokPhysicsGlobals, f336) == 336);
 static_assert(offsetof(HavokPhysicsGlobals, f512) == 512);
 static_assert(offsetof(HavokPhysicsGlobals, f640) == 640);
+static_assert(offsetof(HavokPhysicsGlobals, f1008) == 1008);
+static_assert(offsetof(HavokPhysicsGlobals, f1024) == 1024);
+static_assert(offsetof(HavokPhysicsGlobals, f1040) == 1040);
+
+// ---- 0x8182dc20 (subIntegrateLastStep, physics-loops.md 9; hl/math/MotionStep.h) ----
+// The solver step data (the step info's +16 pointer; U3's HavokMotion above is the same object).
+struct HavokSolverStepData {
+    uint8_t before32[32];
+    float f32;
+    uint8_t before96[60];
+    float f96[2];
+    float f104[2];
+    uint8_t before136[24];
+    float f136;
+    uint8_t before144[4];
+    float f144[2];
+    uint8_t before192[40];
+    float q0[4];
+    float q1[4];
+};
+static_assert(offsetof(HavokSolverStepData, f32) == 32);
+static_assert(offsetof(HavokSolverStepData, f96) == 96);
+static_assert(offsetof(HavokSolverStepData, f104) == 104);
+static_assert(offsetof(HavokSolverStepData, f136) == 136);
+static_assert(offsetof(HavokSolverStepData, f144) == 144);
+static_assert(offsetof(HavokSolverStepData, q0) == 192);
+static_assert(offsetof(HavokSolverStepData, q1) == 208);
+
+// A solver velocity entry (32 bytes): V in floats 0, 1, 2, W in 4, 5, 3; then, in the entry the velocities are
+// integrated from (B), the two packed maxima and the flags word; in the other (A), a 64-bit word.
+struct HavokSolverVelocity {
+    float f[6];
+    uint16_t max_w, max_v;
+    uint32_t flags;
+};
+static_assert(sizeof(HavokSolverVelocity) == 32);
+static_assert(offsetof(HavokSolverVelocity, max_w) == 24);
+static_assert(offsetof(HavokSolverVelocity, flags) == 28);
+constexpr uint64_t kSolverVelocityWord = 24;
 
 // A shape as the two box functions read it: its type (the shape-type table's index) at +24; a convex vertex set's
 // relative vertex array at +56, its radius at +104 times the float whose high half is at +108; an oriented box's

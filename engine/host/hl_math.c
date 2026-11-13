@@ -9,6 +9,8 @@
      sphere  0x800a8400  a model's bounding sphere over its bones' spheres, called directly: HL_GATE
      u3      0x817d9d80  the per-body box update of the solver's last substep (u1, u2 and the segment's box inside),
                          called directly: HL_GATE; it writes through pointers it computes (run_body)
+     sil     0x8182dc20  subIntegrateLastStep (u3's caller), called directly: HL_GATE; a check of its motions' steps and
+                         records only, with the paths' histogram (run_sil): nothing native yet, not validated
    A call takes the native path only when the thread's guest FPCR has no bit but FZ set and the kernel finds every value
    ordinary (hl/math/Exact.h); otherwise ("declined") the translated function runs, as before.
 
@@ -109,8 +111,8 @@ static int sphere_inputs(const Ctx *c, Span *s) {
     return 6;
 }
 
-extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400, hl_gate_on_817d9d80;
-enum { U2, AFFINE, U1, SPHERE, U3, UNITS };
+extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400, hl_gate_on_817d9d80, hl_gate_on_8182dc20;
+enum { U2, AFFINE, U1, SPHERE, U3, SIL, UNITS };
 /* validated: HL_MATH_CHECK=1 over full runs of kokiri-idle, castle-move and hyrule-walk (PC 3050, 2026-11-13) compared
    0.95 M (u2), 27 M (affine), 2.0 M (u1), 1.9 M (sphere) calls with no mismatch (physics-loops.md section 8); u3 over
    the three scenes on the main PC (2026-11-14): 1.01 M calls compared, no mismatch */
@@ -125,6 +127,8 @@ static Unit units[UNITS] = {
                 .inputs = sphere_inputs, .gate = &hl_gate_on_800a8400},
     /* (writes through pointers it computes: run_body below, not run) */
     [U3] = {.name = "u3", .guest = 0x817d9d80ULL, .validated = 1, .gate = &hl_gate_on_817d9d80},
+    /* (a check only for now: run_sil below) */
+    [SIL] = {.name = "sil", .guest = 0x8182dc20ULL, .gate = &hl_gate_on_8182dc20},
 };
 
 /* ---- switches ---- */
@@ -436,6 +440,198 @@ static int run_body(Unit *u, Ctx *c) {
     return 1;
 }
 
+/* ---- sil: 0x8182dc20, subIntegrateLastStep (physics-loops.md 9) ----
+   For now a check only (HL_MATH_CHECK=1, unit "sil"): the native step of each motion (hl_math_motion_step) is computed
+   from copies taken at entry, the translated function runs for real, then each motion's 128 bytes and the records the
+   function appended to the writer at T +0x520 are compared with what the native steps say. The cell lookup is not
+   native: a cell record's new cell is taken as written, its other fields are compared. The counts make the paths'
+   histogram the native version's cut is chosen from. Calls of the other callers (or with x7, the stream-range path)
+   are counted and left alone: their range object may be shared between threads. */
+#define SIL_RETURN 0x8182f958ULL   /* (the return address of 0x8182f860's call, the solver task's path) */
+enum { SIL_MAX = 4096 };
+enum {
+    H_CALLS, H_OTHER_CALLER, H_X7, H_PROFILER, H_FPCR, H_BIG, H_MOTIONS, H_DECLINE_VALUES, H_DECLINE_MODIFIER,
+    H_CALLBACKS, H_CLAMP_V, H_CLAMP_W, H_N1, H_N2, H_N3, H_N4, H_BIT5, H_MOVING, H_DEACT, H_STILL, H_CELL_RECORD,
+    H_ACC, H_NEW_BLOCK, H_RECORDS_UNSURE, H_COMPARED, H_MISMATCH_MOTION, H_MISMATCH_RECORD, H_COUNT
+};
+static const char *const sil_name[H_COUNT] = {
+    "calls", "other-caller", "x7", "profiler", "fpcr", "big", "motions", "decline-values", "decline-modifier",
+    "callbacks", "clamp-v", "clamp-w", "n-within", "n-scaled", "n-w-zero", "n-wv-zero", "bit5", "moving", "deact-on",
+    "still-record", "cell-record", "acc-on", "new-block", "records-unsure", "compared", "mismatch-motion",
+    "mismatch-record"};
+static volatile LONG64 sil_hist[H_COUNT];
+static volatile LONG sil_logged, sil_targets_logged;
+static void sil_count(int h) { InterlockedIncrement64(&sil_hist[h]); }
+
+static void sil_report(void) {
+    if (!sil_hist[H_CALLS]) return;
+    char line[1400];
+    int n = 0;
+    for (int h = 0; h < H_COUNT && n < (int)sizeof line - 40; h++)
+        n += snprintf(line + n, sizeof line - n, " %s %lld", sil_name[h], (long long)sil_hist[h]);
+    hos_log("hl math: sil:%s", line);
+}
+
+static void sil_mismatch(const char *what, int i, uint64_t at, const uint8_t *theirs, const uint8_t *mine, int n,
+                         const uint8_t *before) {
+    if (InterlockedIncrement(&sil_logged) > LOG_FIRST) return;
+    char a[400], b[400], h[400];
+    for (int off = 0; off < n; off += 64) {
+        const int k = n - off < 64 ? n - off : 64;
+        if (mine && !memcmp(theirs + off, mine + off, k)) continue;
+        hex(a, sizeof a, theirs + off, k);
+        if (mine) hex(b, sizeof b, mine + off, k);
+        hos_log("hl math: sil MISMATCH %s (motion %d at %#llx) +%d: translated %s / native %s", what, i,
+                (unsigned long long)at, off, a, mine ? b : "-");
+        if (before) {
+            hex(h, sizeof h, before + off, k);
+            hos_log("hl math: sil   before %s", h);
+        }
+    }
+}
+
+typedef struct {
+    uint64_t at;          /* the motion's guest address */
+    uint8_t before[128];
+} SilMotion;
+
+static int run_sil(Unit *u, Ctx *c) {
+    if (bypass) return 0;
+    if (started != 1) {
+        start();
+        if (!u->check_on) return 0;
+    }
+    if (!u->check_on) return 0;
+    InterlockedIncrement64(&u->calls);
+    sil_count(H_CALLS);
+    InterlockedOr(&u->fpcr_or, (LONG)c->fpcr);
+    InterlockedAnd(&u->fpcr_and, (LONG)c->fpcr);
+    {
+        static volatile LONG once;
+        if (!InterlockedExchange(&once, 1)) atexit(sil_report);
+        static volatile LONG64 last;
+        const int64_t now = hos_now_ns(), was = last;
+        if (now - was >= 10000000000LL && InterlockedCompareExchange64(&last, now, was) == was) sil_report();
+    }
+    if (G64(c->x[31])) sil_count(H_PROFILER);
+    if (c->x[7]) sil_count(H_X7);
+    if (c->x[30] != SIL_RETURN || c->x[7]) {
+        sil_count(H_OTHER_CALLER);
+        return 0;
+    }
+    if (c->fpcr & ~FPCR_FZ) {
+        sil_count(H_FPCR);
+        return 0;
+    }
+    const uint64_t T = c->x[0], I = c->x[1];
+    const int32_t first = (int32_t)c->x[3], count = (int32_t)c->x[4];
+    if (count <= 0 || count > SIL_MAX) {
+        sil_count(H_BIG);
+        return 0;
+    }
+    const uint64_t D = G64(I + 0x10), G = G64(BOX_BIAS_PTR);
+    const uint64_t pages = G64(G64(I + 0x50) + 0x10);
+    const uint64_t va = G64(I + 0x68) + (uint64_t)(int64_t)first * 32, vb = G64(I + 0x80) + (uint64_t)(int64_t)first * 32;
+    static _Thread_local SilMotion snap[SIL_MAX];
+    for (int i = 0; i < count; i++) {
+        const uint32_t id = G32(vb + (uint64_t)i * 32 + 28) >> 8;
+        snap[i].at = G64(pages + (uint64_t)(id >> 6) * 8) + (uint64_t)(id & 63) * 128;
+        memcpy(snap[i].before, GP(snap[i].at), 128);
+    }
+    const uint64_t lists = G64(T + 0x40);
+    const uint64_t mask1 = G64(lists + 0x1210), mask2 = G64(lists + 0x1320);
+    const int deact = G64(G64(T + 8) + 0xdb8) != 0 && G64(T + 0x4b8) != 0;
+    const int acc = G64(T + 0x4d8) != 0;
+    const uint64_t block0 = G64(T + 0x520);
+    const uint32_t used0 = G32(block0) & 0xffff;
+    if (InterlockedIncrement(&sil_targets_logged) == 1) {
+        const uint64_t cells = G64(I + 0x18), mod = G64(G64(T + 8) + 0xd70);
+        hos_log("hl math: sil: cell set-up %#llx, lookup %#llx; modifier %#llx; callback masks %#llx %#llx; deactivation %d;"
+                " accumulators %d; listeners %d",
+                (unsigned long long)G64(G64(cells) + 0x20), (unsigned long long)G64(G64(cells) + 0x28),
+                (unsigned long long)(mod ? G64(G64(mod) + 0x28) : 0), (unsigned long long)mask1,
+                (unsigned long long)mask2, deact, acc, (int)G32(G64(I + 0x48) + 0x500));
+    }
+
+    bypass = 1;
+    u->translated(c);
+    bypass = 0;
+    InterlockedIncrement64(&u->compared);
+
+    /* the records, in order: per motion a V clamp, a W clamp, then maybe a cell record */
+    const uint64_t block1 = G64(T + 0x520);
+    const uint8_t *blk = (const uint8_t *)GP(block1);
+    int sure = block1 == block0;
+    if (!sure) sil_count(H_NEW_BLOCK);
+    uint32_t at = 32 + used0;
+    const uint32_t end = 32 + (G32(block1) & 0xffff);
+    for (int i = 0; i < count; i++) {
+        const uint8_t *before = snap[i].before;
+        const uint32_t id = G32(vb + (uint64_t)i * 32 + 28) >> 8;
+        sil_count(H_MOTIONS);
+        if (deact) sil_count(H_DEACT);
+        if (acc) sil_count(H_ACC);
+        uint32_t m124;
+        memcpy(&m124, before + 124, 4);
+        if (((uint64_t)(m124 | 2) & mask1) || ((uint64_t)(m124 | 2) & mask2)) {
+            sil_count(H_CALLBACKS);
+            if (sure) sil_count(H_RECORDS_UNSURE);
+            sure = 0;
+            continue;
+        }
+        hl_math_motion_plan plan;
+        if (!hl_math_motion_step(before, GP(va + (uint64_t)i * 32), GP(vb + (uint64_t)i * 32), GP(D), GP(G), &plan)) {
+            sil_count(plan.decline == 2 ? H_DECLINE_MODIFIER : H_DECLINE_VALUES);
+            if (plan.decline != 2) count_why(u);
+            if (sure) sil_count(H_RECORDS_UNSURE);
+            sure = 0;
+            continue;
+        }
+        sil_count(H_COMPARED);
+        if (plan.clamp_v) sil_count(H_CLAMP_V);
+        if (plan.clamp_w) sil_count(H_CLAMP_W);
+        if (plan.n_path) sil_count(H_N1 + plan.n_path - 1);
+        if (plan.body_flag) sil_count(H_BIT5);
+        if (plan.moving) sil_count(H_MOVING);
+        if (plan.still_record && deact) sil_count(H_STILL);
+        const uint8_t *now = (const uint8_t *)GP(snap[i].at);
+        if (memcmp(now, plan.motion, 128)) {
+            sil_count(H_MISMATCH_MOTION);
+            InterlockedIncrement64(&u->mismatches);
+            sil_mismatch("motion", i, snap[i].at, now, plan.motion, 128, before);
+        }
+        if (!sure) continue;
+        for (int kind = 0; kind < 2; kind++) {
+            if (!(kind ? plan.clamp_w : plan.clamp_v)) continue;
+            const uint32_t want[5] = {0x03000020u, 6, 0x00ffffffu, id, (uint32_t)kind};
+            if (at + 20 > end || memcmp(blk + at, want, 20)) {
+                sil_count(H_MISMATCH_RECORD);
+                InterlockedIncrement64(&u->mismatches);
+                sil_mismatch(kind ? "clamp record W" : "clamp record V", i, block1 + at, blk + at, (const uint8_t *)want,
+                             20, NULL);
+                sure = 0;
+                break;
+            }
+            at += 32;
+        }
+        if (!sure) continue;
+        uint32_t want[4] = {0x03000020u, 0, 0, id};
+        memcpy(&want[2], before + 96, 4);
+        if (before[92] != 0xff && at + 18 <= end && !memcmp(blk + at, want, 16) && blk[at + 16] == before[92]) {
+            sil_count(H_CELL_RECORD);
+            at += 32;
+        }
+    }
+    if (sure && at != end) {
+        sil_count(H_MISMATCH_RECORD);
+        InterlockedIncrement64(&u->mismatches);
+        if (InterlockedIncrement(&sil_logged) <= LOG_FIRST)
+            hos_log("hl math: sil MISMATCH the records end at +%u in block %#llx, the native steps' at +%u", end,
+                    (unsigned long long)block1, at);
+    }
+    return 1;
+}
+
 static int u2_on(void) {
     start();
     return units[U2].native_on || units[U2].check_on;
@@ -449,3 +645,4 @@ HL_GATE(80ba6d80, "fc814e67d0dad1eb") { return run(&units[AFFINE], c); }
 HL_GATE(81746440, "851bc99bf31be697") { return run(&units[U1], c); }
 HL_GATE(800a8400, "42b7877d24ec9c57") { return run(&units[SPHERE], c); }
 HL_GATE(817d9d80, "fff55648d2f990a0") { return run_body(&units[U3], c); }
+HL_GATE(8182dc20, "34e889a38dac6751") { return run_sil(&units[SIL], c); }
