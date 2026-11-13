@@ -162,9 +162,11 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
                 continue;
             }
             const uint64_t h = config_.check ? hl::stream::page_hash(want, g) : 0;
-            if (host_.drop(host_.ctx, a, g)) {
+            if (const int why = host_.drop(host_.ctx, a, g)) {
                 host_.protect(host_.ctx, a, g, 0);
-                refuse(Refuse::Substrate), waiting = true;
+                // (-2: the substrate knows the back end imported it, which this module may not have been told yet)
+                if (why == -2) r.state[i] = kNever, refuse(Refuse::Imported);
+                else refuse(Refuse::Substrate), waiting = true;
                 continue;
             }
             if (config_.check) r.hash[i] = h;

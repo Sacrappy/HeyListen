@@ -125,6 +125,10 @@ static int on_touch(void *p, size_t size, int write) {
     return ok;
 }
 
+/* the OS layer unmapped, decommitted or discarded [p, p + size) and the substrate forgot the dropped granules inside
+   (a per-file heap's region given back): their records go, and the candidates there with them */
+static void on_forget(void *p, size_t size) { hl_drop_forget(guest_of(p), guest_of(p) + size); }
+
 /* a writer's fault on a granule being decided (read-only for the decision): it waits, then runs its instruction again */
 static LONG CALLBACK pending_handler(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *rec = info->ExceptionRecord;
@@ -212,6 +216,7 @@ void hl_drop_init(void) {
     drop_log = config.check || (lg && atoi(lg) == 1);
     AddVectoredExceptionHandler(1, pending_handler);
     hos_gp_set_owner(on_touch);
+    hos_gp_set_on_forget(on_forget);
     drop_on = 1;
     hos_log("hl drop: on: whole %zu KB granules of decoded resources, %lld s old or more%s, never imported, unchanged "
             "(compared with the file decoded again), given back for good; restored from the file on touch%s "
