@@ -29,7 +29,11 @@
    (hl/bridge/JobGroup.h; docs/native-engine/jobs-boundary.md, "The module system's job group"): an entry gate on it, which
    both of its callers reach (the module workers' message and the main thread's stage wait twin). The group scheduler, its
    heap, mutex and take count, the contexts' words and the guest's events stay in place. HL_JOBGROUP=0: the translated
-   function, as before. HL_JOBGROUP_CHECK=1: its invariants are counted and the counters logged every 10 s. */
+   function, as before. HL_JOBGROUP_CHECK=1: its invariants are counted and the counters logged every 10 s.
+   HL_MODSTAGES=1 (with HL_JOBS and HL_JOBGROUP on): the module system's twins of the registration 0x800711c0 (with the
+   group's seed) and of the stage wait 0x80070b20 are native too (hl/bridge/Stages.h; docs/native-engine/jobs-boundary.md,
+   "The module system's twins"), through two entry gates. HL_MODSTAGES=0: the translated twins, as before. Their
+   invariants are counted with HL_STAGES_CHECK=1, and each twin registration is compared with the translated twin's. */
 #include "hl_host.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +45,7 @@
 #define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
 #define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 15 runs over the three scenes, two PCs) */
 #define HL_JOBGROUP_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 11 runs over the three scenes, two PCs) */
+#define HL_MODSTAGES_DEFAULT 0
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;
@@ -99,6 +104,19 @@ HL_GATE(83acfb90, "e9b61c73cec382d7") {   /* the frame's last stage (actor manag
     return 1;
 }
 
+HL_GATE(800711c0, "81fbe08dca8c572d") {   /* the module system's registration twin (worker set, group) */
+    if (!hl_stage_ctx(c)) return 0;
+    const int answered = hl_bridge_stage_register_module(c->x[0], c->x[1]);
+    if (answered && hl_log_on) hl_report();
+    return answered;
+}
+
+HL_GATE(80070b20, "2920e4fb75af8833") {   /* the module system's stage wait twin (worker set) */
+    if (!hl_stage_ctx(c)) return 0;
+    hl_bridge_stage_wait_module(c->x[0]);
+    return 1;
+}
+
 HL_GATE(8007fe60, "677afe69100ea461") {   /* the module system's job group (group, context) */
     if (c != hos_ctx()) {
         static volatile LONG told;
@@ -130,26 +148,31 @@ static int hl_jobs_on(void) {
     const char *a = getenv("HL_DISPATCH_ALL");
     const int all = on && native && (a && a[0] ? atoi(a) == 1 : HL_DISPATCH_ALL_DEFAULT);
     hl_gate_on_8004ab40 = all;
-    const char *sg = getenv("HL_STAGES"), *sc = getenv("HL_STAGES_CHECK");
-    const int stage_check = sc && sc[0] == '1';
-    const int stages = on && (sg && sg[0] ? atoi(sg) == 1 : HL_STAGES_DEFAULT) &&
-                       hl_bridge_stages_start(HL_STAGES_NATIVE | (stage_check ? HL_STAGES_CHECK : 0));
     const char *jg = getenv("HL_JOBGROUP"), *jc = getenv("HL_JOBGROUP_CHECK");
     const int group_check = jc && jc[0] == '1';
     const int group = on && (jg && jg[0] ? atoi(jg) == 1 : HL_JOBGROUP_DEFAULT) &&
                       hl_bridge_jobgroup_start(HL_JOBGROUP_NATIVE | (group_check ? HL_JOBGROUP_CHECK : 0));
-    hl_log_on = getenv("HL_JOBS_LOG") != NULL || check || (stages && stage_check) || (group && group_check);
-    /* (the registration's gate last: a registration answered natively is waited for natively) */
+    const char *sg = getenv("HL_STAGES"), *sc = getenv("HL_STAGES_CHECK"), *ms = getenv("HL_MODSTAGES");
+    const int stage_check = sc && sc[0] == '1';
+    const int want = (sg && sg[0] ? atoi(sg) == 1 : HL_STAGES_DEFAULT) * HL_STAGES_NATIVE |
+                     (group && (ms && ms[0] ? atoi(ms) == 1 : HL_MODSTAGES_DEFAULT)) * HL_STAGES_MODULE;
+    const int started = on && want ? hl_bridge_stages_start(want | (stage_check ? HL_STAGES_CHECK : 0)) : 0;
+    const int stages = (started & HL_STAGES_NATIVE) != 0, twins = (started & HL_STAGES_MODULE) != 0;
+    hl_log_on = getenv("HL_JOBS_LOG") != NULL || check || ((stages || twins) && stage_check) || (group && group_check);
+    /* (the registrations' gates last: a registration answered natively is waited for natively) */
     hl_gate_on_806afc40 = stages;
     hl_gate_on_83acfb90 = stages;
     hl_gate_on_806b0260 = stages;
     hl_gate_on_8007fe60 = group;
+    hl_gate_on_80070b20 = twins;
+    hl_gate_on_800711c0 = twins;
     char line[2048];
     hl_bridge_report(line, sizeof line);
-    hos_log("hl jobs: %s%s%s%s: %s", on ? "on" : "not started",
+    hos_log("hl jobs: %s%s%s%s%s: %s", on ? "on" : "not started",
             all ? ", every caller of the dispatcher native (HL_DISPATCH_ALL=1)" : "",
             stages ? ", the stages native (HL_STAGES=1)" : "",
-            group ? ", the module system's job group native (HL_JOBGROUP=1)" : "", line);
+            group ? ", the module system's job group native (HL_JOBGROUP=1)" : "",
+            twins ? ", the module system's stage twins native (HL_MODSTAGES=1)" : "", line);
     return on;
 }
 

@@ -60,10 +60,14 @@ extern "C" int hl_bridge_dispatch_gate(uint64_t scheduler, uint64_t context) {
 }
 
 extern "C" int hl_bridge_stages_start(int stages) {
-    if (g_stages) return 1;
-    if (!g_bridge || !(stages & HL_STAGES_NATIVE)) return 0;
-    g_stages = new hl::bridge::Stages(*g_runtime, g_dispatcher, {.check = (stages & HL_STAGES_CHECK) != 0});
-    return 1;
+    static int on;
+    if (g_stages) return on;
+    if (!g_bridge) return 0;
+    on = (stages & HL_STAGES_NATIVE) | (g_group ? stages & HL_STAGES_MODULE : 0);
+    if (!on) return 0;
+    g_stages = new hl::bridge::Stages(*g_runtime, g_dispatcher, (on & HL_STAGES_MODULE) ? g_group : nullptr,
+                                      {.check = (stages & HL_STAGES_CHECK) != 0});
+    return on;
 }
 
 extern "C" int hl_bridge_stage_register(uint64_t set, uint64_t send) {
@@ -73,6 +77,12 @@ extern "C" int hl_bridge_stage_register(uint64_t set, uint64_t send) {
 extern "C" void hl_bridge_stage_wait(uint64_t set) { g_stages->wait(g_runtime->current(), set); }
 
 extern "C" void hl_bridge_stage_last(uint64_t manager) { g_stages->last_stage(g_runtime->current(), manager); }
+
+extern "C" int hl_bridge_stage_register_module(uint64_t set, uint64_t group) {
+    return g_stages && g_stages->register_module_gate(g_runtime->current(), set, group);
+}
+
+extern "C" void hl_bridge_stage_wait_module(uint64_t set) { g_stages->wait_module(g_runtime->current(), set); }
 
 extern "C" int hl_bridge_jobgroup_start(int group) {
     if (g_group) return 1;
