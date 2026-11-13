@@ -385,6 +385,20 @@ void spilled() {
     w.spill_cap = 3;
     d.decoded(range(20, 6), 100 * S);
     CHECK(d.pass(130 * S) == 3 && d.stats().refused[int(Refuse::NoSpill)] == 3);
+    // (a spill-only source, a mirror read back: dropped only into the spill; its source failing is tried again later; a
+    // cancel ends the candidate and leaves what is dropped restorable)
+    w.spill_cap = 1000;
+    DropSource m = range(40, 4, 0, 0);
+    m.name = "(mirror)", m.spill_only = true;
+    w.source_ok = false;
+    d.decoded(m, 200 * S);
+    CHECK(d.pass(230 * S) == 0);
+    w.source_ok = true;
+    CHECK(d.pass(240 * S) == 4 && w.dropped[40] && w.dropped[43]);
+    d.cancel(BASE + 40 * G, BASE + 44 * G);
+    CHECK(d.stats().cancelled == 1);
+    for (uint64_t a = BASE + 40 * G; a < BASE + 44 * G; a += 777) CHECK(w.read(d, a) == w.file[a - BASE]);
+    CHECK(d.pass(1000 * S) == 0 && d.stats().mismatches == 0);
 }
 
 }   // namespace

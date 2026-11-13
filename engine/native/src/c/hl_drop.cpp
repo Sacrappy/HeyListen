@@ -89,6 +89,16 @@ extern "C" void hl_drop_imported(uint64_t lo, uint64_t hi) {
 extern "C" void hl_drop_unimported(uint64_t lo, uint64_t hi) {
     if (auto* d = g_drop.load()) d->unmark_imported(lo, hi);
 }
+extern "C" void hl_drop_mirrored(uint64_t dest, uint64_t size, int64_t now_ns) {
+    auto* d = g_drop.load();
+    if (!d) return;
+    hl::mem::DropSource s;
+    s.dest = dest, s.size = size, s.name = "(mirror)", s.spill_only = true;
+    d->decoded(std::move(s), now_ns);
+}
+extern "C" void hl_drop_cancel(uint64_t lo, uint64_t hi) {
+    if (auto* d = g_drop.load()) d->cancel(lo, hi);
+}
 extern "C" void hl_drop_forget(uint64_t lo, uint64_t hi) {
     if (auto* d = g_drop.load()) d->forget(lo, hi);
 }

@@ -161,6 +161,7 @@ bool Drop::decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uin
     if (!src) {
         stats_.source_failed.fetch_add(1, std::memory_order_relaxed);
         refuse(Refuse::NoSource, cold.size());
+        if (r.src.spill_only) return true;   // (a mirror not readable now: its import taken again, or given back as idle)
         for (uint32_t i : cold) r.state[i] = kNever;
         return false;
     }
@@ -189,7 +190,8 @@ bool Drop::decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uin
             }
             const uint64_t h = config_.check ? hl::stream::page_hash(want, g) : 0;
             int64_t slot = host_.spill_put ? host_.spill_put(host_.ctx, want) : -1;
-            if (host_.spill_put && slot < 0 && config_.max_range_bytes && r.src.size > config_.max_range_bytes) {
+            if ((r.src.spill_only && slot < 0) ||
+                (host_.spill_put && slot < 0 && config_.max_range_bytes && r.src.size > config_.max_range_bytes)) {
                 // (a large file's granule restores from the spill only: no room, not dropped now)
                 host_.protect(host_.ctx, a, g, 0);
                 refuse(Refuse::NoSpill), waiting = true;
@@ -404,6 +406,21 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
     return ok;
 }
 
+void Drop::cancel(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    std::lock_guard<std::mutex> t(table_lock_);
+    auto it = by_dest_.upper_bound(lo);
+    if (it != by_dest_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second->src.dest + prev->second->src.size > lo) it = prev;
+    }
+    while (it != by_dest_.end() && it->first < hi) {
+        it->second->candidate = false;
+        stats_.cancelled.fetch_add(1, std::memory_order_relaxed);
+        it = by_dest_.erase(it);
+    }
+}
+
 void Drop::forget(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     std::vector<uint64_t> ids;
@@ -493,7 +510,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
         "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu; "
-        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu",
+        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu; candidates cancelled %llu",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
         (unsigned long long)restores, stats_.restored_granules.load() * mb,
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
@@ -507,7 +524,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)stats_.sources.load(), (unsigned long long)stats_.source_failed.load(),
         (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load(),
         stats_.spilled_now.load() * mb, (unsigned long long)stats_.from_spill.load(),
-        (unsigned long long)stats_.from_decode.load());
+        (unsigned long long)stats_.from_decode.load(), (unsigned long long)stats_.cancelled.load());
     last_dropped_report_ = dropped, last_restores_report_ = restores, last_report_ns_ = now;
     return n < 0 ? 0 : n;
 }

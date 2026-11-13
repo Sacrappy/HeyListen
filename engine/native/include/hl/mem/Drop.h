@@ -48,6 +48,8 @@ struct DropSource {
     uint64_t compressed = 0;       // the compressed file's size (the restore checks it)
     uint32_t dict_id = 0;          // the frame's dictionary (0: none)
     std::string name;              // the file, as the game's per-file heap names it
+    bool spill_only = false;       // its bytes are had again only at the drop (a VRAM mirror read back): a granule is
+                                   // dropped only into the spill, and a source that fails is tried again later
 };
 
 /// Why a granule was not dropped.
@@ -108,6 +110,7 @@ public:
         std::atomic<uint64_t> ranges{0}, replaced{0}, passes{0};
         std::atomic<uint64_t> too_large{0}, too_large_bytes{0};     // decodes left out by max_range_bytes
         std::atomic<uint64_t> spilled_now{0}, from_spill{0}, from_decode{0};   // slots held; granules restored each way
+        std::atomic<uint64_t> cancelled{0};                                    // candidates whose storage ended
         std::atomic<uint64_t> dropped_granules{0}, dropped_now{0};   // granules dropped in all, dropped now
         std::atomic<uint64_t> restores{0}, restored_granules{0};     // touches that restored a range; granules restored
         std::atomic<uint64_t> by_path[int(TouchPath::kCount)] = {};
@@ -146,6 +149,9 @@ public:
     void unmark_imported(uint64_t lo, uint64_t hi);
     /// [lo, hi) was unmapped: its ranges and dropped granules are forgotten (their bytes were given up).
     void forget(uint64_t lo, uint64_t hi);
+    /// The candidates overlapping [lo, hi) stop being candidates (their storage ended: an NVN pool finalized). Granules
+    /// already dropped stay: their bytes come back from the spill, which is what the memory held.
+    void cancel(uint64_t lo, uint64_t hi);
 
     /// Dropped granules whose substrate says they are not dropped any more (unmapped by the OS layer meanwhile) are
     /// forgotten. Returns how many.

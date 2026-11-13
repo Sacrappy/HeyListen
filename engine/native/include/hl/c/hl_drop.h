@@ -62,6 +62,10 @@ void hl_drop_kernel_use(uint64_t lo, uint64_t hi, int64_t now_ns);
 void hl_drop_imported(uint64_t lo, uint64_t hi);
 void hl_drop_unimported(uint64_t lo, uint64_t hi);
 void hl_drop_forget(uint64_t lo, uint64_t hi);
+/* HL_MEM_DROP_POOLS: [dest, dest + size) is a mirrored pool's storage whose bytes the VRAM mirror holds (a candidate
+   whose source, "(mirror)", is read back at the drop only); a pool's storage ended: its candidates cancelled */
+void hl_drop_mirrored(uint64_t dest, uint64_t size, int64_t now_ns);
+void hl_drop_cancel(uint64_t lo, uint64_t hi);
 uint64_t hl_drop_reconcile(void);
 /* Granules dropped now; one line of counters. */
 uint64_t hl_drop_dropped_now(void);
