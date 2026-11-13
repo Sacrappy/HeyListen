@@ -122,7 +122,10 @@ HL_GATE(814e6ce0, "d3b49da72eac206e") { return alloc_gate(c, 0x814e6ce0, -1, -1)
 HL_GATE(814e6d50, "3b72a1fb983c411a") { return alloc_gate(c, 0x814e6d50, 1, -1); }
 HL_GATE(80709580, "e67268a6064c41d8") { return free_gate(c, 0, -1); }
 
-static const char *thread_name(void) { return hos_thread_name(hos_self()); }
+static const char *thread_name(void) {   /* (a thread of the OS layer's or the back end's has no guest thread) */
+    HosThread *t = hos_self();
+    return t ? hos_thread_name(t) : "host";
+}
 /* (at a crash the report also goes to hl_trace_crash.txt, written through at each line: a log queue the process's end
    does not drain loses nothing there) */
 static FILE *crash_file;
