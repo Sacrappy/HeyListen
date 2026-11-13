@@ -44,6 +44,20 @@ uint64_t hl_stream_fingerprint(const void *data, size_t n, uint64_t seed);
 /* One line of counters (and the provenance table's) for the log. Returns the length written. */
 int hl_stream_report(char *out, size_t cap);
 
+/* The decoded pages that still hold the decoder's bytes, by file kind (hl/stream/Pages.h): made once (the two checks at
+   these ages); a decode's bytes; the checks due now (each range checked is given to `seen` when not null: its whole
+   pages from first_page, their decode-time hashes, and per page 1 equal, 0 changed, 2 not readable); the table, one
+   line per kind separated by newlines. */
+typedef const uint8_t *(*hl_stream_view)(uint64_t addr, size_t n, void *ctx);
+typedef void (*hl_stream_seen)(void *ctx, uint64_t dest, uint64_t size, uint64_t first_page, size_t pages,
+                               const uint64_t *hashes, const uint8_t *equal, int stage, const char *name);
+int hl_stream_pages_start(int64_t first_ns, int64_t second_ns);
+void hl_stream_pages_track(uint64_t dest, const void *bytes, uint64_t size, const char *name, int64_t now_ns);
+size_t hl_stream_pages_check(int64_t now_ns, hl_stream_view view, void *ctx, size_t budget_pages, hl_stream_seen seen,
+                             void *seen_ctx);
+int hl_stream_pages_report(char *out, size_t cap);
+uint64_t hl_stream_page_hash(const void *data, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

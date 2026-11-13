@@ -4,9 +4,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "hl/c/hl_stream.h"
 #include "hl/stream/Decode.h"
+#include "hl/stream/Pages.h"
 #include "hl/stream/Provenance.h"
 
 using hl::stream::Decode;
@@ -123,6 +125,90 @@ void c_surface() {
     CHECK(!hl_stream_find(0x5000, &o, name, sizeof name));
 }
 
+// The page hash: one changed word anywhere changes it; equal bytes give equal hashes.
+void page_hash() {
+    std::vector<uint8_t> a(4096);
+    for (size_t i = 0; i < a.size(); i++) a[i] = static_cast<uint8_t>(i * 7);
+    const uint64_t h = hl::stream::page_hash(a.data(), a.size());
+    std::vector<uint8_t> b = a;
+    CHECK(hl::stream::page_hash(b.data(), b.size()) == h);
+    for (size_t at : {size_t(0), size_t(8), size_t(4088), size_t(2049)}) {
+        b = a;
+        b[at] ^= 1;
+        CHECK(hl::stream::page_hash(b.data(), b.size()) != h);
+    }
+    CHECK(hl::stream::file_kind("Tex/a.bntx") == "Tex/*.bntx");
+    CHECK(hl::stream::file_kind("Model/b.anim.bfres") == "Model/*.bfres");
+    CHECK(hl::stream::file_kind("c.pack") == "*.pack");
+    CHECK(hl::stream::file_kind("Dir.x/noext") == "Dir.x/*");
+    CHECK(hl::stream::file_kind("") == "(no name)");
+}
+
+// The two checks: whole pages only, a page changed after the decode counted apart, a page gone counted as not
+// readable, a range replaced by a new decode before its second check counted as replaced.
+std::vector<uint8_t> g_mem;
+const uint8_t* view(uint64_t addr, size_t n, void*) {
+    if (addr >= 0x30000 && addr < 0x31000) return nullptr;   // (a page decommitted)
+    return addr + n <= g_mem.size() ? g_mem.data() + addr : nullptr;
+}
+
+void pages() {
+    using hl::stream::Pages;
+    g_mem.assign(0x80000, 0);
+    for (size_t i = 0; i < g_mem.size(); i++) g_mem[i] = static_cast<uint8_t>(i * 13 + (i >> 12));
+    Pages::Config c;
+    c.first_ns = 30, c.second_ns = 60;
+    Pages p(c);
+    // [0x10800, 0x15800): whole pages 0x11000..0x15000 (4)
+    CHECK(p.track(0x10800, g_mem.data() + 0x10800, 0x5000, "Tex/a.bntx", 0));
+    CHECK(p.track(0x30000, g_mem.data() + 0x30000, 0x4000, "Tex/b.bntx", 0));
+    CHECK(p.track(0x50000, g_mem.data() + 0x50000, 0x2000, "Model/c.bfres", 0));
+    CHECK(!p.track(0x70010, g_mem.data() + 0x70010, 0x100, "Model/d.bfres", 0));   // (no whole page)
+    g_mem[0x12000 + 40] ^= 0xff;                                                     // (patched in place)
+    std::vector<Pages::Checked> got;
+    CHECK(p.check(29, view, nullptr, 1000, &got) == 0);
+    CHECK(p.check(30, view, nullptr, 1000, &got) == 3 && got.size() == 3);
+    for (const auto& k : got) {
+        CHECK(k.stage == 1);
+        if (k.dest == 0x10800) {
+            CHECK(k.first_page == 0x11000 && k.equal.size() == 4);
+            CHECK(k.equal[0] == 1 && k.equal[1] == 0 && k.equal[2] == 1 && k.equal[3] == 1);
+        }
+        if (k.dest == 0x30000) CHECK(k.equal[0] == 2 && k.equal[1] == 1);
+    }
+    CHECK(p.track(0x50000, g_mem.data() + 0x50000, 0x1000, "Model/e.bfres", 40));   // (c replaced)
+    got.clear();
+    CHECK(p.check(60, view, nullptr, 1000, &got) == 2);
+    CHECK(p.check(100, view, nullptr, 1000, &got) == 1);   // (e's two checks are later: 70 then 100)
+    const auto s = p.stats();
+    uint64_t replaced = 0, equal60 = 0, checked60 = 0, gone30 = 0;
+    for (const auto& k : s) {
+        replaced += k.replaced;
+        equal60 += k.equal[1];
+        checked60 += k.checked[1];
+        gone30 += k.unreadable[0];
+        if (k.kind == "Tex/*.bntx") CHECK(k.ranges == 2 && k.pages == 8 && k.equal[0] == 6);
+    }
+    CHECK(replaced == 1 && checked60 == 2 && equal60 == 6 && gone30 == 1);
+}
+
+// The C surface of the measurement: a range tracked, checked, given to the callback, and the table's lines.
+size_t g_seen;
+void seen(void*, uint64_t dest, uint64_t, uint64_t first_page, size_t pages, const uint64_t* hashes, const uint8_t* equal,
+          int stage, const char* name) {
+    CHECK(dest == 0x20000 && first_page == 0x20000 && pages == 2 && stage == 1 && !std::strcmp(name, "Pack/p.pack"));
+    CHECK(equal[0] == 1 && equal[1] == 1 && hashes[0] == hl_stream_page_hash(g_mem.data() + 0x20000, 4096));
+    g_seen++;
+}
+
+void pages_c() {
+    CHECK(hl_stream_pages_start(10, 20) == 1);
+    hl_stream_pages_track(0x20000, g_mem.data() + 0x20000, 0x2000, "Pack/p.pack", 0);
+    CHECK(hl_stream_pages_check(10, view, nullptr, 100, seen, nullptr) == 1 && g_seen == 1);
+    char out[2048];
+    CHECK(hl_stream_pages_report(out, sizeof out) > 0 && std::strstr(out, "Pack/*.pack"));
+}
+
 }   // namespace
 
 int main() {
@@ -131,6 +217,9 @@ int main() {
     bounded();
     choose();
     c_surface();
+    page_hash();
+    pages();
+    pages_c();
     std::puts("stream_test: ok");
     return 0;
 }
