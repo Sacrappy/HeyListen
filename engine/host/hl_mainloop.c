@@ -21,6 +21,7 @@
 #define HL_JOBS_WORKER_MESSAGE 0x8004aae0ULL   /* (hl_jobs.c: answered when the job bridge is on) */
 
 A64Fn a64_lookup_replaced(uint64_t addr);   /* hl_host.c */
+extern volatile int hl_gate_on_80706be0;     /* (the check's gate, below) */
 
 static const uint64_t loop_gates[] = {0x809667b0};
 static const uint64_t check_gates[] = {0x80706be0};
