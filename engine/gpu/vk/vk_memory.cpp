@@ -4102,8 +4102,35 @@ void lazy_filter(Pool& p, std::vector<VkBufferCopy>& runs) {
 }
 // (2026-11-13) What the release of a mirror holding left-out write-backs does with one left-out page (TICK-023): copy the mirror's
 // bytes back into guest memory only while they are still the newest bytes of a live pool's page.
-enum { kRelCopy, kRelDead, kRelWritten, kRelCpuPage, kRelTexture, kRelKinds };
-int64_t st_release_by[kRelKinds];   // (pages, by verdict; nvn_pools_mu held)
+enum { kRelCopy, kRelDead, kRelWritten, kRelCpuPage, kRelTexture, kRelNoStage, kRelKinds };
+int64_t st_release_by[kRelKinds];   // (pages, by verdict at the release; nvn_pools_mu held)
+int64_t st_apply_by[kRelKinds];     // (page pieces, by verdict at the copy into guest memory; pools_mu held)
+/// (2026-11-14) a release's staged bytes: the host buffer the GPU copies the mirror's left-out pages into, and where each
+/// piece (one page at most) goes in guest memory; written there by the CPU once the submission value is done (lazy_apply)
+struct LazyStage {
+    struct Piece { uint64_t guest, off; uint32_t n; };
+    uint64_t value = 0;
+    uint32_t synced = 0;   // (the mirror's synced_gen: a page written since is newer in guest memory)
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    void* map = nullptr;
+    std::vector<Piece> pieces;
+};
+std::vector<LazyStage> lazy_stages;   // (pools_mu held)
+int64_t st_lazy_staged = 0;
+/// the last check of a staged page before the CPU writes it (the host then checks its pool is live and the page not written
+/// since the last collection, under the lock pool Finalize takes: hos_gpu_write_live): gen and synced as at the release;
+/// cpu_page: a mirror sync saw the CPU write it since
+int lazy_apply_verdict(uint32_t gen, uint32_t synced, bool cpu_page) {
+    if (gen > synced) return kRelWritten;
+    if (cpu_page) return kRelCpuPage;
+    return kRelCopy;
+}
+/// the host's answer for a page it was asked to write (hos_gpu_write_live: 1 written, 2 written by the CPU since, else no live
+/// pool), as a verdict; no host function: nothing is written
+int lazy_host_verdict(int host_result) {
+    return host_result == 1 ? kRelCopy : host_result == 2 ? kRelWritten : kRelDead;
+}
 /// [lo, hi) inside one of the game's live pools (pools: by lo, disjoint, as memory_sync builds them from the host's list)
 bool in_live_pool(const std::vector<GuestPool>& pools, uint64_t lo, uint64_t hi) {
     auto it = std::upper_bound(pools.begin(), pools.end(), lo, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
@@ -6202,8 +6229,48 @@ WbdTable* wbd_table_get(uint64_t bytes) {
     return &t;
 }
 
+/// (2026-11-14) the staged left-out write-backs whose submission is done, into guest memory page by page: each one checked
+/// again here (its write generation against the mirror's sync, cpu_pages), then by the host under the lock pool Finalize takes
+/// (a live pool, no CPU write since the last collection). The pages written are stamped (a mirror or a read of them takes
+/// guest memory from now on); every piece leaves the left-out set. pools_mu held
+void lazy_apply() {
+    if (lazy_stages.empty()) return;
+    using WriteLive = int (*)(uint64_t, const void*, uint64_t);
+    static const WriteLive write_live = (WriteLive)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_write_live");
+    const uint64_t done = vk_timeline_completed();
+    for (auto it = lazy_stages.begin(); it != lazy_stages.end();) {
+        if (it->value > done) {
+            ++it;
+            continue;
+        }
+        uint64_t bytes = 0;
+        for (const auto& pc : it->pieces) bytes = std::max<uint64_t>(bytes, pc.off + pc.n);
+        invalidate_mapped(it->alloc, bytes);
+        for (const auto& pc : it->pieces) {
+            const uint32_t page = (uint32_t)(pc.guest >> kPageShift);
+            bool cpu = false;
+            {
+                std::lock_guard nk(nvn_pools_mu);
+                cpu = cpu_pages.count(page) != 0;
+                skipped_pages.erase(page);
+            }
+            int verdict = lazy_apply_verdict(page_gen(page), it->synced, cpu);
+            if (verdict == kRelCopy)
+                verdict = lazy_host_verdict(write_live ? write_live(pc.guest, (const uint8_t*)it->map + pc.off, pc.n) : 0);
+            st_apply_by[verdict]++;
+            if (verdict == kRelCopy) {
+                st_lazy_written_back += pc.n;
+                trace_gpu(MKWVK_TRACE_LAZY, pc.guest, pc.n, 0, it->value);   // (HL_TRACE: the staged release's write, as it lands)
+                memory_stamp(pc.guest, pc.n);
+            }
+        }
+        destroy_buffer(it->buf, it->alloc);
+        it = lazy_stages.erase(it);
+    }
+}
 void memory_end_submission(VkCommandBuffer cmd) {
     std::lock_guard lk(pools_mu);
+    lazy_apply();
     for (const PresyncNote& n : presync_notes) {   // (TICK-048: a pool the presync synced that no binding used after it)
         const auto it = imported.find(n.key);
         if (it != imported.end() && &it->second == n.p && n.p->last_value == n.bound_before) sst.pre_unbound += n.bytes;
@@ -6502,14 +6569,32 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 }
             }
             cut_cpu_words(*p, runs);
-            if (!runs.empty() && !p->memory && !import_again(*p, kAgainWb)) runs.clear();   // (RX_VK_NO_HOST_IMPORT)
+            // (2026-11-14) staged: the mirror's bytes into a host buffer on the GPU; the CPU writes them into guest memory
+            // once this submission is done, page by page after a last check (lazy_apply). A copy into the pool's import
+            // landed milliseconds after this check, by when the game could have finalized the pool or written the page)
             if (!runs.empty()) {
-                if (!barrier) transfer_barrier(cmd), barrier = true;
-                vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
-                for (const VkBufferCopy& r : runs) {
-                    trace_gpu(MKWVK_TRACE_LAZY, p->lo + r.dstOffset, r.size, p->lo, mem_rec_value);
-                    st_lazy_written_back += r.size;
-                    wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
+                LazyStage st;
+                st.value = mem_rec_value, st.synced = p->synced_gen;
+                uint64_t total = 0;
+                for (const VkBufferCopy& r : runs) total += r.size;
+                if (create_buffer_cached(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, st.buf, st.alloc, &st.map)) {
+                    std::vector<VkBufferCopy> to;
+                    uint64_t off = 0;
+                    for (const VkBufferCopy& r : runs) {
+                        to.push_back({r.srcOffset, off, r.size});
+                        for (uint64_t g = p->lo + r.srcOffset, e = g + r.size; g < e;) {   // (one piece a page: the check is by page)
+                            const uint64_t n = std::min(e, ((g >> kPageShift) + 1) << kPageShift) - g;
+                            st.pieces.push_back({g, off + (g - (p->lo + r.srcOffset)), (uint32_t)n});
+                            g += n;
+                        }
+                        off += r.size;
+                    }
+                    if (!barrier) transfer_barrier(cmd), barrier = true;
+                    vkCmdCopyBuffer(cmd, p->mirror, st.buf, (uint32_t)to.size(), to.data());
+                    st_lazy_staged += total;
+                    lazy_stages.push_back(std::move(st));
+                } else {
+                    st_release_by[kRelNoStage] += (int64_t)runs.size();
                 }
             }
             p->lazy_held = false;
@@ -6517,17 +6602,30 @@ void memory_end_submission(VkCommandBuffer cmd) {
             st_lazy_released++, st_lazy_released_bytes += p->hi - p->lo;
             mirror_free(*p);
         }
-        if (barrier) transfer_barrier(cmd);
+        if (barrier) {   // (the staged bytes visible to the host once the submission is done)
+            VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            hb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            hb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            hb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            hb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            hd.memoryBarrierCount = 1, hd.pMemoryBarriers = &hb;
+            vkCmdPipelineBarrier2(cmd, &hd);
+            transfer_barrier(cmd);
+        }
         lazy_release.clear();
         static int64_t logged_at = -1;
-        if (st_lazy_released / 8 != logged_at) {
-            logged_at = st_lazy_released / 8;
-            logf("vk: mirrors holding left-out write-backs given back: %lld (%llu MB), %.2f MB written back into guest memory first; "
-                 "%llu MB of mirrors now; left-out pages: %lld written back, not written back as the pool is gone (finalized) %lld, "
-                 "written since the mirror's sync %lld, written by the CPU %lld, texture storage %lld",
-                 (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20), st_lazy_written_back / 1048576.0,
-                 (unsigned long long)(mirror_bytes >> 20), (long long)st_release_by[kRelCopy], (long long)st_release_by[kRelDead],
-                 (long long)st_release_by[kRelWritten], (long long)st_release_by[kRelCpuPage], (long long)st_release_by[kRelTexture]);
+        if (st_lazy_released != logged_at) {
+            logged_at = st_lazy_released;   // (every release: they are few, and each is worth a line)
+            logf("vk: mirrors holding left-out write-backs given back: %lld (%llu MB), %.2f MB staged, %.2f MB written back into guest "
+                 "memory; %llu MB of mirrors now; left-out pages at the release: %lld staged, not as the pool is gone (finalized) %lld, "
+                 "written since the mirror's sync %lld, written by the CPU %lld, texture storage %lld, no staging buffer %lld; at the "
+                 "copy into guest memory: %lld written, not as the pool is gone %lld, written since %lld, written by the CPU %lld",
+                 (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20), st_lazy_staged / 1048576.0,
+                 st_lazy_written_back / 1048576.0, (unsigned long long)(mirror_bytes >> 20), (long long)st_release_by[kRelCopy],
+                 (long long)st_release_by[kRelDead], (long long)st_release_by[kRelWritten], (long long)st_release_by[kRelCpuPage],
+                 (long long)st_release_by[kRelTexture], (long long)st_release_by[kRelNoStage], (long long)st_apply_by[kRelCopy],
+                 (long long)st_apply_by[kRelDead], (long long)st_apply_by[kRelWritten], (long long)st_apply_by[kRelCpuPage]);
         }
     }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are

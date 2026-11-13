@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <map>
 #include <unordered_map>
 
 namespace mkwvk {
@@ -98,6 +99,7 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
 // memory type the pool's is not, are allocated as before.
 VmaPool image_pool = VK_NULL_HANDLE;
 bool image_pool_tried = false;
+uint32_t image_type = UINT32_MAX;   // (the pools' memory type, once images_pool found it)
 // (RX_VK_IMAGE_BLOCK_MB=<n>, 16 and up: the block's size. VMA keeps one block empty for the next image, 128 MB of VRAM that a 64 MB block
 // would halve, at twice the memory objects: the driver allows ~4096, the imported pools take ~2400)
 const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : 128u) << 20;
@@ -153,11 +155,78 @@ VmaPool images_pool() {
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
+    image_type = type;
     if (vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
     logf("vk: images from a pool of %llu MB blocks (memory type %u)%s", (unsigned long long)(kImageBlock >> 20), type,
          image_pool ? "" : ": not made");
     return image_pool;
 }
+
+// ---- (HeyListen, 2026-11-14) RX_VK_IMAGE_GENERATIONS=1: images in pools by generation, an empty generation given back whole ----
+// The image pools' blocks did not empty: after a zone change the game finalizes most of its textures, but the few that stay
+// (made at any time before) sit in every block. The play sessions at 2560x1440 showed 33 blocks of 4224 MB holding 835 images of
+// 652 MB right after one (3.5 GB free inside the blocks, the heaps at 84%), so the mirrors' VRAM rule gave mirrors back for
+// nothing. Here images go to the current generation's pool, a new generation starts once one has had RX_VK_IMAGE_GEN_MB
+// (default 512) of images made in it, and a generation that is not the current one is destroyed with its blocks when its last
+// image goes. Images made together (a zone's) mostly go together, and those that stay keep their own generation's blocks only.
+// Blocks of RX_VK_IMAGE_GEN_BLOCK_MB (default 64). Textures only: render targets in generations (tried, PC 3050 castle-move)
+// spread over 10-14 live generations of 3.4-4 GB holding 0.9-1.1 GB, as the dynamic resolution makes new ones all the time
+// and a few of each generation stay (the heaps at 97-109%, images refused); they keep their own pool as before. 0: as before.
+bool image_generations_on() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_IMAGE_GENERATIONS");
+        const bool on = e && atoi(e) != 0;
+        if (on) logf("vk: images in pools by generation, an empty generation given back with its blocks (RX_VK_IMAGE_GENERATIONS=1)");
+        return on;
+    }();
+    return v;
+}
+namespace {
+struct ImageGen {
+    VmaPool pool = VK_NULL_HANDLE;
+    uint64_t made_bytes = 0;   // (images made in it in all)
+    int64_t live = 0;          // (its images now)
+};
+std::mutex gen_mu;
+std::map<uint64_t, ImageGen> gens[2];   // [textures, render targets]: by number, the last one the current
+uint64_t gen_next = 1;
+std::unordered_map<VmaAllocation, std::pair<int, uint64_t>> gen_of;   // (an image's family and generation)
+int64_t st_gens_made = 0, st_gens_freed = 0;
+uint64_t gen_bytes() {
+    static const uint64_t v = (uint64_t)std::max(64, getenv("RX_VK_IMAGE_GEN_MB") ? atoi(getenv("RX_VK_IMAGE_GEN_MB")) : 512) << 20;
+    return v;
+}
+uint64_t gen_block() {
+    static const uint64_t v = (uint64_t)std::max(16, getenv("RX_VK_IMAGE_GEN_BLOCK_MB") ? atoi(getenv("RX_VK_IMAGE_GEN_BLOCK_MB")) : 64) << 20;
+    return v;
+}
+/// the pool images of that family go to now: the current generation's, a new one when it is full (gen_mu held)
+VmaPool gen_current(int family, uint32_t type, uint64_t* number) {
+    auto& g = gens[family];
+    if (g.empty() || std::prev(g.end())->second.made_bytes >= gen_bytes()) {
+        VmaPoolCreateInfo pi{};
+        pi.memoryTypeIndex = type;
+        pi.blockSize = gen_block();
+        ImageGen ng;
+        if (vmaCreatePool(vma, &pi, &ng.pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+        const uint64_t n = gen_next++;
+        g[n] = ng;
+        st_gens_made++;
+        // (the generation before, now not the current one, goes at once if its images went meanwhile)
+        if (g.size() > 1) {
+            auto before = std::prev(std::prev(g.end()));
+            if (before->second.live == 0) {
+                vmaDestroyPool(vma, before->second.pool);
+                g.erase(before);
+                st_gens_freed++;
+            }
+        }
+    }
+    auto cur = std::prev(g.end());
+    *number = cur->first;
+    return cur->second.pool;
+}
+}  // namespace
 
 uint64_t big_image_bytes() {   // (TICK-023: RX_VK_BIG_IMAGE_MB, 16 by default; 0: none forced dedicated)
     static const uint64_t big = (uint64_t)(getenv("RX_VK_BIG_IMAGE_MB") ? std::max(0, atoi(getenv("RX_VK_BIG_IMAGE_MB"))) : 16) << 20;
@@ -196,6 +265,24 @@ static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAlloca
         }
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
+    if (!no_pool && !target && image_generations_on() && images_pool() && image_type != UINT32_MAX) {   // (RX_VK_IMAGE_GENERATIONS, above)
+        const int family = 0;
+        std::lock_guard lk(gen_mu);   // (held through the make: a generation is never destroyed under it)
+        uint64_t number = 0;
+        if (VmaPool gp = gen_current(family, image_type, &number)) {
+            VmaAllocationCreateInfo gai = ai;
+            gai.pool = gp;
+            gai.usage = VMA_MEMORY_USAGE_UNKNOWN;
+            if (vmaCreateImage(vma, &ci, &gai, &image, &allocation, nullptr) == VK_SUCCESS) {
+                VmaAllocationInfo info{};
+                vmaGetAllocationInfo(vma, allocation, &info);
+                ImageGen& g = gens[family][number];
+                g.live++, g.made_bytes += info.size;
+                gen_of[allocation] = {family, number};
+                return true;
+            }
+        }
+    }
     if (VmaPool pool = no_pool ? VK_NULL_HANDLE : target && target_images_pool() ? target_images_pool() : images_pool()) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
@@ -223,6 +310,24 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
 }
 void destroy_image(VkImage image, VmaAllocation allocation) {
     note_free(allocation);
+    if (image_generations_on() && allocation) {
+        std::lock_guard lk(gen_mu);
+        const auto it = gen_of.find(allocation);
+        if (it != gen_of.end()) {
+            const auto [family, number] = it->second;
+            gen_of.erase(it);
+            vmaDestroyImage(vma, image, allocation);
+            auto& g = gens[family];
+            const auto gi = g.find(number);
+            // (its last image gone and not the current generation: the pool and its blocks back to the driver)
+            if (gi != g.end() && --gi->second.live == 0 && gi != std::prev(g.end())) {
+                vmaDestroyPool(vma, gi->second.pool);
+                g.erase(gi);
+                st_gens_freed++;
+            }
+            return;
+        }
+    }
     vmaDestroyImage(vma, image, allocation);
 }
 uint64_t allocation_size(VmaAllocation allocation) {
@@ -301,6 +406,24 @@ void log_alloc_where(const char* what, VmaAllocation allocation) {
 }
 /// The image pools: their blocks, the images in them, and the free ranges between them (every 600 presents, with the heaps)
 void vma_log_image_blocks() {
+    if (image_generations_on()) {   // (RX_VK_IMAGE_GENERATIONS: the live generations, their blocks and images)
+        std::lock_guard lk(gen_mu);
+        for (int family = 0; family < 2; family++) {
+            VmaStatistics sum{};
+            uint32_t ranges = 0;
+            for (const auto& [n, g] : gens[family]) {
+                VmaDetailedStatistics d{};
+                vmaCalculatePoolStatistics(vma, g.pool, &d);
+                sum.blockCount += d.statistics.blockCount, sum.blockBytes += d.statistics.blockBytes;
+                sum.allocationCount += d.statistics.allocationCount, sum.allocationBytes += d.statistics.allocationBytes;
+                ranges += d.unusedRangeCount;
+            }
+            logf("vk: image generations%s (RX_VK_IMAGE_GENERATIONS): %zu live, %lld made, %lld given back so far; %u blocks %llu MB, "
+                 "%u images %llu MB; %u free ranges", family ? " (render targets)" : "", gens[family].size(), (long long)st_gens_made,
+                 (long long)st_gens_freed, sum.blockCount, (unsigned long long)(sum.blockBytes >> 20), sum.allocationCount,
+                 (unsigned long long)(sum.allocationBytes >> 20), ranges);
+        }
+    }
     for (VmaPool pool : {image_pool, target_image_pool}) {
         if (!pool) continue;
         VmaDetailedStatistics d{};

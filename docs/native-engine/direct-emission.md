@@ -869,3 +869,59 @@ part this change owns).
 The PC 3050; long sessions and scene changes (a pool made inside an import after the clip was built is added at the next pool
 list refresh, every pool-map change or 64 captures, as the small pools always were); a game whose shaders read memory outside
 its pools (NVN does not allow it; the check would count it). The switch stays 0 by default as asked; the runs above are clean.
+
+## 11. The lazy release made safe, and the VRAM the image pools keep (2026-11-14)
+
+### A. The release of a mirror holding left-out write-backs, staged
+
+The play sessions' crashes (section 10's sequel, commit 5e0864cb): the release copied the mirror's left-out pages into the
+pool's import on the GPU. Now (`gpu/vk/vk_memory.cpp`):
+- at the release, each left-out page is checked (its pool live in the host's list, its write generation not newer than the
+  mirror's sync, not in `cpu_pages`, not texture storage) and only those passing are copied by the GPU into a **host staging
+  buffer** (`LazyStage`);
+- once that submission is done (`lazy_apply`, at the next `memory_end_submission`), each page is checked again (write
+  generation, `cpu_pages`) and written by the host (`host/nvdrv.c` `hos_gpu_write_live`) **only inside a live NVN pool and only
+  if the soft write watch has no CPU write of the page since its last collection, under the lock `nvnMemoryPoolFinalize`'s
+  untrack takes**: a pool cannot be finalized and its memory reused between the check and the copy, and a page written after the
+  submission's capture is seen. Written pages are stamped; every piece leaves the left-out set.
+- The release line, at every release: `vk: mirrors holding left-out write-backs given back: N (.. MB), X MB staged, Y MB written
+  back into guest memory; ...; left-out pages at the release: staged, not as the pool is gone (finalized), written since the
+  mirror's sync, written by the CPU, texture storage, no staging buffer; at the copy into guest memory: written, not as the pool
+  is gone, written since, written by the CPU`.
+- Seen on the PC 3050 (castle-move, 720p, every run): the one release in the run found **10,126 left-out pages of a pool the game
+  had finalized** (40 MB the old code would have written over the game's heap); none staged. A release that stages pages was not
+  seen in the scripted scenes (with `RX_VK_MIRROR_MB=256` too), so `lazy_apply`'s host write is covered by
+  `tests/test_lazy_release.py` (the verdicts and the wiring), not by a run.
+
+### B. The image pools' blocks
+
+- How VMA is used (`gpu/vk/vk_vma.cpp`): 64 MB default blocks; images in a pool of 128 MB blocks (`images_pool`), render
+  targets in another (`target_images_pool`); images of 16 MB and more dedicated; buffers (mirrors, streams,
+  staging, captures) in VMA's default pools.
+- Why the heaps look full after a zone change: the image pool's blocks stay, pinned by the few images that survive in each. In
+  play3 just after one: **33 blocks of 4,224 MB holding 835 images of 652 MB**, render targets 9 blocks of 1,152 MB holding 308
+  MB; "free in VMA blocks" 4,490 MB, the heaps at 84%. The space free inside the image blocks is usable only by images, not by
+  mirrors.
+- Built, `RX_VK_IMAGE_GENERATIONS=1` (default 0): textures go to the current generation's pool (a new generation after
+  `RX_VK_IMAGE_GEN_MB`, 512, of images made in it; blocks of `RX_VK_IMAGE_GEN_BLOCK_MB`, 64); a generation that is not the
+  current one is destroyed with its blocks when its last image goes. Render targets were tried in generations and left out:
+  with the dynamic resolution making new ones all the time they spread over 10-14 live generations of 3.4-4 GB holding 0.9-1.1
+  GB (PC 3050: the heaps at 97-109%, 16 images refused, the run crawling). Log: `vk: image generations (RX_VK_IMAGE_GENERATIONS):
+  L live, M made, G given back so far; blocks, images` with the image blocks lines.
+- PC 3050, castle-move (one run each): default, textures 11 blocks 1,408 MB for 1,368 MB of images, free in blocks 1,233 MB at
+  the end; with generations, 3 generations of 20 blocks 1,280 MB for 1,053 MB, free in blocks 880 MB, 0 generations given back
+  (the scene has no zone change: nothing to give back). Ran to the end, no crash line. Shots not looked at (the PC 3050's runner
+  kept none).
+- Not validated: the gain itself, which needs zone changes (no scripted scene has one); the main PC.
+- The rules that read the heaps: the mirrors' VRAM rule (80%; `RX_VK_MIRROR_VRAM_FREE=1` counts the free space in blocks as
+  free, off by default), `RX_VK_MIRROR_TIGHT` (90%, off), the write-back shadows (85% to make one, 95% to drop them), the texture
+  budget (counts the free space in blocks already). Counting image-block space as free for the mirrors is not honest (a mirror
+  cannot use it); generations give it back to the driver instead.
+
+### For a hand-played session
+
+`RX_VK_RES_LOG=1` (the breakdown lines) with, to try the blocks' fix, `RX_VK_IMAGE_GENERATIONS=1`. Read after each zone
+change: `vk: VRAM breakdown` (heaps %, free in VMA blocks: it should fall back after the textures are finalized),
+`vk: image generations` (given back should grow at zone changes), `vk: image blocks` (render targets as before), and the
+release lines (`not as the pool is gone` growing at zone changes, `at the copy into guest memory` counts). To compare,
+`RX_VK_IMAGE_GENERATIONS=0` (the default) in another session over the same route.
