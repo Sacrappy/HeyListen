@@ -28,12 +28,14 @@ namespace {
 
 constexpr GuestAddr kBase = 0x10000000, kSize = 8u << 20;
 constexpr GuestAddr kGlobals = 0x84e9f000;   // (the page of the dispatcher's timed-sleep constant and its guard)
-constexpr GuestAddr kBody = 0x70000010, kObserver = 0x70000020, kTranslatedDispatcher = bridge::kDispatcher;
+constexpr GuestAddr kBody = 0x70000010, kObserver = 0x70000020, kNestBody = 0x70000030, kTranslatedDispatcher = bridge::kDispatcher;
 
 constexpr GuestAddr kSched = kBase + 0x1000, kList = kBase + 0x2000, kContexts = kBase + 0x3000, kLaneWord = kBase + 0x4000,
                     kQueues = kBase + 0x5000, kCells = kBase + 0x10000, kJobs = kBase + 0x100000, kNodes = kBase + 0x200000,
                     kObjects = kBase + 0x300000, kVtable = kBase + 0x380000, kObsObject = kBase + 0x380100,
-                    kObsVtable = kBase + 0x380200, kStacks = kBase + 0x400000;
+                    kObsVtable = kBase + 0x380200, kNestVtable = kBase + 0x380300, kStacks = kBase + 0x400000;
+// A second scheduler, its list, contexts, lane word, queues and cells, this far above the first's.
+constexpr GuestAddr kSecond = 0x500000;
 constexpr int kContextsMax = 6;
 
 struct Thread {   // a guest thread: its lane (its context's) and its stack
@@ -61,6 +63,9 @@ struct Model final : bridge::GuestRuntime {
     std::mutex order_mu;
     std::vector<int> order;
     std::atomic<bool> slow_bodies{false};
+    // the translated dispatcher's entry gate (null: none), and the stage a nesting job's body runs (its scheduler, context)
+    bridge::Dispatcher* gate = nullptr;
+    GuestAddr nest_sched = 0, nest_ctx = 0;
 
     void* ptr(GuestAddr at) const override {
         if (at >= kGlobals && at < kGlobals + 0x1000) return const_cast<uint8_t*>(globals.data()) + (at - kGlobals);
@@ -129,9 +134,19 @@ struct Model final : bridge::GuestRuntime {
         case bridge::kSleepFor: std::this_thread::sleep_for(std::chrono::microseconds(20)); return 0;
         case bridge::kForward: forward(t, a[0], (uint32_t)a[1], a[2]); return 0;
         case bridge::kPush: hook_push++; return 0;
-        case kTranslatedDispatcher: translated++; return 0;
+        case kTranslatedDispatcher:   // (its entry gate first; the translated body makes the timed sleep's constant)
+            if (gate && gate->gated(t, a[0], a[1])) return 0;
+            translated++;
+            *at<uint8_t>(bridge::kPollTicksGuard) = 1;
+            return 0;
         case kObserver: observed++; return 0;
         case kBody: body(t, a[0], a[1]); return 0;
+        case kNestBody: {   // (a job that runs a stage of another scheduler and waits for it, as 0x806afc40's callers do)
+            body(t, a[0], a[1]);
+            const uint64_t args[2] = {nest_sched, nest_ctx};
+            call_with(t, kTranslatedDispatcher, args, 2, nullptr, 0);
+            return 0;
+        }
         default: CHECK(!"a guest function the model does not have"); return 0;
         }
     }
@@ -146,7 +161,9 @@ struct Model final : bridge::GuestRuntime {
         const GuestAddr job = *at<GuestAddr>(frame + 8);
         const int index = (int)((job - kJobs) / sizeof(g::Job));
         g::Job* j = at<g::Job>(job);
-        if ((j->object & ~(GuestAddr)1) != object || *at<GuestAddr>(frame) != kSched || *at<uint32_t>(frame + 16) != 1) wrong_frame++;
+        const GuestAddr sched = *at<GuestAddr>(frame);
+        if ((j->object & ~(GuestAddr)1) != object || (sched != kSched && sched != kSched + kSecond) || *at<uint32_t>(frame + 16) != 1)
+            wrong_frame++;
         if (j->lane != bridge::kAnyLane && (int)j->lane != t->lane) wrong_lane++;
         runs[(size_t)index]++;
         {
@@ -193,27 +210,29 @@ struct Model final : bridge::GuestRuntime {
 struct Setup {
     Model& m;
     int contexts;
+    GuestAddr off;   // (0: the first scheduler; kSecond: the second)
     Thread threads[kContextsMax + 2];
-    GuestAddr next_cells = kCells, next_node = kNodes;
+    GuestAddr next_cells, next_node = kNodes;
 
-    Setup(Model& model, int n, int a_size, int b_size) : m(model), contexts(n) {
+    Setup(Model& model, int n, int a_size, int b_size, GuestAddr offset = 0)
+        : m(model), contexts(n), off(offset), next_cells(kCells + offset) {
         *m.at<uint64_t>(bridge::kPollTicks) = 1000;
         *m.at<uint8_t>(bridge::kPollTicksGuard) = 1;
-        g::Scheduler* s = m.at<g::Scheduler>(kSched);
+        g::Scheduler* s = m.at<g::Scheduler>(kSched + off);
         s->context_count = n;
         s->context_room = kContextsMax;
-        s->contexts = kList;
+        s->contexts = kList + off;
         for (int l = 0; l < 3; l++) {
             ring(s->levels[l].a, a_size);
             ring(s->levels[l].b, b_size);
         }
         for (int i = 0; i < n; i++) {
-            const GuestAddr ctx = kContexts + (GuestAddr)i * 0x100;
-            m.at<GuestAddr>(kList)[i] = ctx;
+            const GuestAddr ctx = kContexts + off + (GuestAddr)i * 0x100;
+            m.at<GuestAddr>(kList + off)[i] = ctx;
             g::DispatchContext* c = m.at<g::DispatchContext>(ctx);
             c->lane = i + 1;
-            c->lane_status = kLaneWord;
-            c->queue = kQueues + (GuestAddr)i * 0x100;
+            c->lane_status = kLaneWord + off;
+            c->queue = kQueues + off + (GuestAddr)i * 0x100;
             c->queue_room = 16;
         }
         for (int i = 0; i < kContextsMax + 2; i++) threads[i] = {i + 1, kStacks + (GuestAddr)(i + 1) * 0x10000};
@@ -239,13 +258,14 @@ struct Setup {
         const GuestAddr head = job_at(i) + offsetof(g::Job, dep_node);
         j->dep_first = j->dep_last = head;
     }
+    GuestAddr end() const { return kSched + off + offsetof(g::Scheduler, end_job); }
     void end_job(int waiting) {
-        g::Job* e = &m.at<g::Scheduler>(kSched)->end_job;
+        g::Job* e = &m.at<g::Scheduler>(kSched + off)->end_job;
         std::memset(e, 0, sizeof *e);
         e->waiting = waiting;
         e->runners = 1;
         e->lane = bridge::kAnyLane;
-        e->dep_first = e->dep_last = kSched + offsetof(g::Scheduler, end_job) + offsetof(g::Job, dep_node);
+        e->dep_first = e->dep_last = end() + offsetof(g::Job, dep_node);
     }
     void depends(GuestAddr job, GuestAddr on) {   // `job` waits for `on`: a node at the end of on's list
         g::Job* o = m.at<g::Job>(on);
@@ -259,16 +279,16 @@ struct Setup {
         m.at<g::Job>(job)->waiting++;
     }
     int32_t queued() {
-        g::Scheduler* s = m.at<g::Scheduler>(kSched);
+        g::Scheduler* s = m.at<g::Scheduler>(kSched + off);
         int32_t n = 0;
         for (auto& l : s->levels) n += (int32_t)(l.a.tail - l.a.head) + (int32_t)(l.b.tail - l.b.head);
         return n;
     }
     void begin_stage() {
-        g::Scheduler* s = m.at<g::Scheduler>(kSched);
+        g::Scheduler* s = m.at<g::Scheduler>(kSched + off);
         s->flags = 0;
         for (int i = 0; i < contexts; i++) {
-            g::DispatchContext* c = m.at<g::DispatchContext>(m.at<GuestAddr>(kList)[i]);
+            g::DispatchContext* c = m.at<g::DispatchContext>(m.at<GuestAddr>(kList + off)[i]);
             c->flags = 1;
             c->state = 0;
         }
@@ -344,6 +364,57 @@ void the_first_dispatch_is_translated() {
     tls_thread = &su.threads[0];
     d.dispatch(&su.threads[0], kSched, kContexts);
     CHECK(m.translated == 1 && d.stats().translated == 1 && d.stats().stages == 0);
+    tls_thread = nullptr;
+}
+
+// Every caller through the translated dispatcher's entry gate (HL_DISPATCH_ALL): the first call of the process is let
+// through to the translated dispatcher once (the bypass), and the calls after it are native, among them a stage begun and
+// waited for from inside a job's body (0x806afc40's callers): it runs nested on the same thread, on the second
+// scheduler's context of the same lane (a worker set's own context, whose lane is the owner's core).
+void the_gate_and_a_nested_stage() {
+    Model m;
+    Setup su(m, 1, 8, 8);
+    Setup su2(m, 1, 8, 8, kSecond);
+    su2.next_node = kNodes + 0x80000;
+    bridge::Dispatcher d(m, {.native = true, .check = true});
+    m.gate = &d;
+    Thread* t = &su.threads[0];
+    tls_thread = t;
+    *m.at<uint8_t>(bridge::kPollTicksGuard) = 0;
+    CHECK(d.gated(t, kSched, kContexts));
+    CHECK(m.translated == 1 && d.stats().bypassed == 1 && d.stats().translated == 1 && d.stats().stages == 0);
+    // the first scheduler: jobs 0-3, job 1's body runs the second's stage (jobs 100-104) and waits for it
+    for (int i = 0; i < 4; i++) su.job(i, 7, 1, bridge::kAnyLane, i % 2 == 0);
+    const GuestAddr nest_object = m.at<g::Job>(Setup::job_at(1))->object & ~(GuestAddr)1;
+    *m.at<GuestAddr>(nest_object) = kNestVtable;
+    *m.at<GuestAddr>(kNestVtable + 0x10) = kNestBody;
+    su.end_job(0);
+    for (int i = 0; i < 4; i++) su.depends(su.end(), Setup::job_at(i));
+    for (int i = 100; i < 105; i++) su2.job(i, 7, 1, bridge::kAnyLane, true);
+    su2.end_job(0);
+    for (int i = 100; i < 105; i++) su2.depends(su2.end(), Setup::job_at(i));
+    for (int i = 0; i < 4; i++) d.push(t, kSched, Setup::job_at(i));
+    for (int i = 100; i < 105; i++) d.push(t, kSched + kSecond, Setup::job_at(i));
+    m.nest_sched = kSched + kSecond;
+    m.nest_ctx = kContexts + kSecond;
+    su.begin_stage();
+    su2.begin_stage();
+    CHECK(d.gated(t, kSched, kContexts));
+    const std::vector<int> want = {0, 1, 100, 101, 102, 103, 104, 2, 3};
+    CHECK(m.order == want);
+    CHECK(m.translated == 1 && m.wrong_frame == 0 && m.wrong_lane == 0);
+    for (const Setup* s : {&su, &su2}) {
+        CHECK(m.at<g::Scheduler>(kSched + s->off)->flags & 2);
+        CHECK(*m.at<uint64_t>(kLaneWord + s->off) == 0);
+        CHECK(const_cast<Setup*>(s)->queued() == 0);
+        CHECK((m.at<g::DispatchContext>(kContexts + s->off)->flags & 1) == 0);
+    }
+    const bridge::Dispatcher::Stats& st = d.stats();
+    // (through the gate: the first call, its call let through, the first scheduler's stage, the nested one)
+    CHECK(st.gated == 4 && st.bypassed == 1 && st.stages == 2 && st.stage_ends == 2);
+    CHECK(st.runs == 11 && st.finishes == 11);   // (and the two end jobs, with no body)
+    CHECK(st.bad_finish == 0 && st.bad_count == 0 && st.double_run == 0);
+    CHECK(st.pops_a + st.pops_b == st.runs_from_pops + st.forwards + st.drops);
     tls_thread = nullptr;
 }
 
@@ -463,6 +534,7 @@ void six_contexts_and_two_pushers() {
 int main() {
     the_order_of_service();
     the_first_dispatch_is_translated();
+    the_gate_and_a_nested_stage();
     a_full_ring_drops_the_push();
     six_contexts_and_two_pushers();
     std::puts("native engine: dispatcher on a model of the game's scheduler: ok");
