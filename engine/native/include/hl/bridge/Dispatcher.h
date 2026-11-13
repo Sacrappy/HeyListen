@@ -10,8 +10,12 @@
 // mutex, forwarding to an executor, the timed sleep and the C++ library's table of address waiters are called as guest
 // functions on the worker's guest context (guest::* in JobBridge.h has the structures).
 //
-// The policies a later speed study may change are each one function here, with counters: how a ring word is waited for
-// (wait_change), how many contexts are woken (wake), how a context sleeps (sleep_on_event, timed_sleep).
+// The loop around the rings (entry and leave, handed jobs, waking and sleeping, running a job's body) is shared with the
+// module system's job group (hl/bridge/JobGroup.h) in src/bridge/DispatchLoop.h; the rings are its queue policy here.
+//
+// The policies a later speed study may change are each one function, with counters: how a ring word is waited for
+// (wait_change), how many contexts are woken (loop::Context::wake), how a context sleeps (loop::Context::sleep_on_event,
+// timed_sleep).
 #pragma once
 
 #include <atomic>
@@ -86,22 +90,19 @@ public:
     int report(char* out, size_t cap) const;
 
 private:
+    struct Rings;   // the rings as the dispatch loop's queue policy (src/bridge/DispatchLoop.h)
+
     template <class T>
     T* at(GuestAddr a) const { return static_cast<T*>(runtime_.ptr(a)); }
     uint64_t call(GuestThread as, GuestAddr fn, uint64_t a0, uint64_t a1 = 0, uint64_t a2 = 0);
 
-    void run_native(GuestThread as, GuestAddr s_at, GuestAddr c_at);
     GuestAddr pop(GuestThread as, GuestAddr ring_at, uint64_t& head);
     bool ring_push(GuestThread as, GuestAddr ring_at, GuestAddr job);
     void wait_change(GuestThread as, GuestAddr word, uint64_t seen);
     void finish(GuestThread as, GuestAddr s_at, GuestAddr job);
     void stage_over(GuestThread as, GuestAddr s_at);
-    void wake(GuestThread as, GuestAddr s_at, int32_t count);
-    void run_job(GuestThread as, GuestAddr s_at, GuestAddr c_at, GuestAddr job);
-    void sleep_on_event(GuestThread as, GuestAddr c_at);
     void timed_sleep(GuestThread as);
     int32_t queued(GuestAddr s_at, int from) const;
-    void lane_status(GuestAddr c_at, uint64_t nibble, bool up) const;
     void check_stage_end(GuestAddr s_at);
     void violation(const char* what, GuestAddr job);
 

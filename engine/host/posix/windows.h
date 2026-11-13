@@ -236,6 +236,8 @@ static inline DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 DWORD GetCurrentThreadId(void);
 DWORD GetThreadId(HANDLE t);
 DWORD GetProcessId(HANDLE p);
+/* (this process only) a copy that fails on a page that is not mapped or not readable instead of faulting */
+BOOL ReadProcessMemory(HANDLE p, LPCVOID from, void *to, SIZE_T n, SIZE_T *got);
 HANDLE OpenThread(DWORD access, BOOL inherit, DWORD id);
 BOOL DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, HANDLE *out, DWORD access, BOOL inherit, DWORD options);
 BOOL CloseHandle(HANDLE h);
