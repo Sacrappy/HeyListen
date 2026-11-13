@@ -735,19 +735,40 @@ record names those pages: they are read, if at all, through addresses the GPU fi
 blocks holding pointers: the global memory Eden's recompiler tracks, the culling lists), or by later frames, or not at all;
 this measurement cannot tell which.
 
-### Step 2 not built, and why
+### Step 2: built for the one class equal everywhere, not for the per-draw blocks, and why
 
-- **What an inline at the bind could take out of the capture is at most 1-2% of it**: the pages read only by equal uniform binds,
-  101-168 a frame (0.4-0.7 MB of 37-43 MB). Inlining only the slots found equal everywhere takes fewer: they are bound a few times
-  a frame. Even every page any uniform bind reads (equal or not) is 4-5% (~450-500 pages).
-- **The per-draw blocks are not final at the bind**: in the slots that carry them, 24-82% of binds differ, almost all written after
-  the recording ended. An inline copied at the bind would draw them with the previous use's bytes: wrong, not a question of a
-  rule by slot or size (a slot's binds are equal or not draw by draw, which the bind cannot know).
-- **The capture cannot know safely that a page is needed by no record**: 93-95% of the captured pages are read by no record at
-  all and yet were captured because the GPU may read them through pointers in other data; dropping pages by what records name is
-  not safe, and the pages an inline would free are a few hundred.
-- So `NOP_UBO_INLINE`, the replay's inline slot and the descriptor path's copy from the record were not written. The switch
-  `HL_UBO_INLINE` does not exist.
+**Why not for the per-draw blocks (the numbers).** The slots that carry per-draw data (vertex stage slots 0-4 and 9, fragment
+slots 0-2 and 9, geometry slot 9, compute slot 0: with the few mixed slots, about 90% of all binds) are equal at the bind for 18-84% of their binds, slot by
+slot, and their different binds (36-41% of all binds, 4-9 million a run) changed between the end of the recording and the submit
+in 99.3-99.4% of cases: the game records the command buffer, binding ranges of its small ring pools (`0x22`, 1 MB or less, where
+every different bind lies), and only then writes the blocks it bound, before the submit. A copy at the bind would draw them with
+the ring slot's previous bytes, and whether a bind is one of those cannot be known at the bind (the same slot is equal or not draw
+by draw). **What would make the inline possible for them** is the writer: the code that fills those ring blocks after
+`EndRecording` (not identified by this measurement; a `HOS_POOL_TRAP` / write watch on one `0x22` ring pool between a
+recording's end and its submit names it) writing them before it records the bind, which only a native draw loop (brick D) that
+computes the block and binds it in one step can do. Even then the gain in the capture is small: the pages read only by equal
+uniform binds are 101-168 a frame (0.4-0.7 MB of 37-43 MB), every page any uniform bind reads 4-5% (~450-500 pages).
+
+**The class equal everywhere, inlined (`HL_UBO_INLINE=1`).** Every bind of these slots was equal to what the replay read as
+submitted in the three scenes (0 different, 0 updated in the stream, 15,796-451,954 binds a slot a run): vertex stage slots 5-8,
+10, 11 and 13; fragment slots 4-8 and 10-13; geometry slots 0-8 and 10-13; compute slots 1 and 2. (Vertex slot 12 had one
+different bind in hyrule, fragment slot 3 44-186 a run: left out. Compute slots 3 and up were not in the log, whose slot line was
+cut by the log's line limit in those runs: left out.) They are ~10.5% of the binds (castle: 1.15 M of 10.9 M), bound once or a
+few times a frame: per-frame
+and per-pass constants. Built:
+
+| Piece | Where | What it does |
+|---|---|---|
+| The record | `rx_nvn.h` (`NOP_UBO_INLINE`, `nvn_p_ubo_inline`: stage, slot, address, size, n, then the bytes) | appended after `NOP_UBO_CHECK` |
+| The host | `nvn_native.c` (`ubo_inline_slots`, `ubo_inline_on`, `ubo_inline`, `bind_buf`) | a `BindUniformBuffer(s)` of those slots, at most 64 KB and contiguous in host memory, is recorded as the inline record instead of the address record; `cmd_used` and `hw_used` move as the 40-byte address record hw_fix'd to 20 would make them, the rest of the record is in `cmd_rec.extra`, which `CallCommands` leaves out of the caller's accounting (so `GetCommandMemoryUsed` reads the same numbers as without the switch) |
+| The replay | `vk_replay.cpp` (`NOP_UBO_INLINE`, `NOP_BEGIN`, `NOP_BIND_UBO`, `NOP_BIND_BUFS`), `vk_state.h` (`ubo_bytes`, `ubo_bytes_n`) | in every mode (serial, dry, worker) the slot gets the bind's address as before and a pointer to the bytes; `bind_gen` moves when the address, size or bytes change; a bind by address drops the bytes; every recording's `NOP_BEGIN` drops them too (the bytes live in the recording that bound them, which may be freed after its submission: a later recording drawing without a rebind reads the slot by address, as before). The parallel replay's saved states carry the pointer with the rest of `NvnState` |
+| The descriptor | `vk_draw.cpp` `uniform_range`, `vk_replay.cpp` `ub_overlay_onto` | an inline slot is copied from the bytes into the recording's upload stream, the stream's `UpdateUniformBuffer`s over the range applied as `ub_overlay` does, zeros past the bytes carried; no mirror, no read as submitted |
+| The other readers of a slot's address (DLSS and FSR 3 scene notes, the bank and handle reads, the program pick's constant reads, dumps) | unchanged | they read the slot's address in guest memory as before: the measurement says the same bytes |
+| The WebGPU replay | `rx_nvn.cpp` | the inline record as a bind by address |
+
+The capture is not changed: 93-95% of the captured pages are read by no record at all and are still needed (they are read, if at
+all, through pointers in other data), so "needed by no record" is not a safe test, and the pages only these slots' blocks hold
+are a few at most. The switch is off by default; its validation is below.
 
 ### What this says for the rest of the plan
 
@@ -761,3 +782,11 @@ this measurement cannot tell which.
   fall") holds only for the ~1,000 pages a frame in the `0x22` and `0x24` pools.
 - Section 7's line "whether the uniform blocks the translated draw loop binds are complete at bind time" is answered: no, for
   the per-draw slots; they are complete at the submit.
+- **The next brick proposed instead of more inlining: the capture's attribution.** Name the writer and the readers of the 256 MB
+  region `0x1050000000`-`0x1060000000` (85-95% of the capture): which pool it is (it is in no pool the back end has flags for),
+  which guest functions write it between submits (`HOS_POOL_TRAP` over the region, as `memory-boundary.md` 6 did for the
+  no-access pools), and whether the GPU reads it through pointers (the programs' global-memory descriptors that point into it,
+  logged at the descriptor build). That decides whether the capture can be cut by range (a region the GPU never reads, or reads
+  only through a known table) rather than by record. Second, for the per-draw uniform blocks: find the ring writer that fills
+  them after `EndRecording` (a write watch on one `0x22` ring pool between a recording's end and its submit), which brick D must
+  replace for an inline of those blocks to be right.
