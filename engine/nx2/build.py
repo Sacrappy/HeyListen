@@ -812,11 +812,27 @@ def main():
         host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
     host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
     host_deps += ffmpeg_version_key()
+    # (HeyListen) zstd's decoder (third_party/zstd, plain C) in the game's executable too: host/hl_stream.c decodes the
+    # game's resource files with it (the Vulkan back end has its own copy, below). Only hl_stream.c sees its headers
+    ZSTD = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))
+    ZSTD_DECODER = ("common/debug.c", "common/entropy_common.c", "common/error_private.c", "common/fse_decompress.c",
+                    "common/xxhash.c", "common/zstd_common.c", "decompress/huf_decompress.c", "decompress/zstd_ddict.c",
+                    "decompress/zstd_decompress.c", "decompress/zstd_decompress_block.c")
+    zstd_deps = b"".join(open(os.path.join(d, f), "rb").read() for d in (ZSTD, os.path.join(ZSTD, "common"), os.path.join(ZSTD, "decompress"))
+                         for f in sorted(os.listdir(d)) if f.endswith(".h"))
     jobs += [(cc, s, os.path.join(obj_dir, "host_" + os.path.basename(s)[:-2] + ".o"),
               host_fl + ["-I" + os.path.join(OPUS, "include")] +
               (["-I" + os.path.join(FFMPEG, "include")] if FFMPEG else []) +
               (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
-              ([stamp_def] if os.path.basename(s) == "hos_main.c" else []), host_deps) for s in host_srcs]
+              (["-I" + ZSTD] if os.path.basename(s) == "hl_stream.c" else []) +
+              ([stamp_def] if os.path.basename(s) == "hos_main.c" else []),
+              host_deps + (zstd_deps if os.path.basename(s) == "hl_stream.c" else b"")) for s in host_srcs]
+    if host_srcs:
+        zflags_exe = target() + CPU + ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DZSTD_DISABLE_ASM",
+                                       "-DZSTD_LEGACY_SUPPORT=0", "-DZSTD_MULTITHREAD=0"]
+        for f in ZSTD_DECODER:
+            jobs.append((cc, os.path.join(ZSTD, *f.split("/")), os.path.join(obj_dir, "zstd_" + os.path.basename(f)[:-2] + ".o"),
+                         zflags_exe, zstd_deps))
     # (HeyListen) the native engine, in the game's executable
     if host_srcs:
         ncxx = toolchain.need(toolchain.find("clang++"))
