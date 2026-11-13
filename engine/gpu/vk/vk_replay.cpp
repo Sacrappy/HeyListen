@@ -1065,6 +1065,54 @@ bool buf_unchanged(int32_t stage, int32_t index, uint64_t addr, uint64_t size, i
     return stage == nstage && index == nindex && addr == naddr && size == nsize;
 }
 
+/// (HL_UBO_CHECK) the guest ranges a record reads through an address, by kind (uniform binds: ubo_check_bind). An indexed
+/// indirect draw's index count is in GPU memory: its index buffer's first 64 KB stand for it
+void ubo_check_refs(uint32_t op, const uint8_t* a, uint32_t avail) {
+    switch (op) {
+    case NOP_BIND_SSBO: {
+        const auto b = payload<nvn_p_bind_buf>(a, avail);
+        ubo_check_ref(b.addr, b.size, kRefStorage);
+        break;
+    }
+    case NOP_BIND_BUFS: {
+        const auto b = payload<nvn_p_bind_bufs>(a, avail);
+        for (int i = 0; i < b.n && i < 16; i++) ubo_check_ref(b.r[i].address, b.r[i].size, b.ssbo ? kRefStorage : kRefUboOther);
+        break;
+    }
+    case NOP_BIND_VBUF: {
+        const auto v = payload<nvn_p_bind_vbuf>(a, avail);
+        for (int i = 0; i < v.n && i < 16; i++) ubo_check_ref(v.r[i].address, v.r[i].size, kRefVertex);
+        break;
+    }
+    case NOP_DRAW_IDX: {
+        const auto d = payload<nvn_p_draw_idx>(a, avail);
+        ubo_check_ref(d.ibuf, (uint64_t)std::max(d.count, 0) * (d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4), kRefIndex);
+        break;
+    }
+    case NOP_DRAW_INDIRECT: {
+        const auto d = payload<nvn_p_draw_indirect>(a, avail);
+        ubo_check_ref(d.indirect, (uint64_t)std::max(d.max, 1) * (uint64_t)std::max(d.stride, 20), kRefIndirect);
+        ubo_check_ref(d.count_addr, 4, kRefIndirect);
+        if (d.indexed) ubo_check_ref(d.ibuf, 65536, kRefIndex);
+        break;
+    }
+    case NOP_DRAW_MESH: {
+        const auto d = payload<nvn_p_draw_mesh>(a, avail);
+        ubo_check_ref(d.indirect, (uint64_t)std::max(d.max, 1) * (uint64_t)std::max(d.stride, 12), kRefIndirect);
+        ubo_check_ref(d.count_addr, 4, kRefIndirect);
+        break;
+    }
+    case NOP_DISPATCH_INDIRECT: ubo_check_ref(payload<nvn_p_dispatch_indirect>(a, avail).addr, 12, kRefIndirect); break;
+    case NOP_COPY_B2B: {
+        const auto c = payload<nvn_p_copy_bb>(a, avail);
+        ubo_check_ref(c.src, c.size, kRefOther);
+        break;
+    }
+    case NOP_RENDER_COND: ubo_check_ref(payload<nvn_p_render_cond>(a, avail).addr, 24, kRefOther); break;
+    default: break;
+    }
+}
+
 void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {
     const Mode mode = rmode;
     const bool dry = mode == Mode::Dry, worker = mode == Mode::Worker;
@@ -1074,9 +1122,22 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         std::memcpy(&h, p, sizeof h);
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
+        if (!worker && ubo_check_on()) ubo_check_refs(h.op, a, avail);
         switch (h.op) {
         case NOP_END: return;
-        case NOP_BEGIN: case NOP_JUMP: case NOP_CALL: break;
+        case NOP_BEGIN:
+            if (!worker && ubo_check_on()) ubo_check_begin_cmd();
+            break;
+        case NOP_JUMP: case NOP_CALL: break;
+        case NOP_UBO_CHECK: {   // (HL_UBO_CHECK: vk_ubo_check.cpp; the replay thread's pass only, each record once)
+            if (worker || !ubo_check_on()) break;
+            const auto k = payload<nvn_p_ubo_check>(a, avail);
+            bool updated = false;
+            for (const UbUpdate& u : ub_updates)
+                if (u.dst < k.addr + k.size && k.addr < u.dst + u.bytes.size()) { updated = true; break; }
+            ubo_check_bind(k, updated);
+            break;
+        }
         // ---- memory the stream writes: on the GPU timeline ----
         case NOP_SIGNAL_EVENT: {
             if (!worker) {   // (in stream order: the replay thread's pass)
@@ -1280,6 +1341,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
                 ub_gen++;
                 st_ub_updates++;
+                if (ubo_check_on()) {   // (HL_UBO_CHECK: an update into a range bound already, which a copy at the bind misses)
+                    bool hit = false;
+                    for (int st = 0; st < kNvnStages && !hit; st++)
+                        for (int i = 0; i < 16 && !hit; i++)
+                            hit = s.ubo[st][i].addr && u.dst < s.ubo[st][i].addr + s.ubo[st][i].size && s.ubo[st][i].addr < u.dst + u.size;
+                    if (hit) ubo_check_update_into_bound();
+                }
             }
             break;
         }
@@ -5455,8 +5523,10 @@ void present(const nvn_tex* t, const int crop[4]) {
             drain(0);   // (the frame's work whole before it is shown)
             update_blocked();
             present_value = ++q_values;
+            if (ubo_check_on()) ubo_check_frame();
             return do_present(t, crop);
         }
+        if (ubo_check_on()) ubo_check_frame();
         return do_present(t, crop);
     }
     Job j{JOB_PRESENT};

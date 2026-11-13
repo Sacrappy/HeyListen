@@ -1389,7 +1389,8 @@ static void pool_put(void *b, unsigned cls) {
    object (guest memory). The object holds its slot's number; a slot names the object it belongs to, so a slot number
    that is not the object's own is not used: the object gets a new slot, as an object never initialized does. Slots are
    in chunks that are never freed, so a lookup needs no lock (a command buffer records on one thread at a time). */
-typedef struct { uint64_t owner; uint8_t *seg, *cur, *end; } cmd_rec;
+/* (extra: bytes of the recording no accounting counts, the HL_UBO_CHECK records: a CallCommands of it leaves them out) */
+typedef struct { uint64_t owner; uint8_t *seg, *cur, *end; uint64_t extra; } cmd_rec;
 #define CMD_CHUNK_BITS 10
 #define CMD_CHUNKS 4096u                     /* (4M command buffers at once) */
 static cmd_rec *volatile cmd_chunks[CMD_CHUNKS];
@@ -1532,7 +1533,7 @@ static unsigned rec_bucket(uint64_t ctl) { return (unsigned)(((ctl >> rec_shift)
 static SRWLOCK copy_lock = SRWLOCK_INIT;
 static volatile LONG64 copy_bytes;
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
-typedef struct { uint64_t magic, bytes, cls; } copy_prefix;   /* (cls: its pool class) */
+typedef struct { uint64_t magic, bytes, cls, extra; } copy_prefix;   /* (cls: its pool class; extra: cmd_rec's) */
 /* released copies wait until the replay passed every submit made before their release (the replay runs behind) */
 typedef struct { copy_prefix *p; uint64_t after; } dead_copy;
 static dead_copy *dead;
@@ -1696,20 +1697,60 @@ NV(nvnCommandBufferBeginRecording) {
     o->recording = 1;
     cmd_rec *r = cmd_host(o);
     r->cur = r->seg;
+    r->extra = 0;
     o->rec_start = o->cmd_used;
     uint8_t *p = cmd_alloc(o, 8);
     put_hdr(p, NOP_BEGIN, 8);
     o->hw_used -= 8;   /* BEGIN / END have no hardware equivalent */
     o->hw_start = o->hw_used;
 }
+/* (HeyListen) HL_UBO_CHECK=1 (a measurement, docs/native-engine/direct-emission.md section 9): each BindUniformBuffer's
+   record is followed by a NOP_UBO_CHECK record with a hash of the block's bytes at the bind, completed with their hash
+   at the end of the recording (EndRecording) and at the submit (QueueSubmitCommands); the replay compares them with
+   what it reads as submitted. The record is outside the accounting the game reads (cmd_rec.extra) */
+static int ubo_check_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HL_UBO_CHECK");
+        on = e && atoi(e) != 0;
+        if (on) hos_log("hl ubo check: uniform blocks hashed at their bind, the recording's end and the submit (HL_UBO_CHECK=1)");
+    }
+    return on;
+}
+/* the block's bytes now (at most NVN_UBO_CHECK_MAX), hashed; 0 and *ok = 0 when they cannot be read */
+static uint64_t ubo_check_hash(uint64_t addr, uint64_t size, int *ok) {
+    static _Thread_local uint8_t *buf;
+    if (!buf) buf = (uint8_t *)malloc(NVN_UBO_CHECK_MAX);
+    const uint64_t n = size < NVN_UBO_CHECK_MAX ? size : NVN_UBO_CHECK_MAX;
+    *ok = buf && n && nvn_gpu_read(addr, buf, n);
+    return *ok ? nvn_ubo_hash(buf, n) : 0;
+}
+/* the check records of [p, end) not given their end-of-recording hash yet (a called recording's have theirs) */
+static void ubo_check_end(uint8_t *p, const uint8_t *end) {
+    while (p < end) {
+        nvn_op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.size < 8) return;
+        if (h.op == NOP_UBO_CHECK) {
+            nvn_p_ubo_check *k = (nvn_p_ubo_check *)(p + 8);
+            if (!(k->flags & NVN_UBO_CHECK_END)) {
+                int ok;
+                k->h_end = ubo_check_hash(k->addr, k->size, &ok);
+                k->flags |= NVN_UBO_CHECK_END | (ok ? 0 : NVN_UBO_CHECK_UNREAD);
+            }
+        }
+        p += h.size;
+    }
+}
 /* the recording, BEGIN to END, is contiguous in the command buffer's segment: one copy of it */
-static uint8_t *flatten(const uint8_t *p, size_t n) {
+static uint8_t *flatten(const uint8_t *p, size_t n, uint64_t extra) {
     unsigned cls;
     uint8_t *out = (uint8_t *)pool_get(sizeof(copy_prefix) + n, &cls);
     if (!out) die("recording copy (%zu bytes)", n);
     memcpy(out + sizeof(copy_prefix), p, n);
     copy_prefix *pre = (copy_prefix *)out;
     pre->cls = cls;
+    pre->extra = extra;
     pre->magic = COPY_MAGIC;
     pre->bytes = sizeof(copy_prefix) + n;
     InterlockedAdd64(&copy_bytes, (LONG64)pre->bytes);
@@ -1742,7 +1783,8 @@ NV(nvnCommandBufferEndRecording) {
     o->hw_used -= 8;
     o->recording = 0;
     const cmd_rec *r = cmd_host(o);
-    uint8_t *copy = flatten(r->seg, (size_t)(r->cur - r->seg));
+    if (ubo_check_on()) ubo_check_end(r->seg, r->cur);
+    uint8_t *copy = flatten(r->seg, (size_t)(r->cur - r->seg), r->extra);
     /* the copy is tied to the control memory position the console driver's descriptor would take */
     const uint64_t at = o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     o->ctl_used += 64;
@@ -1800,8 +1842,9 @@ static void inline_recording(nvn_cmd *o, uint64_t h) {
     cmd_reserve_rec(r, n);
     memcpy(r->cur, (const uint8_t *)(uintptr_t)h + 8, n);
     r->cur += n;
-    o->cmd_used += n;
-    o->hw_used += n;
+    r->extra += pre->extra;   /* (the called recording's uncounted records stay uncounted here) */
+    o->cmd_used += n - pre->extra;
+    o->hw_used += n - pre->extra;
     o->last_rec = 0;
 }
 NV(nvnCommandBufferCallCommands) {
@@ -2178,6 +2221,16 @@ static void bind_buf(nvn_cmd *o, uint32_t op, int stage, int index, uint64_t add
     nvn_p_bind_buf *r = REC(o, op, nvn_p_bind_buf);
     r->stage = stage, r->index = index, r->addr = addr, r->size = size;
     hw_fix(o, 20);
+    if (op == NOP_BIND_UBO && ubo_check_on()) {   /* (the check's record, uncounted: the accounting as without it) */
+        const uint64_t cu = o->cmd_used, hu = o->hw_used, lr = o->last_rec;
+        nvn_p_ubo_check *k = REC(o, NOP_UBO_CHECK, nvn_p_ubo_check);
+        o->cmd_used = cu, o->hw_used = hu, o->last_rec = lr;
+        cmd_host(o)->extra += (8 + sizeof *k + 7) & ~(size_t)7;
+        int ok;
+        k->stage = stage, k->index = index, k->addr = addr, k->size = size;
+        k->h_bind = ubo_check_hash(addr, size, &ok);
+        if (!ok) k->flags |= NVN_UBO_CHECK_UNREAD;
+    }
 }
 NV(nvnCommandBufferBindUniformBuffer) { bind_buf(CB(P(0)), NOP_BIND_UBO, I(1), I(2), U64(3), U64(4)); }
 NV(nvnCommandBufferBindStorageBuffer) { bind_buf(CB(P(0)), NOP_BIND_SSBO, I(1), I(2), U64(3), U64(4)); }
@@ -2561,6 +2614,12 @@ static void resolve_deferred(uint8_t *p) {
         if (h.op == NOP_BIND_BUFS) {
             nvn_p_bind_bufs *b = (nvn_p_bind_bufs *)(p + 8);
             if (b->src && b->n > 0 && b->n <= 16) memcpy(b->r, gw(b->src, sizeof(NVNbufferRange) * (size_t)b->n), sizeof(NVNbufferRange) * (size_t)b->n);
+        }
+        if (h.op == NOP_UBO_CHECK) {   /* (HL_UBO_CHECK: the block as the submit sees it) */
+            nvn_p_ubo_check *k = (nvn_p_ubo_check *)(p + 8);
+            int ok;
+            k->h_sub = ubo_check_hash(k->addr, k->size, &ok);
+            k->flags |= NVN_UBO_CHECK_SUB | (ok ? 0 : NVN_UBO_CHECK_UNREAD);
         }
         p += h.size;
     }

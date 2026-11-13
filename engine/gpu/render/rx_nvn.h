@@ -13,6 +13,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "nvn_api.h"
 
 #ifdef __cplusplus
@@ -155,6 +156,7 @@ enum {
     NOP_WAIT_EVENT,                             /* (mkw-recomp: a wait for an event another queue's work signals) */
     NOP_PUSH_CONST,                             /* (hookshot: nvnCommandBufferPushComputeConstants) */
     NOP_CLEAR_BUF,                              /* (hookshot: nvnCommandBufferClearBuffer) */
+    NOP_UBO_CHECK,                              /* (HeyListen, HL_UBO_CHECK: a uniform block's bytes at its bind, beside the bind) */
     NOP_COUNT_
 };
 typedef struct { int32_t n; const nvn_tex *color[8]; nvn_view cview[8]; uint8_t has_cview[8]; const nvn_tex *depth; nvn_view dview; uint8_t has_dview; } nvn_p_set_rt;
@@ -197,6 +199,28 @@ typedef struct { uint32_t offset, size; /* data follows */ } nvn_p_push_const;
 /* (hookshot) a buffer range filled with a 32-bit value */
 typedef struct { uint64_t dst, size; uint32_t value, pad; } nvn_p_clear_buf;
 typedef struct { int32_t enable, index; } nvn_p_restart;
+/* (HeyListen, HL_UBO_CHECK: docs/native-engine/direct-emission.md section 9) written after a BindUniformBuffer's record,
+   outside the accounting the game reads: hashes of the block's bytes (nvn_ubo_hash, at most 64 KB) at the bind, at the
+   end of the recording and at the submit (flags: which of the last two were taken, and whether a read failed). The
+   replay compares them with what it reads as submitted; nothing else reads it */
+typedef struct { int32_t stage, index; uint64_t addr, size; uint32_t flags, pad; uint64_t h_bind, h_end, h_sub; } nvn_p_ubo_check;
+#define NVN_UBO_CHECK_END 1u
+#define NVN_UBO_CHECK_SUB 2u
+#define NVN_UBO_CHECK_UNREAD 4u
+#define NVN_UBO_CHECK_MAX 0x10000u
+static inline uint64_t nvn_ubo_hash(const void *p, uint64_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h = 0x243F6A8885A308D3ull ^ n;
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ull;
+    return h ^ (h >> 31);
+}
 /* (mkw-recomp) indirect draws: up to max draws of `stride`-byte arguments at `indirect` (indexed: count, instances,
    first index, base vertex, base instance; arrays: count, instances, first, base instance), as many as the 32-bit
    value at count_addr says when there is one; read at replay, after the GPU's writes there reached guest memory */

@@ -2465,6 +2465,7 @@ std::unique_ptr<Capture> capture_make() {
             }
         }
     }
+    if (n > 0 && ubo_check_on()) ubo_check_captured(pages, n);   // (HL_UBO_CHECK: the frame's captured pages, by what reads them)
     const auto t_copy = std::chrono::steady_clock::now();
     if (use_pre) {   // (TICK-043: the buffer copied ahead; the new pages after its pages, the ones written again into their slots)
         c->pages.assign(pages, pages + n);
@@ -2610,6 +2611,11 @@ std::unique_ptr<Capture> capture_make() {
     return c;
 }
 
+/// (HL_UBO_CHECK) the texture storage the captures take, as of now (sorted, merged)
+std::vector<std::pair<uint64_t, uint64_t>> memory_tex_capture_ranges() {
+    std::lock_guard lk(cap_ranges_mu);
+    return tex_cap_ranges;
+}
 /// The ranges the captures take (the mirrored pools, the texture storage, the small pools): their union, sorted and
 /// merged, as of now; empty while no capture was made (memory_collect_written: a page in them written after its
 /// submit's capture is left for the next capture). Built again only when one of the three lists changed, as
@@ -3994,6 +4000,13 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
 // NVN's CPU_NO_ACCESS flag keep no zero pages in RAM. The back end's part: no import of such a pool's pages for another pool's
 // binding (clip_noaccess below), and no upload of a texture whose storage lies in such a pool and is all reserved
 // (texture_touch: the image is made cleared to zero, which is what the storage reads as)
+bool memory_nvn_pool_of(uint64_t guest, uint64_t* lo, uint64_t* hi, uint32_t* flags) {
+    std::lock_guard lk(nvn_pools_mu);
+    const NvnPool* np = nvn_pool_at(guest, lo);
+    if (!np) return false;
+    *hi = np->hi, *flags = np->flags;
+    return true;
+}
 bool noaccess_ram_on() {
     static const bool on = [] {
         const char* e = getenv("HOS_NOACCESS_RAM");
