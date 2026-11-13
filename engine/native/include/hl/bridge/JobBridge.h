@@ -33,6 +33,9 @@ struct GuestRuntime {
     /// context (its registers, its stack from where it stands, its thread-local values, its id and core). `as` must not be
     /// running guest code anywhere else meanwhile: the caller holds its lane.
     virtual void call(GuestThread as, GuestAddr fn, uint64_t a0, uint64_t a1) = 0;
+    /// Tells the layer that `n` bytes of guest memory at `at` were written from native code (its write tracking, which
+    /// lifted code feeds on its own stores). Nothing by default.
+    virtual void written(GuestAddr at, uint64_t n) { (void)at, (void)n; }
 };
 
 // ---- the game's structures, in place -------------------------------------------------------------------------------
