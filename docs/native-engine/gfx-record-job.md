@@ -493,6 +493,21 @@ itself (the gate's own call, which the gate lets through) with the tap recording
 Switches: `HL_GFX_STATE` 0 (the translated function) or 1 (native); `HL_GFX_CHECK=1` (or 2) checks instead of answering;
 `HL_GFX_LOG=1` adds the line `hl gfx: render state: native calls N, left to the translation M` every 10 s.
 
+### The check and the runs (PC 3050, 110 s a scene; function only, no speed)
+
+| Run | Scene | Calls compared | NVN calls compared | Mismatched calls | Left to the translation (callback) |
+|---|---|---:|---:|---:|---:|
+| `HL_GFX_CHECK=1` | kokiri-idle | 69,757 | 2,292,361 | 0 | 0 |
+| | castle-move | 44,845 | 1,471,680 | 0 | 0 |
+| | hyrule-walk | 23,473 | 767,094 | 0 | 0 |
+| `HL_GFX_STATE=1` | castle-move (twice) | 54,414 native calls, 0 left | | | |
+
+Both sides are non-empty and equal call for call (an empty or partial tap would show as mismatched lengths), and the
+block's 352 bytes match after every call. The native runs went to the end with no crash, and the castle shots are
+right. **Not done: the validation runs on the main PC** (three scenes with `HL_GFX_STATE=1`, shots, memory table)
+and native runs in kokiri-idle and hyrule-walk. The main PC's lock was held by other streams for more than two hours,
+so `HL_GFX_STATE` stays off by default until those runs are done.
+
 ## Not read yet
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
