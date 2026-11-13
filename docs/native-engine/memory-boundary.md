@@ -1060,7 +1060,7 @@ dropped whole and restored; 20 rounds of 2 MB dropped and touched by 4 threads.
 
 ### A trap found in the game: commits fail while a drop splits the reservation
 
-The first self-test runs crashed twice in five (castle-move): a lazy commit of a page nothing had dropped failed with
+The first self-test runs crashed in two of four runs (castle-move): a lazy commit of a page nothing had dropped failed with
 `ERROR_INVALID_ADDRESS`. A game-free test reproduced it: **while one thread splits the private allocation (releases a
 granule inside it to a placeholder), `VirtualAlloc(MEM_COMMIT)` of reserved pages elsewhere in the same allocation fails**:
 84,561 of 479,668 page commits on two threads during 65,536 splits. First touches of pages already committed are not
