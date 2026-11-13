@@ -30,10 +30,12 @@
    both of its callers reach (the module workers' message and the main thread's stage wait twin). The group scheduler, its
    heap, mutex and take count, the contexts' words and the guest's events stay in place. HL_JOBGROUP=0: the translated
    function, as before. HL_JOBGROUP_CHECK=1: its invariants are counted and the counters logged every 10 s.
-   HL_MODSTAGES=1 (with HL_JOBS and HL_JOBGROUP on): the module system's twins of the registration 0x800711c0 (with the
-   group's seed) and of the stage wait 0x80070b20 are native too (hl/bridge/Stages.h; docs/native-engine/jobs-boundary.md,
-   "The module system's twins"), through two entry gates. HL_MODSTAGES=0: the translated twins, as before. Their
-   invariants are counted with HL_STAGES_CHECK=1, and each twin registration is compared with the translated twin's. */
+   HL_MODSTAGES=1 (the default, with HL_JOBS and HL_JOBGROUP on): the module system's twins of the registration
+   0x800711c0 (with the group's seed) and of the stage wait 0x80070b20 are native too (hl/bridge/Stages.h;
+   docs/native-engine/jobs-boundary.md, "The module system's twins"), through two entry gates. HL_MODSTAGES=0: the
+   translated twins, as before. Their invariants are counted with HL_STAGES_CHECK=1, and each twin registration is
+   compared with the translated twin's.
+   Each switch's gates go on only when all of them are in the lifted code (hl_gates_in; review 2026-11-13, B2). */
 #include "hl_host.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +47,7 @@
 #define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
 #define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 15 runs over the three scenes, two PCs) */
 #define HL_JOBGROUP_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 11 runs over the three scenes, two PCs) */
-#define HL_MODSTAGES_DEFAULT 0
+#define HL_MODSTAGES_DEFAULT 1   /* (validated 2026-11-13 on the PC 3050 only: invariants clean, the three scenes, shots right) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;
