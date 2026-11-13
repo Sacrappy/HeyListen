@@ -88,6 +88,7 @@ __declspec(dllexport)   /* (the Vulkan back end finds it by name, around its com
 void hos_gp_hold(int begin);
 /* the back end imports [p, p + n): its granules are never dropped from now on (and dropped ones are restored first) */
 void hos_gp_imported(void *p, size_t n);
+int  hos_gp_is_imported(const void *p);   /* (a granule the back end imported: never dropped) */
 /* the counters, as one line (0 when off) */
 int  hos_gp_report(char *out, size_t cap);
 
