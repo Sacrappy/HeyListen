@@ -659,6 +659,7 @@ void stamp_page(uint64_t p, uint32_t g) {
 } // namespace
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
+namespace { int cap_only_gpu(); bool cap_excl_hit(uint64_t lo, uint64_t hi); }   // (RX_VK_CAP_ONLY_GPU: below)
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
 void memory_collect_written() {
     uint32_t* pages = nullptr;
@@ -672,8 +673,12 @@ void memory_collect_written() {
             auto it = std::upper_bound(owned.begin(), owned.end(), std::make_pair(guest, ~uint64_t(0)));
             return it != owned.begin() && guest < std::prev(it)->second;
         };
+        const bool only_gpu = cap_only_gpu() == 1;
         for (int64_t i = 0; i < n; i++) {
             const uint64_t guest = (uint64_t)pages[i] << kPageShift;
+            // (RX_VK_CAP_ONLY_GPU=1: heap memory between the pools of an imported chunk, which no GPU address reaches: not
+            // stamped, so no mirror sync copies it either)
+            if (only_gpu && cap_excl_hit(guest, guest + 4096)) continue;
             if (!owned.empty() && in_capture(guest)) {   // (written after its submit's capture: the next capture takes it, as it is then)
                 uint64_t avail = 0;
                 if (const uint8_t* q = host->gpu_ptr(guest, &avail)) host->mark_written(q, 4096);
@@ -1094,17 +1099,68 @@ uint64_t eager_captures() {
     static const uint64_t v = getenv("RX_VK_CAPTURE_EAGER") ? (uint64_t)atoll(getenv("RX_VK_CAPTURE_EAGER")) : 0;
     return v;
 }
+// ---- (HeyListen, RX_VK_CAP_ONLY_GPU; docs/native-engine/direct-emission.md section 10) ----
+// The mirrored pools of cap_ranges are the back end's imports: 16 MB chunks around what was bound (import_chunk), not the
+// game's pools. Where the game makes small pools inside its heap (OoT: 8 KB pools of flags 0x24 scattered through the heap at
+// 0x1050000000-0x1060000000), a chunk spans heap memory no pool covers, which the game writes every frame and the capture
+// copied (85-95% of its pages, section 9). A GPU address below 1 TB is valid only inside a memory pool (NVN), so those pages
+// cannot be read by the GPU. 1: the import ranges are clipped to the game's pools before the capture scans them. 2 (a check):
+// captured as before, and the pages 1 would leave out counted. With 1 or 2 every replay read and buffer binding that reaches
+// into the left-out ranges is counted and the first ones logged (0 expected).
+int cap_only_gpu() {
+    static const int v = [] {
+        const char* e = getenv("RX_VK_CAP_ONLY_GPU");
+        const int m = e ? std::clamp(atoi(e), 0, 2) : 0;
+        if (m) logf("vk: the capture's imported chunks %s the game's pools (RX_VK_CAP_ONLY_GPU=%d)",
+                    m == 1 ? "clipped to" : "checked against", m);
+        return m;
+    }();
+    return v;
+}
+std::vector<std::pair<uint64_t, uint64_t>> all_pool_ranges;   // (every game pool below 1 TB, merged; cap_ranges_mu)
+std::mutex cap_excl_mu;
+std::vector<std::pair<uint64_t, uint64_t>> cap_excl;          // (the import ranges outside every pool and texture storage)
+std::atomic<int64_t> st_excl_pages{0}, st_excl_reads{0}, st_cap_pages{0}, st_cap_presents{0}, st_cap_takes{0};
+std::vector<std::pair<uint64_t, uint64_t>> ranges_merged(std::vector<std::pair<uint64_t, uint64_t>> v) {
+    std::sort(v.begin(), v.end());
+    std::vector<std::pair<uint64_t, uint64_t>> m;
+    for (const auto& r : v) {
+        if (!m.empty() && r.first <= m.back().second) m.back().second = std::max(m.back().second, r.second);
+        else m.push_back(r);
+    }
+    return m;
+}
+/// a and b sorted and merged: a's parts inside b (in = true) or outside it
+std::vector<std::pair<uint64_t, uint64_t>> ranges_clip(const std::vector<std::pair<uint64_t, uint64_t>>& a,
+                                                       const std::vector<std::pair<uint64_t, uint64_t>>& b, bool in) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    size_t j = 0;
+    for (const auto& r : a) {
+        uint64_t at = r.first;
+        while (j < b.size() && b[j].second <= at) j++;
+        for (size_t k = j; k < b.size() && b[k].first < r.second; k++) {
+            const uint64_t lo = std::max(at, b[k].first), hi = std::min(r.second, b[k].second);
+            if (!in && lo > at) out.push_back({at, lo});
+            if (in && lo < hi) out.push_back({lo, hi});
+            at = std::max(at, hi);
+        }
+        if (!in && at < r.second) out.push_back({at, r.second});
+    }
+    return out;
+}
 void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
-    if (!capture_pool_max()) return;
+    if (!capture_pool_max() && !cap_only_gpu()) return;
     const uint32_t g = host->maps_generation();
     if (g == pool_cap_gen && captures_made - pool_cap_built < 64) return;   // (and every 64: the old ones out)
     pool_cap_gen = g, pool_cap_built = captures_made;
     static std::vector<std::array<uint64_t, 2>> list(8192);
     const int n = host->gpu_pools(reinterpret_cast<uint64_t(*)[2]>(list.data()), (int)list.size());
-    std::vector<std::pair<uint64_t, uint64_t>> v;
+    std::vector<std::pair<uint64_t, uint64_t>> v, every;
     std::unordered_map<uint64_t, uint64_t> seen;
     seen.reserve((size_t)std::max(n, 0));
     for (int i = 0; i < n; i++) {
+        if (list[i][1] && list[i][0] < (1ull << 40))
+            every.push_back({list[i][0] & ~4095ull, (list[i][0] + list[i][1] + 4095) & ~4095ull});
         if (!list[i][1] || list[i][1] > capture_pool_max() || list[i][0] >= (1ull << 40)) continue;
         auto it = pool_first_seen.find(list[i][0]);
         const uint64_t first = it != pool_first_seen.end() ? it->second : captures_made;
@@ -1113,6 +1169,7 @@ void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
             v.push_back({list[i][0] & ~4095ull, (list[i][0] + list[i][1] + 4095) & ~4095ull});
     }
     pool_first_seen.swap(seen);
+    all_pool_ranges = ranges_merged(std::move(every));
     cap_ranges_ver++;
     std::sort(v.begin(), v.end());
     std::vector<std::pair<uint64_t, uint64_t>> m;
@@ -1300,9 +1357,47 @@ void publish_tex_spans(uint64_t frame) {
     tex_cap_ranges.swap(v);
     cap_ranges_ver++;
 }
+/// the captures' ranges: the mirrored imports (clipped to the pools with RX_VK_CAP_ONLY_GPU=1), the texture storage, the small
+/// pools; their union, sorted and merged (cap_ranges_mu held). The left-out ranges published for the check
+std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked() {
+    std::vector<std::pair<uint64_t, uint64_t>> imp = cap_ranges;
+    if (cap_only_gpu()) {
+        imp = ranges_merged(imp);
+        std::vector<std::pair<uint64_t, uint64_t>> keep = all_pool_ranges;
+        keep.insert(keep.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
+        keep = ranges_merged(keep);
+        std::vector<std::pair<uint64_t, uint64_t>> excl = ranges_clip(imp, keep, false);
+        {
+            std::lock_guard lk(cap_excl_mu);
+            cap_excl.swap(excl);
+        }
+        if (cap_only_gpu() == 1) imp = ranges_clip(imp, all_pool_ranges, true);
+    }
+    imp.insert(imp.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
+    imp.insert(imp.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
+    return ranges_merged(std::move(imp));
+}
+/// (RX_VK_CAP_ONLY_GPU) whether [lo, hi) of guest memory reaches into the left-out ranges
+bool cap_excl_hit(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(cap_excl_mu);
+    auto it = std::upper_bound(cap_excl.begin(), cap_excl.end(), std::make_pair(lo, ~uint64_t(0)));
+    if (it != cap_excl.begin() && lo < std::prev(it)->second) return true;
+    return it != cap_excl.end() && it->first < hi;
+}
+/// (RX_VK_CAP_ONLY_GPU) a replay read or a buffer binding of [gpu, gpu + n): counted, and the first 20 logged, when it reaches
+/// into the left-out ranges
+void cap_excl_note(uint64_t gpu, uint64_t n, const char* who) {
+    if (!n) return;
+    const uint64_t g = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
+    if (!g || !cap_excl_hit(g, g + n)) return;
+    if (st_excl_reads.fetch_add(1, std::memory_order_relaxed) < 20)
+        logf("vk: RX_VK_CAP_ONLY_GPU: %s of %#llx +%#llx reaches memory the capture leaves out", who, (unsigned long long)gpu,
+             (unsigned long long)n);
+}
 } // namespace
 
 void memory_note_texture_upload(uint64_t guest, uint64_t size) {
+    if (cap_only_gpu() && guest < (1ull << 40)) cap_excl_note(guest, size, "a texture upload");
     if (!size || guest >= (1ull << 40) || size > (1ull << 40) || !tex_capture_on()) return;   // (hookshot: no wrap below)
     uint64_t lo, hi;
     {   // (the pool it is in, when that is at most 256 MB; else the 2 MB regions it spans)
@@ -1346,6 +1441,7 @@ bool guarded_copy(void* dst, const void* src, size_t n);   // (below)
 std::atomic<int64_t> st_late_def_full{0}, st_late_reads{0}, st_late_syncs{0};   // (TICK-060)
 
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
+    if (cap_only_gpu()) cap_excl_note(gpu, n, "a replay read as submitted");
     // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. The next words are
     // the same page: the answer is kept until a stamp or a new capture)
     if (n && capture_on() && captures_seen.load(std::memory_order_relaxed)) {
@@ -2320,17 +2416,7 @@ std::unique_ptr<Capture> capture_make() {
         if (ver != cap_ranges_ver) {   // (the three lists overlap: their union, sorted, once each time one changes)
             ver = cap_ranges_ver;
             ranges_new = true;
-            std::vector<std::pair<uint64_t, uint64_t>> all = cap_ranges;
-            all.insert(all.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
-            all.insert(all.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
-            std::sort(all.begin(), all.end());
-            mirrored.clear();
-            for (const auto& r : all) {
-                if (!mirrored.empty() && r.first <= mirrored.back().second)
-                    mirrored.back().second = std::max(mirrored.back().second, r.second);
-                else
-                    mirrored.push_back(r);
-            }
+            mirrored = capture_union_locked();
         }
     }
     if (pre_on && ranges_new) precopy_ranges(mirrored);
@@ -2474,6 +2560,20 @@ std::unique_ptr<Capture> capture_make() {
         }
     }
     if (n > 0 && ubo_check_on()) ubo_check_captured(pages, n);   // (HL_UBO_CHECK: the frame's captured pages, by what reads them)
+    if (cap_only_gpu()) {   // (RX_VK_CAP_ONLY_GPU: the pages taken, and with 2 those 1 would leave out)
+        st_cap_takes.fetch_add(1, std::memory_order_relaxed);
+        st_cap_pages.fetch_add(std::max<int64_t>(n, 0), std::memory_order_relaxed);
+        if (cap_only_gpu() == 2 && n > 0) {
+            std::lock_guard lk(cap_excl_mu);
+            int64_t k = 0;
+            for (int64_t i = 0; i < n; i++) {
+                const uint64_t g = (uint64_t)pages[i] << kPageShift;
+                auto it = std::upper_bound(cap_excl.begin(), cap_excl.end(), std::make_pair(g, ~uint64_t(0)));
+                k += it != cap_excl.begin() && g < std::prev(it)->second;
+            }
+            st_excl_pages.fetch_add(k, std::memory_order_relaxed);
+        }
+    }
     const auto t_copy = std::chrono::steady_clock::now();
     if (use_pre) {   // (TICK-043: the buffer copied ahead; the new pages after its pages, the ones written again into their slots)
         c->pages.assign(pages, pages + n);
@@ -2619,6 +2719,37 @@ std::unique_ptr<Capture> capture_make() {
     return c;
 }
 
+/// (RX_VK_CAP_ONLY_GPU) a present: every 10 s, the capture's pages a frame (and with 2 those it would leave out), the reads
+/// into the left-out ranges, and the largest of those ranges
+void memory_cap_present() {
+    if (!cap_only_gpu()) return;
+    st_cap_presents.fetch_add(1, std::memory_order_relaxed);
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    const double f = (double)std::max<int64_t>(st_cap_presents.exchange(0), 1);
+    const int64_t pages = st_cap_pages.exchange(0), excl = st_excl_pages.exchange(0), takes = st_cap_takes.exchange(0);
+    std::vector<std::pair<uint64_t, uint64_t>> ex;
+    {
+        std::lock_guard lk(cap_excl_mu);
+        ex = cap_excl;
+    }
+    uint64_t total = 0;
+    for (const auto& r : ex) total += r.second - r.first;
+    std::sort(ex.begin(), ex.end(), [](const auto& a, const auto& b) { return a.second - a.first > b.second - b.first; });
+    std::string top;
+    for (size_t k = 0; k < ex.size() && k < 6; k++) {
+        char t[64];
+        snprintf(t, sizeof t, " %#llx+%lluK", (unsigned long long)ex[k].first, (unsigned long long)((ex[k].second - ex[k].first) >> 10));
+        top += t;
+    }
+    logf("vk: capture (RX_VK_CAP_ONLY_GPU=%d), a frame over the last 10 s (%.0f frames, %.1f captures a frame): %.0f pages taken "
+         "(%.1f MB), of them in the left-out ranges %.0f (counted with 2 only); reads and bindings into the left-out ranges %lld in "
+         "all; left-out ranges %zu, %.0f MB, the largest:%s",
+         cap_only_gpu(), f, takes / f, pages / f, pages * 4096.0 / 1048576.0 / f, excl / f, (long long)st_excl_reads.load(),
+         ex.size(), total / 1048576.0, top.c_str());
+}
 /// (HL_UBO_CHECK) the texture storage the captures take, as of now (sorted, merged)
 std::vector<std::pair<uint64_t, uint64_t>> memory_tex_capture_ranges() {
     std::lock_guard lk(cap_ranges_mu);
@@ -2639,17 +2770,7 @@ const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged() {
     refresh_pool_ranges_locked();   // (a pool made since the last capture: the next one takes its pages, not this)
     if (ver != cap_ranges_ver) {
         ver = cap_ranges_ver;
-        std::vector<std::pair<uint64_t, uint64_t>> all = cap_ranges;
-        all.insert(all.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
-        all.insert(all.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
-        std::sort(all.begin(), all.end());
-        merged.clear();
-        for (const auto& r : all) {
-            if (!merged.empty() && r.first <= merged.back().second)
-                merged.back().second = std::max(merged.back().second, r.second);
-            else
-                merged.push_back(r);
-        }
+        merged = capture_union_locked();
     }
     return merged;
 }
@@ -5041,6 +5162,7 @@ thread_local BindMemo bind_memo[256];
 
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
+    if (cap_only_gpu()) cap_excl_note(gpu, size, "a buffer binding");
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
     // two translations are for the virtual pools above)
     uint64_t guest = gpu;

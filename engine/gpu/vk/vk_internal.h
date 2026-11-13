@@ -233,6 +233,8 @@ bool memory_has_shadow(uint64_t guest, uint64_t n);
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n);
 /// (HL_UBO_CHECK) the game pool holding guest address g: its range and NVN flags (false: in none)
 bool memory_nvn_pool_of(uint64_t guest, uint64_t* lo, uint64_t* hi, uint32_t* flags);
+/// (RX_VK_CAP_ONLY_GPU) a present: the capture's per-frame counts logged every 10 s (vk_memory.cpp)
+void memory_cap_present();
 /// (HL_UBO_CHECK) the texture storage the captures take, sorted and merged
 std::vector<std::pair<uint64_t, uint64_t>> memory_tex_capture_ranges();
 // ---- (HeyListen) HL_UBO_CHECK=1 (vk_ubo_check.cpp; docs/native-engine/direct-emission.md section 9): a measurement, no

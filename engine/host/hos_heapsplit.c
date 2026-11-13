@@ -411,8 +411,9 @@ static void log_heap(const Heap *h, const char *tag, int indent) {
         snprintf(used, sizeof used, "%.1f", BMB(h->size - (uint64_t)h->free));
         snprintf(freeb, sizeof freeb, "%.1f", BMB(h->free));
     }
-    hos_log("%s: %*s%s [%s] size %.1f MB, used %s, free %s; RAM own %.1f + pools %.1f MB, with children %.1f MB%s", tag,
-            indent * 2, "", h->name, cn, BMB(h->size), used, freeb, MB(h->res_own), MB(h->res_pool), MB(h->res_incl), fb);
+    hos_log("%s: %*s%s [%s] at %#llx, size %.1f MB, used %s, free %s; RAM own %.1f + pools %.1f MB, with children %.1f MB%s", tag,
+            indent * 2, "", h->name, cn, (unsigned long long)h->start, BMB(h->size), used, freeb, MB(h->res_own), MB(h->res_pool),
+            MB(h->res_incl), fb);
     line_done();
 }
 
