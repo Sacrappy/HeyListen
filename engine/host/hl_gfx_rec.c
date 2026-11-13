@@ -5,8 +5,8 @@
    The surface is nvn_native.c's (nvn_rec_*: open a command buffer, append a record as the NVN procedures do, the
    recording's mark, its bytes, a rewind, a checked guest read); this file hands it to the native side and reads the
    switches, at the first call of the native render-state function (HL_GFX_STATE=1):
-     HL_GFX_REC=0        (the default) the render state goes through the NVN procedures, as before
-     HL_GFX_REC=1        the render state written as records directly: no NVN procedure called. What the 29 procedures
+     HL_GFX_REC=0        the render state goes through the NVN procedures, as before
+     HL_GFX_REC=1        (the default) the render state written as records directly: no NVN procedure called. What the 29 procedures
                          did besides their record is done or not needed (direct-emission.md section 8): the command
                          buffer's accounting (cmd_used, hw_used, last_rec: GetCommandMemoryUsed) kept by the append; the
                          state objects set on native copies, not in the function's dead stack frame
@@ -37,7 +37,8 @@ static void rec_rewind(void *user, void *cmd, const hl_rec_mark *m) { (void)user
 static const void *rec_guest(void *user, uint64_t a, uint64_t n) { (void)user; return nvn_rec_guest(a, n); }
 static void rec_log(void *user, const char *line) { (void)user; hos_log("%s", line); }
 
-#define HL_GFX_REC_DEFAULT 0   /* (off until the main PC's validation runs) */
+#define HL_GFX_REC_DEFAULT 1   /* (validated 2026-11-13 on both PCs: the record check at 0 mismatches over ~280,000 calls in
+                                  three scenes, the native records alone run in three scenes with the shots right) */
 
 static int switch_of(const char *name, int dflt) {
     const char *e = getenv(name);

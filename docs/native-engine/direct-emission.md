@@ -605,7 +605,7 @@ was found that keys on anything the procedures did beyond their records.
 
 ### Switches
 
-`HL_GFX_REC=1` the render state written as records (default 0 until the main PC's validation runs);
+`HL_GFX_REC=1` the render state written as records (the default since the runs below; `HL_GFX_REC=0` is the NVN path as before);
 `HL_GFX_REC_CHECK=1` the record check (with `HL_GFX_REC=1`: the native records live, the procedures' compared and
 dropped, the spec's `HL_GFX_REC_CHECK=2` folded into the same switch). Both act only where the render-state function is
 answered natively (`HL_GFX_STATE=1` and no `HL_GFX_CHECK`). The line `hl gfx rec: calls written as records N (records R),
@@ -630,3 +630,30 @@ PC 3050, 110 s a scene (function only; last counter line of each run):
 | | hyrule-walk | to the end | 64,993 (518,147) | 0 | right |
 
 About eight records a call: of the ~33 commands, the 18 setters write no record (they set the objects the binds copy).
+
+Main PC (`build/s5/valid.sh`, 110 s a scene):
+
+| Run | Scene | Ran | Game speed ratio | Calls (records) | Mismatched calls (accounting) | Shots |
+|---|---|---|---|---:|---:|---|
+| `HL_GFX_REC_CHECK=1` (brick A) | kokiri-idle | to the end, no crash | 59.63 | 64,773 compared (514,257; 16,942,992 bytes) | 0 (0) | right (`s8a-*-shots`) |
+| | castle-move | to the end, no crash | 59.89 | 54,354 compared (428,552; 14,098,256 bytes) | 0 (0) | right |
+| | hyrule-walk | to the end, no crash | 59.54 | 16,276 compared (125,675; 4,115,544 bytes) | 0 (0) | right |
+| `HL_GFX_REC=1` (brick B) | kokiri-idle | to the end, no crash | 60.18 | 65,217 written (517,793), 0 left to NVN | - | right: the same picture as `refshots-kokiri-idle` |
+| | castle-move | to the end, no crash | 59.63 | 37,015 written (292,292), 0 left | - | right (`s8b-*-shots`) |
+| | hyrule-walk | to the end, no crash | 59.64 | 153,432 written (1,222,285), 0 left | - | right |
+
+Memory with `HL_GFX_REC=1` (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 2,998 / 1,528 / 7,318 /
+19,054 / 5,833; castle-move 3,528 / 1,716 / 7,780 / 19,875 / 7,246; hyrule-walk 3,093 / 1,591 / 7,589 / 19,341 / 6,121.
+The brick changes no memory: what the segments hold is the same bytes.
+
+### For brick C
+
+- A record of any size is one `append`: `NOP_UBO_INLINE` needs no new host surface, only its op number and layout in
+  `hl_gfx_rec.h` (and `rx_nvn.h`), checked the same way.
+- **The accounting the game reads back must not grow with the inline bytes.** Every record counts its own size in
+  `hw_used` unless `hw_fix` replaces it, and the game sizes its command memory from `GetCommandMemoryUsed`: an inline
+  block of up to 64 KB must be appended with `hw` set to what the bind it stands for costs (20 bytes, `BindUniformBuffer`),
+  or the game's heaps would be sized for bytes a console never writes. The record check compares this accounting
+  already and would show it.
+- The check's machinery (`mark`, `bytes`, `rewind`) compares any native unit's records with the NVN procedures' in place,
+  call by call; brick D's check can reuse it as it is.
