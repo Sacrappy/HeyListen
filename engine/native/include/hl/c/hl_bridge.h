@@ -63,6 +63,17 @@ void hl_bridge_stage_last(uint64_t manager);
 /* The stages' counters, one line (0 when they are not native). Returns the length written. */
 int hl_bridge_stages_report(char *out, size_t cap);
 
+enum { HL_JOBGROUP_NATIVE = 1, HL_JOBGROUP_CHECK = 2 };
+
+/* After hl_bridge_start: the module system's job group answered natively (hl::bridge::JobGroup) with HL_JOBGROUP_* bits.
+   Returns 1 when it is (the bridge started and HL_JOBGROUP_NATIVE given). */
+int hl_bridge_jobgroup_start(int group);
+/* The entry gate of the group function (hl::bridge::kJobGroup), with its two arguments, on the calling thread's own guest
+   context: runs the group natively (it always answers). */
+void hl_bridge_jobgroup(uint64_t group, uint64_t context);
+/* The group's counters, one line (0 when it is not native). Returns the length written. */
+int hl_bridge_jobgroup_report(char *out, size_t cap);
+
 /* One line of counters for the log. Returns the length written. */
 int hl_bridge_report(char *out, size_t cap);
 
