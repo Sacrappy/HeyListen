@@ -236,10 +236,17 @@ void DrawBridge::write_submit(GuestAddr block, const gfx::SubmitHandles& h, cons
     }
 }
 
-void DrawBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const {
-    std::memcpy(bytes, runtime_.ptr(block), sizeof(guest::RenderStateBlock));
+namespace {
+// (the block's bytes, then the command buffer object's mark byte: 0 without a command buffer)
+void block_and_mark(const GuestRuntime& rt, GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) {
+    std::memcpy(bytes, rt.ptr(block), sizeof(guest::RenderStateBlock));
     bytes[sizeof(guest::RenderStateBlock)] =
-        command_buffer ? *static_cast<const uint8_t*>(runtime_.ptr(command_buffer + guest::kCommandBufferMark)) : 0;
+        command_buffer ? *static_cast<const uint8_t*>(rt.ptr(command_buffer + guest::kCommandBufferMark)) : 0;
+}
+}   // namespace
+
+void DrawBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const {
+    block_and_mark(runtime_, block, command_buffer, bytes);
 }
 
 void DrawBridge::expect_prologue(uint8_t* bytes, const gfx::PrologueOutputs& out) {
@@ -251,6 +258,103 @@ void DrawBridge::expect_prologue(uint8_t* bytes, const gfx::PrologueOutputs& out
 void DrawBridge::expect_submit(uint8_t* bytes, const gfx::SubmitOutputs& out) {
     if (out.marked) bytes[sizeof(guest::RenderStateBlock)] = 1;
     if (out.counted) std::memcpy(bytes + offsetof(guest::RenderStateBlock, triangles), &out.triangles, 4);
+}
+
+// ---- the shared preparation ----
+
+namespace {
+uint8_t u8(const GuestRuntime& rt, GuestAddr a) { return *static_cast<const uint8_t*>(rt.ptr(a)); }
+uint16_t u16(const GuestRuntime& rt, GuestAddr a) {
+    uint16_t v;
+    std::memcpy(&v, rt.ptr(a), 2);
+    return v;
+}
+}   // namespace
+
+GuestAddr PrepareBridge::material(GuestAddr block, GuestAddr drawable) const {
+    const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
+    // (the block's slot, or the drawable's pass slot for the block's pass: an unsigned byte index)
+    uint8_t slot = b.pass_slot;
+    if (slot == 0xff) slot = u8(runtime_, drawable + guest::kDrawablePassSlots + b.depth_mode);
+    // (the slot is a signed byte index into the material slots, whose entry is signed too)
+    const int8_t entry = (int8_t)u8(runtime_, drawable + guest::kDrawableMaterialSlots + (uint64_t)(int64_t)(int8_t)slot);
+    if (entry == -1) return u64(runtime_, kDefaultMaterialSlot);
+    const guest::Drawable& d = at<guest::Drawable>(runtime_, drawable);
+    return d.materials + (uint64_t)((int64_t)d.material_stride * (int64_t)entry);
+}
+
+void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs& in, gfx::PrepareHandles& h) const {
+    in = gfx::PrepareInputs{};
+    h = gfx::PrepareHandles{};
+    const GuestAddr m = material(block, drawable);
+    const guest::MaterialEntry& e = at<guest::MaterialEntry>(runtime_, m);
+    in.material = e.first != 0;
+    if (!in.material) return;
+    const guest::Drawable& d = at<guest::Drawable>(runtime_, drawable);
+    const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
+    in.state_key = d.state_key;
+    in.applied_state_key = b.state_key_applied;
+    in.mode_bits = b.mode_bits;
+    if (in.state_key != in.applied_state_key) return;
+    if (in.mode_bits & 1) {
+        in.material_state = u32(runtime_, d.material_state + guest::kMaterialStateId);
+        in.applied_material_state = b.done;
+        if (in.material_state != in.applied_material_state) return;
+    }
+    in.program = e.program;
+    in.applied_program = b.program;
+    if (in.program != in.applied_program) return;
+    in.pending = b.pending;
+    if (in.pending) {
+        in.drawable_mask = d.pending_mask;
+        in.applied_mask = b.applied_bits;
+        if (((uint32_t)in.pending & ~(uint32_t)in.drawable_mask) & ~(uint32_t)in.applied_mask) return;
+    }
+    in.view_blocks = at<guest::Material>(runtime_, b.material).drawable_blocks != 0;
+    if (in.view_blocks) {
+        in.drawable_block = d.block_entry;
+        in.applied_drawable_block = b.drawable_block;
+        if (in.drawable_block != in.applied_drawable_block) {
+            in.block_binding = b.block_binding;
+            if (in.block_binding != 0xffffffffu) return;
+        }
+    }
+    // (the function reads the list selector before it tests the mode bit)
+    const uint32_t list = u16(runtime_, d.lists + guest::kListsSelector) & 3;
+    if (!(in.mode_bits & 8)) return;
+    in.list_flags = e.lists[list].flags;
+    if (!(in.list_flags & 1)) return;
+    if (in.list_flags & 2) {
+        h.command_buffer = at<guest::Renderer>(runtime_, b.renderer).command_buffer;
+        in.inline_switch = u32(runtime_, u64(runtime_, kInlineCallSwitchSlot)) != 0;
+        if (in.inline_switch) return;
+        h.command_list = m + offsetof(guest::MaterialEntry, lists) + list * sizeof(guest::MaterialEntry::List);
+    }
+    in.cluster = b.cluster;
+    if (in.cluster) {
+        in.drawable_kinds = (uint8_t)d.flags;
+        if (!(in.drawable_kinds & 4)) in.cluster_count = d.cluster_count;
+    }
+}
+
+void PrepareBridge::write(GuestAddr block, const gfx::PrepareHandles& h, const gfx::PrepareOutputs& out) const {
+    if (out.mask_written) {
+        static_cast<guest::RenderStateBlock*>(runtime_.ptr(block))->applied_bits = out.applied_mask;
+        runtime_.written(block + offsetof(guest::RenderStateBlock, applied_bits), 2);
+    }
+    if (out.marked) {
+        *static_cast<uint8_t*>(runtime_.ptr(h.command_buffer + guest::kCommandBufferMark)) = 1;
+        runtime_.written(h.command_buffer + guest::kCommandBufferMark, 1);
+    }
+}
+
+void PrepareBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const {
+    block_and_mark(runtime_, block, command_buffer, bytes);
+}
+
+void PrepareBridge::expect(uint8_t* bytes, const gfx::PrepareOutputs& out) {
+    if (out.mask_written) std::memcpy(bytes + offsetof(guest::RenderStateBlock, applied_bits), &out.applied_mask, 2);
+    if (out.marked) bytes[sizeof(guest::RenderStateBlock)] = 1;
 }
 
 }   // namespace hl::bridge

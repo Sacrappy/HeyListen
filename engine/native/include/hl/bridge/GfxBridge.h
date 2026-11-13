@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "hl/bridge/JobBridge.h"
+#include "hl/gfx/Prepare.h"
 #include "hl/gfx/RecordPass.h"
 #include "hl/gfx/RenderState.h"
 #include "hl/gfx/SubmeshDraw.h"
@@ -32,29 +33,37 @@ struct RenderStateBlock {
     GuestAddr material;
     uint8_t _20[8];
     GuestAddr renderer;
-    uint8_t _30[9];
-    uint8_t depth_mode;
+    uint8_t _30[8];
+    uint8_t cluster;         ///< the cluster entry's index (the sub-mesh submission; the preparation's cluster calls)
+    uint8_t depth_mode;      ///< (also the pass: the preparation's index into the drawable's pass slots)
     uint8_t _3a;
     uint8_t geometry_mode;   ///< the geometry processing mode applied last (the sub-mesh submission)
     uint8_t _3c[20];
     uint32_t triangles;      ///< the triangles submitted (the sub-mesh submission adds each sub-mesh's)
     uint8_t _54[4];
     uint8_t offset_slot;
-    uint8_t _59;
+    uint8_t state_key_applied;   ///< the drawable state key the preparation applied last
     uint8_t key;
     uint8_t _5b;
     uint32_t mode_bits;
-    uint8_t _60;
+    uint8_t drawable_block;      ///< the per-drawable uniform block's entry bound last (the preparation)
     uint8_t blend_target_mask;
-    uint8_t _62[2];
+    uint8_t pass_slot;           ///< the material slot for the preparation (0xff: from the drawable's pass slots)
+    uint8_t _63;
     int8_t offset_slot_base;
     uint8_t _65[11];
     uint32_t channel_masks_in;
-    uint8_t _74[36];
-    uint32_t done;
+    uint8_t _74[12];
+    uint32_t block_binding;      ///< the per-drawable uniform block's binding word (-1: none)
+    uint8_t _84[20];
+    uint32_t done;           ///< (the material state the preparation applied last: the render-state function resets it)
     uint8_t _9c[4];
     uint64_t blend_color_in[2];
-    uint8_t _b0[64];
+    uint16_t pending;            ///< bits the preparation still has to apply
+    uint16_t applied_bits;
+    uint8_t _b4[36];
+    GuestAddr program;           ///< the program the preparation bound last
+    uint8_t _e0[16];
     uint8_t depth_test;
     uint8_t depth_write;
     uint8_t _f2;
@@ -80,7 +89,15 @@ struct RenderStateBlock {
 };
 static_assert(offsetof(RenderStateBlock, material) == 24);
 static_assert(offsetof(RenderStateBlock, renderer) == 40);
+static_assert(offsetof(RenderStateBlock, cluster) == 0x38);
 static_assert(offsetof(RenderStateBlock, depth_mode) == 57);
+static_assert(offsetof(RenderStateBlock, state_key_applied) == 0x59);
+static_assert(offsetof(RenderStateBlock, drawable_block) == 0x60);
+static_assert(offsetof(RenderStateBlock, pass_slot) == 0x62);
+static_assert(offsetof(RenderStateBlock, block_binding) == 0x80);
+static_assert(offsetof(RenderStateBlock, pending) == 0xb0);
+static_assert(offsetof(RenderStateBlock, applied_bits) == 0xb2);
+static_assert(offsetof(RenderStateBlock, program) == 0xd8);
 static_assert(offsetof(RenderStateBlock, geometry_mode) == 59);
 static_assert(offsetof(RenderStateBlock, triangles) == 80);
 static_assert(offsetof(RenderStateBlock, offset_slot) == 88);
@@ -123,11 +140,14 @@ struct Material {
     uint8_t _0[1224];
     uint32_t offset_units;    ///< slot 0
     uint32_t offset_factor;   ///< slot 0
-    uint8_t _4d0[152];
+    uint8_t _4d0[0x48];
+    GuestAddr drawable_blocks;   ///< the per-drawable uniform blocks' table (the preparation binds an entry: 0 none)
+    uint8_t _520[0x48];
     GuestAddr state_callback;
 };
 static_assert(offsetof(Material, offset_units) == 1224);
 static_assert(offsetof(Material, offset_factor) == 1228);
+static_assert(offsetof(Material, drawable_blocks) == 0x518);
 static_assert(offsetof(Material, state_callback) == 1384);
 
 /// The state callback object (a function object: its invoker at +16 is the game's empty function when none is set).
@@ -139,19 +159,59 @@ static_assert(offsetof(StateCallback, invoke) == 16);
 
 /// The drawable a sub-mesh submission is called on (its x0): only the fields the function reads.
 struct Drawable {
-    uint8_t _0[30];
+    uint8_t _0[8];
+    GuestAddr lists;       ///< (the preparation: its +0x14's low two bits choose the material entry's pre-recorded list)
+    uint8_t _10[4];
+    uint16_t pending_mask; ///< pending bits of the block this drawable takes away (the preparation)
+    uint16_t cluster_count;
+    uint8_t _18[6];
     uint16_t counts;       ///< bits 4-7: the number of sub-meshes
     uint8_t _20[52];
     uint32_t flags;        ///< the draw kinds (with the call's mask: which path)
-    uint8_t _58[4];
+    uint8_t state_key;     ///< the render state's key (the preparation compares the block's)
+    uint8_t _59;
+    uint8_t block_entry;   ///< its per-drawable uniform block's entry
+    uint8_t _5b;
     uint16_t instances;
-    uint8_t _5e[10];
+    uint8_t _5e;
+    uint8_t material_stride;   ///< the material entries' size
+    GuestAddr materials;       ///< the material entries (by the slot the pass selects)
     GuestAddr model;
+    GuestAddr material_state;  ///< its +0x154: the material state's id (the preparation compares the block's)
 };
+static_assert(offsetof(Drawable, lists) == 0x8);
+static_assert(offsetof(Drawable, pending_mask) == 0x14);
+static_assert(offsetof(Drawable, cluster_count) == 0x16);
 static_assert(offsetof(Drawable, counts) == 0x1e);
 static_assert(offsetof(Drawable, flags) == 0x54);
+static_assert(offsetof(Drawable, state_key) == 0x58);
+static_assert(offsetof(Drawable, block_entry) == 0x5a);
 static_assert(offsetof(Drawable, instances) == 0x5c);
+static_assert(offsetof(Drawable, material_stride) == 0x5f);
+static_assert(offsetof(Drawable, materials) == 0x60);
 static_assert(offsetof(Drawable, model) == 0x68);
+static_assert(offsetof(Drawable, material_state) == 0x70);
+/// The drawable's byte tables the preparation indexes: the pass slots (by the block's pass, unsigned) and the material
+/// slots (by the pass slot, signed; -1: the game's default material entry).
+inline constexpr uint64_t kDrawablePassSlots = 0x2c, kDrawableMaterialSlots = 0x3b;
+/// The drawable's lists word (at its lists object's +0x14) and the material state's id (at its +0x154).
+inline constexpr uint64_t kListsSelector = 0x14, kMaterialStateId = 0x154;
+
+/// A material entry the preparation picks (its size is the drawable's material stride): the program and four
+/// pre-recorded command lists with their flags.
+struct MaterialEntry {
+    uint64_t first;        ///< 0: no material (the preparation returns 0)
+    GuestAddr program;
+    struct List {
+        GuestAddr handle;  ///< (CallCommands takes its address: a list of one)
+        uint8_t flags;     ///< bit 0: present; bit 1: call it
+        uint8_t _9[7];
+    } lists[4];
+};
+static_assert(offsetof(MaterialEntry, program) == 8);
+static_assert(offsetof(MaterialEntry, lists) == 0x10);
+static_assert(offsetof(MaterialEntry::List, flags) == 8);
+static_assert(sizeof(MaterialEntry::List) == 16);
 
 /// The drawable's model resource.
 struct Model {
@@ -249,6 +309,9 @@ inline constexpr GuestAddr kPrepareReturn = 0x8007903c;   ///< the link register
 inline constexpr uint64_t kSubmitFrame = 0x150;
 /// A global switch (its GOT slot): set, the pre-recorded path writes the call into the command memory itself.
 inline constexpr GuestAddr kInlineCallSwitchSlot = 0x84ca2dd8;
+/// The preparation's default material entry (a GOT slot holding its address): taken when the drawable's material slot is
+/// -1.
+inline constexpr GuestAddr kDefaultMaterialSlot = 0x84cb5d10;
 /// The game's tables from its primitive and index-type enums to NVN's (32-bit entries).
 inline constexpr GuestAddr kPrimitiveTable = 0x83e79c60, kIndexTypeTable = 0x83e7a994;
 
@@ -334,6 +397,28 @@ public:
     void snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const;
     static void expect_prologue(uint8_t* bytes, const gfx::PrologueOutputs& out);
     static void expect_submit(uint8_t* bytes, const gfx::SubmitOutputs& out);
+
+private:
+    GuestRuntime& runtime_;
+};
+
+/// The shared preparation's inputs and outputs (x0 the block, x1 the drawable), in place.
+class PrepareBridge {
+public:
+    /// What the preparation may write on its cached path: the block's 352 bytes, then the command buffer's mark byte.
+    static constexpr size_t kSnapshotSize = DrawBridge::kSnapshotSize;
+
+    explicit PrepareBridge(GuestRuntime& runtime) : runtime_(runtime) {}
+
+    /// The material entry the call picks (the function's first reads).
+    GuestAddr material(GuestAddr block, GuestAddr drawable) const;
+    /// Reads the call in the function's order, stopping where it leaves the cached path (decide() on the result says
+    /// where); `at`: the command buffer and the list, when the list is called.
+    void read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs& in, gfx::PrepareHandles& at) const;
+    void write(GuestAddr block, const gfx::PrepareHandles& at, const gfx::PrepareOutputs& out) const;
+
+    void snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const;
+    static void expect(uint8_t* bytes, const gfx::PrepareOutputs& out);
 
 private:
     GuestRuntime& runtime_;
