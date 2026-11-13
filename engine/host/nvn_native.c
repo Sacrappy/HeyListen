@@ -20,6 +20,7 @@
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
 #include "../gpu/render/rx_nvn.h"
+#include "hl/c/hl_gfx_rec.h"   /* (HeyListen: the records native producers write, checked against rx_nvn.h below) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1828,6 +1829,80 @@ static void *rec(nvn_cmd *o, uint32_t op, size_t payload) {
 }
 #define REC(o, OP, T) ((T *)rec((o), (OP), sizeof(T)))
 #define RECN(o, OP, T, ARR, N) ((T *)rec((o), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
+
+/* (HeyListen) Records written by native producers (engine/native, hl/c/hl_gfx_rec.h; host/hl_gfx_rec.c hands these to
+   it; docs/native-engine/direct-emission.md): the same rec() and hw_fix() as the procedures, on a command buffer opened
+   once per native unit of work by the thread recording it. The layouts native code writes are this file's, checked
+   here field by field. */
+#define REC_SAME(T, H) _Static_assert(sizeof(T) == sizeof(H), #T " is not " #H)
+#define REC_AT(T, H, f) _Static_assert(offsetof(T, f) == offsetof(H, f), #T "." #f " is not " #H "." #f)
+_Static_assert(sizeof(hl_rec_hdr) == sizeof(nvn_op_hdr) && offsetof(hl_rec_hdr, size) == offsetof(nvn_op_hdr, size), "record header");
+_Static_assert(HL_REC_VIEWPORTS == NOP_VIEWPORTS && HL_REC_SCISSOR == NOP_SCISSOR && HL_REC_DEPTH_RANGE == NOP_DEPTH_RANGE &&
+               HL_REC_BIND_STATE == NOP_BIND_STATE && HL_REC_BIND_VATTR == NOP_BIND_VATTR &&
+               HL_REC_BIND_VSTREAM == NOP_BIND_VSTREAM && HL_REC_BIND_VBUF == NOP_BIND_VBUF && HL_REC_BIND_UBO == NOP_BIND_UBO &&
+               HL_REC_BIND_SSBO == NOP_BIND_SSBO && HL_REC_BIND_TEX == NOP_BIND_TEX && HL_REC_BIND_SAMP == NOP_BIND_SAMP &&
+               HL_REC_STENCIL == NOP_STENCIL && HL_REC_POLY_OFFSET == NOP_POLY_OFFSET && HL_REC_DRAW == NOP_DRAW &&
+               HL_REC_DRAW_IDX == NOP_DRAW_IDX && HL_REC_BARRIER == NOP_BARRIER && HL_REC_BLEND_COLOR == NOP_BLEND_COLOR &&
+               HL_REC_BIND_IMG == NOP_BIND_IMG && HL_REC_DEPTH_CLAMP == NOP_DEPTH_CLAMP &&
+               HL_REC_RENDER_ENABLE == NOP_RENDER_ENABLE && HL_REC_RASTER_DISCARD == NOP_RASTER_DISCARD, "record op numbers");
+_Static_assert(HL_NVN_FACE_FRONT == NVN_FACE_FRONT && HL_NVN_FACE_BACK == NVN_FACE_BACK &&
+               HL_NVN_BLEND_FUNC_ZERO == NVN_BLEND_FUNC_ZERO && HL_NVN_BLEND_FUNC_ONE == NVN_BLEND_FUNC_ONE &&
+               HL_NVN_BLEND_EQUATION_ADD == NVN_BLEND_EQUATION_ADD && HL_NVN_LOGIC_OP_COPY == NVN_LOGIC_OP_COPY &&
+               HL_NVN_ALPHA_FUNC_ALWAYS == NVN_ALPHA_FUNC_ALWAYS, "NVN values of the state objects' defaults");
+/* (the state objects are bit fields declared alike: their sizes here, their bits by records_test.cpp's independent
+   reading and HL_GFX_REC_CHECK in the game) */
+REC_SAME(hl_rec_color_st, nvn_color_st); REC_SAME(hl_rec_chmask_st, nvn_chmask_st); REC_SAME(hl_rec_blend_st, nvn_blend_st);
+REC_SAME(hl_rec_ms_st, nvn_ms_st); REC_SAME(hl_rec_poly_st, nvn_poly_st); REC_SAME(hl_rec_ds_st, nvn_ds_st);
+REC_SAME(hl_rec_range, NVNbufferRange); REC_AT(hl_rec_range, NVNbufferRange, size);
+REC_SAME(hl_rec_viewports, nvn_p_viewports); REC_AT(hl_rec_viewports, nvn_p_viewports, n); REC_AT(hl_rec_viewports, nvn_p_viewports, v);
+REC_SAME(hl_rec_scissor, nvn_p_scissor); REC_AT(hl_rec_scissor, nvn_p_scissor, y); REC_AT(hl_rec_scissor, nvn_p_scissor, w); REC_AT(hl_rec_scissor, nvn_p_scissor, h);
+REC_SAME(hl_rec_flag, nvn_p_flag); REC_AT(hl_rec_flag, nvn_p_flag, index);
+REC_SAME(hl_rec_depth_range, nvn_p_depth_range); REC_AT(hl_rec_depth_range, nvn_p_depth_range, f);
+REC_SAME(hl_rec_bind_state, nvn_p_bind_state); REC_AT(hl_rec_bind_state, nvn_p_bind_state, bytes);
+REC_SAME(hl_rec_bind_vattr, nvn_p_bind_vattr); REC_AT(hl_rec_bind_vattr, nvn_p_bind_vattr, n); REC_AT(hl_rec_bind_vattr, nvn_p_bind_vattr, st);
+REC_SAME(hl_rec_vstream_st, nvn_vs_st); REC_AT(hl_rec_vstream_st, nvn_vs_st, divisor);
+REC_SAME(hl_rec_bind_vstream, nvn_p_bind_vstream); REC_AT(hl_rec_bind_vstream, nvn_p_bind_vstream, n); REC_AT(hl_rec_bind_vstream, nvn_p_bind_vstream, st);
+REC_SAME(hl_rec_bind_vbuf, nvn_p_bind_vbuf); REC_AT(hl_rec_bind_vbuf, nvn_p_bind_vbuf, n); REC_AT(hl_rec_bind_vbuf, nvn_p_bind_vbuf, r);
+REC_SAME(hl_rec_bind_buf, nvn_p_bind_buf); REC_AT(hl_rec_bind_buf, nvn_p_bind_buf, index); REC_AT(hl_rec_bind_buf, nvn_p_bind_buf, addr); REC_AT(hl_rec_bind_buf, nvn_p_bind_buf, size);
+REC_SAME(hl_rec_bind_handles, nvn_p_bind_handles); REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, first); REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, n);
+REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, src); REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, h);
+REC_SAME(hl_rec_stencil, nvn_p_stencil); REC_AT(hl_rec_stencil, nvn_p_stencil, value_mask); REC_AT(hl_rec_stencil, nvn_p_stencil, mask);
+REC_AT(hl_rec_stencil, nvn_p_stencil, ref); REC_AT(hl_rec_stencil, nvn_p_stencil, which);
+REC_SAME(hl_rec_poly_offset, nvn_p_poly_offset); REC_AT(hl_rec_poly_offset, nvn_p_poly_offset, units); REC_AT(hl_rec_poly_offset, nvn_p_poly_offset, clamp);
+REC_SAME(hl_rec_draw, nvn_p_draw); REC_AT(hl_rec_draw, nvn_p_draw, first); REC_AT(hl_rec_draw, nvn_p_draw, count);
+REC_AT(hl_rec_draw, nvn_p_draw, base_instance); REC_AT(hl_rec_draw, nvn_p_draw, instances);
+REC_SAME(hl_rec_draw_idx, nvn_p_draw_idx); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, itype); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, count);
+REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, base_vertex); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, base_instance);
+REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, instances); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, ibuf);
+REC_SAME(hl_rec_blend_color, nvn_p_blend_color);
+_Static_assert(sizeof(hl_rec_barrier) == 8, "Barrier's record: an 8-byte payload, the bits first");
+/* the command buffer at guest address cmd when it holds its own slot (else NULL: the procedures adopt a slot, as always) */
+void *nvn_rec_open(uint64_t cmd) {
+    if (!cmd) return NULL;
+    nvn_cmd *o = CB(gw(cmd, sizeof(nvn_cmd)));
+    const cmd_rec *r = cmd_slot(o->slot);
+    return r && r->owner == cmd ? o : NULL;
+}
+void *nvn_rec_append(void *cmd, uint32_t op, uint32_t payload, uint32_t hw) {
+    nvn_cmd *o = CB(cmd);
+    void *p = rec(o, op, payload);
+    if (hw) hw_fix(o, hw);
+    return p;
+}
+void nvn_rec_mark(void *cmd, hl_rec_mark *m) {
+    const nvn_cmd *o = CB(cmd);
+    const cmd_rec *r = cmd_slot(o->slot);
+    m->offset = r->seg ? (uint64_t)(r->cur - r->seg) : 0;
+    m->cmd_used = o->cmd_used, m->hw_used = o->hw_used, m->last_rec = o->last_rec;
+}
+const uint8_t *nvn_rec_bytes(void *cmd, uint64_t offset) { return cmd_slot(CB(cmd)->slot)->seg + offset; }
+void nvn_rec_rewind(void *cmd, const hl_rec_mark *m) {
+    nvn_cmd *o = CB(cmd);
+    cmd_rec *r = cmd_slot(o->slot);
+    if (r->seg) r->cur = r->seg + m->offset;
+    o->cmd_used = m->cmd_used, o->hw_used = m->hw_used, o->last_rec = m->last_rec;
+}
+const void *nvn_rec_guest(uint64_t a, uint64_t n) { return gw(a, n); }
 
 NV(nvnCommandBufferSignalEvent) {
     {   /* (the GPU's signals as recorded, 40 then every 5000) */
