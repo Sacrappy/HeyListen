@@ -88,7 +88,8 @@ Readiness ready(const JobBridge* bridge) {
     for (const GuestEntry& e : kEntries) native += e.native;
     const bool on = bridge && bridge->mode() != Mode::Off;
     return {on, native, (unsigned)(sizeof kEntries / sizeof kEntries[0]),
-            "the dispatcher still picks the jobs of a stage from the game's queues: jobs are not native jobs one by one yet\n"
+            "the game's jobs are not native jobs one by one: the native dispatcher (HL_DISPATCH=1) runs them from the game's queues\n"
+            "the stage owner's wait and nested waits still run the translated dispatcher\n"
             "the stages' begin, registration and wait, and the worker sets' making, are the game's own functions\n"
             "the module system's job group (the main thread's long wait) does not go through the native job system\n"
             "the identity table and the lane status word are written by the game's functions, not by the native side\n"
