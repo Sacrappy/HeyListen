@@ -128,7 +128,9 @@ translated code); speed is not being measured for now, by the owner's instructio
 | Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |
 | Memory | the back end's caches | `RX_VK_BC_CACHE_LAZY`, `RX_VK_CAP_FIT` | Vulkan memory in system memory 1.5 GB -> 0.5 GB | the driver's own arenas |
 | Rendering | `hl::gfx::RecordPass` | `HL_GFX` (1) | the recording pass's listener is native and runs the pass's two phases | the phases themselves |
-| Rendering | `hl::gfx::RenderState` | `HL_GFX_STATE` (1) | the state of every draw (about 33 NVN calls) is derived and emitted by native code through the `CommandSink` seam; exact check: 0 mismatches over 4.2 million NVN calls | the draw submission (being written: `HL_GFX_DRAW`), the draw loop; writing the back end's records directly (being written: `HL_GFX_REC`; plan: `direct-emission.md`) |
+| Rendering | `hl::gfx::RenderState` | `HL_GFX_STATE` (1) | the state of every draw (about 33 NVN calls) is derived and emitted by native code through the `CommandSink` seam; exact check: 0 mismatches over 4.2 million NVN calls | the shared draw preparation `0x8008fc00` (mapped, being written: `HL_GFX_PREP`), the draw function and its variants, the draw loop |
+| Rendering | `hl::gfx::SubmeshDraw` | `HL_GFX_DRAW` (1) | the sub-mesh submission `0x80078fc0` is native on its direct paths, exact check at 0 mismatches | its cluster paths |
+| Rendering | `hl::gfx::Records` | `HL_GFX_REC` (1) | the native render state writes the back end's records itself, with no NVN procedure call in between (`HL_GFX_REC_CHECK`: byte-identical records) | uniform data in the records (measured: `direct-emission.md` 9), the flatten copy |
 | Streaming | `hl::stream` | `HL_STREAM` (1) | every resource file's decompression is native, the chunked case included: zstd's own decoder with the game's dictionaries, byte-identical over 27,000 files; provenance of each decoded range recorded | the file reads' scheduling, the resource manager around it |
 | Physics loops | `hl::math` | `HL_MATH` (1) | five units native and bit-exact (0 mismatches over tens of millions of compared calls on two machines): four box and sphere kernels and the per-body box update of the solver's last step | the solver's integration and contact loops (being written), the narrow phase, cloth |
 | OS layer | a mutex finds its host object from itself | `HOS_NO_MUTEX_IX` unset | 0.5 ms a frame of lookups gone from the chain | - |
@@ -152,6 +154,12 @@ To look at when speed is measured again: single validation runs sometimes show a
 or a few seconds at a crawl; repeats of the same build and scene have never reproduced it, and it has happened on
 builds without the bricks suspected (several streams' tests run on the same PC): it is not established as a cost of
 any brick, and it is not ruled out either.
+
+Reviewed whole on 2026-11-13 (`review-2026-11-13.md`): the defects that a player could meet are fixed and merged; left
+open are the first-touch commit's protection of already committed pages (B7), the Linux build of the C++ tree (the
+AppImage's toolchain has no C++20: the tree is to be prebuilt as a static library, as the Vulkan back end is) and
+hygiene items. Player releases are cut from the branch `release/0.3.x` (v0.3.0's engine) until this engine is declared
+stable.
 
 ## Rules
 
