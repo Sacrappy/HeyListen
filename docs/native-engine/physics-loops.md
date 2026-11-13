@@ -522,7 +522,15 @@ about 100 s in):
 | kokiri-idle | 318,018 | 8,740,444 (293,034) | 639,105 | 595,751 (23,317) | 0 |
 | hyrule-walk | 338,678 | 9,549,889 (314,698) | 702,411 | 645,939 (25,238) | 0 |
 
-No call was declined for its FPCR. u1 and u2 decline nothing; about 3% of affine and 4% of sphere calls are declined by
+The same check on the main PC (build of `324e7ce`, with every unit native by default otherwise), full runs:
+
+| scene | u2 compared | affine compared (declined) | u1 compared | sphere compared (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|
+| kokiri-idle | 744,408 | 24,046,249 (788,081) | 1,779,489 | 1,644,222 (62,858) | 0 |
+| castle-move | 723,673 | 21,360,215 (668,154) | 1,696,723 | 1,522,972 (60,819) | 0 |
+| hyrule-walk | 711,221 | 21,395,643 (666,650) | 1,681,693 | 1,513,747 (58,136) | 0 |
+
+No call was declined for its FPCR. u1 and u2 decline nothing (u1: 348 calls in one native run); about 3% of affine and 4% of sphere calls are declined by
 the value rules (which value was not looked into: they run translated, as before). FPSR: in about 19 u1 calls a run the
 translated code raised a flag beyond IXC (the outward step of an exact zero gives a subnormal double, whose narrowing
 raises IDC under FZ); the native path sets only IXC. FPSR is read back only by the SDK's context save / restore (4.1):
@@ -531,3 +539,10 @@ not a difference the game sees.
 **Switches**: `HL_MATH` (0: nothing native; 1, the default: the validated units native), `HL_MATH_UNITS=u1,u2,affine,
 sphere` (choose units, validated or not), `HL_MATH_CHECK=1`, `HL_MATH_LOG=1`. All four units are validated (the check
 above) and native by default.
+
+**Validation with the four units native** (main PC, `build/s5/valid.sh`, tag `s7v`): the three scenes ran to the end
+(112 s), no crash, game speed ratio 59.7 (kokiri-idle), 59.9 (castle-move), 59.9 (hyrule-walk); calls answered natively
+in the run, e.g. castle-move: u2 384,334, affine 11,894,740, u1 904,874, sphere 820,467. The last shots of each scene
+look right (no black, missing geometry or tint); what they show differs from the reference shots as the reference runs
+differ among themselves (the scenes' timing moves the characters). Memory: game RAM 2.8 / 3.2 / 3.3 GB, process RAM
+7.1 / 8.2 / 7.7 GB (kokiri-idle / castle-move / hyrule-walk): these kernels allocate nothing.

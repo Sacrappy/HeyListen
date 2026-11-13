@@ -324,7 +324,9 @@ So, in this order:
    not days: it must be bit-exact on Havok's internal formats, and a native version must reproduce the guest's fused
    multiply-adds, its min/max rules for NaN, flush-to-zero and the ARM reciprocal square root estimate.
 4. **The model-bounds kernels** (`0x80ba6d80`, `0x800a8400`, `0x81746440`): small, fully read; they build the hook list
-   for directly called functions and the differential check. Their gain is small (0.1-0.2 ms at best).
+   for directly called functions and the differential check. Their gain is small (0.1-0.2 ms at best). (Done, with
+   `0x81a040bc`: native by default behind `HL_MATH`, bit-exact by `HL_MATH_CHECK` in the three scenes;
+   `physics-loops.md` section 8.)
 
 **The 3.2 ms target is not reachable in 7 to 10 days by these means.** A realistic reading of the numbers for that span:
 steps 1 and 2 and the kernels, for about 1 ms of the chain if every estimate holds, none of them measured yet. Physics
