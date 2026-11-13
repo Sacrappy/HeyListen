@@ -678,3 +678,63 @@ counted 200 to 700 times a run: every logged case is a module worker whose lane 
 at its leave (the lane status word is shared by the module set's contexts and other threads of the same core, and the
 guest's floor at 0 absorbs decrements, as for the stage owner above); the lane was idle at the leave in every logged
 case. `HL_JOBGROUP=1` is the default (with `HL_JOBS` on); `HL_JOBGROUP=0` leaves the gate off (the translated function).
+
+## The module system's twins (`0x800711c0`, `0x80070b20`, read whole for brick 3.6)
+
+Read from the guest instructions of the registration twin `0x800711c0` (264 instructions) and the wait twin `0x80070b20`
+(132), against the stages' protocol above.
+
+**The registration twin** (W, G): two arguments, a worker set and a module group, and no `send`: the message is always
+sent. Against the actors' registration it differs in five places, in this order:
+
+1. When G's graph is made (flags bit 0) and has no job (`+0x28` 0), W's scheduler is set to 0 and nothing else is done
+   (the actors' begin forms do this before their registration; here the twin does it).
+2. Otherwise W's scheduler is set to G and, under G's mutex, G is **seeded**: every job of the graph's list (`+0x30`,
+   count `+0x28`) whose waiting count is 0, in the list's order, goes into the heap as the push puts it there (at the
+   end and up; a full heap is not filled) and the take count goes up by one. A job with a pre-push hook first gets its
+   runners from the hook's first virtual function (called with the hook and the job's object word): the answer's low 16
+   bits become the 32-bit runner word and its bit 16 the cancel flag, and when that gives no runner the job gets one
+   runner and no cancel (it is never complete at once, unlike the push).
+3. The registration proper is the actors' step for step, on the group's list of contexts (`+0x38` count, `+0x3c` room,
+   `+0x40` the array) and the group's flags (`+0xc4`, bit 2 the owner polls). The current core is read twice: the first
+   read is the own context's lane, the second the core whose worker an owner that takes part leaves out (the actors'
+   registration reads it twice too and uses one value).
+4. The workers made ready, between two full barriers, exactly as the actors' (state, flags, wake and done events,
+   scheduler).
+5. Every registered worker is marked "sent its message" and sent message 1, the usual message function inlined as in the
+   actors' registration.
+
+**The wait twin** (W) is the actors' stage wait instruction for instruction, but for the owner's part: the module group
+`0x8007fe60` on the set's own context instead of the dispatcher.
+
+**Who calls them**: the wait twin is called by the module system's frame `0x80706be0` (four registrations and waits a
+frame, through the graph's making `0x80070ea0`, which ends by calling the registration twin), `0x80070d30`, `0x839fbe40`
+and `0x83b7b130`; the registration twin also by `0x80781b00` on the SceneLowPriority thread, three times, **with no wait
+after**: those stages are started and left to end on their own (their workers leave the group when it is over and signal
+their done events; the next registration of the set clears them). In the game every set that the module system's frame
+registers has its owner taking part (the own context is registered and run by the main thread through the group).
+
+### The twins natively (`HL_MODSTAGES`, brick 3.6)
+
+`hl::bridge::Stages` answers both twins through two entry gates (`HL_GATE` in `engine/host/hl_jobs.c`), with the same
+code as the actors' registration and wait and what differs as data: where the scheduler's list and flags are, the core
+read twice, the seed (`hl::bridge::JobGroup::seed`, under the group's mutex, with the group's own up-sift and the hook
+called as the guest calls it), the owner's part run by the native group. Only with `HL_JOBGROUP` on.
+
+`HL_STAGES_CHECK=1` checks the twins with the actors' invariants (every registered worker started once and waited for
+once, done only after leaving the group, the stage over at the wait's end, the mask and count unchanged) and compares
+each twin registration with the translated twin's: the translated twin runs first on the same set and group while every
+worker of the set is shown as not running (its inlined message function then queues nothing), its writes are read back
+(W's scheduler, mask, count and own context, the group's list, flags, heap items, heap size and take count, the workers'
+words), the heap and the take count are put back, and the native twin runs over it. A registration is not compared when
+that would have a side effect: a root job with a hook (the hook would be called twice) or a worker whose message
+function is not the usual one. A set registered again before anybody waited for its last stage is an overlap only when a
+worker that stage started is still in its group; otherwise it is counted apart ("stages over and not waited for").
+
+Validated 2026-11-13 on the PC 3050 only (the main PC was not to be used; function and picture, no speed measured),
+`HL_MODSTAGES=1 HL_STAGES_CHECK=1 HL_JOBGROUP_CHECK=1 HL_DISPATCH_CHECK=1`: the three scenes with shots (right: the
+castle town, the Kokiri scene, the Hyrule walk ending in the town girl's dialogue as in earlier runs). A castle run:
+about 50,000 twin registrations, 41,000 compared with the translated twin (0 differ), 8,800 not compared (a root with a
+hook), 14,700 stages started by SceneLowPriority and never waited for (over when registered again), 35,000 twin waits,
+each with the owner's part run by the native group; every invariant 0, the dispatcher's and the group's too; game speed
+ratio about 60. `HL_MODSTAGES=1` is the default; `HL_MODSTAGES=0` leaves the two gates off.

@@ -18,7 +18,7 @@ Rules of this tree:
 | Module | Headers | State |
 |---|---|---|
 | Job system: workers, dependencies, lanes for gameplay jobs | `hl/jobs/JobSystem.h`, `hl/jobs/GuestLanes.h` | first version, tested; runs the game's stages behind `HL_JOBS` |
-| Main loop: phases, frame step, pacing | `hl/app/MainLoop.h` | first version, tested; not in the game yet |
+| Main loop: phases, frame step, pacing | `hl/app/MainLoop.h`, `hl/bridge/FrameLoop.h` | in the game behind `HL_MAINLOOP` (off by default): the game's frame steps are its phases |
 | Job bridge: the game's job entry points and the structures read in place | `hl/bridge/JobBridge.h` | in the game behind `HL_JOBS`: 1 entry point of 18 answered (`hl::bridge::ready()` lists what is left) |
 | Memory: which cold pages of static GPU data and of the game's heaps leave the working set | `hl/mem/ColdPages.h` | in the game behind `HL_MEM_COLD` (on) and `HL_MEM_COLD_HEAPS`, through `engine/host/hl_mem.c` (`docs/native-engine/memory-boundary.md`, sections 8 and 11) |
 | Graphics front end: the recording pass, its check, the output seam | `hl/gfx/RecordPass.h`, `hl/gfx/PassCheck.h`, `hl/gfx/Commands.h`, `hl/bridge/GfxBridge.h` | in the game behind `HL_GFX` (the listener `0x806602e0` native, its phases translated) and `HL_GFX_CHECK` |

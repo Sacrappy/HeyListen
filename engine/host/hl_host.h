@@ -24,6 +24,13 @@ void hl_answer(uint64_t guest, A64Fn fn, HlOn on, const char *what);
    when the module's switch is on and hl_supported_build() says 1. */
 #define HL_GATE(addr, hash) volatile int hl_gate_on_##addr; int hl_gate_##addr(Ctx *c)
 
+/* Whether the gates are in the lifted code: nx2/hl_gates.py puts, beside each gate it puts in, a constructor that calls
+   hl_gate_present(address) at start; a gate left out (its function's text hashes otherwise in this lift) never says so.
+   hl_gates_in: 1 when every one of the n addresses is in; otherwise 0, and one log line naming `what` and the missing
+   ones. A module whose gates share state (half native, half translated otherwise) switches them on only together. */
+void hl_gate_present(unsigned long long guest);
+int hl_gates_in(const char *what, const uint64_t *guest, int n);
+
 /* The translated function at a guest address (the lifted table's, whatever answers the address now); NULL when there is
    none. For a module that runs the translation itself, beside its native answer (a check, a fallback). */
 A64Fn hl_translated(uint64_t guest);

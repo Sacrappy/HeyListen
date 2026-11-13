@@ -48,10 +48,11 @@ void hl_bridge_worker_message(uint64_t worker, uint64_t message);
    the dispatcher itself is calling the translated one). */
 int hl_bridge_dispatch_gate(uint64_t scheduler, uint64_t context);
 
-enum { HL_STAGES_NATIVE = 1, HL_STAGES_CHECK = 2 };
+enum { HL_STAGES_NATIVE = 1, HL_STAGES_CHECK = 2, HL_STAGES_MODULE = 4 };
 
-/* After hl_bridge_start: the stage protocol answered natively (hl::bridge::Stages) with HL_STAGES_* bits. Returns 1 when
-   it is (the bridge started and HL_STAGES_NATIVE given). */
+/* After hl_bridge_start and hl_bridge_jobgroup_start: the stage protocol answered natively (hl::bridge::Stages) with
+   HL_STAGES_* bits: HL_STAGES_NATIVE the actors' registration, wait and last stage, HL_STAGES_MODULE the module system's
+   twins of the registration and the wait (only with the job group native). Returns the bits of the two that are on. */
 int hl_bridge_stages_start(int stages);
 
 /* The entry gates of the registration (hl::bridge::kStageRegister), the stage wait (kStageWait) and the last stage
@@ -60,6 +61,10 @@ int hl_bridge_stages_start(int stages);
 int hl_bridge_stage_register(uint64_t set, uint64_t send);
 void hl_bridge_stage_wait(uint64_t set);
 void hl_bridge_stage_last(uint64_t manager);
+/* The module system's twins: the registration (hl::bridge::kModuleRegister; 1 when it answered, 0 to let the translated
+   twin run for its own check) and the wait (kModuleWait; always answers). */
+int hl_bridge_stage_register_module(uint64_t set, uint64_t group);
+void hl_bridge_stage_wait_module(uint64_t set);
 /* The stages' counters, one line (0 when they are not native). Returns the length written. */
 int hl_bridge_stages_report(char *out, size_t cap);
 
@@ -76,6 +81,17 @@ int hl_bridge_jobgroup_report(char *out, size_t cap);
 
 /* One line of counters for the log. Returns the length written. */
 int hl_bridge_report(char *out, size_t cap);
+
+enum { HL_MAINLOOP_NATIVE = 1, HL_MAINLOOP_CHECK = 2, HL_MAINLOOP_LOG = 4 };
+
+/* After hl_bridge_start: the game's main loop driven by the native one (hl::bridge::FrameLoop) with HL_MAINLOOP_* bits.
+   scratch: 32 bytes of guest memory for the frame's SDK queries' answers. Returns 1 when it is (the bridge started). */
+int hl_bridge_mainloop_start(int flags, uint64_t scratch);
+/* The entry gate of the framework's main loop (hl::bridge::kMainLoop), on the main thread: frames forever. */
+void hl_bridge_mainloop_run(uint64_t framework);
+/* (HL_MAINLOOP_CHECK) the module system's frame (hl::bridge::kModuleFrame) about to run and having run. */
+void hl_bridge_mainloop_calc_begin(uint64_t object);
+void hl_bridge_mainloop_calc_end(uint64_t object);
 
 #ifdef __cplusplus
 }

@@ -83,7 +83,10 @@ static_assert(offsetof(GroupHeap, size) == 12);
 
 /// A group scheduler of the module system.
 struct Group {
-    uint8_t _0[0x38];
+    uint8_t _0[0x28];
+    int32_t jobs;         ///< jobs in the graph
+    uint32_t job_room;
+    GuestAddr job_list;   ///< an array of the graph's job records' addresses
     int32_t context_count;
     uint32_t context_room;
     GuestAddr contexts;   ///< an array of dispatch contexts' addresses
@@ -95,7 +98,10 @@ struct Group {
     uint32_t flags;       ///< bit 1: the group is over
     int32_t take_count;   ///< jobs that may be taken from the heap, handed out by compare-and-swap
 };
+static_assert(offsetof(Group, jobs) == 0x28);
+static_assert(offsetof(Group, job_list) == 0x30);
 static_assert(offsetof(Group, context_count) == 0x38);
+static_assert(offsetof(Group, context_room) == 0x3c);
 static_assert(offsetof(Group, contexts) == 0x40);
 static_assert(offsetof(Group, heap) == 0x48);
 static_assert(offsetof(Group, mutex) == 0x58);
@@ -140,6 +146,11 @@ public:
     /// The guest's push, natively; the caller holds the group's mutex (a job with a pre-push hook goes to the guest's own
     /// push).
     void push(GuestThread as, GuestAddr group, GuestAddr job);
+    /// The seed of the module system's registration twin (0x800711c0), natively: under the group's mutex, every job of
+    /// the graph's list that waits for none goes into the heap in the list's order, as the push puts it there, except that
+    /// a job with a pre-push hook gets its runners from the hook here and one runner when the hook gives none (it is never
+    /// complete at once). Returns the jobs seeded; `hooks` gets how many of them had a hook.
+    uint32_t seed(GuestThread as, GuestAddr group, uint32_t& hooks);
 
     const Options& options() const { return options_; }
     const Stats& stats() const { return stats_; }
