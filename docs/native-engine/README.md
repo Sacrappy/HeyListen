@@ -1,9 +1,95 @@
 # HeyListen native engine: plan, inventory, boundary
 
+**The directive below is this project's main reference; the rest of this document serves it.**
+
 Decided by the project owner on 2026-11-13, after the translated code's speed stopped moving (`docs/tickets/SPRINT-5.md`,
 sessions 5 and 6): the game's engine is no longer optimised as translated ARM code. Its infrastructure is to be replaced,
 one subsystem at a time, by native x64 C++ written for this project (`engine/native/`). The translated binary stays as the
 functional reference, and as the way the gameplay still runs until its turn comes.
+
+## The directive (project owner, 2026-11-13): the reference for everything below
+
+### 1. Vision and final objective: an engine 100% native x64 (`hl::*`)
+
+The game's engine as translated from ARM is to be **replaced entirely by this project's own C++20 engine, written for
+x64** (`engine/native`). Only the purely gameplay logic and the game's data are kept.
+
+The replacement is **progressive and in production**: brick by brick, each native subsystem switched on in the game at
+once, validated in the three scenes (picture, fps, RAM and VRAM) and committed before the next one starts.
+
+### 2. Pillar 1: RAM and VRAM strictly apart (the break with ARM's unified memory)
+
+On the console memory is unified: the game keeps its graphics resources in its heap because that heap *is* the video
+memory. On a PC with a dedicated GPU the same model makes redundant copies (more than 12 GB of RAM and 10 GB of VRAM).
+The x64 engine keeps **RAM for the CPU only** and **VRAM for the GPU only**:
+
+1. **GPU pools without CPU access** (664 MB, step 1): 0 MB of host RAM, allocated in VRAM alone (device-local memory).
+2. **Static GPU resources in CPU-cached pools** (3,770 MB of textures, geometry, shader code, step 2): once a resource
+   is in VRAM its RAM is released (the guest pages decommitted), with a page trap as the safety net for the rare pages
+   the CPU reads again. In the end (step 5) the native resource loader streams from the file to VRAM and these assets
+   are never stored in the guest heap.
+3. **No copy a frame** (the 46 MB a frame of NVN command memory and dynamic buffers): RAM is no longer copied to VRAM to
+   show a frame. Dynamic buffers (uniform blocks, per-frame constants, streamed vertices) use memory that is both
+   device-local and host-visible (Resizable BAR), written by the CPU in place. The capture of the NVN command lists
+   goes: read in place at first, then Vulkan commands emitted directly by `hl::gfx` (step 4).
+4. **The 2.8 to 5 GB "outside the game"** (this engine's caches and the GPU driver's arenas) are part of the footprint
+   and are to be dealt with: audit and cap the engine's own RAM caches (the BC cache, the capture buffers, oversized
+   staging rings) and correct the back end's Vulkan allocations that are host-visible or host-cached where device-local
+   would do.
+
+### 3. Pillar 2: native x64 performance (120+ fps)
+
+Each brick rewritten in native C++20 uses the hardware fully: AVX2 and FMA, native threads without emulated locks, cache
+locality.
+
+1. **Native graphics front end (`hl::gfx`, steps 3 and 4)**: the recording pass `0x806602e0` (1.91 ms of CPU, 0.70 ms
+   on the critical chain), then the graphics module job `0x8006cd60` and its sister jobs, emitting draw calls directly
+   to Vulkan.
+2. **Scheduler and critical chain (`hl::jobs`)**: the dispatcher and the stage registration answered natively (0.38 ms
+   on the chain); no synchronous CPU-to-GPU wait on the chain in job `0x8007c120` (a non-blocking read of frame N-1);
+   the actor stage job's six lanes balanced (1.25 ms on the chain) so that the frame does not wait for the slowest one.
+3. **Math kernels, culling and physics (`hl::math`, `hl::physics`)**: the bounding-box kernels in C++20 with AVX2/FMA;
+   for Havok (2.57 ms on the chain), without rewriting its whole state machine at once, the **compute-heavy leaf
+   functions** called in loops by the solver (`0x819b8e20`) and the collision tests replaced natively, and the serial
+   stretches (2.40 ms where one thread works alone) made parallel where their dependencies allow.
+
+### 4. How the work is run
+
+Work streams that touch different files run in parallel, as sub-agents:
+
+- **Stream 1, RAM/VRAM and caches**: step 2 (pages released after upload, on the 3,770 MB), the audit and reduction of
+  the 2.8-5 GB of engine caches and driver arenas, the 46 MB a frame.
+- **Stream 2, the graphics front end `hl::gfx`**: step 3 (`0x806602e0` in native C++20), then direct emission to Vulkan
+  (step 4).
+- **Stream 3, the CPU critical chain**: the native dispatcher (0.38 ms), the GPU wait of `0x8007c120`, the bounding-box
+  kernels in AVX2, a profile of the Havok solver's inner leaves.
+
+### How a step is reported
+
+Each step that lands comes with the same before/after table, from interleaved runs of both builds in the three scenes
+(Kokiri Forest, the castle town, Hyrule Field): **the game's RAM (MB), the process's RAM (MB), VRAM (MB), the critical
+chain (ms) and fps**. `tools/bench/steptable.py` makes it from the runs' logs.
+
+### What this document adds to the directive: the measurements it has to be held against
+
+The directive is the goal; these are the figures measured so far that bound it. They are kept here so that a step's
+table is read against them, not to argue with the goal.
+
+- **Game RAM**: 8.2 GB in the castle scene, of which 4.4 GB is CPU-side storage of GPU data (the directive's points 1
+  and 2) and 3.7 GB the game's own heaps, which graphics work does not shrink ("The graphics front end and the memory
+  target", below).
+- **Driver arenas** are the GPU driver's memory, not this engine's: the engine can lower what it asks of the driver
+  (fewer and smaller host-visible allocations, fewer imports), not free them itself. Vulkan memory the back end holds
+  in system memory was 1.6 GB in the castle scene; the capture buffers 0.66 GB.
+- **One build machine shares builds**: the game's build folder and the game folder are single, so streams that build
+  and run the game take turns on the machine (the lock) even when their files differ; static work runs truly in
+  parallel.
+- **The critical chain**: 5.8 ms sampled. The directive's list (recording pass, dispatcher, the wait of `0x8007c120`,
+  kernels, Havok leaves) is what `critical-jobs.md` and `gfx-record-job.md` size; under 3.2 ms needs the Havok part of
+  it to deliver.
+- **Exactness**: a native kernel that replaces a translated one inside physics has to give the same bits (fused
+  multiply-adds, NaN rules of min and max, flush-to-zero, ARM's reciprocal square root estimate), or the game's
+  simulation diverges from the console's. Each replacement is compared on live inputs before it is switched on.
 
 ## Rules
 
