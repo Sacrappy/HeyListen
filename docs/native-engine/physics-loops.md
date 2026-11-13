@@ -834,6 +834,11 @@ on those callees record their arguments and results, then run the native driver 
 recording and compare every write. That driver and its check are the next step; until they exist the unit stays a
 check (`validated` 0), nothing of it is native.
 
+The build with the gate (`5fe0855`, defaults: the five validated units native, `sil` off) passed the validation runs on
+the main PC (`build/s5/valid.sh`, tag `s7cv`): the three scenes ran to the end (112 s), no crash, game speed ratio 59.73
+(kokiri-idle), 60.06 (castle-move), 60.06 (hyrule-walk); the last shots of each scene look right. Memory: game RAM 2.6 /
+3.1 / 3.0 GB, process RAM 6.0 / 7.0 / 6.7 GB (kokiri-idle / castle-move / hyrule-walk).
+
 ## 10. The contact solver's `solveJacobians` `0x8177b2a0` (stream 7, third session: partial)
 
 Read: the entry, the walk over the Jacobian stream, the record header, the cache of the two bodies' velocities, the
