@@ -173,9 +173,7 @@ def main():
         links = [l.split()[6] for l in f.read().splitlines() if l.startswith("part ")]
     foreign = [u for u in links if not u.startswith((ours, "https://github.com/mstorsjo/llvm-mingw/releases/download/"))]
     if foreign:
-        sys.exit("refusing: %s names parts hosted elsewhere:
-  %s" % (LIST, "
-  ".join(foreign)))
+        sys.exit("refusing: %s names parts hosted elsewhere: %s" % (LIST, ", ".join(foreign)))
 
     # 6. notes, guide, checksums
     with open(os.path.join(ROOT, "docs", "release", "RELEASE_NOTES.md"), encoding="utf-8") as f:
