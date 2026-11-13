@@ -720,7 +720,7 @@ void hos_memsplit_init(void) {
         CloseHandle(CreateThread(NULL, 0, discard_main, NULL, 0, NULL));
     }
     hl_mem_init();   /* (HL_MEM_COLD, hl_mem.c: after the trap, which it stays off for) */
-    hl_drop_init();  /* (HL_MEM_DROP, hl_drop.c) */
+    if (!hos_gp_wanted()) hl_drop_init();   /* (HL_MEM_DROP, hl_drop.c: says it is off; with the substrate it starts once the window is reserved) */
 }
 #else
 void hos_memsplit_pool(uint64_t addr, uint64_t size, uint32_t flags, int add) { (void)addr; (void)size; (void)flags; (void)add; }

@@ -85,6 +85,7 @@ int hos_reserve_guest_pages(int write_watch) {
             hos_gp_granule() >> 10);
     void hos_gp_check_start(void);   /* (hos_gpcheck.c: the counters, and HOS_GUEST_PAGES_TEST) */
     hos_gp_check_start();
+    hl_drop_init();   /* (HL_MEM_DROP, hl_drop.c: the policy over the substrate) */
     return 1;
 }
 
