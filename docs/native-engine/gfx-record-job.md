@@ -657,6 +657,26 @@ the tests only, not in the game. No call took the query, callback or inline path
 translation) are 0.01-6% of the calls. The render-state check ran in the same runs: 0 mismatches (castle-move 53,902
 calls, 1,767,096 NVN calls; kokiri-idle 61,777 / 2,029,526; hyrule-walk 56,788 / 1,865,084).
 
+Native (`HL_GFX_DRAW=1`, PC 3050, three runs a scene, the last with shots every 600 frames): every run went to the end
+with no crash and the save unchanged; in the shot runs 91,743 / 104,121 / 110,817 native submissions (castle-move /
+kokiri-idle / hyrule-walk, all pre-recorded), 6,228 / 16 / 20 left to the translation (clusters). The last shots of
+each scene show the scene whole (geometry, shadows, characters, text), as in the reference runs. The game-speed ratio
+was not logged on the PC 3050 (the runs lacked `HOS_SPEED_LOG=1`); it is measured by the main PC's validation.
+
+### Where it leads
+
+- **Skipping unchanged state** does not apply here: the unit's one state call (the geometry mode) is already skipped
+  when unchanged, by the block's +0x3b.
+- **Direct emission**: what a sink handing commands to the back end would need from this unit is small. Nearly every
+  submission is a CallCommands of a list the game recorded once (S+0x50): today the OS layer copies that recording
+  into the caller's at every call (`inline_recording`, section 3). A back-end sink could reference the recording by
+  its handle instead (the back end already registers each recording at EndRecording), keyed on the handle and the
+  command memory it lives in, and invalidated when that memory is reused (`AddControlMemory`'s sweep is the place).
+  The indexed draw needs the index buffer's GPU address, mode, type, count, base vertex and instances: all in the
+  command as it stands.
+- **The rest of the function**: the cluster paths (culling with the frustum and the depth pyramid, merging runs) are a
+  numeric kernel; they are 0.01-6% of the calls in these scenes, so they come after the draw function `0x80681320`.
+
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
   (who fills slot +32 / +44 / +48), and when; whether gameplay reads any of them in place.
