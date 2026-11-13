@@ -830,14 +830,16 @@ int hos_mods_romfs(const char *rel, char *out, size_t cap);
 /* the host bytes of a guest page when it is committed and readable now (a freed region's page is not: reading it would
    commit a zero megabyte through the commit-on-touch handler) */
 static const uint8_t *page_view(uint64_t addr, size_t n, void *ctx) {
+    /* (copied by the kernel: a page that is not committed or not readable fails the copy instead of faulting into the
+       process's handlers, whatever another thread does to it meanwhile. A first form read the page in place after a
+       VirtualQuery and left this thread stuck at its first checks in two runs) */
+    static _Thread_local uint8_t copy[4096];
+    SIZE_T got = 0;
     (void)ctx;
-    MEMORY_BASIC_INFORMATION m;
-    if (!hos_guest_range(addr, n) || !VirtualQuery(GP(addr), &m, sizeof m) || m.State != MEM_COMMIT ||
-        (m.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(m.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ |
-                                                                      PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) ||
-        (uint64_t)((const uint8_t *)m.BaseAddress + m.RegionSize - (const uint8_t *)GP(addr)) < n)
+    if (n > sizeof copy || !hos_guest_range(addr, n) ||
+        !ReadProcessMemory(GetCurrentProcess(), GP(addr), copy, n, &got) || got != n)
         return NULL;
-    return (const uint8_t *)GP(addr);
+    return copy;
 }
 
 static ZSTD_DDict *ddict_by_id(uint32_t id) {
@@ -949,7 +951,11 @@ static DWORD WINAPI pages_thread(LPVOID unused) {
         Sleep(500);
         /* (128 MB of pages a pass at most: 1 GB a pass, with the cold-pages thread's pages read back from the page
            file, froze a run on the PC 3050 for a minute) */
-        hl_stream_pages_check(hos_now_ns(), page_view, NULL, (size_t)1 << 15, restore_test, NULL);
+        const int64_t t0 = hos_now_ns();
+        const size_t n = hl_stream_pages_check(t0, page_view, NULL, (size_t)1 << 15, restore_test, NULL);
+        static int slow;
+        if (hos_now_ns() - t0 > 2000000000LL && slow++ < 8)
+            hos_log("hl stream pages: a pass of %zu ranges took %.1f s", n, (hos_now_ns() - t0) / 1e9);
         if (hos_now_ns() - last < 10000000000LL) continue;
         last = hos_now_ns();
         static char table[16384];
