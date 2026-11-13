@@ -9,7 +9,10 @@
    At a crash (the unhandled exception report, and the OS layer's FATAL, among them a call to an address with no
    function) the report says which block the faulting address and each register are in, live or freed, allocated and
    freed by whom and when, then the last 200 events of the crashing thread and the last 50 of every other thread merged
-   by time; and hl_trace.bin is written in the game's folder.
+   by time, the same lines also into hl_trace_crash.txt; and hl_trace.bin is written in the game's folder.
+   The back end (gpu/vk, through the renderer interface's trace_gpu) records its writes into guest memory (write-backs and
+   the lazy release's), its mirrors made and given back, imports made and given back and readback pages: a block's report
+   says which of them covered it, when, in which submission, and how far the GPU was.
    HL_TRACE_DUMP=<s>: also write hl_trace.bin <s> seconds after the start (runs that end by being stopped), after a
    report as a crash prints it (with the last 3 events of each thread). */
 #include "hl_host.h"
@@ -120,7 +123,22 @@ HL_GATE(814e6d50, "3b72a1fb983c411a") { return alloc_gate(c, 0x814e6d50, 1, -1);
 HL_GATE(80709580, "e67268a6064c41d8") { return free_gate(c, 0, -1); }
 
 static const char *thread_name(void) { return hos_thread_name(hos_self()); }
-static void out_line(const char *line) { hos_log("%s", line); }
+/* (at a crash the report also goes to hl_trace_crash.txt, written through at each line: a log queue the process's end
+   does not drain loses nothing there) */
+static FILE *crash_file;
+static void out_line(const char *line) {
+    hos_log("%s", line);
+    if (crash_file) {
+        fputs(line, crash_file);
+        fputc('\n', crash_file);
+        fflush(crash_file);
+    }
+}
+
+/* (rx_backend.c gives it to the back end: vk_api.h trace_gpu) */
+void hl_trace_gpu(uint32_t what, uint64_t guest, uint64_t size, uint64_t pool, uint64_t value, uint64_t done) {
+    hl_trace_gpu_record(what, guest, size, pool, value, done);
+}
 
 /* (the crash reporter, mkw_glue.c, and hos_fatal, hos_thread.c) */
 void hl_trace_on_crash(Ctx *c, uint64_t fault) {
@@ -129,9 +147,14 @@ void hl_trace_on_crash(Ctx *c, uint64_t fault) {
     static const char *const names[31] = {"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
                                           "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21",
                                           "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30"};
-    hl_trace_report(fault, c ? c->x : NULL, names, c ? 31 : 0, 200, 50);
-    hos_log("TRACE: %s hl_trace.bin", hl_trace_write("hl_trace.bin") ? "could not write" : "wrote");
     hos_log_flush();
+    crash_file = fopen("hl_trace_crash.txt", "w");
+    hl_trace_report(fault, c ? c->x : NULL, names, c ? 31 : 0, 200, 50);
+    hos_log_flush();
+    const int failed = hl_trace_write("hl_trace.bin");
+    out_line(failed ? "TRACE: could not write hl_trace.bin" : "TRACE: wrote hl_trace.bin");
+    hos_log_flush();
+    if (crash_file) fclose(crash_file), crash_file = NULL;
 }
 
 static DWORD WINAPI dump_after(void *p) {

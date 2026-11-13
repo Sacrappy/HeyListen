@@ -48,6 +48,14 @@ static HlTraceFree *freed;
 static uint32_t freed_mask;
 static _Atomic uint64_t freed_head;
 static _Atomic uint64_t n_allocs, n_frees, n_unknown, n_full;
+/* the back end's writes into guest memory, mirrors and imports: a ring */
+typedef struct {
+    uint64_t guest, size, pool, value, done, stamp;
+    uint32_t what, tid;
+} GpuRecord;
+enum { GPU_RECORDS = 1 << 18 };
+static GpuRecord *gpu;
+static _Atomic uint64_t gpu_head, gpu_done;
 
 uint64_t hl_trace_now(void) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -76,7 +84,8 @@ int hl_trace_start(uint32_t mask, const HlTraceConfig *config) {
     const uint32_t nfreed = cfg.freed_slots ? cfg.freed_slots : 1u << 20;
     freed_mask = nfreed - 1;
     freed = calloc(nfreed, sizeof *freed);
-    if (!freed) return 0;
+    gpu = calloc(GPU_RECORDS, sizeof *gpu);
+    if (!freed || !gpu) return 0;
     for (int s = 0; s < STRIPES; s++) {
         atomic_flag_clear(&stripes[s].lock);
         stripes[s].slot = calloc(stripe_slots, sizeof(HlTraceRecord));
@@ -200,6 +209,16 @@ void hl_trace_free(uint64_t block, uint64_t heap, const uint32_t *chain) {
     freed[at & freed_mask] = f;
 }
 
+void hl_trace_gpu_record(uint32_t what, uint64_t guest, uint64_t size, uint64_t pool, uint64_t value, uint64_t done) {
+    if (!hl_trace_mask || !gpu) return;
+    hl_trace_event(HL_EV_GPU, guest, size, what);
+    Ring *r = ring();
+    const uint64_t at = atomic_fetch_add_explicit(&gpu_head, 1, memory_order_relaxed);
+    gpu[at & (GPU_RECORDS - 1)] = (GpuRecord){guest, size, pool, value, done, hl_trace_now(), what, r ? r->tid : 0xffffffffu};
+    uint64_t d = atomic_load_explicit(&gpu_done, memory_order_relaxed);
+    while (done > d && !atomic_compare_exchange_weak(&gpu_done, &d, done)) {}
+}
+
 int hl_trace_lookup(uint64_t addr, HlTraceRecord *live, HlTraceFree *fr) {
     int got = 0;
     HlTraceRecord lv;
@@ -263,11 +282,39 @@ static void print_record(const char *what, const HlTraceRecord *r, uint64_t now)
          (unsigned long long)r->heap, (unsigned long long)r->size, ch);
 }
 
+static const char *gpu_what(uint32_t w) {
+    static const char *const names[] = {"?", "write-back", "lazy release's write-back", "mirror made", "mirror given back",
+                                        "import made", "import given back", "readback page"};
+    return w < sizeof names / sizeof names[0] ? names[w] : "?";
+}
+
+/* The back end's latest records over [lo, hi): its writes into guest memory first (the newest 6), and the mirrors and
+   imports of the pools there (the newest 3). */
+static void print_gpu(uint64_t lo, uint64_t hi, uint64_t now) {
+    if (!gpu) return;
+    const uint64_t head = atomic_load(&gpu_head), done = atomic_load(&gpu_done);
+    const uint64_t n = head < GPU_RECORDS ? head : GPU_RECORDS;
+    int writes = 0, lives = 0;
+    for (uint64_t k = 1; k <= n && (writes < 6 || lives < 3); k++) {
+        const GpuRecord *g = &gpu[(head - k) & (GPU_RECORDS - 1)];
+        if (!(g->guest < hi && lo < g->guest + (g->size ? g->size : 1))) continue;
+        const int write = g->what == 1 || g->what == 2;
+        if (write ? writes++ >= 6 : lives++ >= 3) continue;
+        outf("TRACE:     %s by the back end %.3f ms ago on %s: [%#llx, %#llx) of pool %#llx, submission %llu (the GPU had "
+             "done %llu then; %llu at the last record)", gpu_what(g->what), ms_ago(g->stamp, now), ring_name(g->tid),
+             (unsigned long long)g->guest, (unsigned long long)(g->guest + g->size), (unsigned long long)g->pool,
+             (unsigned long long)g->value, (unsigned long long)g->done, (unsigned long long)done);
+    }
+}
+
 static void print_block(const char *what, uint64_t addr, uint64_t now) {
     HlTraceRecord live;
     HlTraceFree fr;
     const int got = hl_trace_lookup(addr, &live, &fr);
-    if (!got) return;
+    if (!got) {   /* (no block: the back end's records of the address itself) */
+        print_gpu(addr, addr + 1, now);
+        return;
+    }
     if (got & 2) {
         outf("TRACE: %s %#llx is in a FREED block %#llx (+%#llx)%s", what, (unsigned long long)addr,
              (unsigned long long)fr.freed.addr, (unsigned long long)(addr - fr.freed.addr),
@@ -280,6 +327,9 @@ static void print_block(const char *what, uint64_t addr, uint64_t now) {
              (unsigned long long)(addr - live.addr));
         print_record("allocated", &live, now);
     }
+    const uint64_t lo = (got & 1) ? live.addr : fr.freed.addr;
+    const uint64_t size = (got & 1) ? live.size : fr.freed.size;
+    print_gpu(lo, lo + (size ? size : 1), now);
 }
 
 static const char *kind_name(uint32_t kind) {
@@ -289,6 +339,7 @@ static const char *kind_name(uint32_t kind) {
     case HL_EV_HEAP: return "heap";
     case HL_EV_UNMAP: return "unmap";
     case HL_EV_NVN: return "nvn";
+    case HL_EV_GPU: return "gpu";
     case HL_EV_COLD: return "cold";
     case HL_EV_DROP: return "drop";
     case HL_EV_ZERO: return "zero";
@@ -356,7 +407,7 @@ void hl_trace_counts(uint64_t *allocs, uint64_t *frees, uint64_t *unknown_frees,
 /* ---- the file (tools/bench/hltrace.py) ----
    "HLTRACE1", ticks a millisecond (double), the clock now (u64), ring events (u32), rings (u32); each ring: name (32),
    id (u32), head (u64), its events (ring events x 32 bytes); frees kept (u32), freed head (u64), the freed ring
-   (HlTraceFree each); live slots (u32), the live table (HlTraceRecord each, address 0 empty). */
+   (HlTraceFree each); live slots (u32), the live table (HlTraceRecord each, address 0 empty); the back end's records kept`n   (u32), their head (u64), their ring (GpuRecord each). */
 int hl_trace_write(const char *path) {
     if (!hl_trace_mask) return -1;
     FILE *fp = fopen(path, "wb");
@@ -384,6 +435,11 @@ int hl_trace_write(const char *path) {
     const uint32_t nl = stripe_slots * STRIPES;
     fwrite(&nl, 4, 1, fp);
     for (int s = 0; s < STRIPES; s++) fwrite(stripes[s].slot, sizeof(HlTraceRecord), stripe_slots, fp);
+    const uint32_t ng = GPU_RECORDS;
+    const uint64_t gh = atomic_load(&gpu_head);
+    fwrite(&ng, 4, 1, fp);
+    fwrite(&gh, 8, 1, fp);
+    fwrite(gpu, sizeof *gpu, ng, fp);
     /* (the clock as the file ends: the threads went on while it was written, and every event is older than this) */
     now = hl_trace_now();
     fseek(fp, 16, SEEK_SET);

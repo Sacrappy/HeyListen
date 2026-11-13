@@ -73,6 +73,10 @@ int main(void) {
     CHECK(hl_trace_lookup(0x15088, &live, &fr) == 2, "the rest of the freed block");
     CHECK(hl_trace_lookup(0x9999999, &live, &fr) == 0, "an address nothing knows");
 
+    /* the back end's lazy release wrote over the block (submission 41, the GPU at 39 then) */
+    hl_trace_gpu_record(2, 0x14f00, 0x200, 0x10000, 41, 39);
+    hl_trace_gpu_record(4, 0x10000, 0x40000, 0x10000, 42, 40);
+
     /* the report on that state */
     const uint64_t regs[2] = {0x15000, 0x15028};
     const char *const names[2] = {"x0", "x1"};
@@ -81,6 +85,10 @@ int main(void) {
     CHECK(has_line("x1 0x15028 is in a FREED block 0x15000 (+0x28), since allocated again"), "a register's block");
     CHECK(has_line("x1 0x15028 is in a live block 0x15020 (+0x8)"), "the block over it");
     CHECK(has_line("by 0x80003000") && has_line("by 0x80001000 0x80002000"), "the callers");
+    CHECK(has_line("lazy release's write-back by the back end") && has_line("[0x14f00, 0x15100) of pool 0x10000, submission 41 "
+                                                                            "(the GPU had done 39 then; 40 at the last record)"),
+          "the back end's write over it");
+    CHECK(has_line("mirror given back by the back end"), "the pool's mirror given back");
     CHECK(has_line("writer3") && has_line("main") && has_line(" free "), "the events with the threads' names");
 
     /* the rings, through the file: each writer's last EVENTS events whole and in order */

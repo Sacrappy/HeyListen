@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 12
+#define MKWVK_API_VERSION 13
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -131,7 +131,20 @@ typedef struct MkwVkHost {
     /* (hookshot) the game's romfs folder (--romfs, or romfs beside the executable): the overlays read the game's own menu font
        from it (gpu/vk/vk_imgui.cpp), in memory only */
     const char *(*romfs_dir)(void);
+    /* (HeyListen, HL_TRACE: host/hl_trace.h; NULL when the crash recorder is off) the back end's writes into guest memory
+       and its mirrors' and imports' lives, for the recorder's crash report: what (MKWVK_TRACE_*), the guest range, the
+       pool's guest start, the submission's timeline value the write is recorded in, and the GPU's completed value now */
+    void (*trace_gpu)(uint32_t what, uint64_t guest, uint64_t size, uint64_t pool, uint64_t value, uint64_t done);
 } MkwVkHost;
+enum {
+    MKWVK_TRACE_WRITEBACK = 1,     /* a mirror's GPU writes copied into guest memory (in a submission) */
+    MKWVK_TRACE_LAZY = 2,          /* the same, by the lazy release of a mirror holding left-out write-backs */
+    MKWVK_TRACE_MIRROR_MADE = 3,   /* a pool's mirror made (the range: the pool) */
+    MKWVK_TRACE_MIRROR_FREED = 4,  /* a pool's mirror given back (value: the submission after which it is freed) */
+    MKWVK_TRACE_IMPORT_MADE = 5,   /* a pool's guest memory imported for the GPU */
+    MKWVK_TRACE_IMPORT_GONE = 6,   /* a guest range no import pins any more */
+    MKWVK_TRACE_READBACK = 7,      /* a readback page noted (the CPU reads GPU results there) */
+};
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */
 typedef struct MkwVkRenderer {

@@ -1657,6 +1657,7 @@ struct WbPages {
 } wb_pages;
 void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value) {
     static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
+    if (guest_hi > guest_lo) trace_gpu(MKWVK_TRACE_WRITEBACK, guest_lo, guest_hi - guest_lo, 0, value);
     if (off || !value || guest_hi <= guest_lo) return;
     std::lock_guard lk(wb_pages_mu);
     for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) wb_pages.set(p, value);
@@ -3563,6 +3564,7 @@ void bg_drain() {
         }
         if (imp != imported.end()) retire_pool(imp);
         imported.emplace(lo, p);
+        trace_gpu(MKWVK_TRACE_IMPORT_MADE, p.lo, p.hi - p.lo, p.lo, mem_rec_value);
         guest_pages_set(p.lo, p.hi, p.address);
     }
 }
@@ -3759,6 +3761,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
             if (o != imported.end()) retire_pool(o);
         }
         imp = imported.emplace(p.lo, p).first;
+        trace_gpu(MKWVK_TRACE_IMPORT_MADE, p.lo, p.hi - p.lo, p.lo, mem_rec_value);
         guest_pages_set(p.lo, p.hi, p.address);
         noaccess_import_note(range.lo, range.hi, p.lo, p.hi);
         if (chunk) prefetch_chunks(p.lo, p.hi, chunk);
@@ -4904,6 +4907,7 @@ void rb_hazard_locked(uint64_t lo, uint64_t hi) {   // (pools_mu held)
 void memory_note_readback(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_NO_RB_REFRESH") != nullptr;
     if (off || !size || size > 0x4000) return;   // (small results only: meters and counters)
+    trace_gpu(MKWVK_TRACE_READBACK, guest, size, 0, 0);
     std::lock_guard lk(pools_mu);
     for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) {
         rb_pages[(uint32_t)pg] = mirror_epoch;
@@ -5470,6 +5474,7 @@ void mirror_free(Pool& p) {
         const auto live = imported.find(p.lo);
         if (live != imported.end() && &live->second == &p) guest_pages_set(p.lo, p.hi, p.address);
     }
+    trace_gpu(MKWVK_TRACE_MIRROR_FREED, p.lo, p.hi - p.lo, p.lo, std::max(mem_rec_value, p.last_value));
     dead_mirrors.push_back({p.mirror, p.mirror_alloc, std::max(mem_rec_value, p.last_value)});
     shadow_free(p);
     p.mirror = VK_NULL_HANDLE, p.mirror_alloc = nullptr;
@@ -5581,6 +5586,7 @@ void import_unpinned(uint64_t lo, uint64_t hi) {   // (pools_mu held)
     using Note = void (*)(uint64_t, uint64_t);
     static const Note note = (Note)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_noaccess_unimport");
     if (note) note(lo, hi);
+    trace_gpu(MKWVK_TRACE_IMPORT_GONE, lo, hi - lo, lo, mem_rec_value);
     st_unpinned_bytes += (int64_t)(hi - lo);
 }
 
@@ -5914,6 +5920,7 @@ bool mirror_make(Pool& pool) {
             }
         }
         p->mstate = Pool::MIRROR_ON;
+        trace_gpu(MKWVK_TRACE_MIRROR_MADE, p->lo, p->hi - p->lo, p->lo, mem_rec_value);
         p->mirror_id = ++diff_mirror_ids;   // (TICK-048: the diff's hashes of another mirror do not hold for this one)
         if (!p->mirror_id) p->mirror_id = ++diff_mirror_ids;
         pools_gen.fetch_add(1, std::memory_order_relaxed);   // (the binding's buffer changes: guest memory, then this mirror)
@@ -6458,6 +6465,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 if (!barrier) transfer_barrier(cmd), barrier = true;
                 vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
                 for (const VkBufferCopy& r : runs) {
+                    trace_gpu(MKWVK_TRACE_LAZY, p->lo + r.dstOffset, r.size, p->lo, mem_rec_value);
                     st_lazy_written_back += r.size;
                     wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
                 }

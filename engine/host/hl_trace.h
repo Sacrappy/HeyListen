@@ -23,6 +23,7 @@ enum {
     HL_EV_HEAP = HL_TR_KIND(HL_TR_MEM, 3),       /* heap, 1 made / 0 destroyed, caller */
     HL_EV_UNMAP = HL_TR_KIND(HL_TR_MEM, 4),      /* address, size, what (1 unmap, 2 decommit, 3 discard, 4 free pages) */
     HL_EV_NVN = HL_TR_KIND(HL_TR_MEM, 5),        /* storage, size, what (1 pool init, 2 pool final, 3 buffer init, ...) */
+    HL_EV_GPU = HL_TR_KIND(HL_TR_MEM, 6),        /* guest, size, what (MKWVK_TRACE_*: the back end's writes, mirrors, imports) */
     HL_EV_COLD = HL_TR_KIND(HL_TR_BRICKS, 1),    /* address, size, 1 out / 0 back */
     HL_EV_DROP = HL_TR_KIND(HL_TR_BRICKS, 2),    /* address, size, 1 dropped / 0 restored */
     HL_EV_ZERO = HL_TR_KIND(HL_TR_BRICKS, 3),    /* address, size, what */
@@ -72,6 +73,9 @@ int hl_trace_lookup(uint64_t addr, HlTraceRecord *live, HlTraceFree *freed);
 void hl_trace_report(uint64_t fault, const uint64_t *regs, const char *const *names, int n, int own, int others);
 /* Every ring, the freed table and the live table to a file. 0 when written. */
 int hl_trace_write(const char *path);
+/* The back end's writes into guest memory and its mirrors' and imports' lives (gpu/vk/vk_api.h MKWVK_TRACE_*): kept in
+   a ring of their own, told beside a block at a crash. done: the GPU's completed timeline value when it was recorded. */
+void hl_trace_gpu_record(uint32_t what, uint64_t guest, uint64_t size, uint64_t pool, uint64_t value, uint64_t done);
 /* (counters for the log) */
 void hl_trace_counts(uint64_t *allocs, uint64_t *frees, uint64_t *unknown_frees, uint64_t *live_full, uint64_t *threads);
 
