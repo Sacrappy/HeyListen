@@ -794,6 +794,37 @@ does not answer, is taken as written). Motions with a callback (their M124 | 2 m
 are counted and not compared, and the records after them are not walked. Nothing is native: the unit has no native mode
 yet (9.7).
 
+The first run found two mistakes of the first reading, both corrected in 9.3 and the code: steps 2 to 4 run only with A
++24 set, and the maxima's squares overflow. Results after them, PC 3050, build of `a0981ea`, `HL_MATH_CHECK=1
+HL_MATH_UNITS=sil`, full 110 s runs (the last report of each run):
+
+| scene | calls | x7 path (another caller, left) | motions | compared | declined: modifier | declined: values | mismatches (motions / records) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| castle-move | 3,673 | 608 | 173,771 | 159,823 | 13,661 | 287 | 0 / 0 |
+| kokiri-idle | 3,787 | 492 | 180,769 | 168,827 | 11,574 | 368 | 0 / 0 |
+| hyrule-walk | 2,308 | 505 | 93,740 | 84,454 | 8,712 | 574 | 0 / 0 |
+
+(hyrule-walk's last report is from earlier in its run than the others'.) **The paths' histogram** (the same in the three
+scenes): every call has a profiler holder P (so `0x800430a0` / `0x800431c8` run on every call), about one call in six
+comes with x7 (the stream-range path, from the other caller); deactivation and the cell accumulators are on in every
+call; no motion meets a callback list (the masks are 0); A +24 is set on 7-8% of the motions and each of them has the
+integration modifier (`0x818f2b2c`), so **the clamps and the n path were never taken**; 55-72% of the motions move,
+the deactivation's zero case is 40-55%; cell records are rare (about 300 a run, at the start), the writer's block never
+filled. Values declined (0.2-0.6%): squares of velocities near 1e-23 that underflow (Arm flushes them under FZ). FPCR was
+FZ only in every call. The indirect targets seen: cell set-up `0x8190ac00`, lookup `0x8190ad60`, modifier `0x818f2b2c`.
+
+### 9.7 What a native `subIntegrateLastStep` needs (not built)
+
+The check covers each motion's step and the clamp and cell records, byte for byte. A native answer of the whole
+function also writes what the check does not compare yet: the bodies' flags (+0x5c), their cache entries, the listener
+bits, the deactivation bits and records (through `0x81830268`), the cell accumulators, U3's results, and it must call,
+in the guest's order, the profiler hooks (every call has P), the cell set-up and lookup (`0x8190ac00`, `0x8190ad60`,
+every motion), the deactivation check, the modifier for the 8% of motions with one (or decline those calls), the block
+allocator and the frees of the cell cache. Its check therefore has to replay: run the translation for real while gates
+on those callees record their arguments and results, then run the native driver on the entry copies against the
+recording and compare every write. That driver and its check are the next step; until they exist the unit stays a
+check (`validated` 0), nothing of it is native.
+
 ## 10. The contact solver's `solveJacobians` `0x8177b2a0` (stream 7, third session: partial)
 
 Read: the entry, the walk over the Jacobian stream, the record header, the cache of the two bodies' velocities, the
