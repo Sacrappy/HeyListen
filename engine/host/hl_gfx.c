@@ -297,6 +297,7 @@ static A64Fn draw_translated, prepare_translated;
 static volatile LONG draw_ready;   /* as state_ready */
 static _Thread_local int t_draw_inside;   /* the gate's own call of the translated body runs on this thread */
 static _Thread_local int t_draw_armed;    /* that body's call of the preparation is the check's checkpoint */
+extern volatile int hl_gate_on_8008fc00;  /* (the checkpoint's gate, below) */
 
 static int draw_init(void) {
     for (;;) {
