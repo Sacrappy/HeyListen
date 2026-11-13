@@ -135,7 +135,7 @@ bool Drop::wait_pending(uint64_t addr) {
 }
 
 // one range's granules: the checks of the header in order, then the drop of those that pass (range lock held)
-bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
+bool Drop::decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uint64_t& looked, uint64_t& dropped) {
     const uint64_t g = config_.granule;
     std::vector<uint32_t> cold;   // granule indexes that passed every check but the comparison
     bool waiting = false;          // some granule may pass later (in use now)
@@ -153,7 +153,11 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
     }
     r.next_ns = now + config_.retry_ns;
     if (cold.empty()) return waiting || r.dropped;   // (a range with granules dropped may drop them again after a restore)
+    // (the file is decoded without the range's lock: a touch of the range's dropped granules does not wait for it, which
+    // took up to half a second for the largest files. What changed meanwhile is looked at again below)
+    lock.unlock();
     const uint8_t* src = host_.source(host_.ctx, r.src);
+    lock.lock();
     if (!src) {
         stats_.source_failed.fetch_add(1, std::memory_order_relaxed);
         refuse(Refuse::NoSource, cold.size());
@@ -170,6 +174,7 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
         pending_hi_.store(hi, std::memory_order_release);
         for (uint32_t i : cold) {
             const uint64_t a = r.first + uint64_t(i) * g;
+            if (r.state[i] != kCandidate) continue;   // (forgotten meanwhile)
             looked += g;
             if (imported(a)) { refuse(Refuse::Imported), waiting = true; continue; }   // (until its import goes, if it does)
             if (kernel_busy(a, now)) { refuse(Refuse::KernelUse), waiting = true; continue; }
@@ -254,7 +259,7 @@ uint64_t Drop::pass(int64_t now) {
     for (auto& [id, dest] : due) {
         if (looked >= config_.pass_bytes) break;
         if (host_.clock && host_.clock(host_.ctx) - t0 > config_.pass_ns) break;
-        std::lock_guard<std::mutex> l(range_lock(id));
+        std::unique_lock<std::mutex> l(range_lock(id));
         Range* r;
         {
             std::lock_guard<std::mutex> t(table_lock_);
@@ -267,7 +272,7 @@ uint64_t Drop::pass(int64_t now) {
                 continue;
             }
         }
-        if (!decide(*r, now, looked, dropped)) {
+        if (!decide(*r, l, now, looked, dropped)) {
             std::lock_guard<std::mutex> t(table_lock_);
             r->candidate = false;
             auto it = by_dest_.find(r->src.dest);

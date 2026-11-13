@@ -169,7 +169,7 @@ static int cb_plain(void *ctx, uint64_t a) {
 
 /* ---- the substrate's hook: a dropped granule touched ---- */
 static _Thread_local int in_kernel;   /* (1: hos_commit is handing guest memory to the kernel on this thread; 2: the back end imports it) */
-static volatile LONG64 restore_ns_max, restore_ns_sum, restore_count;
+static volatile LONG64 restore_ns_max, restore_ns_sum, restore_count, restore_ns_max_import;
 static int on_touch(void *p, size_t size, int write) {
     const int path = in_kernel == 2 ? HL_DROP_IMPORT : in_kernel ? HL_DROP_KERNEL
                      : hos_ctx() ? (write ? HL_DROP_GUEST_WRITE : HL_DROP_GUEST_READ)
@@ -183,8 +183,10 @@ static int on_touch(void *p, size_t size, int write) {
     const int64_t took = hos_now_ns() - t0;
     InterlockedAdd64(&restore_ns_sum, took);
     InterlockedIncrement64(&restore_count);
-    for (LONG64 m = restore_ns_max; took > m;) {
-        const LONG64 was = InterlockedCompareExchange64(&restore_ns_max, took, m);
+    /* (the longest, apart for the imports' runs: those are a 16 MB chunk's dropped granules at once, on the back end's thread) */
+    volatile LONG64 *mx = path == HL_DROP_IMPORT ? &restore_ns_max_import : &restore_ns_max;
+    for (LONG64 m = *mx; took > m;) {
+        const LONG64 was = InterlockedCompareExchange64(mx, took, m);
         if (was == m) break;
         m = was;
     }
@@ -250,9 +252,9 @@ static DWORD WINAPI drop_main(void *unused) {
             char line[1024];
             if (hl_drop_report(line, sizeof line, hos_now_ns())) {
                 const LONG64 n = InterlockedExchange64(&restore_count, 0), sum = InterlockedExchange64(&restore_ns_sum, 0),
-                             mx = InterlockedExchange64(&restore_ns_max, 0);
-                hos_log("hl drop: %s; a touch took %.2f ms on average, %.2f ms at most (since the last line); a pass %.1f ms at "
-                        "most", line, n ? sum / 1e6 / n : 0.0, mx / 1e6, worst_ms);
+                             mx = InterlockedExchange64(&restore_ns_max, 0), mi = InterlockedExchange64(&restore_ns_max_import, 0);
+                hos_log("hl drop: %s; a touch took %.2f ms on average, %.2f ms at most (an import's %.2f ms at most) (since the "
+                        "last line); a pass %.1f ms at most", line, n ? sum / 1e6 / n : 0.0, mx / 1e6, mi / 1e6, worst_ms);
             }
         }
         worst_ms = 0;

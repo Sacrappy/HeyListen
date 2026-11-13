@@ -174,7 +174,7 @@ private:
     bool imported(uint64_t granule) const;
     bool kernel_busy(uint64_t granule, int64_t now) const;
     // (returns false when the range has nothing left to try: it stops being a candidate)
-    bool decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped);
+    bool decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uint64_t& looked, uint64_t& dropped);
     static int fill(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size);   // (a restore's bytes: the spill, else a decode)
     void free_slot(Range& r, uint32_t k);
 
