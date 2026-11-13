@@ -8,7 +8,7 @@ No translated code is quoted (`README.md`, rule 4): addresses, offsets, sizes, c
 only.
 
 Status of this document: **sections 1, 2 (solver and narrow phase) and 4 are written; in section 6, U1 and U2 are
-specified completely and U3 by its structure only; the cloth loops, the ranked list of every unit and the scheduling
+specified completely, and U3 too (second session); the cloth loops, the ranked list of every unit and the scheduling
 study are partly written. What is left is listed in section 7. Section 8 says what is native now (U1, U2 and two
 kernels of the actor stage, checked bit for bit in the game).**
 
@@ -414,39 +414,65 @@ HL_ANSWER, no new lift.
 
 ### 6.3 U3: `0x817d9d80`, the per-body AABB update of the last substep
 
-**Structure read; operation order of the middle part not yet read: the specification is not complete.** 736 insns,
-called once per body by `0x8182dc20` (subIntegrateLastStep, 1 site: HL_GATE). Arguments x0 = simulation thread context
-(or 0), x1 = motion (+48, +64, +96 read), x2 = a solver per-body record (+76), x3, x4 = **the body** (written), x5 = a
-velocity / motion-state record (+0..+60 read). Global: the pointer at `0x84ca4680` (the same G as in U2: +96, +336,
-+512, +640 read).
+**Read whole (stream 7, second session; native as `u3`, section 8).** 736 insns, called once per body by `0x8182dc20`
+(subIntegrateLastStep, one site, `0x8182ecb4`). Arguments: x0 = simulation thread context (or 0), x1 = motion M, x2 =
+solver record R (104-byte entries: +32 flags, +76 a float), x3 = a box P (min 4 floats, max 4 floats), x4 = the body B
+(192 bytes, written), x5 = motion state S (+0 orientation quaternion x, y, z, w; +16, +24, +32 the centre of mass in
+binary64; +40 .. +84 floats: +64 .. +72 linear and +76 .. +84 angular velocity). G = the object at `*0x84ca4680` (+80
+four floats, +96, +336, +512, +640 float pairs). All single precision unless said, each operation separately rounded,
+no fused operation anywhere. Lanes the function computes and never uses are left out below.
 
-1. If the body flag word at body +92 has bit 10 clear: zero body +94 and +76 and go to step 3.
-2. Otherwise (a moving body): from the motion's velocities (x5 +40 / +56, x1 +96), squared magnitudes (FMUL, pairwise
-   adds), square roots, an FMIN against G +96, scaled by constants and by the 16-bit value at body +154 placed in a
-   float's high half; converted to integers toward zero (FCVTZS) and clamped to 0xffff: three 16-bit fields at body +76,
-   +78, +94 (the body's quantised speed / look-ahead values, likely). Then the body's new transform is rebuilt from the
-   motion's orientation (x5 +0, +16, +32 through byte-shuffle tables at `0x83c5e000`+1488 / +2512 / +32 and +304: a
-   quaternion-to-matrix with 4-wide multiplies and subtractions, then `0x80168130`), written to body +0..+40 (three
-   rows of 12 bytes), and the precise position written to body +48..+60 (high) and +64..+72 (low) by double
-   subtraction and conversion (same two-part scheme as section 3).
-3. Collision look-ahead: `x = max(f(body +60) - G336 * x1 +48 ..., ...)` (an FMAX pair against x2 +76), then, unless the
-   shape's flag (body +140 bit 3) selects the inline path, **the shape's AABB through the shape-type table**: pointer at
-   `0x83e40000` +2248, entry (shape +24 byte) << 9, slot +24, called with (shape at body +120, body, a stack transform):
-   this is where U1 (`0x8173e2ac`, convex) and U2 (`0x81a040bc`, box-like) are reached. The inline path quantises the
-   body's local AABB (bytes at body +157, widened to 16 then 32 bits, converted to float, times a scale from +154) and
-   transforms it like U2 (absolute rotated extents, double centre, outward nudge).
-4. Expansion by the motion: FMIN / FMAX of the static AABB with the swept one (`0x817d8c90` when the body's +32 flags of
-   x3 bit 17 ask for a linear cast), results kept in v23 / v24, stored as the body's AABB (+112..: 8 bytes stored here;
-   the other half not yet traced) and two 16-bit fields at body +148 / +150.
-5. Bookkeeping: the body's index appended to the thread context's moved-bodies arrays (+1568 with its count, +1888 /
-   +1896; grown by `0x816ef7bc`, Havok's block-stream allocator), flag word +92 updated. **These appends are what make
-   the loop's order visible**: the native unit must append in the same order (it runs per body, called in order, so it
-   does).
+1. **Speeds.** If B +92 (16-bit flags) bit 10 is clear: B +94 (16 bits) and B +76 .. +79 are zeroed; go to 3.
+   Otherwise, with a, b = M +96, +100: `q = s56² + s60²`; `l = ((s40 a)² + (s44 b)²) + (s48 a)²`; `w = (s52² + q) +
+   G640`; `mn = FMIN(sqrt l, G96)`; `aw = a · sqrt w`; `sc = ((u8 B156 · k255) + 0) · h(B154)` (k255 = bits
+   0x3b808081; h(x) = the float whose high half is the 16-bit x); `v4 = mn · sc`; then with m = M +64:
+   B +78 = signed-min(trunc(m · v4 + k), 0xffff), B +94 = unsigned-min(trunc(K · mn + k), 0xffff), B +76 =
+   unsigned-min(trunc(m · (v4 + aw) + k), 0xffff) (k = bits 0x3f7fbe77, K = bits 0x4722f8e0; trunc = FCVTZS, Arm's
+   saturation; the low 16 bits stored).
+2. **Transform (moving bodies).** The rotation is S's quaternion times the conjugate of B's own (B +160), a Hamilton
+   product computed by lanes: with m1 = m[0,2,3,1], m2 = m[3,1,0,2], c1 = c[0,3,1,2], c2 = c[3,0,2,1] (c the
+   conjugate), `d = m2 c2 - m1 c1`, `e = m2 c1 + m1 c2`, then `d` reversed (lanes 3,2,1,0) minus `e`, lanes 0 .. 2
+   negated. Rows by `0x80168130`: with t = q + q, xx = t0 q0, yx = t1 q0, zx = t2 q0, yy = t1 q1, zy = t2 q1, xw = t0 q3,
+   yw = t1 q3, zw = t2 q3, zz = q2 t2: row0 = ((1 - zz) - yy, yx + zw, zx - yw), row1 = (yx - zw, (1 - zz) - xx, zy +
+   xw), row2 = (zx + yw, zy - xw, (1 - xx) - yy). The rows' w lanes (B +12, +28, +44) are the local centre of mass c;
+   `cm = row2 c.z + (row0 c.x + row1 c.y)` per lane; position: `p = S.com - (double)cm` (binary64), high = (float)p,
+   low = (float)(p - high). Stored: three rows of 12 bytes at B +0, +16, +32; high x, y, z at +48 .. +59; low at +64 ..
+   +75. B +60 (the high w) is not written.
+3. **Margin.** `t = M48 · G336` (two lanes), `f = FMAX(FMAX(B60 - t, t), R76)`.
+4. **The shape's box** under B's transform (B +0 .. +75 is a precise transform, section 3): unless B +140 bit 3, the
+   shape at B +120 through the shape-type table (`*(*0x84ca78c8)` + (shape +24 byte) · 512, function at +24), called
+   with (shape, B, a stack box). Seen in the three scenes: `0x8173e2ac` (convex vertex set: U1, then the radius
+   shape+104 · h(shape+108) subtracted from the min and added to the max), `0x81a040bc` (U2), `0x8174bb00` (a two-vertex
+   convex: each end rotated, `e0 = row2 z0 + (row0 x0 + row1 y0)` and `e1 = (row0 x1 + row1 y1) + row2 z1`, then
+   `high + (e0 + low)` and `high + (low + e1)`, FMIN / FMAX of the two minus / plus shape +104; single precision, no
+   outward step), and `0x81a011b0`, `0x818556f0` (they call further helpers: not native). With bit 3, inline: half extents
+   `e_k = (G512_(k&1) · h(B154)) · u8 B(157+k)`; per lane `E = |row2 e2| + (|row0 e0| + |row1 e1|)`, clamped to h(B154)
+   by a signed integer minimum of the bit patterns; centre `cl = row2 B44 + (row0 B12 + row1 B28)`; `P = ((double)high +
+   (double)low) + (double)cl` (w lane: low z); min = outward(P + (double)(-E)), max = outward(P + (double)E) (section
+   6.1's step).
+5. **Growth.** `up = (f0, f1, f0, f1) + max`, `dn = min - (f0, f1, f0, f1)`. "Still" when the three linear and three
+   angular velocity components are all zero. If not still: `lin2 = s72² + (s64² + s68²)`, `ang2 = s76² + (s80² + s84²)`.
+   If lin2 > 0: `pad = FMIN(M120 · sqrt lin2, G96) · sc` (two lanes), `reach = f0 + h(B154)`; the box `com ∓ reach` in
+   binary64 (w lane 0), rounded outward; `up = FMIN(up + pad, that max)`, `dn = FMAX(dn - pad, that min)`; then f += pad;
+   else f += G80 (two lanes). With `v6 = (M120 a)` lane-wise times the angular velocity in lanes (s80, s84, s76): if R
+   +32 & 0x380 == 0x80, `s = sqrt(v6z² + (v6x² + v6y²))`, `up += G336 v6 + G336 s`, `dn += G336 v6 - G336 s`; else if
+   R +32 bit 17 and `lin2 > k_c · M104²` (k_c = bits 0x3c33abb1): the swept cast `0x817d8c90` (not native: declined,
+   0.1% of calls); else `up = FMAX(up, v6 + up)`, `dn = FMIN(dn, dn + v6)`.
+6. **Stores.** B +148 = sat16(trunc((M120 a · sqrt ang2 + f0) · M64)) (0 + f0 when still), B +150 = sat16(trunc(f0 ·
+   M64)) (signed to unsigned 16-bit saturation). Then, if not still and M +80 > 0, and the threshold `M104 · M80` is
+   above both |S +56, +60, +52| and |angular velocity| lane-wise: if the new box lies in B's stored box (B +96: max x,
+   y, z and min z; +112: min x, y) and in P, return; otherwise grow both by M80. Then (thread context needed: 0 runs
+   a Havok context lookup, declined natively) unless the stored box holds the shape's box, append a 16-byte record
+   (tag 0x0000000403000010, then B +88) to the block at context +1568; unless the grown box overlaps P, append (tag
+   0x0000000d04000010, then B +176) to the second stream's block (context +1888 +677: a signed index, -1 none; entry
+   context +1896 + 80 · index, its writer at +32, the block its first word). A block's first word: bytes used (low half,
+   records from +32) and records (high half); a full block (used >= 4048) calls the allocator `0x816ef7bc` (declined
+   natively). Finally, still bodies whose box equals the stored one return; otherwise B +92 |= 0x10 and the box is
+   stored (max with min z in its w lane at +96, min x, y at +112).
 
-To finish before coding: the exact operation order of steps 2-4 (about 400 guest instructions), the second half of the
-AABB store, and `0x817d8c90`. It is the best of the three by chain effect, because it runs entirely in the solver's
-alone stretch: J 0.141 (0.141 alone): 2x -0.071, 4x -0.106 (upper = strict). Work: 4-6 days once read, U1 and U2
-included.
+**Callers' registers.** The only caller sets every general and vector register it reads after the call, and the flags
+(`cmp` before its branches): a native answer that leaves the caller-saved registers as they were on entry is not
+visible.
 
 Expected after the three, at 4x: about -0.13 ms of the chain in the strict reading (U1's solver share and U2 counted
 once inside U3), -0.19 in the upper one. Small: their value is that they build the gate, the bridge, the exactness
@@ -461,8 +487,7 @@ strict at 4x) need.
 - The number of solver tasks a step creates, what each covers (`0x819b7700` not read), and the number of islands: so
   the scheduling gain of running islands in parallel is not a number.
 - (Settled, section 8: FZ is set, and only FZ, whenever the Havok units ran.)
-- U3 is not specified completely (6.3): the operation order of its steps 2-4, the second half of the AABB it stores
-  and its callee `0x817d8c90` must be read before coding. U1 and U2 are complete.
+- U3's swept cast `0x817d8c90` and the shape box functions `0x81a011b0`, `0x818556f0` are not read (6.3).
 - The meaning of U2's inputs (which transform x1 is, what the w lanes of the body's rows and G +80 hold) is inferred;
   the specification does not depend on it.
 - The contact solver's Jacobian stream layout (`0x8177b2a0`), the body / motion layouts (offsets beyond those named
@@ -546,3 +571,67 @@ in the run, e.g. castle-move: u2 384,334, affine 11,894,740, u1 904,874, sphere 
 look right (no black, missing geometry or tint); what they show differs from the reference shots as the reference runs
 differ among themselves (the scenes' timing moves the characters). Memory: game RAM 2.8 / 3.2 / 3.3 GB, process RAM
 7.1 / 8.2 / 7.7 GB (kokiri-idle / castle-move / hyrule-walk): these kernels allocate nothing.
+
+### 8.1 Second session: u3, the fused-sum midpoint, what is declined
+
+**u3, `0x817d9d80`** (the per-body box update, specification 6.3; `hl/math/BodyBox.h`, `src/math/BodyBox.cpp`, the body
+and the other layouts in `hl/bridge/MathBridge.h`, the C surface `hl_math_body_box`, the OS layer's `run_body` in
+`engine/host/hl_math.c`). Reached by a gate on the lifted function (`HL_GATE(817d9d80, ...)`, its one caller
+`0x8182dc20`). The native side reads copies of everything the function reads and returns a plan: the body's 192 bytes
+as the function leaves them with the bytes it stores, and the records it appends to the thread's stream blocks (block,
+offset, record, the header word afterwards). The native run writes the stored bytes and the records (and marks them
+for the write watch); the check runs the translation for real and compares the whole 192-byte body, the moved-bodies
+block's header word, and each planned record and header. The shape's box is answered for the four functions that make
+96% of the calls: the convex vertex set (`0x8173e2ac` -> u1), the oriented box (u2), and a segment's box `0x8174bb00`
+(two vertices plus the radius, single precision: `segment_box` in `Bounds.cpp`); declined, the translated function
+runs: the shapes `0x81a011b0` and `0x818556f0` (3.5%), the swept cast `0x817d8c90` (0.1%), no thread context, a full
+stream block, and values outside the rules (0.2%: squares of velocities near 1e-20 that underflow, which Arm flushes
+under FZ). Its only caller sets every register and the flags it reads after the call (read at `0x8182ecb8` .. and
+both branch targets), so what a native answer leaves in caller-saved registers is not seen.
+
+**The fused sum's midpoint rule, widened exactly.** The decline histogram (`hl math: <unit>: declined by rule: ...` in
+the log, from the `Guard`'s first failure, `hl::math::Why`) showed that every declined affine call (3%) and all but
+13 of 1.5 M sphere calls declined (4%) were on the binary32-midpoint rule of the fused multiply-add, with operands of
+short mantissas whose binary64 sum is exact (e.g. a product of -1.5 units of the addend's last place). Rounding twice
+differs from rounding once only when the binary64 sum was inexact; the `Guard` now gives up only then (exactness
+tested by Knuth's two-sum: a zero error). After it: affine declines 0 to 2 calls a run, sphere 13 to 25 (products
+that underflow, which Arm flushes under FZ: not widened, rare).
+
+Check, main PC, build of `2f924ae` (`HL_MATH_CHECK=1`, every unit checked), full runs, the last report of each run:
+
+| scene | u3 compared (declined) | u2 | affine (declined) | u1 | sphere (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|---:|
+| castle-move | 246,611 (9,994) | 401,414 | 12,484,265 (0) | 976,964 | 912,770 (13) | 0 |
+| kokiri-idle | 404,355 (33,863) | 761,782 | 23,947,254 (2) | 1,634,748 | 1,647,810 (25) | 0 |
+| hyrule-walk | 360,135 (15,742) | 648,559 | 21,404,529 (0) | 1,525,367 | 1,524,230 (13) | 0 |
+
+The same check on the PC 3050 (build of `8b2bf47`, u3 native by default otherwise), full runs:
+
+| scene | u3 compared (declined) | u2 | affine (declined) | u1 | sphere (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|---:|
+| castle-move | 147,621 (8,035) | 215,680 | 7,297,090 (0) | 507,015 | 513,282 (13) | 0 |
+| kokiri-idle | 138,276 (6,121) | 219,947 | 7,958,830 (0) | 530,411 | 545,122 (13) | 0 |
+| hyrule-walk | 167,551 (15,558) | 279,215 | 9,036,233 (0) | 606,182 | 619,576 (13) | 0 |
+
+u3's declines by reason on the main PC (castle-move / kokiri-idle / hyrule-walk): shape 8,673 / 32,957 / 14,728, cast 338 / 250 /
+317, values 983 / 656 / 697; none for FPCR (every u3 call ran with FZ set and nothing else). An earlier check build
+(before the segment shape) compared 150,959 u3 calls in castle-move with no mismatch. FPSR: in 3 to 5 u3 calls a run
+the translation raised a flag beyond IXC (as u1's, 8: not read back by the game).
+
+Calls whose output overlaps their inputs: every C surface reads all it needs before writing (tested in
+`math_test.cpp`, `outputs_over_inputs`: the same box with the output written over the inputs); u3 works on copies.
+Whether the translated functions are ever called that way in the game is what the check covers: no mismatch.
+
+**Switches**: as before (`HL_MATH`, `HL_MATH_UNITS`, `HL_MATH_CHECK`, `HL_MATH_LOG`); `u3` is a unit name, validated,
+native by default with the four others.
+
+**Validation with the five units native** (main PC, `build/s5/valid.sh`, tag `s7bv`, build of `fa783dc`): the three
+scenes ran to the end (112 s), no crash, game speed ratio 60.17 (kokiri-idle), 59.76 (castle-move), 59.99
+(hyrule-walk); u3 answered 365,279 / 395,701 / 360,936 calls natively (95%). The last shots of each scene look right
+(complete geometry, no black, tint or flicker), differing from the reference shots only as the reference runs differ
+among themselves. Memory: game RAM 2.4 / 3.2 / 3.1 GB, process RAM 6.9 / 7.7 / 7.7 GB (kokiri-idle / castle-move /
+hyrule-walk): u3 allocates nothing (its plan is a per-thread buffer).
+
+**Not done in this session**: `subIntegrateLastStep` `0x8182dc20` (1,591 insns, 7 indirect calls, Havok's block
+allocator and profiler calls) and `solveJacobians` `0x8177b2a0` (3,969 insns, 48 calls, 7 indirect) were not read
+beyond their call lists; no specification of them is written yet, and `BuildJacobians` was not started.
