@@ -56,6 +56,7 @@ enum { kCaptured, kOnlyEqual, kUboDiff, kUboAndOther, kOtherOnly, kTexture, kNot
        kWithIndirect, kWithOther, kClasses };
 int64_t win[kClasses], all[kClasses];
 int64_t win_frames = 0, all_frames = 0;
+std::map<uint64_t, int64_t> nothing_by_pool, nothing_by_region;   // (the last 10 s' pages read by no record: pool flags:size, 16 MB region)
 std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 
 int size_class(uint64_t n) {
@@ -131,6 +132,25 @@ void log_tables() {
     };
     pages("the last 10 s", win, win_frames);
     pages("since the start", all, all_frames);
+    const double f = win_frames ? (double)win_frames : 1.0;
+    s.clear();
+    for (const auto& [key, n] : nothing_by_pool) {
+        char t[64];
+        if (key == ~0ull) snprintf(t, sizeof t, " none:%.0f", n / f);
+        else snprintf(t, sizeof t, " %#llx:%s:%.0f", (unsigned long long)(key >> 8), pool_names[key & 0xff], n / f);
+        s += t;
+    }
+    std::vector<std::pair<int64_t, uint64_t>> top;
+    for (const auto& [r, n] : nothing_by_region) top.push_back({n, r});
+    std::sort(top.rbegin(), top.rend());
+    s += "; by 16 MB region:";
+    for (size_t k = 0; k < top.size() && k < 12; k++) {
+        char t[48];
+        snprintf(t, sizeof t, " %#llx:%.0f", (unsigned long long)(top[k].second << 24), top[k].first / f);
+        s += t;
+    }
+    logf("hl ubo check capture the last 10 s, pages a frame read by no record, by pool flags:size:%s", s.c_str());
+    nothing_by_pool.clear(), nothing_by_region.clear();
 }
 
 }  // namespace
@@ -215,7 +235,19 @@ void ubo_check_frame() {
         else {
             const uint64_t ga = (uint64_t)page[i] << 12;
             auto it = std::upper_bound(tex.begin(), tex.end(), std::make_pair(ga, ~uint64_t(0)));
-            (it != tex.begin() && ga < std::prev(it)->second ? v[kTexture] : v[kNothing]) += t;
+            if (it != tex.begin() && ga < std::prev(it)->second) {
+                v[kTexture] += t;
+                continue;
+            }
+            v[kNothing] += t;
+            static uint64_t plo = 1, phi = 0, pkey = ~0ull;   // (the last pool found: pages come in address order)
+            if (ga < plo || ga >= phi) {
+                uint32_t flags = 0;
+                if (memory_nvn_pool_of(ga, &plo, &phi, &flags)) pkey = (uint64_t)flags << 8 | (uint64_t)pool_class(phi - plo);
+                else plo = ga, phi = ga + 4096, pkey = ~0ull;
+            }
+            nothing_by_pool[pkey] += t;
+            nothing_by_region[ga >> 24] += t;
         }
     }
     for (int k = 0; k < kClasses; k++) win[k] += v[k], all[k] += v[k];
