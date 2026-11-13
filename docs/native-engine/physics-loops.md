@@ -819,10 +819,10 @@ contact solver's vtable only (no direct caller).
   point (two float4: the point's angular Jacobians, the w lanes the right-hand side and the effective mass); after the
   points, the friction rows (+0x9c + 32 · points: a factor; +0xc0 + 32 · points: a float4).
 - **The velocities' cache**: the two bodies' entries (A: V, W as in 9.2, and their packed maxima as floats) are loaded
-  into a frame block when a record's bodies differ from the previous record's; the previous pair is written back then
-  (V and W.z at +0, W.x, W.y at +16), and at the end of the walk. So **the entries in memory are behind the solver while a
-  run of records on the same pair lasts**: a native version must keep exactly this write-back order only where something
-  reads the entries in between (`0x81785c00` and the modifiers do: they get the frame block).
+  into a frame block at the start of each record (the second body's only with flag bit 6) and written back at its end
+  (V and W.z at +0, W.x, W.y at +16; `0x8177cbd0`). The comparison of a record's body ids (+8, +12) with the previous
+  record's decides only whether the deferred lists are solved (`0x81785c00`, on the previous pair) before the new record:
+  so the deferred records of a pair are solved after all its direct records, and their order is part of the result.
 - **After the normal rows**, with friction (flags 0x30) and P +16 bit 3 clear: the friction rows use integer "magic"
   steps (`0x7ef504f3`, `0x5f2fed52`, with `0xbf0e425b`, `0x3fc6fa83`: reciprocal and reciprocal square-root
   approximations by an integer subtraction and a polynomial refinement, exact operations a native version can
