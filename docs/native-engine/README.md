@@ -163,9 +163,39 @@ The project owner set the targets: the critical chain under 3.2 ms, memory halve
      resident guest memory splits (heaps, GPU pools, resources), then drop the guest copy of static GPU data after upload
      behind a page trap, and shrink the back end's caches (the BC cache, the texture shadows, the pool mirrors).
 
-Said plainly about the 3.2 ms: the chain is 5.8 ms sampled (about 7 ms of wait) and its six largest jobs are half of it.
-Native jobs and kernels shorten those; whether what is left fits under 3.2 ms depends on the order the jobs run in, which
-`critical-jobs.md` has to settle with numbers before it is promised.
+### Revised the same day, with `critical-jobs.md` and `gfx-record-job.md`
+
+What the two specifications established changes the order of work:
+
+- **The chain is physics.** The "numeric families" of the profile are Havok: Havok Physics with its driver is 2.24 ms of
+  the 5.80 ms sampled chain, Havok Cloth 0.33 ms, the actor stage jobs 1.25 ms, the graphics module jobs 0.81 ms (1.27 ms
+  counting the main thread's own share of the recording job), the job system 0.38 ms. 2.40 ms of the chain runs while
+  every other job thread is idle.
+- **The set decided in the morning does not reach 3.2 ms.** The 25 kernels and the two jobs that are replaceable whole
+  hold 1.24 ms of the chain: at infinite speed they leave 4.56 ms. Under 3.2 ms needs Havok Physics and Cloth themselves
+  shortened (3.12 ms left with both at zero time, 3.8 ms at four times their speed), or the serial stretches of the chain
+  spread over threads, which needs the jobs' dependencies read first.
+- **The player's job is an actor stage job on six executors**; the chain goes through the instance that ends last. The
+  25 kernels are 3.5% of it.
+- **The recording job's cost was partly this engine's own**: its slot scan locks one mutex a slot, and the OS layer's
+  lookup of each mutex's host object was 0.69 ms a frame. Fixed in the OS layer (a mutex now carries its host object's
+  number: `host/nn_os_sync.c`).
+
+So, in this order:
+
+1. **What is ours first**: costs of the OS layer and of the back end that sit on the chain (the mutex lookup, done; the
+   dispatcher's and the stage registration's 0.38 ms through the native job system; the GPU write-back wait of module job
+   `0x8007c120`).
+2. **The recording pass `0x806602e0`** natively (`hl::gfx`): answered with no new lift, 1.91 ms of CPU, 0.70 ms of chain.
+3. **The Havok solver task `0x819b8e20`** natively: reached through a table, runs alone for 0.375 ms of the chain. Weeks,
+   not days: it must be bit-exact on Havok's internal formats, and a native version must reproduce the guest's fused
+   multiply-adds, its min/max rules for NaN, flush-to-zero and the ARM reciprocal square root estimate.
+4. **The model-bounds kernels** (`0x80ba6d80`, `0x800a8400`, `0x81746440`): small, fully read; they build the hook list
+   for directly called functions and the differential check. Their gain is small (0.1-0.2 ms at best).
+
+**The 3.2 ms target is not reachable in 7 to 10 days by these means.** A realistic reading of the numbers for that span:
+steps 1 and 2 and the kernels, for about 1 ms of the chain if every estimate holds, none of them measured yet. Physics
+as a native module is the plan's step 6 and the largest block of the game; it is what stands between 4.5 ms and 3.2 ms.
 
 ## What is not known yet, said plainly
 

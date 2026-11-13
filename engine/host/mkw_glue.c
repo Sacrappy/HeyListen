@@ -69,7 +69,15 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     const uint64_t guest = (uint64_t)(p - A64_MEM);
     if (guest < 0x100000) return EXCEPTION_CONTINUE_SEARCH;   /* (a null pointer: the game's own fault) */
     MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    if (!VirtualQuery(p, &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
+    /* (committed by another thread between the fault and here, two threads touching the same fresh megabyte: run the
+       instruction again) */
+    if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mbi.Protect & PAGE_GUARD) &&
+        guest >= HOS_HEAP_BASE && hos_lazy_commit()) {
+        static _Thread_local const uint8_t *again;
+        if (again != p) { again = p; return EXCEPTION_CONTINUE_EXECUTION; }   /* (once an address: a real fault goes on to the report) */
+    }
+    if (mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
     /* (HeyListen) the heap and the address regions, left reserved (hos_lazy_commit): 1 MB at a time, so that a heap
        the game fills takes a fault a megabyte and not one every 64 KB */
     if (guest >= HOS_HEAP_BASE && hos_lazy_commit()) {
@@ -78,8 +86,20 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
         const LONG64 total = InterlockedAdd64(&lazy_bytes, 0x100000);
         if (total >> 30 > said && InterlockedExchange(&said, (LONG)(total >> 30)) < (LONG)(total >> 30))
             hos_log("mem: %lld MB of the game's memory committed on first touch", (long long)(total >> 20));
-        return VirtualAlloc(GP(guest & ~0xFFFFFULL), 0x100000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
-                                                                                            : EXCEPTION_CONTINUE_SEARCH;
+        if (VirtualAlloc(GP(guest & ~0xFFFFFULL), 0x100000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
+        /* (the megabyte around it cannot be committed as one: a part of it is not this reservation's to commit, as
+           memory the renderer has mapped over the window. The 64 KB around the touch then, and the page alone: a
+           run crashed here on 2026-11-13 with the megabyte alone tried) */
+        const DWORD err = GetLastError();
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 8)
+            hos_log("mem: the megabyte at %#llx was not committed as one (error %lu): the 64 KB around %#llx",
+                    (unsigned long long)(guest & ~0xFFFFFULL), err, (unsigned long long)guest);
+        if (VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
+        if (VirtualAlloc(GP(guest & ~0xFFFULL), 0x1000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
+        hos_log("mem: %#llx could not be committed on first touch (error %lu, state %#lx, protection %#lx)",
+                (unsigned long long)guest, GetLastError(), mbi.State, mbi.Protect);
+        return EXCEPTION_CONTINUE_SEARCH;
     }
     static volatile LONG touched;
     if (InterlockedIncrement(&touched) <= 16)

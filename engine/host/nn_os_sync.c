@@ -17,6 +17,7 @@ enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_H
 typedef struct Obj {
     uint64_t key;
     int kind;
+    uint32_t ix;   /* (HeyListen) a mutex's number in mx_objs once it has one (0: none): see obj() */
     SRWLOCK lk;
     CONDITION_VARIABLE cv;
     /* mutex / rwlock */
@@ -196,11 +197,59 @@ static Obj *find_unlocked(uint64_t key, int kind) {
 }
 
 static Obj *obj_lookup(uint64_t key, int kind);
+static Obj *obj(uint64_t key, int kind);
 /* Every nn::os call looks its object up by the guest address (~1.6% of the game threads' time at the castle: a probe
    of the shared table and a cache miss on a scattered object). Game threads use a few objects over and over: a small
    direct-mapped cache per thread answers those. An entry holds while its object is still that address's and of the
    kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off. */
+/* (HeyListen, 2026-11-13) A mutex's host object, found from the mutex itself. The game's graphics recording job locks
+   one mutex per slot of a table of slots, a different one each time: the per-thread cache below misses on every one, and
+   the shared table's probe was 0.69 ms a frame of that job, on the frame's critical chain (docs/native-engine/
+   gfx-record-job.md). nn::os::MutexType's nesting count (+8) is the SDK's own bookkeeping, which this layer does not
+   use (the count is in the host object): it holds the object's number + nothing else, and an answer is taken only when
+   that object is this address's mutex, so a mutex the game copied, cleared or made anew is found the old way and
+   numbered again. HOS_NO_MUTEX_IX=1: off. */
+#define MX_IX_OFFSET 8
+#define MX_IX_CAP (1u << 20)
+static Obj *volatile mx_objs[MX_IX_CAP];
+static volatile long mx_next = 1;
+static Obj *obj(uint64_t key, int kind);
+static Obj *obj_any(uint64_t key, int kind);
 static Obj *obj(uint64_t key, int kind) {
+    static int ix_off = -1;
+    if (kind != K_MUTEX || ix_off > 0) return obj_any(key, kind);
+    if (ix_off < 0) {
+        ix_off = getenv("HOS_NO_MUTEX_IX") != NULL;
+        if (ix_off) return obj_any(key, kind);
+    }
+    uint32_t *at = (uint32_t *)GP(key + MX_IX_OFFSET);
+    const uint32_t ix = *at;
+    if (ix && ix < MX_IX_CAP) {
+        Obj *o = mx_objs[ix];
+        if (o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key && __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == K_MUTEX) {
+            hos_vcore_checkpoint();
+            return o;
+        }
+    }
+    Obj *o = obj_any(key, kind);
+    uint32_t mine = __atomic_load_n(&o->ix, __ATOMIC_RELAXED);
+    if (!mine) {
+        const long n = __sync_fetch_and_add(&mx_next, 1);
+        if (n < (long)MX_IX_CAP) {
+            uint32_t none = 0;
+            if (__atomic_compare_exchange_n(&o->ix, &none, (uint32_t)n, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                mx_objs[n] = o;
+                mine = (uint32_t)n;
+            } else {
+                mine = none;   /* (another thread numbered it first) */
+            }
+        }
+    }
+    if (mine && mx_objs[mine] == o && *at != mine) *at = mine;
+    return o;
+}
+
+static Obj *obj_any(uint64_t key, int kind) {
     hos_vcore_checkpoint();   /* (virtual cores: every nn::os call, where a better waiter takes the core) */
     /* (hookshot: 128 still missed: obj_lookup was the busiest leaf in dense Kokiri, 3.2% of all samples, 4.3% of the instants when one
        thread alone ran; each actor has its own mutexes) */
