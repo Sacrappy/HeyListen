@@ -553,3 +553,52 @@ says it pays.
 - Where the recording job's handles (slot +80) are called and submitted (`gfx-record-job.md`), which matters for E.
 - The readers of `NvnState::ubo` addresses outside the descriptor path: two found (DLSS, FSR 3 scene notes); the full
   list was not made.
+
+## 8. Bricks A and B as built
+
+### What is built, and how the game reaches it
+
+| Piece | Where | What it does |
+|---|---|---|
+| The shared layouts | `engine/native/include/hl/c/hl_gfx_rec.h` | the header `{op, size}`, the op numbers native code writes, the payloads (`bind_state`, `stencil`, `poly_offset`, `blend_color`, `flag`, `depth_range`, `viewports`, `scissor`, `bind_buf`, `bind_handles`, `bind_vbuf`, `bind_vattr`, `bind_vstream`, `draw`, `draw_idx`, `barrier`), the six NVN state objects a bind copies, the NVN values of their defaults; `nvn_native.c` static-asserts every size, offset, op number and value against `rx_nvn.h` / `nvn_api.h` |
+| `RecordWriter` | `hl/gfx/Records.h`, `src/gfx/Records.cpp` | one typed method a record kind, each writing the record and the accounting (`hw` as the procedure's `hw_fix`) the NVN procedure would; for producers written for it (brick D) |
+| `RecordSink` | same | a `CommandSink`: the 29 procedures of `Nvn.h` turned into records for one command buffer; the 18 setters applied to native copies of the state objects, keyed by guest address, each seeded from its guest bytes at first use (the depth-stencil and polygon objects have bits no setter covers: they keep what the stack held, as with the procedures); a bind appends the copy's bytes; nothing is written to guest memory |
+| `ScratchSegment` | same | a segment in host memory keeping the command buffer's accounting as the NVN layer does: the check's other side, and the tests' |
+| The sink chosen | `src/c/hl_gfx_rec.cpp` (`hl::c::gfx_rec_emit`), one line in `hl_gfx_state_apply` (`src/c/hl_gfx.cpp`) | at each answered call of the render-state function: `NvnSink` (as before), `RecordSink` on the live segment, or both compared |
+| The OS layer's surface | `nvn_native.c` (`nvn_rec_open / _append / _mark / _bytes / _rewind / _guest`, beside `rec()`), `engine/host/hl_gfx_rec.c` (hands it over at start, reads the switches, logs) | below |
+| Tests | `engine/native/tests/records_test.cpp` | each record kind's bytes and accounting against the layout; the sink against an independent model of the 29 handlers (bit fields rewritten as shifts on the guest bytes) over ~350 inputs of the render-state function, in both orders; seeds, strays |
+
+The game reaches it through brick 2.2's gate: `0x80077d60` answered natively (`HL_GFX_STATE=1`, the default),
+`hl_gfx_state_apply` derives and writes the block, then hands the commands to `gfx_rec_emit`, which asks the OS layer
+once for the switches.
+
+### The host surface, against section 3.2's proposal
+
+| Proposed | Built | Why |
+|---|---|---|
+| `open(cmd)` checked on magic, `recording`, owner | `open(cmd)`: the object's slot is its own (else 0, and the call goes through the NVN procedures, counted "left to NVN") | that is the one case where the procedures do something else (`cmd_host` adopts a new slot and logs); the procedures record whether or not the buffer is recording, so requiring it would only send more calls to the fallback |
+| `append(seg, op, payload)` | `append(cmd, op, payload, hw)`: the NVN layer's own `rec()` (and `hw_fix` when `hw` is not 0) | the same code as the procedures, so the accounting cannot drift; `hw_bytes` folded in |
+| `tex_pin(tex)` | not built | none of the 29 procedures pins a texture (no `SET_RT`, no copy): it belongs with the first producer that records targets |
+| `hw_bytes(seg, n)` | `append`'s `hw` | none of the 29 procedures calls `hw_fix`; the other record kinds' sizes are in `RecordWriter` |
+| - | `mark`, `bytes`, `rewind` | the check: where the recording stands (length, `cmd_used`, `hw_used`, `last_rec`), its bytes, and a rewind to drop the NVN procedures' copy in `HL_GFX_REC=1 HL_GFX_REC_CHECK=1` |
+| - | `guest(addr, n)` | the guest reads the procedures make (`gw`: the game stops on an address outside the window, as there): the blend color at bind time, the state objects' seeds, an object bound but not set |
+| - | `mode`, `log` | switches read and logged by the OS layer, once |
+
+### What the 29 procedures did besides their record, and what happens to each
+
+| Side effect | Procedures | With `HL_GFX_REC=1` |
+|---|---|---|
+| the state object packed in place in guest memory (the render-state function's own stack frame, dead after it returns) | the 18 `*StateSet*` | applied to the sink's native copy; the guest frame is not written. Nothing reads it but the binds of the same call (`gfx-record-job.md` 8) |
+| out-of-range target index ignored | `ColorStateSetBlendEnable`, `ChannelMaskStateSetChannelMask` | the same guard |
+| `HOS_NVN_CHMASK_LOG` (the first 40 calls' arguments, debugging) | `ChannelMaskStateSetChannelMask` | not reproduced: a debugging print |
+| the command buffer looked up per record (`cmd_host`; a slot that is not the object's own: a new one adopted, logged) | the 11 `CommandBuffer*` | looked up once (`open`); not its own slot: the whole call goes through the procedures, which do what they always did |
+| the segment grown (`cmd_reserve_rec`: pool blocks, the segments' byte and count statistics) | the 11 | the same function, through `rec()` |
+| **the accounting the game reads back**: `cmd_used`, `hw_used`, `last_rec` in the guest command buffer object (`GetCommandMemoryUsed` / `Free`; the game sizes its heaps from it) | the 11 (none calls `hw_fix`: the record's size counts) | the same `rec()`; compared by the check after every call |
+| guest pointer arguments checked (`gw`: the game stops outside the window) | the binds (the object), `SetBlendColor` (16 bytes) | the same check (`guest`) |
+| the bound object's bytes and the blend color read at the call | the five binds, `SetBlendColor` | read at the same point of the call: the block is written before the commands, as before |
+| the guest context's argument registers set (x0-x5, s0-s2) by the native caller (`nvn_call`) | all | not set: they are caller-saved scratch registers at the function's return, which nothing may read |
+| texture pins, control-memory marks, events, counters, reports | none of the 29 | - |
+
+The pass check's tap (`HL_GFX_CHECK`) sees NVN calls; with it set the gate compares the translated function instead of
+answering, so the records path is not used then. The parallel replay and its dry pass read the same bytes; no consumer
+was found that keys on anything the procedures did beyond their records.
