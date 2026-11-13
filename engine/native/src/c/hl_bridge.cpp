@@ -7,6 +7,7 @@
 
 #include "hl/bridge/Dispatcher.h"
 #include "hl/bridge/JobBridge.h"
+#include "hl/bridge/JobGroup.h"
 #include "hl/bridge/Stages.h"
 #include "hl/jobs/JobSystem.h"
 
@@ -25,6 +26,7 @@ hl::jobs::JobSystem* g_jobs;
 hl::bridge::Dispatcher* g_dispatcher;
 hl::bridge::JobBridge* g_bridge;
 hl::bridge::Stages* g_stages;
+hl::bridge::JobGroup* g_group;
 
 }   // namespace
 
@@ -71,6 +73,19 @@ extern "C" int hl_bridge_stage_register(uint64_t set, uint64_t send) {
 extern "C" void hl_bridge_stage_wait(uint64_t set) { g_stages->wait(g_runtime->current(), set); }
 
 extern "C" void hl_bridge_stage_last(uint64_t manager) { g_stages->last_stage(g_runtime->current(), manager); }
+
+extern "C" int hl_bridge_jobgroup_start(int group) {
+    if (g_group) return 1;
+    if (!g_bridge || !(group & HL_JOBGROUP_NATIVE)) return 0;
+    g_group = new hl::bridge::JobGroup(*g_runtime, {.check = (group & HL_JOBGROUP_CHECK) != 0});
+    return 1;
+}
+
+extern "C" void hl_bridge_jobgroup(uint64_t group, uint64_t context) { g_group->run(g_runtime->current(), group, context); }
+
+extern "C" int hl_bridge_jobgroup_report(char* out, size_t cap) {
+    return g_group && cap ? g_group->report(out, cap) : 0;
+}
 
 extern "C" int hl_bridge_report(char* out, size_t cap) {
     if (!g_bridge || !cap) return 0;
