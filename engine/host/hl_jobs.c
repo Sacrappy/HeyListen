@@ -128,6 +128,15 @@ HL_GATE(8007fe60, "677afe69100ea461") {   /* the module system's job group (grou
     return 1;
 }
 
+/* Each switch's entry gates, switched on all together or not at all (hl_gates_in): the stages' three share the registered
+   mask and count, the twins share them too and seed the group's heap that the native group then runs. Every HL_GATE of
+   this file is in one of these lists (tests/test_hl_gates.py reads it so). */
+static const uint64_t dispatch_gates[] = {0x8004ab40};
+static const uint64_t stage_gates[] = {0x806b0260, 0x806afc40, 0x83acfb90};
+static const uint64_t group_gates[] = {0x8007fe60};
+static const uint64_t twin_gates[] = {0x800711c0, 0x80070b20};
+#define GATES_IN(what, list) hl_gates_in(what, list, (int)(sizeof list / sizeof list[0]))
+
 /* 1 when the native job system answers the game's worker message (asked once, at the function's first lookup) */
 static int hl_jobs_on(void) {
     const char *e = getenv("HL_JOBS"), *w = getenv("HL_JOBS_WORKERS");
@@ -146,16 +155,18 @@ static int hl_jobs_on(void) {
     const int on = hl_bridge_start(hl_host(), mode, w ? (unsigned)atoi(w) : 0,
                                    (native ? HL_DISPATCH_NATIVE : 0) | (check ? HL_DISPATCH_CHECK : 0));
     const char *a = getenv("HL_DISPATCH_ALL");
-    const int all = on && native && (a && a[0] ? atoi(a) == 1 : HL_DISPATCH_ALL_DEFAULT);
+    const int all = on && native && (a && a[0] ? atoi(a) == 1 : HL_DISPATCH_ALL_DEFAULT) &&
+                    GATES_IN("HL_DISPATCH_ALL", dispatch_gates);
     hl_gate_on_8004ab40 = all;
     const char *jg = getenv("HL_JOBGROUP"), *jc = getenv("HL_JOBGROUP_CHECK");
     const int group_check = jc && jc[0] == '1';
-    const int group = on && (jg && jg[0] ? atoi(jg) == 1 : HL_JOBGROUP_DEFAULT) &&
+    const int group = on && (jg && jg[0] ? atoi(jg) == 1 : HL_JOBGROUP_DEFAULT) && GATES_IN("HL_JOBGROUP", group_gates) &&
                       hl_bridge_jobgroup_start(HL_JOBGROUP_NATIVE | (group_check ? HL_JOBGROUP_CHECK : 0));
     const char *sg = getenv("HL_STAGES"), *sc = getenv("HL_STAGES_CHECK"), *ms = getenv("HL_MODSTAGES");
     const int stage_check = sc && sc[0] == '1';
-    const int want = (sg && sg[0] ? atoi(sg) == 1 : HL_STAGES_DEFAULT) * HL_STAGES_NATIVE |
-                     (group && (ms && ms[0] ? atoi(ms) == 1 : HL_MODSTAGES_DEFAULT)) * HL_STAGES_MODULE;
+    const int want = ((sg && sg[0] ? atoi(sg) == 1 : HL_STAGES_DEFAULT) && GATES_IN("HL_STAGES", stage_gates)) * HL_STAGES_NATIVE |
+                     (group && (ms && ms[0] ? atoi(ms) == 1 : HL_MODSTAGES_DEFAULT) && GATES_IN("HL_MODSTAGES", twin_gates)) *
+                         HL_STAGES_MODULE;
     const int started = on && want ? hl_bridge_stages_start(want | (stage_check ? HL_STAGES_CHECK : 0)) : 0;
     const int stages = (started & HL_STAGES_NATIVE) != 0, twins = (started & HL_STAGES_MODULE) != 0;
     hl_log_on = getenv("HL_JOBS_LOG") != NULL || check || ((stages || twins) && stage_check) || (group && group_check);

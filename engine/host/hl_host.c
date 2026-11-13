@@ -57,6 +57,30 @@ A64Fn a64_lookup_replaced(uint64_t addr) {
     return NULL;
 }
 
+/* ---- entry gates in the lifted code (constructors: one thread, before the game starts) ---- */
+enum { GATES_IN = 256 };
+static uint64_t gates_in[GATES_IN];
+static int ngates_in;
+
+void hl_gate_present(unsigned long long guest) {
+    if (ngates_in < GATES_IN) gates_in[ngates_in++] = guest;
+}
+
+int hl_gates_in(const char *what, const uint64_t *guest, int n) {
+    char missing[256];
+    int len = 0, all = 1;
+    missing[0] = 0;
+    for (int i = 0; i < n; i++) {
+        int in = 0;
+        for (int k = 0; k < ngates_in && !in; k++) in = gates_in[k] == guest[i];
+        if (in) continue;
+        all = 0;
+        if (len < (int)sizeof missing - 20) len += snprintf(missing + len, sizeof missing - (size_t)len, " %#llx", (unsigned long long)guest[i]);
+    }
+    if (!all) hos_log("hl: %s left off: the entry gates of%s are not in the lifted code (another lift: nx2/hl_gates.py's build log)", what, missing);
+    return all;
+}
+
 /* (the lifted table: rt/a64_rt.c reads it the same way) */
 extern const uint32_t a64_fn_count;
 extern const uint32_t a64_fn_addr[];
