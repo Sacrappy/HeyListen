@@ -301,7 +301,8 @@ the registration in one), and the module system's twins `0x800711c0` / `0x80070b
 ### More of the objects
 
 **The current core** is read the way rule 2 says: a thread-local value holding the core plus one (`0x83c61cf0` is the
-thread-local read), and when it is 0 the OS's current core (`0x83c61f60`). Every function below reads it this way.
+thread-local read, its key the 32-bit word at `0x84e9f7ac`), and when it is 0 the OS's current core (`0x83c61f60`, used
+as it is). Every function below reads it this way (the registration twice, the same value both times).
 
 **A stage's holder** P (the actor manager M has it at `M + 0x80`): `+0x08` the scheduler, `+0x10` the worker set, `+0x68`
 who waits for the stage (a field of the current thread's object, stored by the begin forms around the wait, 0 after).
@@ -350,7 +351,10 @@ first (`0x806b08a0`; the second form expects it made). Then, with S the holder's
   (`send` 0) and no wait when the call's last argument says so: the workers are then started by the last stage.
 
 `0x806afa20` is the common tail of the first form; `0x8389aef0` and `0x8389af40` are the seed and the registration with
-`send` 1 and 0, for callers that made the graph themselves.
+`send` 1 and 0, for callers that made the graph themselves. `0x83afff70` (read for brick 3.4) is the begin of the frame's
+last stage: the stage cores, M's state byte 2, the graph, then the seed and the registration without the message
+(through `0x8389af40`, or directly, with W's scheduler set to 0 when the graph has no job); the job `0x83b001c0` then
+calls the last stage on every core.
 
 ### The registration `0x806b0260` (W, send)
 
@@ -363,23 +367,35 @@ first (`0x806b08a0`; the second form expects it made). Then, with S the holder's
    its context appended to S's list, its bit set in the registered mask, the registered count up by one.
 4. Each registered worker, between two full barriers: its context's state word and flags set to 0, its wake event and its
    done event cleared, its scheduler set to S.
-5. With `send`: each registered worker's context gets bit 0 of its flags ("sent its message"), and the worker is sent
-   message 1 (its message function; when it is the usual one, inlined: the message is queued unless the worker is not
-   running, see the worker's run state).
+5. With `send` (its bit 0): each registered worker's context gets bit 0 of its flags ("sent its message"), and the worker
+   is sent message 1 (its message function, `+0x10` of its virtual table, called with (worker, 1, 1); when it is the
+   usual one, `0x801c5ea0`, whose address the guest reads from `0x84cab408`, inlined: the message is queued on the
+   worker's queue `+0x28` by `0x83c62d20` unless `+0xac` is 3 or 4 or `+0xa0` already equals the message).
+
+The writes of steps 1 to 3 are plain stores but the registered count's increments and the scheduler's flag bit 2, which
+are atomic; the mask's bits are set by plain read-modify-write (only the owner writes it).
 
 ### The stage wait `0x806afc40` (W)
 
 Returns at once when W has no scheduler. Otherwise, with c the owner's core:
 
-1. When the owner takes part: every worker whose core is c gets bit 1 of its context's flags ("not to run"), the own
-   context's lane is set to c, and the dispatcher runs on S with the
-   own context, on the owner's thread.
+1. When the owner takes part: every worker whose core is c, registered or not, gets bit 1 of its context's flags ("not to
+   run"), the own context's lane is set to c (the store is skipped when W's flags have bit 1 and the lane already is c),
+   and the dispatcher runs on S with the own context, on the owner's thread.
 2. For each registered worker in index order: its done event is waited for; when W has a lane status word and c is not 0,
    the low four bits of lane c's byte go down by one before the wait and up by one after it (staying within 0..15), as the
    dispatcher's own sleep does.
 
 The owner does not wait for the stage's end itself: the workers leave their dispatcher when the end job completes, and
 each one's done event is signalled by its message function after it leaves (`0x8004aae0`: the dispatcher, then the event).
+
+**Nothing lowers the registered count of a stage that is waited for**: neither the wait nor the worker message touch W's
+`+0xfc` or `+0x100`; both keep the registration's values until the next registration empties them. Only the last stage
+lowers the count. (Brick 3.4's brief asked for "the owner's wait returns only when the registered count is back to zero":
+that is not the game's protocol; the check counts instead that every registered worker was started and waited for once,
+and that the mask and the count are unchanged at the wait's end.) The lane status is changed on the owner's lane c
+whether or not the owner is counted in it: an owner that is not (not inside a job of its lane) leaves its lane's count
+one higher for each worker waited for, the floor at 0 absorbing the decrement.
 
 ### The frame's last stage `0x83acfb90` (M)
 
@@ -389,9 +405,10 @@ is negative. With W = P's set
 and S its scheduler (registered without the message, above), on the calling thread's core c:
 
 - When W has no scheduler: M's state word's low byte set to 0, return.
-- When a registered worker of core c has not been sent its message (flags bit 0 clear): its flags get bit 0, it is sent
-  message 1, the lane status of W's own lane (not c) goes down by one around the wait for its done event, then W's
-  registered count goes down by one.
+- When a registered worker of core c has not been sent its message (flags bit 0 clear; W's worker count, registered mask
+  and array are read once before the search): its flags get bit 0, it is sent message 1 (as the registration sends
+  it), the lane status of W's own lane (not c) goes down by one around the wait for its done event (the word's address
+  and the lane read again after the wait, nothing done when either is 0), then W's registered count goes down by one.
 - Otherwise, when the owner takes part, the own context has not been sent its message and its lane is c: its flags get
   bit 0 and the dispatcher runs on S with it, on this thread; then the registered count goes down by one.
 - Otherwise (another thread already took this core): return.
