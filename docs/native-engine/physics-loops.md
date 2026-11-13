@@ -804,13 +804,22 @@ HL_MATH_UNITS=sil`, full 110 s runs (the last report of each run):
 | kokiri-idle | 3,787 | 492 | 180,769 | 168,827 | 11,574 | 368 | 0 / 0 |
 | hyrule-walk | 2,308 | 505 | 93,740 | 84,454 | 8,712 | 574 | 0 / 0 |
 
-(hyrule-walk's last report is from earlier in its run than the others'.) **The paths' histogram** (the same in the three
+(hyrule-walk's last report is from earlier in its run than the others'.) The same check on the main PC (build of
+`48749bd`), full runs:
+
+| scene | calls | x7 path | motions | compared | declined: modifier | declined: values | mismatches (motions / records) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| castle-move | 6,961 | 589 | 341,061 | 313,480 | 27,160 | 421 | 0 / 0 |
+| kokiri-idle | 9,443 | 649 | 431,093 | 393,503 | 35,685 | 1,905 | 0 / 0 |
+| hyrule-walk | 9,071 | 668 | 412,052 | 376,295 | 32,338 | 3,419 | 0 / 0 |
+
+**The paths' histogram** (the same in the three
 scenes): every call has a profiler holder P (so `0x800430a0` / `0x800431c8` run on every call), about one call in six
 comes with x7 (the stream-range path, from the other caller); deactivation and the cell accumulators are on in every
 call; no motion meets a callback list (the masks are 0); A +24 is set on 7-8% of the motions and each of them has the
 integration modifier (`0x818f2b2c`), so **the clamps and the n path were never taken**; 55-72% of the motions move,
 the deactivation's zero case is 40-55%; cell records are rare (about 300 a run, at the start), the writer's block never
-filled. Values declined (0.2-0.6%): squares of velocities near 1e-23 that underflow (Arm flushes them under FZ). FPCR was
+filled. Values declined (0.1-0.8%): squares of velocities near 1e-23 that underflow (Arm flushes them under FZ). FPCR was
 FZ only in every call. The indirect targets seen: cell set-up `0x8190ac00`, lookup `0x8190ad60`, modifier `0x818f2b2c`.
 
 ### 9.7 What a native `subIntegrateLastStep` needs (not built)
