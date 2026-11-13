@@ -426,7 +426,17 @@ static DWORD WINAPI heapsplit_main(void *p) {
             hos_log("heapsplit: address-region heap %s at %#llx: +264 %.1f MB, +272 %.1f MB, lists %u and %u", heaps[i].name,
                     (unsigned long long)heaps[i].obj, BMB(a264), BMB((uint64_t)-(int64_t)a272), n192, n256);
         }
-    hos_log("heapsplit: the pointer at 0x84e9f460: %#llx", (unsigned long long)vah);
+    {
+        uint64_t w[36] = {0};
+        for (int k = 0; k < 36; k++) rd64(vah + 8ull * k, &w[k]);
+        uint64_t s29 = 0;
+        rd64(w[0] + 232, &s29);
+        hos_log("heapsplit: the pointer at 0x84e9f460: %#llx, vtable %#llx (slot 29 %#llx)", (unsigned long long)vah,
+                (unsigned long long)w[0], (unsigned long long)s29);
+        for (int k = 0; k < 36; k += 6)
+            hos_log("heapsplit:   +%3d %#llx %#llx %#llx %#llx %#llx %#llx", k * 8, (unsigned long long)w[k], (unsigned long long)w[k + 1],
+                    (unsigned long long)w[k + 2], (unsigned long long)w[k + 3], (unsigned long long)w[k + 4], (unsigned long long)w[k + 5]);
+    }
     const int64_t t_walk = hos_now_ns();
     hos_log("heapsplit: %d heaps read (%lld free blocks' insides kept), %.0f ms; counting their pages", nheaps, (long long)ninner,
             (t_walk - t0) / 1e6);
@@ -552,6 +562,11 @@ static DWORD WINAPI heapsplit_main(void *p) {
             if (best < 0) break;
             hos_log("heapregion %2d: %#llx size %.1f MB committed, %.1f MB in RAM outside pools", k + 1, (unsigned long long)reg[best].lo,
                     BMB(reg[best].hi - reg[best].lo), MB(reg[best].res));
+            uint64_t w[8] = {0};
+            for (int k = 0; k < 8; k++) rd64(reg[best].lo + 8ull * k, &w[k]);
+            hos_log("heapregion    %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx", (unsigned long long)w[0], (unsigned long long)w[1],
+                    (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[5],
+                    (unsigned long long)w[6], (unsigned long long)w[7]);
             reg[best].res = 0;
         }
     }
