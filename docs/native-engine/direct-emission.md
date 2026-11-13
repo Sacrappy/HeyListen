@@ -896,7 +896,7 @@ pool's import on the GPU. Now (`gpu/vk/vk_memory.cpp`):
 ### B. The image pools' blocks
 
 - How VMA is used (`gpu/vk/vk_vma.cpp`): 64 MB default blocks; images in a pool of 128 MB blocks (`images_pool`), render
-  targets in another (`target_images_pool`, since TICK-...); images of 16 MB and more dedicated; buffers (mirrors, streams,
+  targets in another (`target_images_pool`); images of 16 MB and more dedicated; buffers (mirrors, streams,
   staging, captures) in VMA's default pools.
 - Why the heaps look full after a zone change: the image pool's blocks stay, pinned by the few images that survive in each. In
   play3 just after one: **33 blocks of 4,224 MB holding 835 images of 652 MB**, render targets 9 blocks of 1,152 MB holding 308
