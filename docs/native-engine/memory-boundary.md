@@ -657,3 +657,93 @@ What the next brick (native streaming) needs, in order:
 Not read, and needed before building: the decoding thread's body on the chunked path; the file object's read (`+144`) and
 how a request names its file; which requests allocate from `ForResourceG` (the request's heap at `+16`, by resource kind);
 where `0x80c17040`'s input comes from.
+
+## 10. The back end's own caches, its imports, and Vulkan memory in system memory (2026-11-14)
+
+Before: the validation runs of section 8 (main PC, `HL_MEM_COLD` on). After: `valid.sh s1c3v s1-cache3` (main PC, the three
+scenes, 110 s each, `HOS_MEM_SPLIT=95 RX_VK_RES_LOG=1`); the previous behaviour with this build: one castle run with the
+three switches below off (`s1c2off`). Function and picture: the three scenes ran to the end, no crash line, game speed ratio
+60.1 / 60.2 / 60.0; the last shots looked at beside the reference shots: the same scenes, complete and right. Counters are
+from the runs' last `RX_VK_RES_LOG` and `BC cache` lines. One run each.
+
+| Scene | Build | Game RAM | of it GPU pools | Process RAM | Commit | VRAM | Vulkan in system memory (heap 1 blocks) | of it BC cache | of it capture buffers |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | before | 5435 | 1817 | 10575 | 19965 | 6059 | 1431 | 756 | 619 |
+| | after | 5252 | 1616 | **9619** | 19013 | 5936 | **422** | 0 | 402 |
+| castle-move | before | 5704 | 2037 | 11342 | 21435 | 6810 | 1668 | 890 | 670 |
+| | switches off (`s1c2off`) | 5221 | 1547 | 11069 | 20947 | 6417 | 1650 | 890 | 716 |
+| | after | 5211 | 1540 | **9974** | 20445 | 6941 | **553** | 0 | 525 |
+| hyrule-walk | before | 5299 | 1772 | 11032 | 20596 | 6491 | 1518 | 853 | 652 |
+| | after | 5147 | 1497 | **9860** | 19290 | 6100 | **528** | 0 | 446 |
+
+MB. **Vulkan memory in system memory: -1.0 to -1.1 GB in every scene; the process's working set: -1.0 to -1.4 GB; the
+commit charge: -1.0 to -1.3 GB.** The game's RAM moves by -0.1 to -0.5 GB between runs whatever the build (the cold pages'
+come-backs at the scene load, section 8): not this change's.
+
+### 10.1 The BC cache (`RX_VK_BC_CACHE_LAZY`, `gpu/vk/vk_texture.cpp`)
+
+- What it holds and why (TICK-051): the BC blocks of every ASTC texture the GPU transcodes, in host-cached system memory, keyed
+  by a hash of the ASTC bytes, so that a texture evicted by the VRAM budget and made again is copied from there instead of
+  decoded and encoded again (82% of a Market walk's transcodes on an RTX 3050 were of bytes transcoded before). Cap 1024 MB.
+- Counted: on the RTX 5070 it stored 1016-1308 textures (756-890 MB) a scene and served **0**: the texture budget (6144 MB)
+  is never reached (textures at most 3760 MB), nothing transcoded is evicted. A new counter, the transcodes of bytes
+  transcoded before (`bcc_seen`, counted with the switch on or off): 179 in the castle run with every transcode stored and 0
+  served (the same bytes made again before the GPU had written their first blocks, which the cache cannot serve), 137-266
+  with the change. **No work redone.**
+- The change: the cache stores nothing until the textures pass 3/4 of their budget or an ASTC texture uploaded from memory is
+  evicted; from then on it stores every transcode, as before. The default is on where the driver allows more than 9.5 GB of
+  VRAM, off below: on the PC 3050 (7273 MB allowed, castle walk, one run each) the textures made again were transcoded at the
+  scene's load, before either trigger: storing all, 416 came from the cache and 274 were transcoded again; storing from the
+  first eviction, 360 and 404; from 3/4 of the budget, 12 and 208 (of 220 made again). There the cache earns its memory and
+  keeps it. Storing the bytes transcoded before alone (tried first) held 76-104 MB on the 5070 for no hit: left out.
+- Switch: `RX_VK_BC_CACHE_LAZY=1` / `=0` (0: every transcode stored, as before); `RX_VK_BC_CACHE_MB` unchanged. The log line
+  `vk: BC cache (RX_VK_BC_CACHE_MB): ...` now gives the transcodes of bytes transcoded before, those not stored, and whether it
+  stores; a line says when and why storing began.
+
+### 10.2 The capture buffers (`RX_VK_CAP_FIT`, `RX_VK_CAP_SPARE_SECS`, `gpu/vk/vk_memory.cpp`)
+
+- What they hold and why: each submit's capture copies the pages written since the last one into a host-cached buffer; the
+  last 25 are kept (`kKeep`) because the mirror syncs copy from them (TICK-019); retired buffers are kept as spares (up to 12)
+  because making one on the submitting thread every submit cost the replay (comment at `cap_free`).
+- Counted (new line `vk: capture buffers since the last line`): with best fit alone, 68-886 takes per 600 frames gave a
+  spare of over twice the need's size class (the load's 40-64 MB buffers to captures of a few MB), so the 25 kept buffers were
+  283-369 MB of which their captures filled 150-173 MB; the fewest spares left after a take was 8-10 of 11 (one or two in use
+  at a time); 45-48 buffers made in a run.
+- The change, `RX_VK_CAP_FIT=1` (default): a capture takes a spare at most twice its need's size class, else a buffer of its
+  size is made; a returned buffer, when 12 spares are kept, takes the place of the largest spare left untaken for 2 s if it
+  is smaller (any largest at first: a castle walk's ~50 MB capture a frame then lost its spare every frame, 728-1130 buffers
+  made in a run; with the 2 s rule, 93-113). And `RX_VK_CAP_SPARE_SECS=20` (default): a spare untaken for 20 s is freed. It
+  freed 0-2 spares a run: in these scenes every spare is taken again within 20 s; it is there for scenes left behind.
+- Result: kept + spares 402-525 MB (619-716 before). **Work redone: 93-113 buffers made in a run instead of 45-48** (about
+  2 a second while walking, after the load), each a host-cached allocation on the thread that takes the capture. Not measured
+  as time (rule of the night).
+- Switches: `RX_VK_CAP_FIT=0` and `RX_VK_CAP_SPARE_SECS=0` give the previous behaviour.
+
+### 10.3 The imports that pin game memory: measured, not changed
+
+- What they are for: the back end imports guest memory into Vulkan (`VK_EXT_external_memory_host`) by 16 MB chunk around a
+  binding (`import_chunk`, `RX_VK_IMPORT_CHUNK_MB`), because an import cost 5-45 ms in the driver and the game makes ~13 pools a
+  second; each import gets a VRAM mirror of its size (section 9 (i)). The driver locks an import's pages.
+- Counted: 50-60 live imports of 1622-1832 MB on the main PC. **What stays of `0x024` in RAM under section 8 is not mostly
+  these**: on the PC 3050, castle walk, `RX_VK_IMPORT_CHUNK_MB=4` against 16 (one run each): live imports 1444 MB against 1846,
+  mirrors 1292 MB against 1686 (VRAM -394 MB), imports 95 against 73 in 315 ms against 344 ms in all, but `0x024` in RAM 1344
+  MB against 1355. The pages that stay are mostly the cold pages' come-backs at the scene's load (1.06-1.29 GB come back in the
+  10-20 s of the load, section 8), held in for 30 s by the policy, which the memory split at 95 s still sees. This corrects
+  section 8's sentence that they sit "mostly in the 16 MB chunks".
+- Not changed: smaller chunks would save VRAM (the mirrors) rather than RAM, and the cost to watch is imports made on the
+  replay's thread at a binding (a hitch history: 130-147 ms, `import_span`), a timing question this brick does not measure.
+  Left for the decommit brick (section 9 (i)), which needs the imports dropped anyway.
+
+### 10.4 Vulkan memory in system memory: what it was
+
+Heap 1 (system) of the `vk: memory heaps` line held 1431-1668 MB in blocks before: the BC cache's 756-890 MB, the capture
+buffers' 619-716 MB, and 7 MB of other host memory (the imports are counted in the heap's "used", not in its blocks). After
+10.1 and 10.2: 422-553 MB, of which the capture buffers are 402-525 MB. The staging arenas (140 MB) and the streams (96 MB)
+are VRAM behind the BAR, not here. Nothing else to take.
+
+### Not verified
+
+- The PC 3050 with the final build (its default keeps the BC cache as before; 10.2 ran there in an earlier form only).
+- Long sessions, several scene changes, a scene that evicts on a 12 GB card (the BC cache then stores from its trigger on,
+  as before; the textures transcoded before it are transcoded again if made again).
+- The time taken by the extra capture buffers made (10.2) and by smaller imports (10.3).

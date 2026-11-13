@@ -963,7 +963,6 @@ bool cap_fit() {
     static const bool v = !getenv("RX_VK_CAP_FIT") || atoi(getenv("RX_VK_CAP_FIT")) != 0;
     return v;
 }
-uint64_t cap_buf_size(uint64_t need);   // (below)
 uint64_t cap_now_ms() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
