@@ -49,7 +49,7 @@ int Counters::report(char* out, size_t cap) const {
                            static_cast<unsigned long long>(f), bytes[i].load(std::memory_order_relaxed) / 1048576.0);
     }
     if (n > 0 && static_cast<size_t>(n) < cap && errors.load())
-        n += std::snprintf(out + n, cap - n, ", native error paths %llu", static_cast<unsigned long long>(errors.load()));
+        n += std::snprintf(out + n, cap - n, ", error paths %llu", static_cast<unsigned long long>(errors.load()));
     if (n > 0 && static_cast<size_t>(n) < cap && (checked_files.load() || unchecked.load()))
         n += std::snprintf(out + n, cap - n, "; check: files %llu (%llu chunked), %.1f MB, mismatches %llu, not checked %llu",
                            static_cast<unsigned long long>(checked_files.load()),

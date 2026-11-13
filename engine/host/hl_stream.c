@@ -204,6 +204,19 @@ static void record(uint64_t req, uint64_t dest, uint64_t size, uint64_t compress
     hl_stream_record(&d);
 }
 
+/* a decode that ended on an error path: counted, the first ones logged */
+static void error_path(uint64_t req, const char *who, uint32_t code, uint64_t size) {
+    hl_stream_error();
+    static volatile LONG told;
+    if (InterlockedIncrement(&told) > 12) return;
+    char name[160];
+    request_name(req, name, sizeof name);
+    hos_log("hl stream: %s decode of %s ended on an error path: code %u, decompressed size %llu, given %#llx, limit %u, "
+            "quiet %u, result at %#llx", who, name[0] ? name : "(no name)", code, (unsigned long long)size,
+            (unsigned long long)l64(req + R_DEST), l32(req + R_LIMIT), l8(req + R_QUIET) & 1,
+            (unsigned long long)l64(req + R_RESULT));
+}
+
 /* what a request is, read before anything is done for it */
 static int choose(uint64_t obj, uint64_t req) {
     const uint64_t file = l64(req + R_FILE), buf = l64(obj + D_BUFFER);
@@ -271,6 +284,8 @@ static void check_file(Ctx *A64_NOESC c) {
     ReleaseSRWLockExclusive(&collect_lock);
     if (!dest) {   /* (an error path: nothing decoded) */
         hl_stream_count(reason, 0);
+        const uint64_t at = l64(req + R_RESULT);
+        error_path(req, "the translated", at ? l32(at) : 0, 0);
         free(own);
         return;
     }
@@ -401,7 +416,7 @@ static void hl_decode_file(Ctx *A64_NOESC c) {
     if (!handle) {   /* (not opened: code 8, nothing to close) */
         const uint64_t at = l64(req + R_RESULT);
         if (at) s32(c, at, 8);
-        hl_stream_error();
+        error_path(req, "the native", 8, 0);
         goto out_unflagged;
     }
     s64_sp(c, sp + 72, file);
@@ -535,7 +550,7 @@ static void hl_decode_file(Ctx *A64_NOESC c) {
         if (ZSTD_isError(r)) e = ZSTD_getErrorCode(r) == ZSTD_error_dstSize_tooSmall ? -2 : -1;
         else if ((int32_t)r < 0) e = (int32_t)r;
         if (e) {
-            hl_stream_error();
+            error_path(req, "the native", result_code(e), fcs);
             if (!(l8(req + R_QUIET) & 1) && l64(req + R_RESULT)) s32(c, l64(req + R_RESULT), result_code(e));
             if (x28 & 1) gcall(c, F_FREE, 1, dest, 0, 0, 0, 0);
             dest = 0;
@@ -552,7 +567,7 @@ static void hl_decode_file(Ctx *A64_NOESC c) {
     goto flag;
 
 fail:
-    hl_stream_error();
+    error_path(req, "the native", (uint32_t)code, fcs);
     {
         const uint64_t at = l64(req + R_RESULT);
         if (at && (quiet_ok || !(l8(req + R_QUIET) & 1))) s32(c, at, (uint32_t)code);

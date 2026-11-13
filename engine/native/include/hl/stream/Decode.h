@@ -43,7 +43,7 @@ Reason choose(const Request& r);
 struct Counters {
     std::atomic<uint64_t> files[static_cast<int>(Reason::Count)] = {};
     std::atomic<uint64_t> bytes[static_cast<int>(Reason::Count)] = {};   // decompressed bytes, when known
-    std::atomic<uint64_t> errors{0};                                       // native decodes that ended on an error path
+    std::atomic<uint64_t> errors{0};                                       // decodes that ended on an error path (no destination)
     // the check (translated decode, then the same bytes decoded natively and compared)
     std::atomic<uint64_t> checked_files{0}, checked_bytes{0}, mismatches{0}, unchecked{0};
     std::atomic<uint64_t> checked_chunked{0};
