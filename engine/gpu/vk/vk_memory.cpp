@@ -954,6 +954,16 @@ uint64_t cap_spare_ms() {
     static const uint64_t v = (getenv("RX_VK_CAP_SPARE_SECS") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_CAP_SPARE_SECS"))) : 20) * 1000;
     return v;
 }
+// (HeyListen, 2026-11-14) RX_VK_CAP_FIT=1 (default; 0: as before): a capture takes a spare at most twice its need's size class
+// (cap_buf_size), else a buffer of its size is made; and a spare returned when 12 are kept takes the largest one's place if it is
+// smaller. Best fit alone gave the load's 40-64 MB spares to captures of a few MB: 68-886 such takes per 600 frames on the RTX
+// 5070, and the 25 kept buffers (each held for 24 captures, for the mirror syncs) were 283-309 MB of which their captures filled
+// 150-171 MB
+bool cap_fit() {
+    static const bool v = !getenv("RX_VK_CAP_FIT") || atoi(getenv("RX_VK_CAP_FIT")) != 0;
+    return v;
+}
+uint64_t cap_buf_size(uint64_t need);   // (below)
 uint64_t cap_now_ms() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -983,6 +993,16 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
                 } else {
                     i++;
                 }
+        if (cap_fit() && cap_free.size() >= 12 && size <= (64ull << 20)) {   // (RX_VK_CAP_FIT: a smaller one takes the largest's place)
+            size_t big = 0;
+            for (size_t i = 1; i < cap_free.size(); i++)
+                if (cap_free[i].size > cap_free[big].size) big = i;
+            if (cap_free[big].size > size && n_old < 12) {
+                old[n_old++] = cap_free[big];
+                cap_free_bytes -= cap_free[big].size;
+                cap_free.erase(cap_free.begin() + (ptrdiff_t)big);
+            }
+        }
         if (cap_free.size() < 12 && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
             cap_free.push_back({buffer, alloc, map, size, cap_gets, now});
             cap_free_bytes += size;
@@ -1019,6 +1039,8 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     size_t best = cap_free.size();
     for (size_t i = 0; i < cap_free.size(); i++)
         if (cap_free[i].size >= need && (best == cap_free.size() || cap_free[i].size < cap_free[best].size)) best = i;
+    if (best < cap_free.size() && cap_fit() && cap_free[best].size > 2 * cap_buf_size(need))   // (RX_VK_CAP_FIT: counted as over)
+        best = cap_free.size(), cap_taken_over++;
     if (best < cap_free.size()) {
         buffer = cap_free[best].buffer, alloc = cap_free[best].alloc, map = cap_free[best].map, size = cap_free[best].size;
         cap_free_bytes -= size;
@@ -6226,7 +6248,8 @@ void memory_res_log() {
             if (n < 150) n += snprintf(spare_sizes + n, sizeof spare_sizes - n, " %llu", (unsigned long long)(f.size >> 20));
     }
     used_b = cap_used;   // (the replay's, read racily, for the count only)
-    logf("vk: capture buffers since the last line: largest need %llu KB, %llu spares taken over twice the need's size, fewest "
+    logf("vk: capture buffers since the last line: largest need %llu KB, %llu spares over twice the need's size class (refused with "
+         "RX_VK_CAP_FIT, else taken), fewest "
          "spares left after a take %llu; kept buffers filled %llu MB of %llu; spare sizes (MB):%s",
          (unsigned long long)(need_max >> 10), (unsigned long long)taken_over, (unsigned long long)free_low,
          (unsigned long long)(used_b >> 20), (unsigned long long)(cap_bytes >> 20), spare_sizes);

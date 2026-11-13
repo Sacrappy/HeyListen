@@ -1110,12 +1110,12 @@ uint64_t bcc_cap() {
     return v;
 }
 // (HeyListen, 2026-11-14) RX_VK_BC_CACHE_LAZY=1 (the default on cards the driver allows more than 9.5 GB of; 0: every
-// transcode stored, as before): blocks are stored only for
-// bytes transcoded before (bcc_seen), or once the textures passed 3/4 of their budget or an ASTC texture uploaded from memory was
-// evicted (bcc_evicting: from then on every transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the
-// three scenes stored 1016-1308 textures, 756-890 MB of host-cached memory, and served 0. The cost where it does serve: one
-// transcode more for a texture made again whose first transcode came before (counted: st_bcc_again, transcodes of bytes
-// transcoded before). Not by default where the driver allows 9.5 GB of VRAM or less: on the PC 3050 (8 GB, 7273 MB allowed) a
+// transcode stored, as before): blocks are stored only once
+// the textures passed 3/4 of their budget or an ASTC texture uploaded from memory was evicted (bcc_evicting: from then on every
+// transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the three scenes stored 1016-1308 textures,
+// 756-890 MB of host-cached memory, and served 0. The transcodes of bytes transcoded before (st_bcc_again, kept in bcc_seen) are
+// counted with the switch on and off: 168-226 a scene there, which the cache did not serve when it stored all either (the same
+// bytes made again before the GPU had written their first blocks). Storing those alone held 76-104 MB for no hit. Not by default where the driver allows 9.5 GB of VRAM or less: on the PC 3050 (8 GB, 7273 MB allowed) a
 // castle walk evicts and makes again textures transcoded at the scene's load, before either trigger: storing all, 416 came from
 // the cache and 274 were transcoded again; storing from the first eviction, 360 and 404; from 3/4 of the budget, 12 and 208 of
 // 220 made again (one run each)
@@ -1217,7 +1217,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 if (bcc_seen.size() >= 262144) bcc_seen.clear();
                 const bool again = !bcc_seen.insert(cache_key).second;
                 if (again) st_bcc_again.fetch_add(1, std::memory_order_relaxed);
-                if (bcc_lazy() && !again && !bcc_evicting.load(std::memory_order_relaxed))
+                if (bcc_lazy() && !bcc_evicting.load(std::memory_order_relaxed))
                     cache_key = 0, st_bcc_skipped.fetch_add(1, std::memory_order_relaxed);   // (not stored: RX_VK_BC_CACHE_LAZY)
             }
         }
