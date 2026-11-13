@@ -231,6 +231,24 @@ PC 3050, builds `s6-a`, one run a scene (110 s); the counts are the last 10-seco
 One file (`Tex/CmnTex_Map_Soil_FairyFountain_Floor_D_Nrm.bntx`) ends on the bad-header path (code 4) every time it is
 asked, in the translated function as in the native one: the game's own behaviour, not counted as a mismatch.
 
+### The chunked case natively (brick 6.2, second session)
+
+The check of the new form (`HL_STREAM_CHECK=1`: the translated function and its decoding thread answer; the chunks the
+thread was given are decoded again by the native path's streaming decode, fed in the same chunks, and compared byte for
+byte). PC 3050, build `s6b-1`, one run a scene, the last 10-second line:
+
+| Scene | Files checked | Of them chunked | MB compared | Mismatches |
+|---|---:|---:|---:|---:|
+| castle-move | 9,814 | 507 | 4,979 | **0** |
+| kokiri-idle | 8,146 | 441 | 4,187 | **0** |
+| hyrule-walk | 9,611 | 489 | 4,801 | **0** |
+
+The native function itself in the game (`HL_STREAM_CHECK=2`: it answers, chunked files included, and each chunked file
+it decoded is decoded again in one call from the bytes it read and compared): castle-move on the PC 3050, ran to the end,
+514 chunked files (2,927 MB) decoded natively, **0 mismatches**, no fallback to the translated function.
+
+ValidationPlaceholder
+
 ### Share of the native path
 
 In every scene about 95% of the files and about 40% of the decompressed bytes are one-read files (native); the chunked
@@ -256,9 +274,9 @@ not named. With this the default is on (`HL_STREAM=1`).
 - The rare paths given to the translated function whole (no file object, a temporary read buffer, no heap, a bad
   granularity) were never taken in the three scenes; the native error paths other than code 4 were never taken either:
   they are written from the reading, not seen working.
-- The chunked case is translated, after one extra open, read and close of the file (section 5); that this extra read is
-  invisible to the game is reasoned, not shown beyond the runs being right.
-- The provenance table is recorded only: nothing reads it, so its use (decommit and restore) is not tested in the game.
+- That the decoding thread and the descriptor need nothing more than what the native chunked path leaves (section 5) is
+  established by reading, then by the runs being right; the fallback to the translated function was never taken.
+- The provenance table is read only by the measurement and the restore test of section 9; nothing is decommitted.
 - Other scenes, a scene change, and a save loaded elsewhere than the castle town market.
 
 ## 9. A decoded resource's pages given back for good (brick 6.3)
@@ -331,7 +349,7 @@ PC 3050, the same three runs (build `s6b-3`). Every range at its second check, 1
 The one range with no RomFS file is the resource system's own archive, whose heap is named `ares::System` (not a path);
 it would need its own name to file rule and is not a candidate. The size on disk equalled the recorded compressed size
 for every file. A restore costs the whole file (read and decode, ~1.8 ms a MB on this PC): a few ms for a texture, up to
-a third of a second for the largest files (the 310 MB shader archive's range class); a touch of one page of a large range
+0.33-0.37 s for the largest files; a touch of one page of a large range
 would pay that unless restores keep a cache of the last files or decode only up to the touched page (zstd decodes a frame
 in order: a page near the start is cheaper).
 
