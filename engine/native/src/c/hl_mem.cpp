@@ -57,6 +57,10 @@ extern "C" void hl_mem_cold_imported(uint64_t lo, uint64_t hi) {
     for (int k = 0; k < HL_MEM_COLD_KINDS; k++)
         if (auto* c = of(k)) c->mark_imported(lo, hi);
 }
+extern "C" void hl_mem_cold_unimported(uint64_t lo, uint64_t hi) {
+    for (int k = 0; k < HL_MEM_COLD_KINDS; k++)
+        if (auto* c = of(k)) c->unmark_imported(lo, hi);
+}
 extern "C" int hl_mem_cold_report(int kind, char* out, size_t cap) {
     auto* c = of(kind);
     return c ? c->report(out, cap) : 0;

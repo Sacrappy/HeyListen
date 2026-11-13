@@ -85,6 +85,11 @@ struct Pool {
     uint32_t mirror_id = 0;      // (TICK-048: a new number at each mirror_make; the sync diff's page hashes name their mirror)
     uint64_t idle_freed_epoch = 0;   // (TICK-057: its mirror last given back as idle, at this submission; 0: never)
     uint32_t remade = 0;             // (TICK-057: its mirror made again within kLongIdle of being given back as idle)
+    // (HeyListen, RX_VK_NO_HOST_IMPORT: see "imports given back once the mirror holds the pool")
+    bool gpu_written = false;        // a written binding of it was seen: its write-backs go through the import, kept
+    uint64_t fill_value = 0;         // the recording whose uploads filled its mirror
+    uint64_t again_epoch = 0;        // the submission that last imported it again
+    uint32_t again = 0;              // times imported again after its import was given back
 };
 void diff_gpu_wrote(uint64_t guest, uint64_t size);   // (TICK-048, below: the GPU may have written there)
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
@@ -100,6 +105,9 @@ Pool* last_pool = nullptr;            // (the last pool_of hit: draws in a row b
 extern Pool* pool_cache[4096];
 void retire_pool(std::map<uint64_t, Pool>::iterator it);
 Pool* pool_lookup(uint64_t guest, uint64_t size);
+// (RX_VK_NO_HOST_IMPORT: a pool whose import was given back, imported again where guest memory is needed through it; below)
+enum { kAgainBind, kAgainWrite, kAgainSync, kAgainMake, kAgainRb, kAgainTexture, kAgainFree, kAgainWb, kAgainKinds };
+bool import_again(Pool& p, int why);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
     SRWLOCK l = SRWLOCK_INIT;
     void lock() { AcquireSRWLockExclusive(&l); }
@@ -4123,6 +4131,7 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_inherit_kept, st_inherit_newer, st_inherit_unfilled;   // (TICK-036: bytes a new mirror took from retired mirrors / from guest memory instead)
+int64_t st_sync_live_lost;   // (RX_VK_NO_HOST_IMPORT: live pages of a pool not imported again: left out of a sync)
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
@@ -4681,6 +4690,10 @@ int64_t mirror_sync(Pool& p) {
         for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
         st_sync_copies += (int64_t)rs.size();
     }
+    if (!runs.empty() && !p.memory && !import_again(p, kAgainSync)) {   // (RX_VK_NO_HOST_IMPORT: not imported again: left out)
+        runs.clear();
+        st_sync_live_lost++;
+    }
     if (!runs.empty() && maddr && scatter_add(p.address, maddr, runs)) {
         for (const VkBufferCopy& r : runs) st_sync_bytes += (int64_t)r.size;
         st_sync_copies += (int64_t)runs.size();
@@ -4840,6 +4853,7 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         --pit;
         Pool& p = pit->second;
         if (g < p.lo || g >= p.hi || p.mstate != Pool::MIRROR_ON || !p.mirror) continue;
+        if (!p.memory && !import_again(p, kAgainRb)) continue;   // (RX_VK_NO_HOST_IMPORT)
         const uint64_t a = std::max(g + span_lo, p.lo) - p.lo, b = std::min(g + span_hi, p.hi) - p.lo;
         if (b <= a) continue;
         if (joined && (!ahead_made || written_ahead(p.lo + a, p.lo + b))) {   // (not here: see above)
@@ -4887,7 +4901,7 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     const uint64_t guest = host->gpu_guest(gpu);
     std::lock_guard lk(pools_mu);
     Pool* p = pool_of(guest, size);
-    if (!p) return {};
+    if (!p || (!p->memory && !import_again(*p, kAgainTexture))) return {};
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
@@ -4922,7 +4936,7 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
     auto it = imported.upper_bound(hi);   // (pools by lo: those starting below hi, the last ones checked first)
     while (it != imported.begin()) {
         --it;
-        if (it->second.hi > lo) return 1;
+        if (it->second.hi > lo && it->second.memory) return 1;   // (RX_VK_NO_HOST_IMPORT: one given back is not)
         if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
     }
     for (const auto& nh : retired_pools)
@@ -5064,7 +5078,8 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
-        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) {
+        if ((!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) &&
+            p->buffer) {   // (RX_VK_NO_HOST_IMPORT: a pool without its import goes the locked way, to be imported again)
             if (p->lazy_held) st_lazy_direct.fetch_add(1, std::memory_order_relaxed);   // (a diagnostic: guest memory without the GPU writes left in the mirror)
             if (mirror_on()) st_direct_fast.fetch_add(1, std::memory_order_relaxed), st_direct_fast_bytes.fetch_add((int64_t)size, std::memory_order_relaxed);
             return remember({p->buffer, off, size, 0});
@@ -5093,6 +5108,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
+        if (!p->memory && !import_again(*p, kAgainBind)) return {};   // (RX_VK_NO_HOST_IMPORT)
         if (p->lazy_held) st_lazy_direct.fetch_add(1, std::memory_order_relaxed);
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
         return remember({p->buffer, off, size, 0});
@@ -5118,6 +5134,8 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         mirror_wanted.push_back(p);
     }
     if (p->mstate != Pool::MIRROR_ON) {
+        if (written) p->gpu_written = true;
+        if (!p->memory && !import_again(*p, written ? kAgainWrite : kAgainBind)) return {};   // (RX_VK_NO_HOST_IMPORT)
         auto& e = direct_by_pool[p->lo];
         e.first++, e.second = (int)p->mstate;
         direct_bytes_by_pool[p->lo] += size;
@@ -5125,6 +5143,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (written && size <= (1u << 20))   // (EvilBoyce: GPU results written in place; small ones: the readbacks are)
             wb_pages_note(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo), mem_rec_value);
         return remember({p->buffer, off, size, 0});
+    }
+    if (written) {   // (RX_VK_NO_HOST_IMPORT: its write-backs go through the import: kept from now on)
+        p->gpu_written = true;
+        if (!p->memory && !import_again(*p, kAgainWrite)) return {};
     }
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
     if (written) {
@@ -5168,9 +5190,13 @@ std::deque<DeadMirror> dead_mirrors;
 // Forest ~1.3 GB of imports, 15-45 ms a submission (3-4 fps on an RX 7800 XT with 11 ms of GPU time; issues 312, 413). Its
 // table entries went at its retirement, and its mirror goes before (mstate), so once the GPU is past retired_value nothing
 // reaches it. The node stays (pointers to it are kept elsewhere); only its buffer and memory go. RX_VK_KEEP_RETIRED=1: kept
-struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; uint64_t value; uint64_t bytes; std::vector<VkDeviceMemory> pieces; };
+struct DeadImport {
+    VkBuffer buffer; VkDeviceMemory memory; uint64_t value; uint64_t bytes; std::vector<VkDeviceMemory> pieces;
+    uint64_t lo = 0, hi = 0;   // (RX_VK_NO_HOST_IMPORT: a live pool's import given back: the host is told once it is freed)
+};
 std::deque<DeadImport> dead_imports;
 uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
+void import_unpinned(uint64_t lo, uint64_t hi);   // (below)
 void reap_mirrors() {   // (pools_mu held)
     while (!dead_mirrors.empty() && dead_mirrors.front().value <= mem_completed) {
         if (getenv("RX_VK_LOG_ADDR")) {
@@ -5186,7 +5212,8 @@ void reap_mirrors() {   // (pools_mu held)
         vkDestroyBuffer(dev.device, dead_imports.front().buffer, nullptr);
         vkFreeMemory(dev.device, dead_imports.front().memory, nullptr);
         for (VkDeviceMemory m : dead_imports.front().pieces) vkFreeMemory(dev.device, m, nullptr);
-        st_retired_imports_freed++, st_retired_import_bytes_freed += dead_imports.front().bytes;
+        if (dead_imports.front().hi) import_unpinned(dead_imports.front().lo, dead_imports.front().hi);
+        else st_retired_imports_freed++, st_retired_import_bytes_freed += dead_imports.front().bytes;
         dead_imports.pop_front();
     }
 }
@@ -5202,8 +5229,9 @@ void retired_imports_give_back() {   // (pools_mu held)
     static const bool keep = getenv("RX_VK_KEEP_RETIRED") && getenv("RX_VK_KEEP_RETIRED")[0] != '0';
 #endif
     uint64_t live_bytes = 0, retired_bytes = 0;
-    size_t retired_alive = 0;
-    for (auto& [lo, p] : imported) live_bytes += p.hi - p.lo;
+    size_t retired_alive = 0, live = 0;
+    for (auto& [lo, p] : imported)
+        if (p.memory) live_bytes += p.hi - p.lo, live++;   // (RX_VK_NO_HOST_IMPORT: a pool whose import was given back is not)
     for (auto& nh : retired_pools) {
         Pool& p = nh.mapped();
         if (!p.memory) continue;
@@ -5221,11 +5249,90 @@ void retired_imports_give_back() {   // (pools_mu held)
     if (mirror_epoch - logged_epoch >= 1200) {
         logged_epoch = mirror_epoch;
         logf("vk: imports: %zu live (%llu MB), %zu retired still imported (%llu MB), %llu retired given back (%llu MB)",
-             imported.size(), (unsigned long long)(live_bytes >> 20), retired_alive, (unsigned long long)(retired_bytes >> 20),
+             live, (unsigned long long)(live_bytes >> 20), retired_alive, (unsigned long long)(retired_bytes >> 20),
              (unsigned long long)st_retired_imports_freed, (unsigned long long)(st_retired_import_bytes_freed >> 20));
     }
 }
+// ---- (HeyListen) imports given back once the mirror holds the pool: RX_VK_NO_HOST_IMPORT=1 (default 0) ----
+// The driver locks every page of an import (VK_EXT_external_memory_host): 1.4-1.8 GB of the game's memory pinned in RAM, which
+// cold pages cannot take out of the working set and the guest-pages substrate cannot give back (memory-boundary.md 11.3, 14).
+// Once a pool has its VRAM mirror the import is read only for: the mirror's fill (done), syncs of pages the CPU wrote that no
+// kept capture holds ("live" pages), the write-backs of what the GPU wrote (pools bound for writing), readback pages (written
+// by the GPU too), and bindings while the pool has no usable mirror (made later, given back as idle, a parallel segment). The
+// GPU's texture paths read no import here (the counters "GPU reads of imported guest memory": texel views and unswizzles 0 MB).
+// So a mirrored pool never bound for writing, whose mirror's fill is done, gives its import back (freed once the GPU is past
+// everything that used it; the host is told then, so its pages are no longer counted pinned), and any of the uses above
+// imports it again first (import_again: counted by why). A pool imported again is kept 600 submissions before its import may
+// go again, and for good after its third time: a pool whose live pages come every frame keeps its import, as before.
+bool no_host_import_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_NO_HOST_IMPORT");
+        const bool v = e && atoi(e) != 0 && dev.external_memory_host;
+        logf("vk: imports of mirrored pools %s (RX_VK_NO_HOST_IMPORT)", v ? "given back once the mirror holds the pool" : "kept, as before");
+        return v;
+    }();
+    return on;
+}
+constexpr uint64_t kAgainHoldEpochs = 600;
+constexpr uint32_t kAgainGiveUp = 3;
+int64_t st_released = 0, st_released_bytes = 0, st_again[kAgainKinds] = {}, st_again_failed = 0, st_unpinned_bytes = 0;
+double st_again_ms = 0, st_again_max_ms = 0;
+
+bool import_again(Pool& p, int why) {   // (pools_mu held)
+    if (p.memory) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    Pool q;
+    if (!import_pool(p.lo, p.hi, q)) {
+        if (st_again_failed++ < 16)
+            logf("vk: pool %#llx..%#llx not imported again (why %d, VkResult %d)", (unsigned long long)p.lo, (unsigned long long)p.hi,
+                 why, (int)import_result);
+        return false;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    st_again_ms += ms, st_again_max_ms = std::max(st_again_max_ms, ms);
+    p.memory = q.memory, p.buffer = q.buffer, p.address = q.address, p.pieces = std::move(q.pieces);
+    if (p.mstate != Pool::MIRROR_ON) guest_pages_set(p.lo, p.hi, p.address);
+    p.again++, p.again_epoch = mirror_epoch;
+    st_again[why]++;
+    pools_gen++;   // (bindings remembered with the pool's old state are looked up again)
+    return true;
+}
+
+/// At a submission's start: the mirrored pools' imports that may go, given back (pools_mu held)
+void imports_release() {
+    if (!no_host_import_on()) return;
+    for (auto& [lo, p] : imported) {
+        if (!p.memory || p.mstate != Pool::MIRROR_ON || p.gpu_written || p.lazy_held || p.shadow || p.inherit_pending ||
+            p.fill_value > mem_completed || p.pieces.size() || p.again >= kAgainGiveUp ||
+            (p.again && mirror_epoch - p.again_epoch < kAgainHoldEpochs))
+            continue;
+        DeadImport d{p.buffer, p.memory, std::max(mem_rec_value, p.last_value), p.hi - p.lo, {}};
+        d.lo = p.lo, d.hi = p.hi;
+        dead_imports.push_back(std::move(d));
+        p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0;
+        st_released++, st_released_bytes += (int64_t)(p.hi - p.lo);
+        pools_gen++;
+    }
+    static int64_t logged_at = -1;
+    int64_t again = 0;
+    for (int64_t a : st_again) again += a;
+    if ((st_released + again) / 32 != logged_at) {
+        logged_at = (st_released + again) / 32;
+        logf("vk: imports given back as their mirror holds the pool: %lld (%llu MB), %llu MB unpinned; imported again %lld (bind %lld, "
+             "written %lld, live sync %lld, mirror made %lld, readback %lld, texture %lld, mirror freed %lld, write-back %lld; failed %lld; live pages "
+             "left out %lld), %.1f ms in all, %.1f ms at most", (long long)st_released, (unsigned long long)(st_released_bytes >> 20),
+             (unsigned long long)(st_unpinned_bytes >> 20), (long long)again, (long long)st_again[kAgainBind],
+             (long long)st_again[kAgainWrite], (long long)st_again[kAgainSync], (long long)st_again[kAgainMake], (long long)st_again[kAgainRb],
+             (long long)st_again[kAgainTexture], (long long)st_again[kAgainFree], (long long)st_again[kAgainWb], (long long)st_again_failed,
+             (long long)st_sync_live_lost, st_again_ms, st_again_max_ms);
+    }
+}
+
 void mirror_free(Pool& p) {
+    {   // (RX_VK_NO_HOST_IMPORT: a live pool without its import takes it again: the table goes back to guest memory below)
+        const auto live = imported.find(p.lo);
+        if (live != imported.end() && &live->second == &p && !p.memory) import_again(p, kAgainFree);
+    }
     p.was_mirrored = true;
     {   // (the table back to guest memory, for a pool still in use only: a retired one's range is another pool's now, and its
         // address there sent the foliage culling into freed memory, a device lost)
@@ -5332,6 +5439,21 @@ int64_t st_imports_evicted = 0;
 uint64_t st_import_bytes_evicted = 0;
 constexpr uint64_t kImportIdle = 600;
 
+/// (the host) the pages of [lo, hi) are no longer pinned by an import of ours, unless another one still holds them
+void import_unpinned(uint64_t lo, uint64_t hi) {   // (pools_mu held)
+    for (const auto& [k, p] : imported)
+        if (p.memory && p.lo < hi && lo < p.hi) return;
+    for (const auto& nh : retired_pools)
+        if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) return;
+    for (const auto& nh : evicted_pools)
+        if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) return;
+    using Note = void (*)(uint64_t, uint64_t);
+    static const Note note = (Note)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_noaccess_unimport");
+    if (note) note(lo, hi);
+    st_unpinned_bytes += (int64_t)(hi - lo);
+}
+
+
 void imports_give_back() {   // (pools_mu held)
     while (!evicted_pools.empty() && evicted_pools.front().mapped().retired_value <= mem_completed) {
         Pool& p = evicted_pools.front().mapped();
@@ -5404,6 +5526,7 @@ void memory_begin_submission() {
     std::lock_guard lk(pools_mu);
     reap_mirrors();
     retired_imports_give_back();
+    imports_release();   // (RX_VK_NO_HOST_IMPORT)
     mirror_epoch++;
     mirror_upload = true;
     mirror_synced.clear();
@@ -5503,6 +5626,10 @@ bool mirror_make(Pool& pool) {
                      (unsigned long long)(mirror_budget() >> 20));
             return false;
         }
+        if (!p->memory && !import_again(*p, kAgainMake)) {   // (RX_VK_NO_HOST_IMPORT: the fill reads the import)
+            p->mstate = Pool::MIRROR_NONE;
+            return false;
+        }
         MemKindScope mem_kind_(MemKind::Mirror);   // (TICK-038: RX_VK_RES_LOG)
         if (!create_device_buffer(n, kUsage, p->mirror, p->mirror_alloc)) {
             p->mstate = Pool::MIRROR_REFUSED;
@@ -5599,7 +5726,7 @@ bool mirror_make(Pool& pool) {
                 if (const uint64_t wa = inherit_watch_page() << kPageShift; inherit_watch_page() != ~0ull && wa >= a && wa < b) {
                     static const uint64_t at = getenv("RX_VK_LOG_INHERIT") ? strtoull(getenv("RX_VK_LOG_INHERIT"), nullptr, 16) & ~15ull : 0;
                     if (!iw_buf) create_buffer(4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, iw_buf, iw_alloc, &iw_map);
-                    if (iw_buf && at >= a && at + 64 <= b) {
+                    if (iw_buf && p->buffer && at >= a && at + 64 <= b) {
                         const VkBufferCopy c0{at - r.lo, 0, 64}, c1{at - p->lo, 64, 64}, c2{at - p->lo, 128, 64};
                         vkCmdCopyBuffer(upload_command_buffer(), r.mirror, iw_buf, 1, &c0);
                         vkCmdCopyBuffer(upload_command_buffer(), p->buffer, iw_buf, 1, &c1);
@@ -5656,6 +5783,7 @@ bool mirror_make(Pool& pool) {
             }
         }
         p->mstate = Pool::MIRROR_ON;
+        p->fill_value = mem_rec_value;   // (RX_VK_NO_HOST_IMPORT: its import may go once this recording is done)
         p->mirror_id = ++diff_mirror_ids;   // (TICK-048: the diff's hashes of another mirror do not hold for this one)
         if (!p->mirror_id) p->mirror_id = ++diff_mirror_ids;
         pools_gen.fetch_add(1, std::memory_order_relaxed);   // (the binding's buffer changes: guest memory, then this mirror)
@@ -6069,6 +6197,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
             cut_cpu_words(*p, runs);
             if (wb_lazy_on()) lazy_filter(*p, runs);   // (TICK-015)
             if (runs.empty()) continue;
+            if (!p->memory && !import_again(*p, kAgainWb)) continue;   // (RX_VK_NO_HOST_IMPORT: never so: written pools keep theirs)
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
@@ -6193,6 +6322,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 }
             }
             cut_cpu_words(*p, runs);
+            if (!runs.empty() && !p->memory && !import_again(*p, kAgainWb)) runs.clear();   // (RX_VK_NO_HOST_IMPORT)
             if (!runs.empty()) {
                 if (!barrier) transfer_barrier(cmd), barrier = true;
                 vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());

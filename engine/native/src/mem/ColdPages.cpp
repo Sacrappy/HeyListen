@@ -111,6 +111,16 @@ void ColdPages::mark_imported(uint64_t lo, uint64_t hi) {
     }
 }
 
+void ColdPages::unmark_imported(uint64_t lo, uint64_t hi) {
+    if (!ok()) return;
+    if (hi > config_.units) hi = config_.units;
+    for (uint64_t u = lo; u < hi; u++) {
+        const uint64_t bit = 1ull << (u & 63);
+        if (std::atomic_ref<uint64_t>(imported_[u >> 6]).fetch_and(~bit, std::memory_order_relaxed) & bit)
+            stats_.imported_units.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
 bool ColdPages::imported(uint64_t unit) const {
     if (!ok() || unit >= config_.units) return false;
     return std::atomic_ref<uint64_t>(imported_[unit >> 6]).load(std::memory_order_relaxed) >> (unit & 63) & 1;

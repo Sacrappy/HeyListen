@@ -125,6 +125,8 @@ public:
     void kernel_use(uint64_t lo, uint64_t hi, int64_t now);
     /// [lo, hi) is imported by the back end: never dropped from now on.
     void mark_imported(uint64_t lo, uint64_t hi);
+    /// [lo, hi) is no longer imported (the back end gave its import back): its granules may be dropped again.
+    void unmark_imported(uint64_t lo, uint64_t hi);
     /// [lo, hi) was unmapped: its ranges and dropped granules are forgotten (their bytes were given up).
     void forget(uint64_t lo, uint64_t hi);
 

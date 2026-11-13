@@ -80,6 +80,9 @@ extern "C" void hl_drop_kernel_use(uint64_t lo, uint64_t hi, int64_t now_ns) {
 extern "C" void hl_drop_imported(uint64_t lo, uint64_t hi) {
     if (auto* d = g_drop.load()) d->mark_imported(lo, hi);
 }
+extern "C" void hl_drop_unimported(uint64_t lo, uint64_t hi) {
+    if (auto* d = g_drop.load()) d->unmark_imported(lo, hi);
+}
 extern "C" void hl_drop_forget(uint64_t lo, uint64_t hi) {
     if (auto* d = g_drop.load()) d->forget(lo, hi);
 }

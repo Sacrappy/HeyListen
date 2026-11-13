@@ -51,6 +51,7 @@ int hl_drop_touch(uint64_t addr, int path, int64_t now_ns);
 int hl_drop_wait_pending(uint64_t addr);
 void hl_drop_kernel_use(uint64_t lo, uint64_t hi, int64_t now_ns);
 void hl_drop_imported(uint64_t lo, uint64_t hi);
+void hl_drop_unimported(uint64_t lo, uint64_t hi);
 void hl_drop_forget(uint64_t lo, uint64_t hi);
 uint64_t hl_drop_reconcile(void);
 /* Granules dropped now; one line of counters. */

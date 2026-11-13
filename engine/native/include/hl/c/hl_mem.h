@@ -36,6 +36,8 @@ uint64_t hl_mem_cold_back_pages(int kind);
 /* Any thread, every kind: units [lo, hi) hold new data; units [lo, hi) are pinned by the driver (never taken out). */
 void hl_mem_cold_forget(uint64_t lo, uint64_t hi);
 void hl_mem_cold_imported(uint64_t lo, uint64_t hi);
+/* Units [lo, hi) are no longer pinned (the back end gave its import back). */
+void hl_mem_cold_unimported(uint64_t lo, uint64_t hi);
 /* One line of counters of one kind for the log. Returns the length written. */
 int hl_mem_cold_report(int kind, char *out, size_t cap);
 

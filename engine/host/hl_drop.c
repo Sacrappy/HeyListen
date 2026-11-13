@@ -156,6 +156,10 @@ void hl_drop_import(uint64_t lo, uint64_t hi) {
     in_kernel = 2;
 }
 void hl_drop_import_end(void) { in_kernel = 0; }
+/* (hos_memsplit.c hos_noaccess_unimport) the back end gave its import of [lo, hi) back */
+void hl_drop_unimport(uint64_t lo, uint64_t hi) {
+    if (drop_on) hl_drop_unimported(lo, hi);
+}
 /* (hl_stream.c) a decode wrote [dest, dest + size) */
 void hl_drop_decode(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name) {
     if (drop_on) hl_drop_decoded(dest, size, compressed, dict_id, name, hos_now_ns());
@@ -235,6 +239,7 @@ void hl_drop_kernel_begin(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_kernel_end(void) {}
 void hl_drop_import(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_import_end(void) {}
+void hl_drop_unimport(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_decode(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name) {
     (void)dest; (void)size; (void)compressed; (void)dict_id; (void)name;
 }

@@ -179,10 +179,15 @@ void refusals() {
     CHECK(d.stats().refused[int(Refuse::Imported)] == 1);
     CHECK(d.stats().refused[int(Refuse::KernelUse)] == 1);
     CHECK(!w.read_only[11] && !w.read_only[13]);
-    CHECK(d.pass(40 * S) == 1);   // 13 now; 11 and 12 never
+    CHECK(d.pass(40 * S) == 1);   // 13 now; 11 never; 12 while it is imported
     CHECK(d.pass(50 * S) == 0 && d.pass(60 * S) == 0);
     CHECK(w.dropped[13] && !w.dropped[11] && !w.dropped[12]);
-    CHECK(d.stats().refused[int(Refuse::Changed)] == 1 && d.stats().refused[int(Refuse::Imported)] == 1);
+    CHECK(d.stats().refused[int(Refuse::Changed)] == 1 && d.stats().refused[int(Refuse::Imported)] == 4);
+    // (the import given back: only whole granules leave the list, so a range cutting 12 keeps it; the whole of it frees it)
+    d.unmark_imported(BASE + 12 * G + 10, BASE + 13 * G);
+    CHECK(d.pass(70 * S) == 0);
+    d.unmark_imported(BASE + 12 * G, BASE + 13 * G);
+    CHECK(d.pass(80 * S) == 1 && w.dropped[12]);
     // (no source: refused for good)
     Window w2;
     fresh(w2);

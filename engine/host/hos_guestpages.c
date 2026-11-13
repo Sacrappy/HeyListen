@@ -386,6 +386,14 @@ void hos_gp_imported(void *p, size_t n) {
     if (any_bit(bm_dropped, a, b)) ask_owner(a, b, 1, HOS_GP_PATH_IMPORT);
 }
 
+/* (RX_VK_NO_HOST_IMPORT, stream M2) the back end freed its import of [p, p + n) and no other import holds it: its granules
+   may be dropped again */
+void hos_gp_unimported(void *p, size_t n) {
+    uint64_t a, b;
+    if (!span(p, n, &a, &b)) return;
+    for (uint64_t i = a; i < b; i++) bit_clear(bm_imported, i);
+}
+
 int hos_gp_report(char *out, size_t cap) {
     if (!gp_on) return 0;
     const LONG64 restored = n_restores[0] + n_restores[1] + n_restores[2] + n_restores[3];
@@ -419,5 +427,6 @@ int hos_gp_commit(void *p, size_t n) { (void)p, (void)n; return 0; }
 int hos_gp_decommit(void *p, size_t n) { (void)p, (void)n; return 0; }
 int hos_gp_reset(void *p, size_t n) { (void)p, (void)n; return 0; }
 void hos_gp_imported(void *p, size_t n) { (void)p, (void)n; }
+void hos_gp_unimported(void *p, size_t n) { (void)p, (void)n; }
 int hos_gp_report(char *out, size_t cap) { (void)out, (void)cap; return 0; }
 #endif

@@ -76,6 +76,10 @@ void hl_mem_pool_made(uint64_t addr, uint64_t size) {
 void hl_mem_imported(uint64_t lo, uint64_t hi) {
     if (cold_on && hi > lo) hl_mem_cold_imported(lo >> COLD_UNIT_SHIFT, (hi + 0xFFFF) >> COLD_UNIT_SHIFT);
 }
+/* (the back end gave its import of [lo, hi) back: the units wholly inside may go out of the working set again) */
+void hl_mem_unimported(uint64_t lo, uint64_t hi) {
+    if (cold_on && hi > lo) hl_mem_cold_unimported((lo + 0xFFFF) >> COLD_UNIT_SHIFT, hi >> COLD_UNIT_SHIFT);
+}
 
 typedef struct { void *va; ULONG_PTR attr; } ColdWs;   /* PSAPI_WORKING_SET_EX_INFORMATION (bit 0: valid) */
 typedef BOOL(WINAPI *ColdQueryFn)(HANDLE, PVOID, DWORD);
@@ -319,5 +323,6 @@ void hl_mem_init(void) {
 #else
 void hl_mem_pool_made(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 void hl_mem_imported(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
+void hl_mem_unimported(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_mem_init(void) {}
 #endif

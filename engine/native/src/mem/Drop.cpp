@@ -95,6 +95,21 @@ void Drop::mark_imported(uint64_t lo, uint64_t hi) {
     imported_.resize(n);
 }
 
+void Drop::unmark_imported(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    const uint64_t g = config_.granule;
+    lo = (lo + g - 1) & ~(g - 1), hi &= ~(g - 1);   // (whole granules only: a neighbour import may hold the ends)
+    if (hi <= lo) return;
+    std::lock_guard<std::mutex> m(marks_lock_);
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    for (const auto& [a, b] : imported_) {
+        if (b <= lo || a >= hi) { out.emplace_back(a, b); continue; }
+        if (a < lo) out.emplace_back(a, lo);
+        if (b > hi) out.emplace_back(hi, b);
+    }
+    imported_.swap(out);
+}
+
 void Drop::kernel_use(uint64_t lo, uint64_t hi, int64_t now) {
     if (hi <= lo) return;
     const uint64_t g = config_.granule;
@@ -121,7 +136,7 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
     for (uint32_t i = 0; i < r.state.size(); i++) {
         if (r.state[i] != kCandidate) continue;
         const uint64_t a = r.first + uint64_t(i) * g;
-        if (imported(a)) { r.state[i] = kNever, refuse(Refuse::Imported); continue; }
+        if (imported(a)) { refuse(Refuse::Imported), waiting = true; continue; }   // (until its import goes, if it does)
         if (kernel_busy(a, now)) { refuse(Refuse::KernelUse), waiting = true; continue; }
         if (host_.plain && !host_.plain(host_.ctx, a)) { refuse(Refuse::NotPlain), waiting = true; continue; }
         if (config_.require_cold && host_.resident && host_.resident(host_.ctx, a)) {
@@ -150,7 +165,7 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
         for (uint32_t i : cold) {
             const uint64_t a = r.first + uint64_t(i) * g;
             looked += g;
-            if (imported(a)) { r.state[i] = kNever, refuse(Refuse::Imported); continue; }
+            if (imported(a)) { refuse(Refuse::Imported), waiting = true; continue; }   // (until its import goes, if it does)
             if (kernel_busy(a, now)) { refuse(Refuse::KernelUse), waiting = true; continue; }
             if (host_.protect(host_.ctx, a, g, 1)) { refuse(Refuse::NotPlain), waiting = true; continue; }
             const uint8_t* now_bytes = host_.view(host_.ctx, a);
@@ -165,8 +180,7 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
             if (const int why = host_.drop(host_.ctx, a, g)) {
                 host_.protect(host_.ctx, a, g, 0);
                 // (-2: the substrate knows the back end imported it, which this module may not have been told yet)
-                if (why == -2) r.state[i] = kNever, refuse(Refuse::Imported);
-                else refuse(Refuse::Substrate), waiting = true;
+                refuse(why == -2 ? Refuse::Imported : Refuse::Substrate), waiting = true;
                 continue;
             }
             if (config_.check) r.hash[i] = h;

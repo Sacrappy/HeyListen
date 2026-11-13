@@ -69,6 +69,8 @@ public:
 
     /// Units [lo, hi) are pinned by the GPU driver (an import): never taken out, from now on.
     void mark_imported(uint64_t lo, uint64_t hi);
+    /// Units [lo, hi) are no longer pinned (the import was given back): they may be taken out again.
+    void unmark_imported(uint64_t lo, uint64_t hi);
     bool imported(uint64_t unit) const;
 
     const Stats& stats() const { return stats_; }

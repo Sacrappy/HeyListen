@@ -616,6 +616,13 @@ static int discard_on(void) {
     }
     return discard_state;
 }
+/* (the back end, RX_VK_NO_HOST_IMPORT: its import of [lo, hi) was freed and no other import of its holds those pages: no longer
+   pinned. The no-access discard list keeps the range: it stays conservative) */
+__declspec(dllexport) void hos_noaccess_unimport(uint64_t lo, uint64_t hi) {
+    hl_mem_unimported(lo, hi);
+    hl_drop_unimport(lo, hi);
+    if (hos_gp_ready() && hi > lo) hos_gp_unimported(GP(lo), (size_t)(hi - lo));
+}
 /* (the back end, before it commits and imports [lo, hi)) */
 __declspec(dllexport) void hos_noaccess_import(uint64_t lo, uint64_t hi) {
     hl_mem_imported(lo, hi);   /* (HL_MEM_COLD: pinned pages are never taken out of the working set) */
