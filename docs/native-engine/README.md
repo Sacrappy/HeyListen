@@ -124,7 +124,7 @@ speed is not being measured for now, by the owner's instruction: it comes back w
 | Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |
 | Rendering | `hl::gfx::RecordPass` | `HL_GFX` (1) | the recording pass's listener is native and runs the pass's two phases | the phases themselves (translated); the first native producer of NVN calls is being written (`HL_GFX_STATE`); direct emission to Vulkan |
 | OS layer | a mutex finds its host object from itself | `HOS_NO_MUTEX_IX` unset | 0.5 ms a frame of lookups gone from the chain | - |
-| Streaming | - | - | - | everything; the per-file heaps (one heap a loaded resource file, named by its path) are the handle for it |
+| Streaming | `hl::stream` (`host/hl_stream.c`) | `HL_STREAM` (0), `HL_STREAM_CHECK` | the decode of a resource file (`0x80108da0`) native for files that fit one read (95% of the files, 40% of the bytes): zstd's own decoder with the game's dictionaries; its check found 0 mismatches over ~24,000 files in the three scenes; every decode recorded in a provenance table (`stream-boundary.md`) | files larger than one read (their chunked decode on a second thread), the loading threads, the requests, the file system |
 | Physics loops | - | - | - | everything; specified in `physics-loops.md` (the step as a task graph, first units) |
 
 Measured with all of the above on (main PC, validation runs, MB): the game's memory in RAM 5,040-5,515 (it was
@@ -250,7 +250,7 @@ engine/native/
 |---|---|---|---|
 | 1 | Jobs and main loop | the 18 entry points answered natively, gameplay jobs run under lanes | **on in the game behind `HL_JOBS`**: each stage's work of a job thread is a job of the native job system, run by that thread (1) or by a native pool worker going on as that guest thread (2). 1 entry point of 18 answered; the dispatcher, the stages' begin and wait, the job group and the main loop are still the game's |
 | 2 | Memory | heap entry points answered by a native allocator that owns the guest address space | boundary mapped (`memory-boundary.md`); nothing native yet |
-| 3 | Resources and streaming | requests served by native loaders | boundary to map |
+| 3 | Resources and streaming | requests served by native loaders | first brick behind `HL_STREAM`: the decode of a file that fits one read (`stream-boundary.md`); the requests, the loading threads and the chunked decode are the game's |
 | 4 | Render submission | the graphics module's passes produced natively | boundary to map |
 | 5 | Audio | voices and mixing native | boundary to map |
 | 6 | Physics and navigation | services native | boundary to map; middleware |
