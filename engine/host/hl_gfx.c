@@ -34,7 +34,15 @@
                     on any other path (the cluster, indirect, query and inline-write paths) is left whole to the
                     translation
    With HL_GFX_CHECK=1 (or 2) it checks instead, in two segments around the preparation: a second gate at 0x8008fc00 is
-   the checkpoint, for the call the checked body makes (gfx-record-job.md section 9 says how). */
+   the checkpoint, for the call the checked body makes (gfx-record-job.md section 9 says how).
+
+   That gate is also the shared preparation's own (guest 0x8008fc00, 263 callers; gfx-record-job.md section 10):
+     HL_GFX_PREP=0  (the default) the translated function, as before
+     HL_GFX_PREP=1  native on its cached path (hl::gfx::Prepare): the material, the state and the program already applied,
+                    so that the call writes at most the block's applied bits and calls the material entry's pre-recorded
+                    list; every other call is left whole to the translation
+   With HL_GFX_CHECK=1 (or 2) every call is checked instead: its route counted, the native version compared call by call
+   on the cached path, and the translated body's NVN calls filed by kind in the paths' histogram. */
 #include "hl_host.h"
 #include "hl/c/hl_gfx.h"
 #include <stdio.h>
@@ -63,17 +71,19 @@ static int check_wanted(void) {
 }
 
 /* ---- the check's tap on the NVN procedures ---- */
-typedef struct { HostFn fn; void *user; uint32_t op; uint32_t proc; } Tap;   /* proc: the native numbering */
+/* proc: the native numbering; group: the kind of procedure, for the preparation's histogram (HL_GFX_PREP_GROUP_*) */
+typedef struct { HostFn fn; void *user; uint32_t op; uint32_t proc; uint32_t group; } Tap;
 static _Thread_local int recording;         /* a pass runs on this thread and is being recorded */
 static _Thread_local int state_recording;   /* the render-state function's translated body runs here, compared */
 static _Thread_local int draw_recording;    /* the sub-mesh submission's translated body runs here, compared (by segment) */
+static _Thread_local int prep_recording;    /* the shared preparation's translated body runs here, compared */
 static volatile LONG taps;
 enum { TAP_NAMES = 2048 };
 static const char *tap_names[TAP_NAMES];
 
 static void tap(Ctx *c, void *user) {
     const Tap *t = (const Tap *)user;
-    if (recording | state_recording | draw_recording) {
+    if (recording | state_recording | draw_recording | prep_recording) {
         uint64_t x[8];
         uint32_t f[4];
         memcpy(x, c->x, sizeof x);
@@ -81,8 +91,27 @@ static void tap(Ctx *c, void *user) {
         if (recording) hl_gfx_check_call(t->op, x, f);
         if (state_recording) hl_gfx_state_check_call(t->proc, x, f);
         if (draw_recording) hl_gfx_draw_check_call(t->proc, x, f);
+        if (prep_recording) hl_gfx_prep_check_call(t->proc, t->group, x, f);
     }
     t->fn(c, t->user);
+}
+
+/* The kind of an NVN procedure, by its name, for the preparation's histogram. */
+static uint32_t tap_group(const char *name) {
+    static const char *const state[] = {"nvnBlendState", "nvnColorState", "nvnChannelMaskState", "nvnDepthStencilState",
+                                        "nvnPolygonState", "nvnCommandBufferBindBlendState",
+                                        "nvnCommandBufferBindColorState", "nvnCommandBufferSetBlendColor",
+                                        "nvnCommandBufferBindChannelMaskState", "nvnCommandBufferBindDepthStencilState",
+                                        "nvnCommandBufferSetStencil", "nvnCommandBufferBindPolygonState",
+                                        "nvnCommandBufferSetPolygonOffsetClamp", "nvnCommandBufferSetDepthClamp"};
+    for (size_t i = 0; i < sizeof state / sizeof state[0]; i++)
+        if (!strncmp(name, state[i], strlen(state[i]))) return HL_GFX_PREP_GROUP_STATE;
+    if (!strcmp(name, "nvnCommandBufferBindProgram")) return HL_GFX_PREP_GROUP_PROGRAM;
+    if (!strncmp(name, "nvnCommandBufferBindUniformBuffer", 33)) return HL_GFX_PREP_GROUP_UNIFORM;
+    if (!strncmp(name, "nvnCommandBufferBindStorageBuffer", 33)) return HL_GFX_PREP_GROUP_STORAGE;
+    if (strstr(name, "Texture") || strstr(name, "Sampler")) return HL_GFX_PREP_GROUP_TEXTURE;
+    if (!strcmp(name, "nvnCommandBufferCallCommands")) return HL_GFX_PREP_GROUP_CALL;
+    return HL_GFX_PREP_GROUP_OTHER;
 }
 
 /* (nvn_native.c, for every procedure it hands the game, once a procedure) */
@@ -94,6 +123,7 @@ void hl_gfx_nvn_proc(const char *name, HostFn *fn, void **user) {
     t->op = (uint32_t)InterlockedIncrement(&taps) - 1;
     const uint32_t n = hl_gfx_nvn_count();
     for (t->proc = 0; t->proc < n && strcmp(hl_gfx_nvn_name(t->proc), name); t->proc++) {}
+    t->group = tap_group(name);
     if (t->op < TAP_NAMES) tap_names[t->op] = name;   /* (the NVN layer's table: lives as long as the process) */
     *fn = tap;
     *user = t;
@@ -113,6 +143,9 @@ static void hl_report(void) {
         hos_log("hl gfx: %s; passes on another context %lld", line, (long long)other_ctx);
     if (hl_gfx_state_report(line, sizeof line)) hos_log("hl gfx: %s", line);
     if (hl_gfx_draw_report(line, sizeof line)) hos_log("hl gfx: %s", line);
+    if (hl_gfx_prep_report(line, sizeof line)) hos_log("hl gfx: %s", line);
+    char shapes[2048];
+    if (hl_gfx_prep_shapes(shapes, sizeof shapes)) hos_log("hl gfx: %s", shapes);
 }
 
 /* ---- the pass ---- */
@@ -321,7 +354,7 @@ static int draw_init(void) {
     } else if (nvn_resolve() && hl_gfx_draw_start(hl_host(), &gfx_host, draw_check)) {
         on = 1;
         log_on |= draw_check || getenv("HL_GFX_LOG") != NULL;
-        hl_gate_on_8008fc00 = draw_check;
+        if (draw_check) hl_gate_on_8008fc00 = 1;   /* (the checkpoint; the gate is also the preparation's own) */
         hos_log("hl gfx: draw: %s",
                 draw_check ? "the check: each direct call compared in two segments around its preparation, the "
                              "translated function answering"
@@ -380,10 +413,78 @@ HL_GATE(80078fc0, "329b54a385248a34") {
 }
 __attribute__((constructor)) static void hl_gfx_draw_gate(void) { hl_gate_on_80078fc0 = 1; }
 
-/* The preparation (x0 block, x1 drawable, w2 0): only the check's checkpoint, for the call the checked body makes on this
-   thread; every other call runs the translation (on only while checking). */
+/* ---- the shared preparation ---- */
+
+#define HL_GFX_PREP_DEFAULT 0   /* (off until the main PC's validation) */
+
+static int prep_check;
+static volatile LONG prep_ready;          /* as state_ready */
+static _Thread_local int t_prep_inside;   /* the gate's own call of the translated body runs on this thread */
+
+static int prep_init(void) {
+    for (;;) {
+        const LONG s = prep_ready;
+        if (s == 1 || s == 2) return s == 2;
+        if (s == 0 && InterlockedCompareExchange(&prep_ready, 3, 0) == 0) break;
+        Sleep(0);
+    }
+    const char *e = getenv("HL_GFX_PREP");
+    const int mode = e && e[0] ? atoi(e) : HL_GFX_PREP_DEFAULT;
+    prep_check = check_wanted() != 0;
+    int on = 0;
+    if (mode != 1 && !prep_check) {
+        hos_log("hl gfx: preparation: the translated function (HL_GFX_PREP=%d)", mode);
+    } else if (!hl_supported_build()) {
+        hos_log("hl gfx: preparation off: not the supported build");
+    } else if (hl_gfx_prep_address() != HL_DRAW_PREPARE || !(prepare_translated = hl_translated(HL_DRAW_PREPARE))) {
+        hos_log("hl gfx: preparation off: the bridge answers %#llx", (unsigned long long)hl_gfx_prep_address());
+    } else if (nvn_resolve() && hl_gfx_prep_start(hl_host(), &gfx_host, prep_check)) {
+        on = 1;
+        log_on |= prep_check || getenv("HL_GFX_LOG") != NULL;
+        hos_log("hl gfx: preparation: %s",
+                prep_check ? "the check: each call's route counted, the calls on the cached path compared with the "
+                             "translated function, which answers"
+                           : "native on its cached path (HL_GFX_PREP=1)");
+    }
+    prep_ready = on ? 2 : 1;
+    return on;
+}
+
+/* The translated preparation, compared call by call (and its shape filed in the histogram). */
+static void prep_checked(Ctx *c) {
+    hl_gfx_prep_check_begin(c->x[0], c->x[1]);
+    t_prep_inside = 1;
+    prep_recording = 1;
+    prepare_translated(c);
+    prep_recording = 0;
+    t_prep_inside = 0;
+    hl_gfx_prep_check_end(c->x[0]);
+}
+
+/* The preparation (x0 block, x1 drawable, w2 not read; returns w0, bit 0: go on). Answered natively on its cached path
+   (HL_GFX_PREP=1), compared with the check; and the sub-mesh submission check's checkpoint, for the call the checked
+   body makes on this thread. */
 HL_GATE(8008fc00, "4df7e218373859d0") {
-    if (!t_draw_armed) return 0;
+    if (t_prep_inside) return 0;
+    if (!t_draw_armed) {
+        if (prep_ready != 2 && !prep_init()) {
+            if (!check_wanted()) hl_gate_on_8008fc00 = 0;   /* (the checkpoint needs the gate while checking) */
+            return 0;
+        }
+        Ctx *before = t_ctx;
+        t_ctx = c;
+        int answered = 1;
+        if (prep_check) {
+            prep_checked(c);
+        } else {
+            uint64_t result;
+            answered = hl_gfx_prep_apply(c->x[0], c->x[1], &result);
+            if (answered) c->x[0] = result;
+        }
+        t_ctx = before;
+        if (log_on) hl_report();
+        return answered;
+    }
     t_draw_armed = 0;
     draw_recording = 0;
     hl_gfx_draw_check_segment();
@@ -396,3 +497,4 @@ HL_GATE(8008fc00, "4df7e218373859d0") {
     draw_recording = 1;
     return 1;
 }
+__attribute__((constructor)) static void hl_gfx_prep_gate(void) { hl_gate_on_8008fc00 = 1; }

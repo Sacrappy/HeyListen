@@ -53,6 +53,8 @@ enum class Proc : uint32_t {
     CommandBufferDrawMeshTasks,
     BufferGetAddress,
     CommandBufferDrawElementsInstanced,
+    // the shared preparation (Prepare.h)
+    CommandBufferBindProgram,
     Count
 };
 inline constexpr uint32_t kProcCount = (uint32_t)Proc::Count;
