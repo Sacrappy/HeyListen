@@ -1080,3 +1080,158 @@ that faults meanwhile waits for the drop, then runs its write again over the dro
 the owner: a touch restores the granule from its buffer, then the granule in guest memory is hashed against the saved hash.
 At most 256 MB saved (`HOS_GUEST_PAGES_TEST_MB`), 32 MB dropped a pass. A line every 10 s: drops, restores, mismatches,
 refusals, writers held, and how much of the pools' storage imports made undroppable in the last whole sweep.
+
+## 14. GPU data's system-memory copy given back for good (`HL_MEM_DROP`, `RX_VK_NO_HOST_IMPORT`, 2026-11-13)
+
+Section 13's substrate makes a dropped granule (no RAM, no commit charge) come back atomically on any touch. This brick
+is the policy over it: which granules go, where their bytes come back from, and the back end's imports that pinned the
+game's memory. Two sources of exact bytes were specified (section 9); (ii), a resource file decoded again, is built;
+(i), reading a buffer's VRAM mirror back, is not (see the end).
+
+### Decoded resources dropped (`hl::mem::Drop`, `host/hl_drop.c`)
+
+- **Candidates.** Every decode the stream module records (`stream-boundary.md` 7) is told to the policy with what makes
+  it again: the file's name (its per-file heap's), its dictionary id, its compressed and decoded sizes. Only the whole
+  64 KB granules inside the range count (the two ends are shared with the heap's other data).
+- **When a granule goes**, checked in this order, from a thread of its own every 500 ms: the range is 30 s old or more
+  (`HL_MEM_DROP_AGE`), and not held back (a restored range waits 60 s, then 120 s, 240 s, and is left alone for good after
+  its fourth restore); the back end has not imported it (the driver pins imported pages; the substrate refuses them too);
+  the kernel was not given it in the last 5 s (`hos_commit`); none of its pages is in the working set (cold pages took them
+  out and nobody touched them since: the cold-pages clock is reused, `HL_MEM_COLD=0` leaves the age alone); it is
+  plain read-write committed memory; and **it is unchanged**: the file is read again from the RomFS and decoded with the
+  host's own copy of its dictionary (the bytes step 2 proved exact), the granule is made read-only, compared byte for byte
+  with the decode, and dropped only if equal. A granule written since its decode is never dropped. A pass looks at 64 MB of
+  granules and stops after 250 ms.
+- **The decision and its writers.** While the granules of a range are read-only for the comparison, a writer faults: a
+  handler of this module (first in line, only for the range being decided) makes it wait for the decision, then runs the
+  instruction again: on the bytes if the granule was kept, through the substrate's restore if it was dropped. The kernel
+  (`hos_commit`, which tells the module first and waits for a decision under way there) and the driver (`hos_noaccess_import`,
+  the same) never meet a read-only page.
+- **The touch** (the substrate's owner hook): every dropped granule of the touched range is restored from the file in one
+  atomic restore a run, under the range's lock (a second thread on the same range waits, then finds it restored). The
+  kernel's and the import's paths restore only the granules they are given (an import of a 16 MB chunk would otherwise bring
+  back every range it cuts). Restores are counted by path: the game (read/write), the back end's threads, the kernel, an import.
+- **What may become of a dropped range.** The game's allocator handing it out again: the new owner's first touch restores
+  the old bytes and its write lands on them, which is what the memory held. A new decode over it: the same, then the new
+  range replaces the old as a candidate (granules of the old range still dropped keep their source). The per-file heap's
+  region unmapped, decommitted or discarded: the substrate forgets the granules and tells the module
+  (`hos_gp_set_on_forget`), which forgets them and the candidates there; a record the substrate no longer calls dropped is
+  forgotten every 10 s as a second line of defence. The source never goes away: the RomFS file is read by its name (the
+  mods' file first, as the game reads it) and the dictionaries' host copies are kept for the session.
+- Why not a hook at the NVN `Finalize` of pools, buffers and textures (asked by the owner): the ranges dropped are the
+  resource files' decoded bytes in the game's heaps; a pool, buffer or texture made over them ends without the memory
+  being given up (it stays the heap's allocation, which the game may read or free later). Forgetting a dropped granule
+  there would leave the substrate with a dropped granule nobody can restore; keeping it is right whatever the game does
+  next. The signal that the bytes are given up is the heap region's unmap, which the substrate's forget hook carries.
+- Switches: `HL_MEM_DROP=1` (default **0**), needs `HOS_GUEST_PAGES=1`; `HL_MEM_DROP_CHECK=1` hashes each granule at its
+  drop and again at its restore and counts mismatches; `HL_MEM_DROP_LOG=1` a line every 10 s (always with the check):
+  MB dropped now and in all, restores by path and a second, a touch's time (mean, most), refusals by reason (imported,
+  kernel, in use, changed, no source, not plain, substrate, given up), sources decoded. Tests:
+  `native/tests/drop_test.cpp` (a stand-in substrate: drop and exact restore, every refusal, eight threads on one dropped
+  range with a slow restore, a writer during the decision, hold and give-up, a new decode over a dropped range, forget,
+  reconcile, the import's partial restore).
+
+### The imports given back once the mirror holds the pool (`RX_VK_NO_HOST_IMPORT`, `gpu/vk/vk_memory.cpp`)
+
+- What the import is read for once a pool has its VRAM mirror (read whole: `import_pool`, `pool_lookup`, the mirror's
+  make and syncs, the write-backs and their diff, the readback refresh, the texel views and the GPU unswizzle,
+  `hos_noaccess_import`): the mirror's first fill; syncs of pages the CPU wrote that no kept capture holds ("live" pages);
+  the write-backs of what the GPU wrote (pools bound for writing); readback pages (written by the GPU too); bindings while
+  the pool has no usable mirror (not made yet, given back as idle, a parallel replay's segment). The texture paths read
+  none here: the log's "GPU reads of imported guest memory" says 0 texel views and 0 MB of unswizzles in the castle walk.
+- So a pool with its mirror on, never bound for writing, whose mirror's fill is done, gives its import back at a
+  submission's start (freed once the GPU is past every use; the host is then told, `hos_noaccess_unimport`, that those
+  pages are no longer pinned, unless another import holds them: cold pages, the drop policy and the substrate may take
+  them again). Every use above imports it again first, counted by why; a pool imported again keeps its import 600
+  submissions, and for good after its third time (a pool whose live pages come every frame keeps it, as before). Pools
+  bound for writing keep their import: their write-backs go through it (the kind that genuinely needs it).
+- Switch `RX_VK_NO_HOST_IMPORT=1` (default **0**); a line `vk: imports given back as their mirror holds the pool: ...`
+  gives the counts. `memory_guest_imported` and the `vk: imports:` line count only pools that hold an import.
+
+### (i) Buffer storage restored from its VRAM mirror: not built
+
+What it would take, now that the imports can go: a mirrored pool's pages dropped once synced (`PageX::syn` equal to the
+page's generation, no GPU write pending), and a touch served by a GPU copy of the granule from the mirror into a
+host-visible buffer, waited for. That wait is the hard part: a touch can come from the replay's own thread (texture
+uploads read pool memory) while it holds `pools_mu` and records the very command buffer the copy would need, so the
+restore needs a queue and command pool of its own and a rule for touches under the back end's locks. Not started in this
+session; the decoded resources came first, as the brief ordered.
+
+### In the game (PC 3050, one run a line, 110 s; development and function, not the main PC's figures)
+
+Every run below ran to its end with no crash line, and its last shots were looked at against `build/s5/refshots-<scene>/`:
+the market complete, textures and geometry right, nothing black, missing, flickering or tinted (the camera and the
+characters elsewhere at a given frame, as between any two runs). **`HL_MEM_DROP_CHECK`: 0 mismatches in every run** (every
+restored granule hashed against its hash at the drop). "Base" is the same build with every switch off; "all" is
+`RX_VK_CAP_ONLY_GPU=1 RX_VK_NO_HOST_IMPORT=1 HOS_GUEST_PAGES=1 HL_MEM_DROP=1 HL_MEM_DROP_CHECK=1`. MB; game RAM from
+`HOS_MEM_SPLIT=95`, the rest from `RX_VK_RES_LOG=1`'s last lines; "dropped" is the drop's own count at the end.
+
+| Scene | Switches | Game RAM | Process RAM | **Process commit** | VRAM | Live imports | Dropped now | Restores (MB) | Imports given back (MB unpinned) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| castle-move | base | 4063 | 7727 | 19221 | 6412 | 1895 | - | - | - |
+| | `RX_VK_NO_HOST_IMPORT=1` alone | 3639 | 7687 | 19328 | 6380 | 716 | - | - | 29 (1179) |
+| | `HL_MEM_DROP=1` alone (an earlier build, `m2-d`) | 4478 | 8441 | **17936** | 6657 | 1862 | 1246 | 59 (323) | - |
+| | drop + no host import | 4652 | 7596 | **17727** | 6334 | 684 | 1115 | 95 (384) | 29 (1146) |
+| | all | 4193 | 7508 | **17688** | 6658 | 716 | 1274 | 91 (364) | 28 (1146) |
+| | all, build `m2-f` (partial restores for imports) | 4424 | 8227 | **17584** | 6300 | 716 | 1212 | 130 (405) | 31 (840) |
+| | all, `m2-g` (decodes over 32 MB left out: the final build) | 4024 | 7103 | **17307** | 6480 | 700 | 1029 | 271 (401) | 30 (889) |
+| kokiri-idle | base | 2509 | 5728 | 16748 | 5132 | 1589 | - | - | - |
+| | all | 2509 | 7020 | **15963** | 5643 | 700 | 1085 | 16 (291) | 28 (921) |
+| | all, `m2-f` | 2790 | 6070 | **15467** | 5540 | 684 | 1281 | 27 (324) | 31 (891) |
+| | all, `m2-g` | 2829 | 6341 | **15320** | 5602 | 700 | 1438 | 246 (441) | 29 (810) |
+| hyrule-walk | base | 3410 | 7432 | 18735 | 6214 | 1798 | - | - | - |
+| | all | 2537 | 5559 | **15241** | 5379 | 700 | 1479 | 17 (305) | 31 (905) |
+| | all, `m2-f` | 3004 | 5658 | **15836** | 5964 | 700 | 1233 | 43 (312) | 29 (1225) |
+| | all, `m2-g` | 2796 | 6018 | **15605** | 5873 | 700 | 1370 | 212 (366) | 30 (937) |
+
+What it says:
+
+- **The process's commit charge, with every switch on (the final build `m2-g`): -1.9 GB in the castle walk (19.2 -> 17.3 GB),
+  -1.4 GB in kokiri-idle (16.7 -> 15.3), -3.1 GB in hyrule-walk (18.7 -> 15.6)**; -0.8 to -3.5 GB over all the runs with
+  the drop on (one run a line; the hyrule base run's commit was high, part of that is the run). The drop gives back 1.0-1.5 GB of decoded resources by the
+  end of a 110 s run, and that figure was still growing at every run's end: a range is looked at 30 s after its decode and only
+  once cold pages have taken it out of the working set, and the scenes load at 40-60 s; "in use" (granules still resident)
+  is the largest refusal by far (17,000-26,000 looks at a granule in a run, each counted). A longer session drops more.
+- **The game's RAM does not move with the drop alone**: what is dropped was out of the working set already (that is the
+  rule). The gain in RAM is what no longer comes back: the scene loads' come-backs of cold pages (section 8: ~1 GB in 10-20 s)
+  are now restores of exactly the granules touched, from the file. No run here changed scene, so that is **not measured**.
+- **`RX_VK_NO_HOST_IMPORT` gives back 28-31 imports (1.2-1.4 GB) a run; 0.9-1.2 GB of game memory is no longer pinned**;
+  live imports 1.6-1.9 GB -> 0.7 GB. Imported again: 3-6 a run (3 at a mirror given back as idle, 1-2 at a pool's first
+  written binding), 2-5 ms in all, 1.5 ms at most; no live page left out of a sync. With it the drop's "imported" refusals
+  fall from 10,468 granules (654 MB) to 0-63. VRAM: within run-to-run differences (the mirrors are unchanged).
+- Restores: 16-271 a run, 290-440 MB, nearly all at a scene's load; granules come back through the handler (the game and the
+  back end reading a texture or a model again) and through the imports of new pools over dropped ranges (5-184 restores a
+  run; in the `m2-g` runs those are most of the granules restored, 5,399-6,555 of 5,853-7,053 by the substrate's count,
+  each restore a few granules since it is cut to the run the import asks for). A touch: 1-13 ms on average over 10 s, at most
+  642-836 ms (a large file decoded whole on the touching thread at a load): see the size limit below.
+- `RX_VK_CAP_ONLY_GPU=1` on the PC 3050 (stream 8d asked): 1,317-1,612 capture pages a frame (5.1-6.3 MB), 0 of them in the
+  left-out ranges, 0 reads or bindings into them, in all three scenes.
+- No large slowdown: the runs' frame counts are those of the base runs (the PC 3050 is not measured for speed).
+- The touch's cost: before the size limit, a restore decodes the whole file on the touching thread, and the castle, kokiri
+  and hyrule runs had touches of 836, 675 and 764 ms at their loads (large files decoded whole at ~1.8 ms a MB): hitches. Decodes over 32 MB are
+  now not candidates (`HL_MEM_DROP_MAX_MB`, 0 for any): 9 files, 854 MB, left out in the castle walk, and the longest touch
+  fell to 57-61 ms in the three scenes (build `m2-g`).
+
+### Not verified
+
+- The main PC: every figure above is the PC 3050's, one run each; the commit and RAM columns move by a few hundred MB
+  between runs of one build there. Both switches stay off by default until the main PC's validation.
+- Scene changes, long sessions, a PC short of RAM or of page file: the restores at a load, and the RAM that no longer comes
+  back then, were not measured (no run changed scene).
+- The writer-during-decision path in the game: no writer met a granule being decided in any run ("writers waited 0"); it is
+  tested without the game only. The kernel's path likewise (0 restores through `hos_commit`).
+- `RX_VK_NO_HOST_IMPORT` with the parallel replay (`RX_VK_PARALLEL`), on AMD and Intel drivers (imports freed while live: the
+  device losses noted in `retired_imports_give_back` were Intel's and AMD's), and with `RX_VK_IMPORT_HIGH`.
+- A drop pass can still take seconds (one of 10.6 s in the castle at its load: a range is decided whole, its file decoded
+  and its pages read back from the page file); it runs on its own thread, but a touch of a range on the same lock stripe
+  waits for it.
+- (i), the mirrors' readback restore, is not built.
+
+### For a session played by hand (zone changes, the log on)
+
+    HOS_GUEST_PAGES=1 HL_MEM_DROP=1 HL_MEM_DROP_CHECK=1 HL_MEM_DROP_LOG=1 RX_VK_NO_HOST_IMPORT=1 RX_VK_CAP_ONLY_GPU=1 RX_VK_RES_LOG=1
+
+and in the log: `hl drop:` (every 10 s: MB dropped now, restores a second and by path, a touch's time, **MISMATCHES**, which
+must stay 0), `mem: guest pages:` (the substrate's counters), `vk: imports given back as their mirror holds the pool`
+(imports given back and taken again), `vk: process memory` (the commit). A zone change is where the restores and the
+come-backs are: the restores a second and the longest touch of the lines around it are the figures to read.
