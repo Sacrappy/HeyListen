@@ -5,13 +5,16 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include "hl/stream/Decode.h"
+#include "hl/stream/Pages.h"
 #include "hl/stream/Provenance.h"
 
 namespace {
 // (made once and never destroyed: loading threads use them until the process ends)
 std::atomic<hl::stream::Provenance*> g_prov{nullptr};
+std::atomic<hl::stream::Pages*> g_pages{nullptr};
 hl::stream::Counters g_counters;
 }   // namespace
 
@@ -102,3 +105,54 @@ extern "C" int hl_stream_report(char* out, size_t cap) {
     }
     return n;
 }
+
+extern "C" int hl_stream_pages_start(int64_t first_ns, int64_t second_ns) {
+    if (g_pages.load()) return 1;
+    hl::stream::Pages::Config c;
+    if (first_ns > 0) c.first_ns = first_ns;
+    if (second_ns > first_ns) c.second_ns = second_ns;
+    auto* p = new hl::stream::Pages(c);
+    hl::stream::Pages* none = nullptr;
+    if (!g_pages.compare_exchange_strong(none, p)) delete p;
+    return 1;
+}
+
+extern "C" void hl_stream_pages_track(uint64_t dest, const void* bytes, uint64_t size, const char* name, int64_t now_ns) {
+    if (auto* p = g_pages.load()) p->track(dest, static_cast<const uint8_t*>(bytes), size, name ? name : "", now_ns);
+}
+
+extern "C" size_t hl_stream_pages_check(int64_t now_ns, hl_stream_view view, void* ctx, size_t budget_pages,
+                                        hl_stream_seen seen, void* seen_ctx) {
+    auto* p = g_pages.load();
+    if (!p || !view) return 0;
+    std::vector<hl::stream::Pages::Checked> got;
+    const size_t n = p->check(now_ns, view, ctx, budget_pages, seen ? &got : nullptr);
+    for (const auto& c : got)
+        seen(seen_ctx, c.dest, c.size, c.first_page, c.hashes.size(), c.hashes.data(), c.equal.data(), c.stage,
+             c.name.c_str());
+    return n;
+}
+
+extern "C" int hl_stream_pages_report(char* out, size_t cap) {
+    auto* p = g_pages.load();
+    if (!p || !out || !cap) return 0;
+    int n = std::snprintf(out, cap, "%-22s %7s %9s %9s | %7s %9s %9s %7s | %7s %9s %9s %7s | %s", "kind", "ranges",
+                          "MB", "pages MB", "at 30s", "MB", "equal MB", "gone", "at 60s", "MB", "equal MB", "gone",
+                          "replaced");
+    for (const auto& k : p->stats()) {
+        if (n < 0 || static_cast<size_t>(n) >= cap) break;
+        const double mb = 4096.0 / 1048576.0;
+        n += std::snprintf(out + n, cap - n,
+                           "\n%-22s %7llu %9.1f %9.1f | %7llu %9.1f %9.1f %7.1f | %7llu %9.1f %9.1f %7.1f | %llu",
+                           k.kind.c_str(), static_cast<unsigned long long>(k.ranges), k.bytes / 1048576.0, k.pages * mb,
+                           static_cast<unsigned long long>(k.checked[0]), k.pages_checked[0] * mb, k.equal[0] * mb,
+                           k.unreadable[0] * mb, static_cast<unsigned long long>(k.checked[1]), k.pages_checked[1] * mb,
+                           k.equal[1] * mb, k.unreadable[1] * mb, static_cast<unsigned long long>(k.replaced));
+    }
+    if (n >= 0 && static_cast<size_t>(n) < cap && p->not_tracked())
+        n += std::snprintf(out + n, cap - n, "\n(not tracked, the table full: %llu ranges)",
+                           static_cast<unsigned long long>(p->not_tracked()));
+    return n < 0 ? 0 : (static_cast<size_t>(n) >= cap ? static_cast<int>(cap) - 1 : n);
+}
+
+extern "C" uint64_t hl_stream_page_hash(const void* data, size_t n) { return hl::stream::page_hash(data, n); }

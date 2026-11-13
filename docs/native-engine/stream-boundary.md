@@ -21,8 +21,8 @@ document corrects and completes it.
 
 Threads: the decode runs on the resource system's four loading threads (`ARes Loading 0`..`3`), each with a decompressor
 of its own (its own read buffer), and once on the main thread at start (the resource system's own archive). The chunked
-case's chunks are decoded on another thread, reached through a callback object in the decompressor (`+1640`); the
-`ParallelDecompThread`s of `0x8069a5e0` are, by their creator, those threads (not traced further).
+case's chunks are decoded on another thread, reached through a callback object in the decompressor (`+1640`): the
+decompressor's own `ParallelDecompThread`, made with it by `0x8069a5e0` (section 5).
 
 ## 2. The decompressor and the request
 
@@ -103,24 +103,82 @@ archive from the romfs because these are by construction the bytes the game deco
 mod they came from, and because nothing has to parse the archive: the same id can never mean other bytes. A frame whose
 dictionary is not in the tree fails to decode (the translated function would read through a null node there).
 
-## 5. The chunked case and its hand-off
+## 5. The chunked case and its hand-off (read whole 2026-11-13, second session)
 
-A file whose compressed size is at least a chunk (902,912 bytes) is decoded while it is read: the loading thread fills the
-descriptor (state 1, destination, decompressed size, workspace, the two source buffers, the DDict), waits on and clears its
-events, then in a loop: hands the chunk just read to the decoding thread (count at `+1624`, the callback's slot 0 with the
-descriptor), reads the next chunk into the other buffer, and waits for the decoding thread to finish the previous one. A
-short read ends the loop (a last partial chunk is handed over and waited for). The decoding thread (`0x80115bf0`) decodes
-the chunk from the buffer its index chooses with the game's own block decoder (`0x80115c80`), counts the chunk, and
-signals; an error goes to the status. Success is the state byte at 4.
+A file whose compressed size is at least a chunk (902,912 bytes) is decoded while it is read. Everything before the
+decision is the main path's: the header, the dictionary, the limit, the destination (section 3, steps 1 to 5); the
+chunked case is chosen after the destination is had, when the first read filled the chunk.
 
-**What the native path does with it**: the chunked case is decided only after the first read (the read filled the
-chunk). At that point the native path has opened the file and read one chunk, and nothing else: no header was acted on, no
-memory allocated. It closes the file as the translated function closes it, and gives the request, unchanged, to the
-translated function, which opens and reads the file again from its start. What the game can see of that: one more
-prepare/open/read/close of the same file object, with the same arguments, before the real one; the read buffer's first
-chunk written twice with the same bytes. Nothing else changes (the request, the heap and the results are untouched until
-the translated function runs). Reproducing the hand-off natively would mean reproducing the game's block decoder's
-progress fields in the descriptor; it was not done.
+**Who takes part.** Each decompressor owns one decoding thread (made with it by `0x8069a5e0`, the `ParallelDecompThread`
+of its creator: a message-queue thread, class `0x84c376e0`). The decompressor's `+1640` is a small callback object in
+place (vtable `0x84c37578`, `+8` the thread): its slot 0 (`0x801c5e80`) posts the descriptor to the thread's queue
+(the thread's slot 2, `0x801c5ea0`). The thread's loop (`0x80df2680`) takes a message and calls its slot 14
+(`0x836dda20`), which calls the message's slot 2: for the descriptor, the step `0x80115bf0`. The thread does nothing
+else with the descriptor before or after. The descriptor is made in place by `0x8069a8d0` (its events: the one at
+`+1544` is made signalled, the one at `+1592` not); the decompressor's destructor (`0x836dea10`) calls the callback's
+slot 3 (which does nothing) and finalizes the events. No other code was found that reads the descriptor.
+
+**The descriptor** (offsets in the decompressor; the step sees it at `+1440`, its decoder state at `+1456`):
+
+| Offset | Set by the loading thread | What the step does with it |
+|---|---|---|
+| `+1456` (8 bits) | 1 | the state: 1 a frame to start (the step reads the frame header, resets the decoder context in the workspace, sets 2), 2 under way, 3 failed, 4 decoded (the input ended at the frame's end) |
+| `+1464` | the destination | advanced by every byte written |
+| `+1472` (32 bits) | the decompressed size | room left: decreased by every byte written |
+| `+1476` (32 bits) | 0 | set to the header's content size at the frame's start, decreased by every byte written; **the step's result** |
+| `+1480` | the read buffer (the workspace) | the decoder context |
+| `+1488` | the read buffer + `0x271f8` | a staging area for a block split between two chunks |
+| `+1496` (32 bits), `+1500` (32 bits) | 128 KB, 0 | the staging area's size and fill |
+| `+1504` | 0 | the decoder context, set at the frame's start |
+| `+1544`, `+1592` | (light events) | `+1544` signalled when a step ends the frame or fails; `+1592` signalled at the end of every step |
+| `+1608` | the source (the first buffer; the second is a chunk after it) | |
+| `+1616` (32 bits) | the chunk | |
+| `+1620` (32 bits) | 0 | chunks decoded: the step picks the buffer by its parity, then counts the chunk |
+| `+1624` (32 bits) | the byte count of the chunk handed over (before each hand-off) | |
+| `+1628` (32 bits) | 0 | the step's error, when negative |
+| `+1632` | the guest DDict (0: none) | |
+
+**The hand-off.** The loading thread waits on the event `+1544` (the previous frame finished: it is signalled when
+idle), clears it, fills the descriptor (above), then for each full chunk: stops if the status is negative, clears
+`+1592`, stores the chunk's count, posts the descriptor (the callback), reads the next chunk into the other buffer (the
+same read calls and checks as the first read: the handle's kind and readiness each time, one read of a chunk or reads
+of at most `+64`), waits on `+1592`. A chunk shorter than the chunk ends the loop; a last non-empty one is handed over
+and waited for the same way. Then: a negative status gives the result code of the decoder's error, state 4 is success,
+state 2 code 3, anything else code 1; on every failure a destination allocated here is freed and 0 returned. A failed
+read in the loop gives code 9 (whatever the quiet bit), frees an allocated destination, and returns without waiting for
+the chunk handed over last (the decoding thread may still be writing into the freed destination: the game's own
+behaviour, never seen).
+
+**The step** (`0x80115bf0`): when the status is not negative, decodes the chunk (`0x80115c80` on `+1456`, the source
+chosen by the index, the count, the DDict), counts it, and with the result r (the frame's bytes still to come, `+1476`):
+r < 0 stores the status and signals both events, r = 0 (the frame ended) signals both, r > 0 signals `+1592` only. The
+chunk decoder decodes block by block with the game's own decoder over the context in the workspace; a block split
+between two chunks waits in the staging area; once the frame has ended a further chunk is an error (-3); what follows
+the frame's end in the chunk that ended it is ignored.
+
+**What later code reads.** The loading thread reads the state byte and the status after the last wait; nothing reads the
+other fields after a decode (the next chunked decode sets every one of them before use, and the step's frame start resets
+the decoder context and the fields it reads). The two events stay as the last decode left them: `+1544` signalled,
+`+1592` signalled.
+
+**What the native path does** (`HL_STREAM=1`, `decode_chunked` in `hl_stream.c`): the same function, on the loading
+thread, with the step's decode done in place instead of on the decoding thread. It waits on and clears `+1544`, fills
+every field the translated function fills with the same values, then for each chunk clears `+1592`, stores the count,
+decodes the chunk from the buffer its index chooses with zstd's streaming decoder (`ZSTD_decompressStream`, the
+destination as a stable output buffer: no window copy whatever the frame's window, any window accepted as the game's
+decoder accepts it, a context of its own per thread, the game's dictionary bytes as for one-read files), counts it,
+signals as the step signals (`+1544` once the frame's bytes are all written, `+1592` each time), reads the next chunk
+into the other buffer with the same calls, and waits on `+1592` (already signalled: it returns at once). After the
+frame, the descriptor is left as the step leaves it (state 4, the destination advanced by the size, room and bytes to
+come 0, the decoder context set). The decoding thread is never given the descriptor: it only runs the step for a
+descriptor it is given, so nothing of it is missing. What differs: the decoder context in the workspace and the staging
+area are not written (scratch: the next frame start resets them), the staging area's fill (`+1500`) stays 0, and the
+reads and the decode alternate on one thread instead of overlapping on two.
+
+If zstd fails, a chunk comes after the frame's end, or the input ends before it (never seen; the game's decoder gives an
+error code there), the native path signals `+1544`, frees a destination it allocated, closes the file and gives the
+request whole to the translated function, which opens and reads the file again and reproduces the game's own result;
+counted as `chunked-translated`.
 
 ## 6. The other callers of the decoder (not this brick)
 
@@ -133,21 +191,26 @@ progress fields in the descriptor; it was not done.
 | Piece | Where |
 |---|---|
 | The path a request takes, decided before anything is done for it (`hl::stream::choose`), the counters | `engine/native/include/hl/stream/Decode.h`, `src/stream/Decode.cpp` |
-| The provenance table: destination range -> file name (the per-file heap's), file object, compressed size (0 for a chunked file, whose later chunks the native side does not see) and decompressed size, dictionary id, chunked or not, a fingerprint of the decoded bytes; lookup by address; a new decode drops the ranges it overlaps; at most 65,536 ranges, oldest dropped | `engine/native/include/hl/stream/Provenance.h`, `src/stream/Provenance.cpp` |
+| The provenance table: destination range -> file name (the per-file heap's), file object, compressed size and decompressed size, dictionary id, chunked or not, a fingerprint of the decoded bytes; lookup by address; a new decode drops the ranges it overlaps; at most 65,536 ranges, oldest dropped | `engine/native/include/hl/stream/Provenance.h`, `src/stream/Provenance.cpp` |
+| The measurement of brick 6.3: a hash of every whole 4 KB page of every decode, checked again at 30 s and 60 s, by file kind (section 9) | `engine/native/include/hl/stream/Pages.h`, `src/stream/Pages.cpp` |
 | The C surface | `engine/native/include/hl/c/hl_stream.h`, `src/c/hl_stream.cpp` |
-| The answer of `0x80108da0` (and of `0x80115bf0` for the check), the native function, the dictionaries, the zstd calls | `engine/host/hl_stream.c` |
+| The answer of `0x80108da0` (and of `0x80115bf0` for the check), the native function and its chunked case, the dictionaries, the zstd calls, the pages' thread and the restore test | `engine/host/hl_stream.c` |
 | zstd's decoder in the game's executable (the vendored `third_party/zstd`, decoder only) | `engine/nx2/build.py` |
 | Tests without the game | `engine/native/tests/stream_test.cpp` |
 
-Switches: `HL_STREAM=1` the native function (the default; 0 the translated function, as before), `HL_STREAM_CHECK=1` the check (the translated function answers,
-then the same compressed bytes are decoded natively and compared), `HL_STREAM_LOG=1` the counters every 10 s.
+Switches: `HL_STREAM=1` the native function, the chunked case included (the default; 0 the translated function, as
+before), `HL_STREAM_CHECK=1` the check (the translated function answers, then the same compressed bytes are decoded
+natively and compared: a chunked file by the native path's streaming decode fed the same chunks), `HL_STREAM_CHECK=2`
+the native function answers and each chunked file it decoded is decoded again in one call from the bytes it read and
+compared, `HL_STREAM_LOG=1` the counters every 10 s, `HL_STREAM_PAGES=1` the measurement of section 9 (off by default).
 
 The native path takes a request when it has a file object of the usual kind, a heap, a granularity that is a multiple of
 32, and a decompressor with its own usable read buffer: every request seen in the three scenes. Everything the function
 does on that path goes through the game's own objects (the file object's slots, the heap's allocation, the guard, the
-close) on the calling thread's guest context, in the translated function's order, with its stack frame at the same
-address; only the header read and the decode are native (zstd 1.5.7). What is not reproduced: the decoder context's
-fields in the read buffer (scratch, section 3), and the chunked case (section 5).
+close, the descriptor's events) on the calling thread's guest context, in the translated function's order, with its
+stack frame at the same address; only the header read and the decode are native (zstd 1.5.7). What is not reproduced:
+the decoder context's fields in the read buffer and the chunked case's staging area (scratch, sections 3 and 5), and the
+overlap of reads and decoding on two threads in the chunked case.
 
 The provenance table sees no free: a range that was freed and given to another decode is replaced when that decode
 records; until then a lookup returns the old entry, whose fingerprint (the decoded bytes' first and last 4 KB) tells the
@@ -167,6 +230,38 @@ PC 3050, builds `s6-a`, one run a scene (110 s); the counts are the last 10-seco
 
 One file (`Tex/CmnTex_Map_Soil_FairyFountain_Floor_D_Nrm.bntx`) ends on the bad-header path (code 4) every time it is
 asked, in the translated function as in the native one: the game's own behaviour, not counted as a mismatch.
+
+### The chunked case natively (brick 6.2, second session)
+
+The check of the new form (`HL_STREAM_CHECK=1`: the translated function and its decoding thread answer; the chunks the
+thread was given are decoded again by the native path's streaming decode, fed in the same chunks, and compared byte for
+byte). PC 3050, build `s6b-1`, one run a scene, the last 10-second line:
+
+| Scene | Files checked | Of them chunked | MB compared | Mismatches |
+|---|---:|---:|---:|---:|
+| castle-move | 9,814 | 507 | 4,979 | **0** |
+| kokiri-idle | 8,146 | 441 | 4,187 | **0** |
+| hyrule-walk | 9,611 | 489 | 4,801 | **0** |
+
+The native function itself in the game (`HL_STREAM_CHECK=2`: it answers, chunked files included, and each chunked file
+it decoded is decoded again in one call from the bytes it read and compared): castle-move on the PC 3050, ran to the end,
+514 chunked files (2,927 MB) decoded natively, **0 mismatches**, no fallback to the translated function.
+
+Validation (main PC, `valid.sh s6v2 s6-v2 HL_STREAM=1 HL_STREAM_LOG=1`, the chunked case native, 2026-11-13):
+
+| Scene | Ran | Game speed ratio | Files (one read / chunked) | MB decompressed (one read / chunked) | Fallbacks | Game RAM | Process RAM | Commit | VRAM |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | to the end, no crash | 59.84 | 9,199 / 453 | 2,090 / 2,976 | 0 | 3,252 | 7,365 | 18,811 | 5,747 |
+| castle-move | to the end, no crash | 59.99 | 9,486 / 617 | 2,149 / 4,563 | 0 | 3,401 | 7,788 | 20,162 | 6,589 |
+| hyrule-walk | to the end, no crash | 60.02 | 9,476 / 586 | 2,142 / 4,228 | 0 | 2,842 | 7,453 | 19,525 | 6,209 |
+
+(MB; the counts are the last 10-second line of each run; the memory from `HOS_MEM_SPLIT=95 RX_VK_RES_LOG=1` as
+`valid.sh` reports it; main moved since section 8's runs, with the heaps' cold pages: the memory columns are not a
+comparison.) Every decode now goes through the native path: no file was given to the translated function. Every error
+path logged was the texture file named above (code 4, as in the translated function). The last shots of each scene were
+looked at: castle-move's matches its reference (the stall in the market), kokiri-idle shows the market square with its
+fountain and characters, hyrule-walk the flower beds by the fountain; nothing black, missing, flickering or tinted.
+With this, the chunked case is on by default with `HL_STREAM=1`.
 
 ### Share of the native path
 
@@ -193,7 +288,115 @@ not named. With this the default is on (`HL_STREAM=1`).
 - The rare paths given to the translated function whole (no file object, a temporary read buffer, no heap, a bad
   granularity) were never taken in the three scenes; the native error paths other than code 4 were never taken either:
   they are written from the reading, not seen working.
-- The chunked case is translated, after one extra open, read and close of the file (section 5); that this extra read is
-  invisible to the game is reasoned, not shown beyond the runs being right.
-- The provenance table is recorded only: nothing reads it, so its use (decommit and restore) is not tested in the game.
+- That the decoding thread and the descriptor need nothing more than what the native chunked path leaves (section 5) is
+  established by reading, then by the runs being right; the fallback to the translated function was never taken.
+- The provenance table is read only by the measurement and the restore test of section 9; nothing is decommitted.
 - Other scenes, a scene change, and a save loaded elsewhere than the castle town market.
+
+## 9. A decoded resource's pages given back for good (brick 6.3)
+
+### Step 1: how much is eligible (`HL_STREAM_PAGES=1`)
+
+A page can be decommitted and made again by decoding the file again only while its bytes are exactly what the decoder
+wrote. The unit is the 4 KB page (what Windows decommits); only the whole pages inside a decoded range count (the two
+end pages are shared with the heap's other data). With the switch, every decode's whole pages are hashed when it is
+recorded (`hl::stream::page_hash`: four multiply-xor lanes over 8-byte words, a bijection per word, so one changed word
+always changes the hash), and a thread of the OS layer hashes them again when the range is 30 s old and 60 s old
+(`hl::stream::Pages`), through `VirtualQuery` first (a page of a freed region is counted as gone, not read: reading it
+would commit a zero megabyte through the commit-on-touch handler). A range given to a new decode before its second check
+is counted as replaced. The table holds at most 8 Mi page hashes (64 MB). Reading the pages brings back those the
+cold-pages thread had taken out (`memory-boundary.md` section 12): the measurement runs are measurement only.
+
+PC 3050, build `s6b-3`, `HL_STREAM_PAGES=1 HL_MEM_COLD_HEAPS=0` (the heaps' cold pages off, so that the checks do not
+read pages back from the page file: a first form that hashed 1 GB a pass with them on froze a run for a minute; the
+measurement now hashes at most 128 MB a pass, so the checks lag behind a scene's load: "at 30 s" and "at 60 s" mean
+that age or more, and the ranges loaded in the last 40-50 s of the 110 s run never reached their second check). One run
+a scene; MB of whole pages; the end of each run.
+
+| Kind | Scene | Decoded MB | at 30 s: checked MB | equal MB | at 60 s: checked MB | equal MB | gone MB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `Tex/*.bntx` | castle-move | 2076 | 1285 | 1243 | 865 | **831** | 8 |
+| | kokiri-idle | 2065 | 1638 | 1593 | 1228 | **1190** | 9 |
+| | hyrule-walk | 2065 | 1636 | 1592 | 1228 | **1190** | 8 |
+| `Model/*.bfres` | castle-move | 1468 | 1059 | 720 | 665 | **634** | 0 |
+| | kokiri-idle | 1248 | 1246 | 901 | 721 | **686** | 0 |
+| | hyrule-walk | 1248 | 1246 | 901 | 721 | **686** | 0 |
+| `Shader/*.bfsha` | all three | 311 | 311 | 293 | 311 | **293** | 0 |
+| `UI/*.bntx` | all three | 278 | 274-278 | 252-255 | 233 | **217** | 15 |
+| `Effect/*.byml` | castle / kokiri / hyrule | 105 | 96 / 105 / 105 | 63 / 71 / 71 | 82 / 89 / 89 | **47 / 54 / 54** | 0 |
+| `Pack/*.pack` | castle / kokiri / hyrule | 73 / 72 / 72 | 55 / 66 / 66 | 53 / 63 / 63 | 38 / 52 / 52 | **35 / 49 / 49** | 0 |
+| `Sound/*.bars` | all three | 68 | 67 | 67 | 9 | 9 | 0 |
+| `Lib/*.sarc` | all three | 26 | 26 | 22 | 26 | 22 | 0 |
+| `Bake/*.bkprb` | all three | 20 | 20 | 20 | - | - | - |
+| `Font2/*.bfotf`, `AnimationEvent/*.baev` | all three | 9, 6 | 9, 6 | **0**, **0** | | | |
+
+(The other kinds are under 10 MB each.) What it says:
+
+- **Texture files keep 96-97% of their pages as the decoder wrote them** (1190 of 1228 MB at 60 s in the two scenes that
+  reached it, 831 of 865 in castle-move): they are the first candidates, as section 10 of `memory-boundary.md` expected.
+  Under 1% of their pages were gone (freed) by then; 590-607 of ~5,250 texture ranges were given to another decode
+  before their second check.
+- Models keep 68-72% at 30 s over all their ranges and 95% of the ranges that reached 60 s (a different, earlier-loaded
+  subset: the second figure is not a trend), shader archives 94%, the UI textures 93%. Effects keep 60%, font files and
+  animation events nothing (relocated or rebuilt in place right after loading).
+- Over the scene, at 60 s about **2.5 GB** of decoded pages (kokiri-idle, hyrule-walk) still equal the decode; castle-move,
+  which loads more while moving, had fewer ranges at their second check by the end (about 2.1 GB).
+
+### Step 2: the restore path
+
+The provenance table gives, for a range, the name of the file (its per-file heap's), its dictionary id and its sizes. A
+name maps to the RomFS file `<RomFS>/<name>.zs` (the mods' file first when a mod has one, as `nn_fs.c` resolves the
+game's own opens); the game's file object may be gone by then and is not needed. At its 60 s check a range is read
+whole from that file through the host's own file access, decoded in one call with the dictionary of its id, and
+compared: every page with the hash taken at decode time, and byte for byte with memory for the pages that still match
+it (a page that differs is hashed again: written since the check, it is counted apart, not as a mismatch). At most 64
+MB of ranges a second are tested, so the thread keeps up with its checks.
+
+PC 3050, the same three runs (build `s6b-3`). Every range at its second check, 16 MB of ranges a second at most:
+
+| Scene | Ranges decoded again | MB | Pages unlike their decode-time hash | Pages compared byte for byte with memory | **Mismatches** | No RomFS file | Size differs | Decode failed | A restore: mean / per MB / at most |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| castle-move | 872 | 505 | 0 | 117,437 | **0** | 1 | 0 | 0 | 1.03 ms / 1.78 ms / 332 ms |
+| kokiri-idle | 1,360 | 623 | 0 | 146,093 | **0** | 1 | 0 | 0 | 0.85 ms / 1.87 ms / 369 ms |
+| hyrule-walk | 1,179 | 667 | 0 | 154,470 | **0** | 1 | 0 | 0 | 1.02 ms / 1.81 ms / 346 ms |
+
+The one range with no RomFS file is the resource system's own archive, whose heap is named `ares::System` (not a path);
+it would need its own name to file rule and is not a candidate. The size on disk equalled the recorded compressed size
+for every file. A restore costs the whole file (read and decode, ~1.8 ms a MB on this PC): a few ms for a texture, up to
+0.33-0.37 s for the largest files; a touch of one page of a large range
+would pay that unless restores keep a cache of the last files or decode only up to the touched page (zstd decodes a frame
+in order: a page near the start is cheaper).
+
+### Step 3: decommit and restore on touch: not built, and why
+
+What it needs to coordinate, found by reading the OS layer:
+
+- **Every commit over guest memory would make a dropped page a zero page.** The heap and the address regions are
+  committed lazily (`mkw_glue.c` `commit_on_touch`: a megabyte at a time on any touch of a reserved page) and on demand
+  (`hos_commit`: before the kernel reads or writes a guest buffer, `nn_fs.c`, `hos_svc.c`, `hos_mem.c`), and the back end
+  commits the ranges it imports (`gpu/vk/vk_memory.cpp`). Each would have to ask the stream module to restore the dropped
+  pages of its range first (a megabyte committed by a touch of its neighbour included), and the decommits and resets of
+  the OS layer (`hos_mem.c` unmap and discard, `hos_svc.c`) would have to forget the dropped pages of their range (their
+  contents are given up there: zero is then right). The per-file heap's destruction reaches the OS layer as such an unmap
+  of its address region: that is the reliable signal that a dropped range is gone. A plain reuse of a dropped range by the
+  game's allocator (the heap's free `0x8021dea0`, then an allocation over it) needs no signal: the first touch restores
+  the old bytes and the new owner's write goes on, which is what the memory would have held had it not been dropped.
+- **The restore cannot be made atomic with the guest window as it is reserved today, and this is what stops the
+  brick.** A decommitted page is made again by committing it and copying its bytes in. Committing makes a zero page
+  visible to every thread at once: a thread that touches it between the commit and the end of the copy does not fault and
+  reads zeros (silent corruption). Committing it `PAGE_NOACCESS` first does not help: the copy needs the page writable,
+  and the moment it is, every thread can read it. Windows has no "commit with these contents" for plain private memory.
+  What would close it: (a) the guest window reserved as placeholders, so that a restored page is a section view filled
+  through a second view and then mapped in place in one call (`VirtualAlloc2` / `MapViewOfFile3` with
+  `MEM_REPLACE_PLACEHOLDER`: 64 KB granularity, a change to how the whole window is reserved and committed); (b) AWE
+  physical pages (`MapUserPhysicalPages`: atomic, but needs the lock-pages privilege); (c) stopping every other thread
+  of the process (game, back end, driver) for the copy, with the page committed `PAGE_NOACCESS` until all are suspended.
+  None was built in this session.
+- The rest of the races are closable and are written down for whoever builds it: two threads touching one dropped range
+  (a lock per range; the second waits, then runs its instruction again); a kernel touch (through `hos_commit`, above); the
+  back end's threads (user-mode copies come through the handler; imports through `hos_noaccess_import`, which would have
+  to restore before the driver locks the pages); a write to a dropped page (restored first, then the write goes on: the
+  handler returns to the faulting instruction); the decommit itself racing a write (pages made read-only, hashed against
+  the decode-time hash, decommitted only if equal: a writer faults on the read-only page and waits for the decision).
+
+`HL_STREAM_DROP` was therefore not added: nothing is decommitted.

@@ -8,12 +8,18 @@
    dictionary the frame names; a file larger than the read buffer is read chunk by chunk while a second thread decodes.
      HL_STREAM=0  off: the translated function, as before
      HL_STREAM=1  native (the default): the function's main path here, its decode by zstd's own decoder (third_party/zstd) with the
-                  game's dictionaries (their bytes read from the game's dictionary objects); the rare paths and the
-                  chunked case go to the translated function (hl::stream::choose; stream-boundary.md section 5)
+                  game's dictionaries (their bytes read from the game's dictionary objects); a file larger than one
+                  read is decoded here too, chunk by chunk as it is read, by zstd's streaming decoder, with the
+                  decompressor's descriptor and events kept as the game's decoding thread keeps them (no chunk is given
+                  to that thread); the rare paths go to the translated function (hl::stream::choose;
+                  stream-boundary.md sections 5 and 7)
    HL_STREAM_CHECK=1: the translated function answers, and after each decode the same compressed bytes are decoded here
    and compared with the destination byte for byte (the chunked case's chunks are collected as its decoding thread is
-   given them: guest 0x80115bf0, also reached only through a vtable, is wrapped). Counts and the first mismatches are
-   logged. With the check on the translated function answers whatever HL_STREAM says.
+   given them: guest 0x80115bf0, also reached only through a vtable, is wrapped; they are decoded by the native path's
+   streaming decode, fed in the same chunks). Counts and the first mismatches are logged. With the check on the
+   translated function answers whatever HL_STREAM says.
+   HL_STREAM_CHECK=2: the native function answers (HL_STREAM=1), and each chunked file it decodes is decoded again in one
+   call from the bytes it read and compared with what it wrote.
    HL_STREAM_LOG=1: the counters every 10 s (always with the check). Every decode is recorded in the provenance table
    (hl::stream::Provenance: destination range, file, sizes, dictionary), not used yet. */
 #include "hl_host.h"
@@ -51,6 +57,26 @@
 #define D_CHUNK 1424                    /* (u32) its read buffer's chunk */
 #define D_BUFFER 1432                   /* its read buffer: the decoder's workspace, then two chunks */
 #define D_DESC 1440                     /* the chunked case's descriptor (what the decoding thread is given) */
+/* that descriptor's fields, by their offset in the decompressor (stream-boundary.md section 5) */
+#define K_STATE 1456                    /* (u8) 1 a frame to start, 2 under way, 3 failed, 4 decoded */
+#define K_DEST 1464                     /* where the next decoded byte goes */
+#define K_LEFT 1472                     /* (s32) room left in the destination; +4: the frame's bytes still to come */
+#define K_WORK 1480                     /* the decoder's workspace (the read buffer's start) */
+#define K_STAGE 1488                    /* a staging area in that workspace, and +8 (u32) its size, +12 (u32) its fill */
+#define K_STAGE_SIZE 1496
+#define K_DCTX 1504                     /* the decoder context, set by the first chunk */
+#define K_FRAME_DONE 1544               /* light event: the frame ended (or failed); set when idle */
+#define K_CHUNK_DONE 1592               /* light event: the chunk handed over is decoded */
+#define K_SOURCE 1608                   /* the first source buffer (the second is a chunk after it) */
+#define K_CHUNK 1616                    /* (u32) the chunk */
+#define K_INDEX 1620                    /* (u32) chunks decoded; +4 (u32): the byte count of the chunk handed over */
+#define K_COUNT 1624
+#define K_STATUS 1628                   /* (s32) negative: the decoder's error */
+#define K_DDICT 1632                    /* the guest DDict, 0 without a dictionary */
+#define STAGE_OFFSET 0x271f8            /* the staging area's place in the workspace */
+#define F_SIGNAL_LIGHT 0x85101620ULL
+#define F_CLEAR_LIGHT 0x85101710ULL
+#define F_WAIT_LIGHT 0x85101740ULL
 #define WORKSPACE 290816                /* the decoder's workspace at the read buffer's start */
 #define BUFFER_FIXED 0x471f9u           /* the buffer's size is this + 2 chunks + 30 */
 /* the request (the second argument) */
@@ -81,6 +107,8 @@
 #define S_COUNT 120                     /* a read's count in the loop of reads (the frame header's place) */
 
 static int stream_mode, check_on, log_on;
+static int self_check;   /* HL_STREAM_CHECK=2: the native path answers, and each chunked file it decoded is decoded again
+                            in one call from the bytes it read and compared */
 static A64Fn translated_file, translated_chunk;
 
 /* ---- guest memory ---- */
@@ -183,6 +211,46 @@ static ZSTD_DCtx *thread_dctx(void) {
     return dctx;
 }
 
+/* ---- the chunked case's decode: zstd's streaming decoder writing straight into the destination ---- */
+/* A context of its own (a DDict referenced for streaming would stay referenced for the one-call decodes otherwise). The
+   destination is the output buffer for the whole frame (stableOutBuffer: no window buffer of zstd's, whatever the frame's
+   window), and any window the frame names is accepted, as the game's decoder accepts it. */
+typedef struct { ZSTD_DCtx *z; ZSTD_outBuffer out; int done; } Stream;
+
+static int stream_begin(Stream *s, void *dst, size_t cap, ZSTD_DDict *dd) {
+    static _Thread_local ZSTD_DCtx *own;
+    if (!own) own = ZSTD_createDCtx();
+    s->z = own, s->out = (ZSTD_outBuffer){dst, cap, 0}, s->done = 0;
+    return own && !ZSTD_isError(ZSTD_DCtx_reset(own, ZSTD_reset_session_and_parameters)) &&
+           !ZSTD_isError(ZSTD_DCtx_setParameter(own, ZSTD_d_stableOutBuffer, 1)) &&
+           !ZSTD_isError(ZSTD_DCtx_setParameter(own, ZSTD_d_windowLogMax, ZSTD_WINDOWLOG_MAX)) &&
+           (!dd || !ZSTD_isError(ZSTD_DCtx_refDDict(own, dd)));
+}
+
+/* One chunk. 1: decoded (the frame may have ended in it; what follows the end in that chunk is left, as the game's
+   decoder leaves it), 0: an error, no progress, or a chunk after the frame's end (an error in the game's decoder too). */
+static int stream_feed(Stream *s, const void *src, size_t n) {
+    if (s->done) return 0;
+    ZSTD_inBuffer in = {src, n, 0};
+    while (in.pos < in.size) {
+        const size_t was_in = in.pos, was_out = s->out.pos;
+        const size_t r = ZSTD_decompressStream(s->z, &s->out, &in);
+        if (ZSTD_isError(r)) return 0;
+        if (!r) { s->done = 1; return 1; }
+        if (in.pos == was_in && s->out.pos == was_out) return 0;
+    }
+    return 1;
+}
+
+/* a whole chunked file in memory, fed in the decompressor's chunks (the check's side): 1 when the frame decoded to `fcs` */
+static int stream_whole(void *dst, size_t fcs, const uint8_t *src, size_t n, size_t chunk, ZSTD_DDict *dd) {
+    Stream s;
+    if (!chunk || !stream_begin(&s, dst, fcs, dd)) return 0;
+    for (size_t at = 0; at < n; at += chunk)
+        if (!stream_feed(&s, src + at, n - at < chunk ? n - at : chunk)) return 0;
+    return s.done && s.out.pos == fcs;
+}
+
 /* ---- the counters ---- */
 static void report(int force) {
     static volatile LONG64 last;
@@ -193,9 +261,12 @@ static void report(int force) {
     if (hl_stream_report(line, sizeof line)) hos_log("hl stream: %s", line);
 }
 
+static int pages_on;   /* HL_STREAM_PAGES=1 (section 9 of stream-boundary.md) */
+
 static void record(uint64_t req, uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, int chunked) {
     char name[160];
     request_name(req, name, sizeof name);
+    if (pages_on) hl_stream_pages_track(dest, GP(dest), size, name, hos_now_ns());
     const uint64_t head = size < 4096 ? size : 4096;
     const uint8_t *p = (const uint8_t *)GP(dest);
     uint64_t fp = hl_stream_fingerprint(p, (size_t)head, 0xcbf29ce484222325ULL);
@@ -329,9 +400,13 @@ static void check_file(Ctx *A64_NOESC c) {
         if (!scratch) scratch_cap = 0;
     }
     size_t r = (size_t)-1;
-    if (scratch && (dd || !h.dictID))
-        r = dd ? ZSTD_decompress_usingDDict(thread_dctx(), scratch, (size_t)fcs, src, csize, dd)
-               : ZSTD_decompressDCtx(thread_dctx(), scratch, (size_t)fcs, src, csize);
+    if (scratch && (dd || !h.dictID)) {
+        if (chunked)   /* (the native path's decode: zstd's streaming decoder, fed the chunks the decoding thread was given) */
+            r = stream_whole(scratch, (size_t)fcs, own, own_len, l32(obj + D_CHUNK), dd) ? (size_t)fcs : (size_t)-1;
+        else
+            r = dd ? ZSTD_decompress_usingDDict(thread_dctx(), scratch, (size_t)fcs, src, csize, dd)
+                   : ZSTD_decompressDCtx(thread_dctx(), scratch, (size_t)fcs, src, csize);
+    }
     const uint8_t *got = (const uint8_t *)GP(dest);
     const int mismatch = ZSTD_isError(r) || r != fcs || memcmp(scratch, got, (size_t)fcs) != 0;
     hl_stream_checked(1, chunked, fcs, mismatch);
@@ -367,6 +442,132 @@ static uint32_t result_code(int32_t e) {
     if (e >= 0) return 0;
     if ((uint32_t)e + 3u < 3u) return l32(G_ERROR_TABLE + 4 * (uint64_t)(uint32_t)~(uint32_t)e);
     return 11;
+}
+
+/* The next chunk read into `to` through the open handle, as the translated function's loop reads it (the handle's kind
+   and readiness checked each time; one read of a chunk, or reads of at most read_max). The count lands at the frame's
+   S_READ. 0: the code-9 path. */
+static int read_next(Ctx *c, uint64_t sp, uint64_t holder, uint64_t to, uint32_t chunk, uint32_t read_max) {
+    const uint64_t handle = l64(sp + 64);
+    if (!handle || l8(handle + F_KIND) != 1) return 0;
+    const uint64_t ready = l64(l64(handle) + V_READY);
+    if (ready != l64(G_ALWAYS_READY) && !(gcall(c, ready, 2, handle, holder, 0, 0, 0) & 1)) return 0;
+    const uint64_t read = l64(l64(handle) + V_READ);
+    if (!read_max) return (int)(gcall(c, read, 5, handle, sp + S_READ, holder, to, chunk) & 1);
+    uint32_t left = chunk, total = 0;
+    for (;;) {
+        s32_sp(c, sp + S_COUNT, 0);
+        const uint32_t n = (int32_t)left < (int32_t)read_max ? left : read_max;
+        if (!(gcall(c, read, 5, handle, sp + S_COUNT, holder, to, n) & 1)) {
+            s32_sp(c, sp + S_READ, total);
+            return 0;
+        }
+        const uint32_t got = l32(sp + S_COUNT);
+        total += got;
+        if (got < n) break;
+        to += got;
+        left -= n;
+        if (!left) break;
+    }
+    s32_sp(c, sp + S_READ, total);
+    return 1;
+}
+
+/* The chunked case on the loading thread (stream-boundary.md section 5): the descriptor filled and the events waited on,
+   cleared and signalled as the translated function and its decoding thread do it, the file read chunk after chunk into
+   the two source buffers in turn by the same calls, each chunk decoded here (zstd's streaming decoder, into the
+   destination) where the decoding thread's step would have decoded it, and the descriptor left as that step leaves it
+   after a frame. The decoding thread is not given anything (it only runs the step for a descriptor it is given).
+   1: decoded, `*total` the compressed bytes; 0: a read failed (the code-9 path); -1: the decoder failed or the frame did
+   not end where it should: nothing is left waiting, and the caller gives the request to the translated function, which
+   reproduces whatever the game's decoder makes of the file. */
+static int decode_chunked(Ctx *c, uint64_t obj, uint64_t sp, uint64_t holder, uint64_t src, uint32_t chunk,
+                          uint32_t read_max, uint64_t dest, uint32_t fcs, uint64_t gdd, ZSTD_DDict *dd, uint32_t count,
+                          uint32_t *total) {
+    const uint64_t buf = l64(obj + D_BUFFER);
+    gcall(c, F_WAIT_LIGHT, 1, obj + K_FRAME_DONE, 0, 0, 0, 0);
+    gcall(c, F_CLEAR_LIGHT, 1, obj + K_FRAME_DONE, 0, 0, 0, 0);
+    s32(c, obj + K_CHUNK, chunk);
+    s64(c, obj + K_DEST, dest);
+    s32(c, obj + K_LEFT, fcs), s32(c, obj + K_LEFT + 4, 0);
+    s64(c, obj + K_WORK, buf);
+    s64(c, obj + K_DCTX, 0);
+    s64(c, obj + K_SOURCE, src);
+    s32(c, obj + K_STATUS, 0);
+    s64(c, obj + K_DDICT, gdd);
+    s8(c, obj + K_STATE, 1);
+    s64(c, obj + K_STAGE, buf + STAGE_OFFSET);
+    s64(c, obj + K_STAGE_SIZE, 0x20000);
+    s64(c, obj + K_INDEX, 0);
+    Stream s;
+    static _Thread_local uint8_t *seen;   /* (HL_STREAM_CHECK=2: the compressed bytes, for the check after) */
+    static _Thread_local size_t seen_cap;
+    size_t seen_len = 0;
+    if (!stream_begin(&s, GP(dest), fcs, dd)) {
+        gcall(c, F_SIGNAL_LIGHT, 1, obj + K_FRAME_DONE, 0, 0, 0, 0);
+        return -1;
+    }
+    uint32_t index = 0, sum = 0;
+    for (;;) {
+        /* hand-off: the chunk in the buffer its index chooses, decoded as the step decodes it */
+        gcall(c, F_CLEAR_LIGHT, 1, obj + K_CHUNK_DONE, 0, 0, 0, 0);
+        s32(c, obj + K_COUNT, count);
+        const uint64_t from = index & 1 ? src + chunk : src;
+        if (self_check) {
+            if (seen_len + count > seen_cap) {
+                size_t cap = seen_cap ? seen_cap : (32u << 20);
+                while (cap < seen_len + count) cap *= 2;
+                uint8_t *b = (uint8_t *)realloc(seen, cap);
+                if (b) seen = b, seen_cap = cap;
+            }
+            if (seen_len + count <= seen_cap) memcpy(seen + seen_len, GP(from), count), seen_len += count;
+        }
+        const int ok = stream_feed(&s, GP(from), count);
+        s32(c, obj + K_INDEX, ++index);
+        sum += count;
+        if (!ok) {
+            gcall(c, F_SIGNAL_LIGHT, 1, obj + K_FRAME_DONE, 0, 0, 0, 0);
+            gcall(c, F_SIGNAL_LIGHT, 1, obj + K_CHUNK_DONE, 0, 0, 0, 0);
+            return -1;
+        }
+        /* (the step's result: the frame's bytes still to come, 0 once it ended; 0 also signals the frame's event) */
+        if (s.done || s.out.pos == fcs) gcall(c, F_SIGNAL_LIGHT, 1, obj + K_FRAME_DONE, 0, 0, 0, 0);
+        gcall(c, F_SIGNAL_LIGHT, 1, obj + K_CHUNK_DONE, 0, 0, 0, 0);
+        if (count < chunk) break;   /* (the last, partial chunk: handed over after the loop of full ones) */
+        if (!read_next(c, sp, holder, index & 1 ? src + chunk : src, chunk, read_max)) return 0;
+        gcall(c, F_WAIT_LIGHT, 1, obj + K_CHUNK_DONE, 0, 0, 0, 0);
+        count = l32(sp + S_READ);
+        if (!count) break;
+    }
+    if (count) gcall(c, F_WAIT_LIGHT, 1, obj + K_CHUNK_DONE, 0, 0, 0, 0);
+    if (!s.done || s.out.pos != fcs) {
+        gcall(c, F_SIGNAL_LIGHT, 1, obj + K_FRAME_DONE, 0, 0, 0, 0);
+        return -1;
+    }
+    HOS_WRITTEN(GP(dest), fcs);
+    /* the descriptor as the step leaves it after a frame */
+    s64(c, obj + K_DEST, dest + fcs);
+    s32(c, obj + K_LEFT, 0), s32(c, obj + K_LEFT + 4, 0);
+    s64(c, obj + K_DCTX, buf);
+    s8(c, obj + K_STATE, 4);
+    *total = sum;
+    if (self_check) {
+        size_t n = seen_len, r = (size_t)-1;
+        const size_t fsz = ZSTD_findFrameCompressedSize(seen, seen_len);
+        if (!ZSTD_isError(fsz)) n = fsz;
+        uint8_t *mine = (uint8_t *)malloc(fcs ? fcs : 1);
+        if (mine && seen_len == sum)
+            r = dd ? ZSTD_decompress_usingDDict(thread_dctx(), mine, fcs, seen, n, dd)
+                   : ZSTD_decompressDCtx(thread_dctx(), mine, fcs, seen, n);
+        const int mismatch = ZSTD_isError(r) || r != fcs || memcmp(mine, GP(dest), fcs) != 0;
+        hl_stream_checked(1, 1, fcs, mismatch);
+        static volatile LONG told;
+        if (mismatch && InterlockedIncrement(&told) <= 10)
+            hos_log("hl stream check: MISMATCH of a native chunked decode: %u bytes from %u in %u chunks (%s)", fcs, sum,
+                    index, ZSTD_isError(r) ? ZSTD_getErrorName(r) : "bytes differ");
+        free(mine);
+    }
+    return 1;
 }
 
 static void hl_decode_file(Ctx *A64_NOESC c) {
@@ -460,24 +661,6 @@ static void hl_decode_file(Ctx *A64_NOESC c) {
         s32_sp(c, sp + S_READ, total);
         csize = total;
     }
-    if (csize >= chunk) {
-        /* the chunked case: closed here, and the request given to the translated function, which opens and reads the
-           file again and hands its chunks to the decoding thread (stream-boundary.md section 5) */
-        ZSTD_frameHeader first;   /* (for the provenance table: the first chunk holds the frame header) */
-        const int known = ZSTD_getFrameHeader(&first, GP(src), csize) == 0 && first.frameType == ZSTD_frame &&
-                          first.frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN;
-        s64_sp(c, holder, holder_class + 16);
-        gcall(c, F_CLOSE, 2, file, holder, 0, 0, 0);
-        c->x[31] = sp0;
-        c->x[0] = obj, c->x[1] = req, c->x[2] = actx, c->x[3] = a3, c->x[4] = a4, c->x[5] = a5;
-        translated_file(c);
-        const uint64_t got = c->x[0];
-        hl_stream_count(HL_STREAM_CHUNKED, got && known ? first.frameContentSize : 0);
-        if (got && known) record(req, got, first.frameContentSize, 0, first.dictID, 1);
-        if (log_on) report(0);
-        return;
-    }
-
     /* the frame header: the decompressed size, the dictionary */
     const uint8_t *s = (const uint8_t *)GP(src);
     ZSTD_frameHeader h;
@@ -540,6 +723,51 @@ static void hl_decode_file(Ctx *A64_NOESC c) {
         x28 = 1;
     }
 
+    /* the chunked case: the file is larger than one read (stream-boundary.md section 5) */
+    if (csize >= chunk) {
+        ZSTD_DDict *dd = gdd ? host_ddict(gdd, h.dictID) : NULL;
+        uint32_t total = 0;
+        const int k = h.frameType != ZSTD_frame || (h.dictID && !dd)
+                          ? -1
+                          : decode_chunked(c, obj, sp, holder, src, chunk, read_max, dest, fcs, gdd, dd, csize, &total);
+        if (k < 0) {
+            /* (never seen: the decoder failed, or a frame the game's decoder takes another way) the destination given
+               back if it was allocated here, the file closed, and the request given whole to the translated function,
+               which opens and reads the file again */
+            static volatile LONG told;
+            if (InterlockedIncrement(&told) <= 8) {
+                char name[160];
+                request_name(req, name, sizeof name);
+                hos_log("hl stream: %s: the native chunked decode gave up (%u bytes, dictionary %u%s): the translated "
+                        "function decodes it", name[0] ? name : "(no name)", fcs, h.dictID,
+                        h.dictID && !dd ? " not found" : "");
+            }
+            hl_stream_count(HL_STREAM_CHUNKED_FALLBACK, 0);
+            if (x28 & 1) gcall(c, F_FREE, 1, dest, 0, 0, 0, 0);
+            s64_sp(c, holder, holder_class + 16);
+            gcall(c, F_CLOSE, 2, file, holder, 0, 0, 0);
+            c->x[31] = sp0;
+            c->x[0] = obj, c->x[1] = req, c->x[2] = actx, c->x[3] = a3, c->x[4] = a4, c->x[5] = a5;
+            translated_file(c);
+            if (log_on) report(0);
+            return;
+        }
+        if (!k) {   /* (a read failed: code 9 whatever the quiet bit, the destination freed, the flag left as it was) */
+            error_path(req, "the native", 9, fcs);
+            const uint64_t at = l64(req + R_RESULT);
+            if (at) s32(c, at, 9);
+            if (x28 & 1) gcall(c, F_FREE, 1, dest, 0, 0, 0, 0);
+            dest = 0;
+            goto flag;
+        }
+        const uint64_t os = l64(sp + S_OUT_SIZE), oa = l64(sp + S_OUT_ALLOC);
+        if (os) s32(c, os, fcs);
+        if (oa) s32(c, oa, size);
+        hl_stream_count(HL_STREAM_CHUNKED, fcs);
+        record(req, dest, fcs, total, h.dictID, 1);
+        goto flag;
+    }
+
     /* the decode: the whole file at once */
     {
         ZSTD_DDict *dd = gdd ? host_ddict(gdd, h.dictID) : NULL;
@@ -590,11 +818,174 @@ out_unflagged:
     if (log_on) report(0);
 }
 
+/* ---- HL_STREAM_PAGES=1: which decoded pages still hold the decoder's bytes, and the restore path's proof ----
+   (stream-boundary.md section 9) Every decode's whole pages are hashed when it is recorded; a thread of its own hashes
+   them again when the range is 30 s and 60 s old (hl::stream::Pages) and logs the table by file kind every 10 s. At the
+   second check, ranges are decoded again from the RomFS by their name (the restore a decommitted page would need) and
+   compared: with the hashes taken at decode time for every page, and byte for byte with memory for the pages that still
+   match. Measurement only: it decommits nothing. Reading pages brings back those the cold-pages thread took out. */
+extern const char *hos_romfs_dir;
+int hos_mods_romfs(const char *rel, char *out, size_t cap);
+
+/* the host bytes of a guest page when it is committed and readable now (a freed region's page is not: reading it would
+   commit a zero megabyte through the commit-on-touch handler) */
+static const uint8_t *page_view(uint64_t addr, size_t n, void *ctx) {
+    /* (copied by the kernel: a page that is not committed or not readable fails the copy instead of faulting into the
+       process's handlers, whatever another thread does to it meanwhile. A first form read the page in place after a
+       VirtualQuery and left this thread stuck at its first checks in two runs) */
+    static _Thread_local uint8_t copy[4096];
+    SIZE_T got = 0;
+    (void)ctx;
+    if (n > sizeof copy || !hos_guest_range(addr, n) ||
+        !ReadProcessMemory(GetCurrentProcess(), GP(addr), copy, n, &got) || got != n)
+        return NULL;
+    return copy;
+}
+
+static ZSTD_DDict *ddict_by_id(uint32_t id) {
+    ZSTD_DDict *dd = NULL;
+    AcquireSRWLockShared(&dict_lock);
+    for (int i = 0; i < ndicts && !dd; i++)
+        if (dicts[i].id == id) dd = dicts[i].dd;
+    ReleaseSRWLockShared(&dict_lock);
+    return dd;
+}
+
+/* the restore test's counters */
+static struct {
+    uint64_t tests, bytes, pages_equal_now, mismatches, hash_mismatches, changed_meanwhile, no_entry, no_file,
+        size_differs, failed, ns, max_ns;
+} rt;
+static int64_t rt_budget_at;
+static uint64_t rt_budget_bytes;
+
+/* a whole RomFS file into a malloc'd buffer (the mods' file when a mod has it, as the game would read it) */
+static uint8_t *read_romfs(const char *name, size_t *len) {
+    char rel[200], path[1024];
+    snprintf(rel, sizeof rel, "%s.zs", name);
+    if (!hos_mods_romfs(rel, path, sizeof path)) {
+        if (!hos_romfs_dir) return NULL;
+        snprintf(path, sizeof path, "%s/%s", hos_romfs_dir, rel);
+    }
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz;
+    uint8_t *b = NULL;
+    DWORD got = 0;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart < (1LL << 31) && (b = (uint8_t *)malloc((size_t)sz.QuadPart)) &&
+        (!ReadFile(h, b, (DWORD)sz.QuadPart, &got, NULL) || got != (DWORD)sz.QuadPart))
+        free(b), b = NULL;
+    CloseHandle(h);
+    if (b) *len = (size_t)sz.QuadPart;
+    return b;
+}
+
+static void restore_test(void *ctx, uint64_t dest, uint64_t size, uint64_t first_page, size_t pages, const uint64_t *hashes,
+                         const uint8_t *equal, int stage, const char *name) {
+    (void)ctx;
+    if (stage != 2 || !pages || !name[0]) return;
+    /* (a budget: 64 MB of decoded bytes a second at most, so that the thread keeps up with the checks) */
+    const int64_t now = hos_now_ns();
+    if (now - rt_budget_at > 1000000000LL) rt_budget_at = now, rt_budget_bytes = 0;
+    if (rt_budget_bytes > (16u << 20)) return;
+    rt_budget_bytes += size;
+    hl_stream_decode d;
+    if (!hl_stream_find(dest, &d, NULL, 0) || d.dest != dest || d.size != size) { rt.no_entry++; return; }
+    size_t clen = 0;
+    uint8_t *cbytes = read_romfs(name, &clen);
+    if (!cbytes) {
+        rt.no_file++;
+        static int told;
+        if (told++ < 6) hos_log("hl stream restore: no RomFS file for %s", name);
+        return;
+    }
+    if (d.compressed && d.compressed != clen) rt.size_differs++;
+    ZSTD_DDict *dd = d.dict_id ? ddict_by_id(d.dict_id) : NULL;
+    static uint8_t *scratch;
+    static size_t scratch_cap;
+    if (size > scratch_cap) {
+        free(scratch);
+        scratch_cap = (size_t)size + (4u << 20);
+        scratch = (uint8_t *)malloc(scratch_cap);
+        if (!scratch) scratch_cap = 0;
+    }
+    size_t r = (size_t)-1;
+    if (scratch && (dd || !d.dict_id)) {
+        const size_t fsz = ZSTD_findFrameCompressedSize(cbytes, clen);
+        const size_t n = ZSTD_isError(fsz) ? clen : fsz;
+        r = dd ? ZSTD_decompress_usingDDict(thread_dctx(), scratch, (size_t)size, cbytes, n, dd)
+               : ZSTD_decompressDCtx(thread_dctx(), scratch, (size_t)size, cbytes, n);
+    }
+    free(cbytes);
+    const int64_t took = hos_now_ns() - now;
+    rt.tests++, rt.bytes += size, rt.ns += (uint64_t)took;
+    if ((uint64_t)took > rt.max_ns) rt.max_ns = (uint64_t)took;
+    if (ZSTD_isError(r) || r != size) {
+        rt.failed++;
+        static int told;
+        if (told++ < 6) hos_log("hl stream restore: %s: the decode failed (%s)", name, ZSTD_isError(r) ? ZSTD_getErrorName(r) : "size");
+        return;
+    }
+    int told_here = 0;
+    for (size_t i = 0; i < pages; i++) {
+        const uint8_t *mine = scratch + (first_page - dest) + i * 4096;
+        if (hl_stream_page_hash(mine, 4096) != hashes[i]) rt.hash_mismatches++, told_here |= 1;
+        if (equal[i] != 1) continue;
+        const uint8_t *now_p = page_view(first_page + i * 4096, 4096, NULL);
+        if (!now_p) continue;
+        if (!memcmp(mine, now_p, 4096)) { rt.pages_equal_now++; continue; }
+        if (hl_stream_page_hash(now_p, 4096) != hashes[i]) { rt.changed_meanwhile++; continue; }   /* (written since the check) */
+        rt.mismatches++, told_here |= 2;
+    }
+    static int told;
+    if (told_here && told++ < 10)
+        hos_log("hl stream restore: MISMATCH %s (%llu bytes at %#llx):%s%s", name, (unsigned long long)size,
+                (unsigned long long)dest, told_here & 1 ? " a page differs from its decode-time hash" : "",
+                told_here & 2 ? " a page equal to its decode differs from the decode again" : "");
+}
+
+static DWORD WINAPI pages_thread(LPVOID unused) {
+    (void)unused;
+    int64_t last = hos_now_ns();
+    for (;;) {
+        Sleep(500);
+        /* (128 MB of pages a pass at most: 1 GB a pass, with the cold-pages thread's pages read back from the page
+           file, froze a run on the PC 3050 for a minute) */
+        const int64_t t0 = hos_now_ns();
+        const size_t n = hl_stream_pages_check(t0, page_view, NULL, (size_t)1 << 15, restore_test, NULL);
+        static int slow;
+        if (hos_now_ns() - t0 > 2000000000LL && slow++ < 8)
+            hos_log("hl stream pages: a pass of %zu ranges took %.1f s", n, (hos_now_ns() - t0) / 1e9);
+        if (hos_now_ns() - last < 10000000000LL) continue;
+        last = hos_now_ns();
+        static char table[16384];
+        if (hl_stream_pages_report(table, sizeof table) > 0) {
+            hos_log("hl stream pages: whole 4 KB pages still equal to the decode (MB), by file kind:");
+            for (char *line = table, *nl; line; line = nl) {
+                nl = strchr(line, '\n');
+                if (nl) *nl++ = 0;
+                hos_log("hl stream pages: %s", line);
+            }
+        }
+        hos_log("hl stream restore: tests %llu (%.1f MB), pages equal to memory %llu, MISMATCHES %llu, pages unlike their "
+                "decode-time hash %llu, written meanwhile %llu; no entry %llu, no file %llu, size differs %llu, decode "
+                "failed %llu; a restore took %.2f ms on average (%.2f ms a MB), at most %.2f ms",
+                (unsigned long long)rt.tests, rt.bytes / 1048576.0, (unsigned long long)rt.pages_equal_now,
+                (unsigned long long)rt.mismatches, (unsigned long long)rt.hash_mismatches,
+                (unsigned long long)rt.changed_meanwhile, (unsigned long long)rt.no_entry, (unsigned long long)rt.no_file,
+                (unsigned long long)rt.size_differs, (unsigned long long)rt.failed,
+                rt.tests ? rt.ns / 1e6 / rt.tests : 0.0, rt.bytes ? rt.ns / 1e6 / (rt.bytes / 1048576.0) : 0.0,
+                rt.max_ns / 1e6);
+    }
+    return 0;
+}
+
 /* 1 when the decode is answered here (asked once, at the function's first lookup) */
 static int hl_stream_on(void) {
     const char *e = getenv("HL_STREAM"), *k = getenv("HL_STREAM_CHECK");
     stream_mode = e && e[0] ? atoi(e) : HL_STREAM_DEFAULT;
-    check_on = k && k[0] ? atoi(k) != 0 : 0;
+    check_on = k && k[0] ? atoi(k) == 1 : 0;
+    self_check = k && k[0] && atoi(k) == 2 && stream_mode;
     if (!stream_mode && !check_on) {
         hos_log("hl stream: off (HL_STREAM=0)");
         return 0;
@@ -607,11 +998,22 @@ static int hl_stream_on(void) {
         return 0;
     }
     hl_stream_start(1u << 16);
-    log_on = check_on || getenv("HL_STREAM_LOG") != NULL;
+    log_on = check_on || self_check || getenv("HL_STREAM_LOG") != NULL;
+    {
+        const char *p = getenv("HL_STREAM_PAGES");
+        if (p && atoi(p) == 1 && hl_stream_pages_start(30000000000LL, 60000000000LL)) {
+            pages_on = 1;
+            CloseHandle(CreateThread(NULL, 0, pages_thread, NULL, 0, NULL));
+            hos_log("hl stream: pages: every decode's whole pages hashed, checked again at 30 s and 60 s, and the ranges "
+                    "decoded again from the RomFS at 60 s (HL_STREAM_PAGES=1, a measurement)");
+        }
+    }
     hos_log("hl stream: %s (zstd %s)",
             check_on ? "the check: the translated decode of each resource file, then the same bytes decoded natively and "
                        "compared with it"
-                     : "the native decode of resource files (the chunked case and rare paths translated)",
+            : self_check ? "the native decode of resource files (rare paths translated), each chunked file checked against "
+                           "a one-call decode of the bytes read"
+                         : "the native decode of resource files, the chunked case included (rare paths translated)",
             ZSTD_versionString());
     return 1;
 }
