@@ -1081,6 +1081,51 @@ the owner: a touch restores the granule from its buffer, then the granule in gue
 At most 256 MB saved (`HOS_GUEST_PAGES_TEST_MB`), 32 MB dropped a pass. A line every 10 s: drops, restores, mismatches,
 refusals, writers held, and how much of the pools' storage imports made undroppable in the last whole sweep.
 
+### Validation (main PC, build `m1-gp`, main 528b17c7 merged, 2026-11-13)
+
+`valid.sh` in the three scenes, three ways: the switch off (`m1off`), on with nothing dropped (`m1on`), on with the self-test
+(`m1t`). All nine runs went to the end (112 s), no crash line, game speed ratio 59.8-60.5. The last shots of each `m1on` and
+`m1t` scene looked at beside the reference shots: the market complete and right, no missing geometry, no tint, no black or
+white frames.
+
+| Scene | Run | Game RAM | of it GPU pools | Process RAM | Process commit | VRAM |
+|---|---|---:|---:|---:|---:|---:|
+| kokiri-idle | off | 3232 | 1556 | 7616 | 18446 | 5415 |
+| | on, nothing dropped | 3119 | 1506 | 7239 | 18861 | 5661 |
+| | self-test | 3380 | 1852 | 7599 | 17630 | 5329 |
+| castle-move | off | 3596 | 1727 | 7692 | 19802 | 6435 |
+| | on, nothing dropped | 3236 | 1543 | 7631 | 20304 | 6969 |
+| | self-test | 4003 | 2073 | 8470 | 20221 | 6973 |
+| hyrule-walk | off | 2738 | 1631 | 7104 | 19925 | 6565 |
+| | on, nothing dropped | 3127 | 1627 | 7512 | 19408 | 6153 |
+| | self-test | 4042 | 1934 | 8783 | 19311 | 6279 |
+
+MB; `HOS_MEM_SPLIT=95` and `RX_VK_RES_LOG=1`; one run each. On with nothing dropped is within the run-to-run spread of off
+(the reservation is the same but for its two parts). The self-test holds up to 256 MB of saved bytes in host memory and
+reads every granule it drops back into RAM first (to copy it), so its RAM is not a saving: it exercises the path.
+
+Self-test counters at the end of each run (kokiri / castle / hyrule): granules dropped 4,670 / 4,241 / 3,729; restored
+574 / 1,665 / 1,283, by the handler 539 / 1,554 / 1,172 and before an import 35 / 111 / 111 (none through `hos_commit`: no
+system call was given a dropped granule); **hash mismatches 0**; restores refused, drops failed, fills failed, maps failed,
+owner declines: 0; writers held during a drop: 0. Drops refused because the range is imported: 0, because a granule is a
+candidate only when none of its pages is resident, and pages the driver locked for an import stay resident: the imports
+keep those granules out of reach without a refusal being counted (the per-sweep figure of imported granules is not
+reliable: the sweep stops at the 256 MB cap). Before the split lock, two of four castle-move self-test runs crashed on a
+failed lazy commit; after it, three castle-move runs and the three scenes above ran clean.
+
+### Not verified
+
+- Linux (stubs: `hos_gp_ready()` is 0); `HOS_LARGE_PAGES=1` (not with large pages: the window is reserved as before) and the
+  hardware write-watch build (refused, logged).
+- `hos_commit`'s path with a dropped granule in the game (0 restores by that path: no system call was given one), the
+  forget path in the game (0 forgotten: the self-test drops only pool storage and no pool's memory was given up while
+  dropped); both are covered by the game-free test only.
+- Kernel writes into a granule the self-test has made read-only for its copy (a `ReadFile` there would fail instead of
+  faulting; `hos_commit` before it would make it writable again): not seen, not excluded. A policy that drops granules
+  the game may still write must prove them unchanged the same way.
+- Long sessions, several scene changes, the PC 3050, a PC short of RAM; the time a restore costs on the thread that touches
+  (no speed study by the rule of the night).
+
 ## 14. GPU data's system-memory copy given back for good (`HL_MEM_DROP`, `RX_VK_NO_HOST_IMPORT`, 2026-11-13)
 
 Section 13's substrate makes a dropped granule (no RAM, no commit charge) come back atomically on any touch. This brick
