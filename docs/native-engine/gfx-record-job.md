@@ -636,13 +636,13 @@ as a mismatch of segment B.
 | Tests | `engine/native/tests/gfx_test.cpp` | the prologue (signed range, mode bit 14), the paths and the counts (negative span, 32-bit counter, task rounding), the calls' order and arguments, the bridge's reads and writes in place against the expected bytes, the route, the sink's query and eight-register procedure, the check's path flag |
 
 Both gates are in `code_hot_7.c` (one recompile of that file when they go in). Switches: `HL_GFX_DRAW` 0 (the
-translated function, the default) or 1 (native on the direct paths); `HL_GFX_CHECK=1` (or 2) checks instead of answering
+translated function) or 1 (native on the direct paths; **the default** since the main PC's validation below); `HL_GFX_CHECK=1` (or 2) checks instead of answering
 (it checks the render state too); `HL_GFX_LOG=1` adds the line `hl gfx: draw: native pre-recorded N, indexed N, ...;
 left to the translation: query N, callback N, clusters N, inline N` every 10 s.
 
-### The check and the runs (PC 3050, 110 s a scene; function only, no speed)
+### The check and the runs (110 s a scene; function only, no speed)
 
-Counts at the run's last report (10 s before its end):
+Counts at the run's last report (10 s before its end). PC 3050:
 
 | Run | Scene | Prologue: calls / NVN calls compared | Submission: calls / NVN calls compared | Mismatched | Left to the translation |
 |---|---|---:|---:|---:|---:|
@@ -651,8 +651,15 @@ Counts at the run's last report (10 s before its end):
 | | hyrule-walk | 119,723 / 52 | 94,045 / 94,045 | 0 | 320 (clusters) |
 
 The prologue's calls include the sub-meshes out of range (23,746 / 26,564 / 25,678: the callers ask for more sub-meshes
-than a drawable has, and the function returns at once). **Every submission in the three scenes took the pre-recorded
-path** (CallCommands): the indexed draw, the mesh tasks and the "nothing" kind were never taken, so they are checked by
+than a drawable has, and the function returns at once). Main PC (the same build, `HL_GFX_CHECK=1`):
+
+| Scene | Prologue: calls / NVN calls compared | Submission: calls / NVN calls compared | Mismatched | Left (clusters) | Render state: calls / NVN calls, mismatched |
+|---|---:|---:|---:|---:|---|
+| kokiri-idle | 319,701 / 0 | 245,085 / 245,085 | 0 | 20 | 62,136 / 2,031,538, 0 |
+| castle-move | 271,888 / 52 | 216,726 / 216,726 | 0 | 3,836 | 48,598 / 1,580,214, 0 |
+| hyrule-walk | 278,207 / 136 | 219,734 / 219,734 | 0 | 516 | 142,446 / 4,679,303, 0 |
+
+In all six runs **every submission took the pre-recorded path** (CallCommands): the indexed draw, the mesh tasks and the "nothing" kind were never taken, so they are checked by
 the tests only, not in the game. No call took the query, callback or inline paths; the cluster paths (left whole to the
 translation) are 0.01-6% of the calls. The render-state check ran in the same runs: 0 mismatches (castle-move 53,902
 calls, 1,767,096 NVN calls; kokiri-idle 61,777 / 2,029,526; hyrule-walk 56,788 / 1,865,084).
@@ -661,7 +668,20 @@ Native (`HL_GFX_DRAW=1`, PC 3050, three runs a scene, the last with shots every 
 with no crash and the save unchanged; in the shot runs 91,743 / 104,121 / 110,817 native submissions (castle-move /
 kokiri-idle / hyrule-walk, all pre-recorded), 6,228 / 16 / 20 left to the translation (clusters). The last shots of
 each scene show the scene whole (geometry, shadows, characters, text), as in the reference runs. The game-speed ratio
-was not logged on the PC 3050 (the runs lacked `HOS_SPEED_LOG=1`); it is measured by the main PC's validation.
+was not logged on the PC 3050 (the runs lacked `HOS_SPEED_LOG=1`).
+
+**Validation on the main PC** (`build/s5/valid.sh s2c-draw gfx-draw HL_GFX_DRAW=1`, 110 s a scene):
+
+| Scene | Ran | Game speed ratio | Native submissions (last report) | Left to the translation | Shots |
+|---|---|---|---:|---:|---|
+| kokiri-idle | to the end, no crash | 60.35 | 255,120 | 24 | right (the Market square, characters, shadows, HUD; as `refshots-kokiri-idle`) |
+| castle-move | to the end, no crash | 60.15 | 198,147 | 128 | right (as `refshots-castle-move`; the camera is in another place of the same street at the same frame number) |
+| hyrule-walk | to the end, no crash | 60.41 | 225,609 | 20 | right (the fountain, water, speech text) |
+
+Memory (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 2,692 / 1,490 / 6,901 / 19,278 / 5,965;
+castle-move 3,350 / 1,766 / 7,910 / 19,715 / 6,267; hyrule-walk 3,174 / 1,632 / 7,810 / 19,520 / 6,117 (the brick
+changes no memory: these are the build's figures with the other streams' memory bricks). `HL_GFX_DRAW` is on by
+default since these runs.
 
 ### Where it leads
 

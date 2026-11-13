@@ -27,11 +27,12 @@
 
    The draw path's sub-mesh submission (guest 0x80078fc0, a virtual method its callers call directly) is answered through
    an entry gate too (gfx-record-job.md section 9):
-     HL_GFX_DRAW=0  off (the default): the translated function, as before
-     HL_GFX_DRAW=1  the native function on its direct paths (hl::gfx::SubmeshDraw): the prologue native, the shared
-                    preparation 0x8008fc00 called back on the same context, the submission native (pre-recorded list,
-                    indexed instanced draw or mesh tasks, and the block's triangle counter); a call on any other path
-                    (the cluster, indirect, query and inline-write paths) is left whole to the translation
+     HL_GFX_DRAW=0  off: the translated function, as before
+     HL_GFX_DRAW=1  (the default) the native function on its direct paths (hl::gfx::SubmeshDraw): the prologue native,
+                    the shared preparation 0x8008fc00 called back on the same context, the submission native
+                    (pre-recorded list, indexed instanced draw or mesh tasks, and the block's triangle counter); a call
+                    on any other path (the cluster, indirect, query and inline-write paths) is left whole to the
+                    translation
    With HL_GFX_CHECK=1 (or 2) it checks instead, in two segments around the preparation: a second gate at 0x8008fc00 is
    the checkpoint, for the call the checked body makes (gfx-record-job.md section 9 says how). */
 #include "hl_host.h"
@@ -288,7 +289,7 @@ __attribute__((constructor)) static void hl_gfx_state_gate(void) { hl_gate_on_80
 
 /* ---- the sub-mesh submission ---- */
 
-#define HL_GFX_DRAW_DEFAULT 0
+#define HL_GFX_DRAW_DEFAULT 1   /* (the check and the validation clean in the three scenes on both PCs: gfx-record-job.md section 9) */
 #define HL_DRAW_FN 0x80078fc0ULL      /* (hl_gfx_draw_address: draw_init checks the two agree) */
 #define HL_DRAW_PREPARE 0x8008fc00ULL
 
