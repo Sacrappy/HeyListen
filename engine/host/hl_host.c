@@ -57,6 +57,21 @@ A64Fn a64_lookup_replaced(uint64_t addr) {
     return NULL;
 }
 
+/* (the lifted table: rt/a64_rt.c reads it the same way) */
+extern const uint32_t a64_fn_count;
+extern const uint32_t a64_fn_addr[];
+extern const A64Fn a64_fn_ptr[];
+A64Fn hl_translated(uint64_t guest) {
+    uint32_t lo = 0, hi = a64_fn_count;
+    if (guest >> 32) return NULL;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (a64_fn_addr[mid] < (uint32_t)guest) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < a64_fn_count && a64_fn_addr[lo] == (uint32_t)guest ? a64_fn_ptr[lo] : NULL;
+}
+
 /* ---- what the native side is given ---- */
 static void *cb_ptr(void *user, uint64_t guest) { (void)user; return GP(guest); }
 static void *cb_current(void *user) { (void)user; return hos_self(); }
