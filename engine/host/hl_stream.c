@@ -261,9 +261,12 @@ static void report(int force) {
     if (hl_stream_report(line, sizeof line)) hos_log("hl stream: %s", line);
 }
 
+static int pages_on;   /* HL_STREAM_PAGES=1 (section 9 of stream-boundary.md) */
+
 static void record(uint64_t req, uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, int chunked) {
     char name[160];
     request_name(req, name, sizeof name);
+    if (pages_on) hl_stream_pages_track(dest, GP(dest), size, name, hos_now_ns());
     const uint64_t head = size < 4096 ? size : 4096;
     const uint8_t *p = (const uint8_t *)GP(dest);
     uint64_t fp = hl_stream_fingerprint(p, (size_t)head, 0xcbf29ce484222325ULL);
@@ -815,6 +818,160 @@ out_unflagged:
     if (log_on) report(0);
 }
 
+/* ---- HL_STREAM_PAGES=1: which decoded pages still hold the decoder's bytes, and the restore path's proof ----
+   (stream-boundary.md section 9) Every decode's whole pages are hashed when it is recorded; a thread of its own hashes
+   them again when the range is 30 s and 60 s old (hl::stream::Pages) and logs the table by file kind every 10 s. At the
+   second check, ranges are decoded again from the RomFS by their name (the restore a decommitted page would need) and
+   compared: with the hashes taken at decode time for every page, and byte for byte with memory for the pages that still
+   match. Measurement only: it decommits nothing. Reading pages brings back those the cold-pages thread took out. */
+extern const char *hos_romfs_dir;
+int hos_mods_romfs(const char *rel, char *out, size_t cap);
+
+/* the host bytes of a guest page when it is committed and readable now (a freed region's page is not: reading it would
+   commit a zero megabyte through the commit-on-touch handler) */
+static const uint8_t *page_view(uint64_t addr, size_t n, void *ctx) {
+    (void)ctx;
+    MEMORY_BASIC_INFORMATION m;
+    if (!hos_guest_range(addr, n) || !VirtualQuery(GP(addr), &m, sizeof m) || m.State != MEM_COMMIT ||
+        (m.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(m.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ |
+                                                                      PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) ||
+        (uint64_t)((const uint8_t *)m.BaseAddress + m.RegionSize - (const uint8_t *)GP(addr)) < n)
+        return NULL;
+    return (const uint8_t *)GP(addr);
+}
+
+static ZSTD_DDict *ddict_by_id(uint32_t id) {
+    ZSTD_DDict *dd = NULL;
+    AcquireSRWLockShared(&dict_lock);
+    for (int i = 0; i < ndicts && !dd; i++)
+        if (dicts[i].id == id) dd = dicts[i].dd;
+    ReleaseSRWLockShared(&dict_lock);
+    return dd;
+}
+
+/* the restore test's counters */
+static struct {
+    uint64_t tests, bytes, pages_equal_now, mismatches, hash_mismatches, changed_meanwhile, no_entry, no_file,
+        size_differs, failed, ns, max_ns;
+} rt;
+static int64_t rt_budget_at;
+static uint64_t rt_budget_bytes;
+
+/* a whole RomFS file into a malloc'd buffer (the mods' file when a mod has it, as the game would read it) */
+static uint8_t *read_romfs(const char *name, size_t *len) {
+    char rel[200], path[1024];
+    snprintf(rel, sizeof rel, "%s.zs", name);
+    if (!hos_mods_romfs(rel, path, sizeof path)) {
+        if (!hos_romfs_dir) return NULL;
+        snprintf(path, sizeof path, "%s/%s", hos_romfs_dir, rel);
+    }
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz;
+    uint8_t *b = NULL;
+    DWORD got = 0;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart < (1LL << 31) && (b = (uint8_t *)malloc((size_t)sz.QuadPart)) &&
+        (!ReadFile(h, b, (DWORD)sz.QuadPart, &got, NULL) || got != (DWORD)sz.QuadPart))
+        free(b), b = NULL;
+    CloseHandle(h);
+    if (b) *len = (size_t)sz.QuadPart;
+    return b;
+}
+
+static void restore_test(void *ctx, uint64_t dest, uint64_t size, uint64_t first_page, size_t pages, const uint64_t *hashes,
+                         const uint8_t *equal, int stage, const char *name) {
+    (void)ctx;
+    if (stage != 2 || !pages || !name[0]) return;
+    /* (a budget: 64 MB of decoded bytes a second at most, so that the thread keeps up with the checks) */
+    const int64_t now = hos_now_ns();
+    if (now - rt_budget_at > 1000000000LL) rt_budget_at = now, rt_budget_bytes = 0;
+    if (rt_budget_bytes > (64u << 20)) return;
+    rt_budget_bytes += size;
+    hl_stream_decode d;
+    if (!hl_stream_find(dest, &d, NULL, 0) || d.dest != dest || d.size != size) { rt.no_entry++; return; }
+    size_t clen = 0;
+    uint8_t *cbytes = read_romfs(name, &clen);
+    if (!cbytes) {
+        rt.no_file++;
+        static int told;
+        if (told++ < 6) hos_log("hl stream restore: no RomFS file for %s", name);
+        return;
+    }
+    if (d.compressed && d.compressed != clen) rt.size_differs++;
+    ZSTD_DDict *dd = d.dict_id ? ddict_by_id(d.dict_id) : NULL;
+    static uint8_t *scratch;
+    static size_t scratch_cap;
+    if (size > scratch_cap) {
+        free(scratch);
+        scratch_cap = (size_t)size + (4u << 20);
+        scratch = (uint8_t *)malloc(scratch_cap);
+        if (!scratch) scratch_cap = 0;
+    }
+    size_t r = (size_t)-1;
+    if (scratch && (dd || !d.dict_id)) {
+        const size_t fsz = ZSTD_findFrameCompressedSize(cbytes, clen);
+        const size_t n = ZSTD_isError(fsz) ? clen : fsz;
+        r = dd ? ZSTD_decompress_usingDDict(thread_dctx(), scratch, (size_t)size, cbytes, n, dd)
+               : ZSTD_decompressDCtx(thread_dctx(), scratch, (size_t)size, cbytes, n);
+    }
+    free(cbytes);
+    const int64_t took = hos_now_ns() - now;
+    rt.tests++, rt.bytes += size, rt.ns += (uint64_t)took;
+    if ((uint64_t)took > rt.max_ns) rt.max_ns = (uint64_t)took;
+    if (ZSTD_isError(r) || r != size) {
+        rt.failed++;
+        static int told;
+        if (told++ < 6) hos_log("hl stream restore: %s: the decode failed (%s)", name, ZSTD_isError(r) ? ZSTD_getErrorName(r) : "size");
+        return;
+    }
+    int told_here = 0;
+    for (size_t i = 0; i < pages; i++) {
+        const uint8_t *mine = scratch + (first_page - dest) + i * 4096;
+        if (hl_stream_page_hash(mine, 4096) != hashes[i]) rt.hash_mismatches++, told_here |= 1;
+        if (equal[i] != 1) continue;
+        const uint8_t *now_p = page_view(first_page + i * 4096, 4096, NULL);
+        if (!now_p) continue;
+        if (!memcmp(mine, now_p, 4096)) { rt.pages_equal_now++; continue; }
+        if (hl_stream_page_hash(now_p, 4096) != hashes[i]) { rt.changed_meanwhile++; continue; }   /* (written since the check) */
+        rt.mismatches++, told_here |= 2;
+    }
+    static int told;
+    if (told_here && told++ < 10)
+        hos_log("hl stream restore: MISMATCH %s (%llu bytes at %#llx):%s%s", name, (unsigned long long)size,
+                (unsigned long long)dest, told_here & 1 ? " a page differs from its decode-time hash" : "",
+                told_here & 2 ? " a page equal to its decode differs from the decode again" : "");
+}
+
+static DWORD WINAPI pages_thread(LPVOID unused) {
+    (void)unused;
+    int64_t last = hos_now_ns();
+    for (;;) {
+        Sleep(500);
+        hl_stream_pages_check(hos_now_ns(), page_view, NULL, (size_t)1 << 18, restore_test, NULL);
+        if (hos_now_ns() - last < 10000000000LL) continue;
+        last = hos_now_ns();
+        static char table[16384];
+        if (hl_stream_pages_report(table, sizeof table) > 0) {
+            hos_log("hl stream pages: whole 4 KB pages still equal to the decode (MB), by file kind:");
+            for (char *line = table, *nl; line; line = nl) {
+                nl = strchr(line, '\n');
+                if (nl) *nl++ = 0;
+                hos_log("hl stream pages: %s", line);
+            }
+        }
+        hos_log("hl stream restore: tests %llu (%.1f MB), pages equal to memory %llu, MISMATCHES %llu, pages unlike their "
+                "decode-time hash %llu, written meanwhile %llu; no entry %llu, no file %llu, size differs %llu, decode "
+                "failed %llu; a restore took %.2f ms on average (%.2f ms a MB), at most %.2f ms",
+                (unsigned long long)rt.tests, rt.bytes / 1048576.0, (unsigned long long)rt.pages_equal_now,
+                (unsigned long long)rt.mismatches, (unsigned long long)rt.hash_mismatches,
+                (unsigned long long)rt.changed_meanwhile, (unsigned long long)rt.no_entry, (unsigned long long)rt.no_file,
+                (unsigned long long)rt.size_differs, (unsigned long long)rt.failed,
+                rt.tests ? rt.ns / 1e6 / rt.tests : 0.0, rt.bytes ? rt.ns / 1e6 / (rt.bytes / 1048576.0) : 0.0,
+                rt.max_ns / 1e6);
+    }
+    return 0;
+}
+
 /* 1 when the decode is answered here (asked once, at the function's first lookup) */
 static int hl_stream_on(void) {
     const char *e = getenv("HL_STREAM"), *k = getenv("HL_STREAM_CHECK");
@@ -834,6 +991,15 @@ static int hl_stream_on(void) {
     }
     hl_stream_start(1u << 16);
     log_on = check_on || self_check || getenv("HL_STREAM_LOG") != NULL;
+    {
+        const char *p = getenv("HL_STREAM_PAGES");
+        if (p && atoi(p) == 1 && hl_stream_pages_start(30000000000LL, 60000000000LL)) {
+            pages_on = 1;
+            CloseHandle(CreateThread(NULL, 0, pages_thread, NULL, 0, NULL));
+            hos_log("hl stream: pages: every decode's whole pages hashed, checked again at 30 s and 60 s, and the ranges "
+                    "decoded again from the RomFS at 60 s (HL_STREAM_PAGES=1, a measurement)");
+        }
+    }
     hos_log("hl stream: %s (zstd %s)",
             check_on ? "the check: the translated decode of each resource file, then the same bytes decoded natively and "
                        "compared with it"
