@@ -273,6 +273,7 @@ static void record(uint64_t req, uint64_t dest, uint64_t size, uint64_t compress
     if (size > head) fp = hl_stream_fingerprint(p + size - head, (size_t)head, fp);
     const hl_stream_decode d = {dest, size, compressed, l64(req + R_FILE), fp, dict_id, chunked, name};
     hl_stream_record(&d);
+    hl_drop_decode(dest, size, compressed, dict_id, name);   /* (HL_MEM_DROP: a candidate) */
 }
 
 /* a decode that ended on an error path: counted, the first ones logged */
@@ -878,6 +879,33 @@ static uint8_t *read_romfs(const char *name, size_t *len) {
     CloseHandle(h);
     if (b) *len = (size_t)sz.QuadPart;
     return b;
+}
+
+/* (hl_drop.c, HL_MEM_DROP) a decode made again: the RomFS file by its name, decoded in one call with the host's copy of
+   its dictionary into a malloc'd buffer of `size` bytes. NULL when there is no such file (a heap not named by a path),
+   its size is not the one read at the decode, the dictionary was never seen, or the decode does not give `size` bytes. */
+uint8_t *hl_stream_decode_again(const char *name, uint32_t dict_id, uint64_t size, uint64_t compressed) {
+    if (!name || !name[0] || !size) return NULL;
+    ZSTD_DDict *dd = dict_id ? ddict_by_id(dict_id) : NULL;
+    if (dict_id && !dd) return NULL;
+    size_t clen = 0;
+    uint8_t *cbytes = read_romfs(name, &clen);
+    if (!cbytes) return NULL;
+    uint8_t *out = compressed && compressed != clen ? NULL : (uint8_t *)malloc((size_t)size);
+    if (out) {
+        const size_t fsz = ZSTD_findFrameCompressedSize(cbytes, clen);
+        const size_t n = ZSTD_isError(fsz) ? clen : fsz;
+        /* (a context of its own: this runs from the substrate's handler, which may have stopped this thread inside a
+           decode of its own: the native path's write into a dropped granule) */
+        static _Thread_local ZSTD_DCtx *again;
+        if (!again) again = ZSTD_createDCtx();
+        const size_t r = !again ? (size_t)-1
+                         : dd   ? ZSTD_decompress_usingDDict(again, out, (size_t)size, cbytes, n, dd)
+                                : ZSTD_decompressDCtx(again, out, (size_t)size, cbytes, n);
+        if (ZSTD_isError(r) || r != size) free(out), out = NULL;
+    }
+    free(cbytes);
+    return out;
 }
 
 static void restore_test(void *ctx, uint64_t dest, uint64_t size, uint64_t first_page, size_t pages, const uint64_t *hashes,

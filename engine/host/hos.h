@@ -66,6 +66,13 @@ int hos_guest_stacks(uint64_t (*out)[2], int max);
 void hl_mem_pool_made(uint64_t addr, uint64_t size);
 void hl_mem_imported(uint64_t lo, uint64_t hi);
 void hl_mem_init(void);
+/* (hl_drop.c, HL_MEM_DROP) the drop module: started after the memory module; told of decodes, of guest memory handed to
+   the kernel (hos_commit) and of the back end's imports */
+void hl_drop_init(void);
+void hl_drop_decode(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name);
+void hl_drop_kernel_begin(uint64_t lo, uint64_t hi);
+void hl_drop_kernel_end(void);
+void hl_drop_import(uint64_t lo, uint64_t hi);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))

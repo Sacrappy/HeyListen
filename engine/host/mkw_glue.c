@@ -38,6 +38,9 @@ void hos_commit(uint64_t addr, uint64_t size) {
     /* (HOS_POOL_TRAP, hos_memsplit.c: trapped pages the kernel is given back their access first, and counted; the commit
        below would make them read-write without the trap knowing. Nothing when the trap is off) */
     { void hos_pool_trap_release(uint64_t, uint64_t, const char *); hos_pool_trap_release(lo, hi - lo, "hos_commit"); }
+    /* (HL_MEM_DROP, hl_drop.c: a decision under way over these pages ends first, and they are not dropped for a while:
+       the kernel must not meet a read-only page; a restore made from here is counted as the kernel's) */
+    hl_drop_kernel_begin(lo, hi);
     if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
         const DWORD err = GetLastError();
         hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
@@ -51,6 +54,7 @@ void hos_commit(uint64_t addr, uint64_t size) {
             }
         }
     }
+    hl_drop_kernel_end();
 }
 
 DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {

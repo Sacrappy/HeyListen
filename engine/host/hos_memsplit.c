@@ -618,6 +618,7 @@ static int discard_on(void) {
 /* (the back end, before it commits and imports [lo, hi)) */
 __declspec(dllexport) void hos_noaccess_import(uint64_t lo, uint64_t hi) {
     hl_mem_imported(lo, hi);   /* (HL_MEM_COLD: pinned pages are never taken out of the working set) */
+    hl_drop_import(lo, hi);    /* (HL_MEM_DROP: never dropped; a decision under way there ends first) */
     if (!discard_on() || hi <= lo) return;
     AcquireSRWLockExclusive(&discard_lock);   /* (the list changes: exclusive; imports are rare) */
     int merged = 0;
@@ -713,6 +714,7 @@ void hos_memsplit_init(void) {
         CloseHandle(CreateThread(NULL, 0, discard_main, NULL, 0, NULL));
     }
     hl_mem_init();   /* (HL_MEM_COLD, hl_mem.c: after the trap, which it stays off for) */
+    hl_drop_init();  /* (HL_MEM_DROP, hl_drop.c) */
 }
 #else
 void hos_memsplit_pool(uint64_t addr, uint64_t size, uint32_t flags, int add) { (void)addr; (void)size; (void)flags; (void)add; }
