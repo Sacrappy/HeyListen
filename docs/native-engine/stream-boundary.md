@@ -21,8 +21,8 @@ document corrects and completes it.
 
 Threads: the decode runs on the resource system's four loading threads (`ARes Loading 0`..`3`), each with a decompressor
 of its own (its own read buffer), and once on the main thread at start (the resource system's own archive). The chunked
-case's chunks are decoded on another thread, reached through a callback object in the decompressor (`+1640`); the
-`ParallelDecompThread`s of `0x8069a5e0` are, by their creator, those threads (not traced further).
+case's chunks are decoded on another thread, reached through a callback object in the decompressor (`+1640`): the
+decompressor's own `ParallelDecompThread`, made with it by `0x8069a5e0` (section 5).
 
 ## 2. The decompressor and the request
 
