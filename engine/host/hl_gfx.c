@@ -38,6 +38,8 @@ static int check_wanted(void) {
 typedef struct { HostFn fn; void *user; uint32_t op; } Tap;
 static _Thread_local int recording;   /* a pass runs on this thread and is being recorded */
 static volatile LONG taps;
+enum { TAP_NAMES = 2048 };
+static const char *tap_names[TAP_NAMES];
 
 static void tap(Ctx *c, void *user) {
     const Tap *t = (const Tap *)user;
@@ -53,12 +55,12 @@ static void tap(Ctx *c, void *user) {
 
 /* (nvn_native.c, for every procedure it hands the game, once a procedure) */
 void hl_gfx_nvn_proc(const char *name, HostFn *fn, void **user) {
-    (void)name;
     if (!check_wanted()) return;
     Tap *t = (Tap *)malloc(sizeof *t);
     t->fn = *fn;
     t->user = *user;
     t->op = (uint32_t)InterlockedIncrement(&taps) - 1;
+    if (t->op < TAP_NAMES) tap_names[t->op] = name;   /* (the NVN layer's table: lives as long as the process) */
     *fn = tap;
     *user = t;
 }
@@ -74,7 +76,8 @@ static void hl_report(void) {
     const int64_t was = last;
     if (now - was < 10000000000LL || InterlockedCompareExchange64(&last, now, was) != was) return;
     char line[1024];
-    if (hl_gfx_report(line, sizeof line)) hos_log("hl gfx: %s; passes on another context %lld", line, (long long)other_ctx);
+    if (hl_gfx_report(line, sizeof line, tap_names, TAP_NAMES))
+        hos_log("hl gfx: %s; passes on another context %lld", line, (long long)other_ctx);
 }
 
 static void hl_gfx_pass(Ctx *A64_NOESC c) {

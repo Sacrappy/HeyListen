@@ -68,7 +68,7 @@ extern "C" void hl_gfx_check_end(int native) {
     g_check->add(native ? hl::gfx::PassPath::Native : hl::gfx::PassPath::Translated, t_mode, t_recording);
 }
 
-extern "C" int hl_gfx_report(char* out, size_t cap) {
+extern "C" int hl_gfx_report(char* out, size_t cap, const char* const* op_names, size_t n_names) {
     if (!g_pass || !cap) return 0;
     const hl::gfx::RecordPass::Stats& s = g_pass->stats();
     int n = std::snprintf(out, cap, "mode %d; native passes %llu (scene %llu, second %llu)", g_mode,
@@ -77,8 +77,12 @@ extern "C" int hl_gfx_report(char* out, size_t cap) {
     if (g_check && n > 0 && (size_t)n < cap) {
         const hl::gfx::PassCheck::Report r = g_check->report();
         const char* names[2] = {"translated", "native"};
-        n += std::snprintf(out + n, cap - n, "; check: passes by mode %llu/%llu/%llu", (unsigned long long)r.by_mode[0],
-                           (unsigned long long)r.by_mode[1], (unsigned long long)r.by_mode[2]);
+        n += std::snprintf(out + n, cap - n,
+                           "; check: passes by mode %llu/%llu/%llu, procedures compared %u, largest difference of calls a "
+                           "pass %.1f%% (%s)",
+                           (unsigned long long)r.by_mode[0], (unsigned long long)r.by_mode[1],
+                           (unsigned long long)r.by_mode[2], r.ops_compared, 100.0 * r.most_op_difference,
+                           r.most_op < n_names && op_names[r.most_op] ? op_names[r.most_op] : "?");
         for (int p = 0; p < 2 && n > 0 && (size_t)n < cap; p++) {
             const hl::gfx::PassCheck::PathStats& t = r.path[p];
             n += std::snprintf(out + n, cap - n,

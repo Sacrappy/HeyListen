@@ -25,15 +25,15 @@ uint64_t hl_gfx_pass_address(void);
 uint32_t hl_gfx_record_pass(uint64_t listener, uint64_t args);
 
 /* The check. Per pass: next_native says which path it takes (1 native, 0 the translated listener); begin starts the
-   calling thread's recording (args: the pass's argument block, whose mode it reads before the pass); call adds one NVN call to it (op: the OS layer's number of the procedure; x: x0..x5; f: the
-   low 32 bits of s0..s3); end files it. */
+   calling thread's recording (args: the pass's argument block, whose mode it reads before the pass); call adds one NVN
+   call to it (op: the OS layer's number of the procedure; x: x0..x5; f: the low 32 bits of s0..s3); end files it. */
 int hl_gfx_check_next_native(void);
 void hl_gfx_check_begin(uint64_t args);
 void hl_gfx_check_call(uint32_t op, const uint64_t *x, const uint32_t *f);
 void hl_gfx_check_end(int native);
 
-/* One line of counters for the log. Returns the length written. */
-int hl_gfx_report(char *out, size_t cap);
+/* One line of counters for the log (op_names: the procedures' names by op, n_names of them). Returns the length written. */
+int hl_gfx_report(char *out, size_t cap, const char *const *op_names, size_t n_names);
 
 #ifdef __cplusplus
 }

@@ -74,6 +74,8 @@ void the_check_compares_the_two_paths() {
     CHECK(r.path[0].passes == 2 && r.path[1].passes == 2 && r.path[0].calls == 7 && r.path[1].calls == 6);
     CHECK(r.path[0].most_calls == 4 && r.path[0].shapes == 2 && r.path[1].shapes == 1);
     CHECK(r.path[1].unmatched == 0 && r.path[0].unmatched == 1 && r.path[0].unmatched_shapes == 1);
+    // (procedures 1 and 2 once a pass on both paths; 3 1.5 times a pass translated, once native)
+    CHECK(r.ops_compared == 3 && r.most_op == 3 && r.most_op_difference > 0.33 && r.most_op_difference < 0.34);
 
     // (the same stream in another mode is another shape; a native stream the translated path never made is unmatched)
     check.add(gfx::PassPath::Native, 1, recording({1, 2, 3}, 0));
