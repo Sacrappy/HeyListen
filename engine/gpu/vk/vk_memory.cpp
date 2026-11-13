@@ -916,7 +916,7 @@ uint64_t cap_bytes = 0, cap_used = 0;   // (pools_mu: the kept buffers' sizes, a
 constexpr size_t kKeep = 24;
 constexpr uint64_t kCapBytesMax = 768ull << 20;   // (and no more than this in them: loads capture hundreds of MB)
 // (retired buffers, for the next captures: making and freeing a 5 MB buffer every submit cost the replay too)
-struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; uint64_t at = 0; };
+struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; uint64_t at = 0; uint64_t ms = 0; };
 std::vector<FreeBuf> cap_free;
 uint64_t cur_cap_value = 0;   // (the submission being recorded: what its syncs' copies wait for)
 uint32_t cur_cap_gen = 0;     // (its capture's generation)
@@ -945,11 +945,34 @@ uint64_t cap_spare_age() {
     return v;
 }
 uint64_t cap_spares_aged = 0;   // (cap_free_mu)
+// (HeyListen, 2026-11-14) RX_VK_CAP_SPARE_SECS=<s> (20 by default; 0: kept, as before): a spare no capture took for that long is
+// freed. The spares are what a load's captures left (40-64 MB each): after the scene had loaded, 10 of the 11 were never taken
+// again (the fewest spares left after a take, RX_VK_RES_LOG), 276-400 MB of host-cached memory in the three scenes on the RTX
+// 5070. Unlike RX_VK_CAP_SPARE_AGE (counted in takes, ~1000 a second: 600 freed spares the next frames took again) it is time:
+// a spare left unused for 20 s is not part of the scene's steady need
+uint64_t cap_spare_ms() {
+    static const uint64_t v = (getenv("RX_VK_CAP_SPARE_SECS") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_CAP_SPARE_SECS"))) : 20) * 1000;
+    return v;
+}
+uint64_t cap_now_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
     FreeBuf old[12];
     int n_old = 0;
+    const uint64_t now = cap_spare_ms() ? cap_now_ms() : 0;
     {
         std::lock_guard lk(cap_free_mu);
+        if (const uint64_t ms = cap_spare_ms())
+            for (size_t i = 0; i < cap_free.size();)
+                if (now - cap_free[i].ms > ms && n_old < 12) {
+                    old[n_old++] = cap_free[i];
+                    cap_free_bytes -= cap_free[i].size;
+                    cap_free.erase(cap_free.begin() + (ptrdiff_t)i);
+                    cap_spares_aged++;
+                } else {
+                    i++;
+                }
         if (const uint64_t age = cap_spare_age())
             for (size_t i = 0; i < cap_free.size();)
                 if (cap_gets - cap_free[i].at > age && n_old < 12) {
@@ -961,7 +984,7 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
                     i++;
                 }
         if (cap_free.size() < 12 && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
-            cap_free.push_back({buffer, alloc, map, size, cap_gets});
+            cap_free.push_back({buffer, alloc, map, size, cap_gets, now});
             cap_free_bytes += size;
             buffer = VK_NULL_HANDLE;
         }

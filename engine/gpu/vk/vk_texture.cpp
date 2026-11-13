@@ -1110,10 +1110,11 @@ uint64_t bcc_cap() {
     return v;
 }
 // (HeyListen, 2026-11-14) RX_VK_BC_CACHE_LAZY=1 (the default; 0: every transcode stored, as before): blocks are stored only for
-// bytes transcoded before (bcc_seen), or once the budget has evicted an ASTC texture uploaded from memory (bcc_evicting: from then
-// on every transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the three scenes stored 1016-1308
-// textures, 756-890 MB of host-cached memory, and served 0. The cost where it does serve: one transcode more for a texture made
-// again before the first such eviction (counted: st_bcc_again, transcodes of bytes transcoded before)
+// bytes transcoded before (bcc_seen), or once the textures passed 3/4 of their budget or an ASTC texture uploaded from memory was
+// evicted (bcc_evicting: from then on every transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the
+// three scenes stored 1016-1308 textures, 756-890 MB of host-cached memory, and served 0. The cost where it does serve: one
+// transcode more for a texture made again whose first transcode came before (counted: st_bcc_again, transcodes of bytes
+// transcoded before)
 bool bcc_lazy() {
     static const bool v = !getenv("RX_VK_BC_CACHE_LAZY") || atoi(getenv("RX_VK_BC_CACHE_LAZY")) != 0;
     return v;
@@ -4430,6 +4431,14 @@ void texture_frame(uint64_t completed) {
     static const bool no_evict = getenv("RX_VK_NO_EVICT") != nullptr;   // (an experiment: nothing evicted)
     // (hookshot) under the budget, every 600 presents: the render targets drawn over since (below), unused for 120
     const bool sweep = total_bytes <= budget;
+    // (RX_VK_BC_CACHE_LAZY) the BC cache stores from when the textures pass 3/4 of their budget: the transcodes of a load that
+    // evictions follow are kept (PC 3050, castle walk: storing from the first eviction only, 130 more transcodes than with the
+    // cache always storing). The RTX 5070's three scenes stayed under 62% (3760 of 6137 MB at most)
+    if (bcc_lazy() && !bcc_evicting.load(std::memory_order_relaxed) && total_bytes > budget / 4 * 3) {
+        bcc_evicting.store(true, std::memory_order_relaxed);
+        logf("vk: BC cache: textures %llu MB, over 3/4 of their budget (%llu MB): transcodes stored from now on",
+             (unsigned long long)(total_bytes >> 20), (unsigned long long)(budget >> 20));
+    }
     static const bool dead_targets = !getenv("RX_VK_DEAD_TARGETS") || atoi(getenv("RX_VK_DEAD_TARGETS")) != 0;
     // (TICK-027) a render target another image has since been drawn over (drawn_over, overlapped_later below) holds nothing: it
     // goes once unused for RX_VK_EVICT_OVERWRITTEN_UNUSED frames (8; 0: off), at every call (every 10 frames), under the budget
