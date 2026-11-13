@@ -1114,9 +1114,16 @@ uint64_t bcc_cap() {
 // evicted (bcc_evicting: from then on every transcode is stored, as before). On the RTX 5070 nothing of the kind is evicted: the
 // three scenes stored 1016-1308 textures, 756-890 MB of host-cached memory, and served 0. The cost where it does serve: one
 // transcode more for a texture made again whose first transcode came before (counted: st_bcc_again, transcodes of bytes
-// transcoded before)
+// transcoded before). Not by default where the driver allows 9.5 GB of VRAM or less: on the PC 3050 (8 GB, 7273 MB allowed) a
+// castle walk evicts and makes again textures transcoded at the scene's load, before either trigger: storing all, 416 came from
+// the cache and 274 were transcoded again; storing from the first eviction, 360 and 404; from 3/4 of the budget, 12 and 208 of
+// 220 made again (one run each)
 bool bcc_lazy() {
-    static const bool v = !getenv("RX_VK_BC_CACHE_LAZY") || atoi(getenv("RX_VK_BC_CACHE_LAZY")) != 0;
+    static const bool v = [] {
+        if (const char* e = getenv("RX_VK_BC_CACHE_LAZY")) return atoi(e) != 0;
+        uint64_t used = 0, allowed = 0;
+        return vram_usage(&used, &allowed) && allowed > (9ull << 30) + (512ull << 20);
+    }();
     return v;
 }
 std::atomic<bool> bcc_evicting{false};
