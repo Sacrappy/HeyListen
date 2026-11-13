@@ -32,6 +32,7 @@ void hos_memsplit_pool(uint64_t addr, uint64_t size, uint32_t flags, int add) {
     }
     ReleaseSRWLockExclusive(&pools_lock);
     if (add) hl_mem_pool_made(addr, size);
+    else hl_drop_pool_gone(addr, addr + size);   /* (HL_MEM_DROP_POOLS: the pool's storage ended) */
     if (add) trap_new_pool(addr, size, flags);
     else trap_pool_gone(addr, size, flags);
 }

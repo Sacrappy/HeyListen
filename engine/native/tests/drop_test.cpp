@@ -37,6 +37,11 @@ struct Window {
     std::atomic<int> protect_calls{0};
     bool source_ok = true;
     std::atomic<bool> slow_fill{false};
+    std::mutex spill_lock;                 // (the spill: slots of granule bytes, a few of them can be made to fail)
+    std::vector<std::vector<uint8_t>> spill;
+    std::vector<int64_t> spill_free_list;
+    size_t spill_cap = 1000;
+    int spill_live = 0;
 
     static uint64_t gi(uint64_t a) { return (a - BASE) / G; }
     uint8_t* at(uint64_t a) { return mem.data() + (a - BASE); }
@@ -111,6 +116,32 @@ Drop::Host host_of(Window& w) {
         return 0;
     };
     return h;
+}
+
+void with_spill(Drop::Host& h) {
+    h.spill_put = [](void* c, const uint8_t* b) -> int64_t {
+        auto* w = static_cast<Window*>(c);
+        std::lock_guard<std::mutex> l(w->spill_lock);
+        if ((size_t)w->spill_live >= w->spill_cap) return -1;
+        int64_t s;
+        if (!w->spill_free_list.empty()) s = w->spill_free_list.back(), w->spill_free_list.pop_back();
+        else s = (int64_t)w->spill.size(), w->spill.emplace_back();
+        w->spill[s].assign(b, b + G);
+        w->spill_live++;
+        return s;
+    };
+    h.spill_get = [](void* c, int64_t s, uint8_t* buf) -> int {
+        auto* w = static_cast<Window*>(c);
+        std::lock_guard<std::mutex> l(w->spill_lock);
+        std::memcpy(buf, w->spill[s].data(), G);
+        return 0;
+    };
+    h.spill_free = [](void* c, int64_t s) {
+        auto* w = static_cast<Window*>(c);
+        std::lock_guard<std::mutex> l(w->spill_lock);
+        w->spill_free_list.push_back(s);
+        w->spill_live--;
+    };
 }
 
 Drop::Config config() {
@@ -330,6 +361,46 @@ void partial() {
     CHECK(d2.pass(30 * S) == 0 && d2.stats().too_large == 1 && d2.stats().ranges == 0);
 }
 
+// With a spill: a touch restores the granule touched and ahead after it from the spill, decoding nothing; a large file
+// is a candidate (its granules restore from the spill only) and is not dropped where the spill is full.
+void spilled() {
+    Window w;
+    fresh(w);
+    Drop::Host h = host_of(w);
+    with_spill(h);
+    Drop::Config c = config();
+    c.ahead = 2;
+    c.max_range_bytes = 4 * G;
+    Drop d(c, h);
+    d.decoded(range(2, 10), 0);   // 2..11, larger than max_range_bytes
+    CHECK(d.pass(30 * S) == 10 && w.spill_live == 10 && d.stats().spilled_now == 10);
+    const int decoded_before = w.sources;
+    CHECK(w.read(d, BASE + 5 * G + 9) == w.file[5 * G + 9]);
+    CHECK(w.sources == decoded_before);   // (no decode)
+    CHECK(!w.dropped[5] && !w.dropped[6] && !w.dropped[7] && w.dropped[4] && w.dropped[8]);
+    CHECK(d.stats().from_spill == 3 && d.stats().from_decode == 0 && w.spill_live == 7);
+    for (uint64_t a = BASE + 2 * G; a < BASE + 12 * G; a += 501) CHECK(w.read(d, a) == w.file[a - BASE]);
+    CHECK(d.stats().mismatches == 0 && d.stats().dropped_now == 0 && w.spill_live == 0 && w.sources == decoded_before);
+    // (the spill full: a large range's granules stay)
+    w.spill_cap = 3;
+    d.decoded(range(20, 6), 100 * S);
+    CHECK(d.pass(130 * S) == 3 && d.stats().refused[int(Refuse::NoSpill)] == 3);
+    // (a spill-only source, a mirror read back: dropped only into the spill; its source failing is tried again later; a
+    // cancel ends the candidate and leaves what is dropped restorable)
+    w.spill_cap = 1000;
+    DropSource m = range(40, 4, 0, 0);
+    m.name = "(mirror)", m.spill_only = true;
+    w.source_ok = false;
+    d.decoded(m, 200 * S);
+    CHECK(d.pass(230 * S) == 0);
+    w.source_ok = true;
+    CHECK(d.pass(240 * S) == 4 && w.dropped[40] && w.dropped[43]);
+    d.cancel(BASE + 40 * G, BASE + 44 * G);
+    CHECK(d.stats().cancelled == 1);
+    for (uint64_t a = BASE + 40 * G; a < BASE + 44 * G; a += 777) CHECK(w.read(d, a) == w.file[a - BASE]);
+    CHECK(d.pass(1000 * S) == 0 && d.stats().mismatches == 0);
+}
+
 }   // namespace
 
 int main() {
@@ -340,6 +411,7 @@ int main() {
     hold_and_give_up();
     replace_and_forget();
     partial();
+    spilled();
     std::printf("drop_test: ok\n");
     return 0;
 }

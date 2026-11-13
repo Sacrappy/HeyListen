@@ -1280,3 +1280,91 @@ and in the log: `hl drop:` (every 10 s: MB dropped now, restores a second and by
 must stay 0), `mem: guest pages:` (the substrate's counters), `vk: imports given back as their mirror holds the pool`
 (imports given back and taken again), `vk: process memory` (the commit). A zone change is where the restores and the
 come-backs are: the restores a second and the longest touch of the lines around it are the figures to read.
+
+## 15. A touch restores what it needs: the spill; mirrored pools' storage (`HL_MEM_DROP_POOLS`, 2026-11-13, second session)
+
+### Why a decode cannot restore one granule
+
+Read from the frame and block headers of the RomFS's largest files (headers only): every file is **one
+zstd frame with an 8 MB window** (the 12 largest: 18-306 MB of content, 148-2,447 blocks), and 86-100% of its compressed
+blocks bring their own entropy tables while the rest reuse the previous block's ("treeless"); repeat offsets and the
+window's history are carried from block to block too. A block can therefore only be decoded after every block before it:
+there is no point to seek to. The chunked files (`stream-boundary.md` 5) are the same single frame, read in chunks. So a
+granule deep in a 300 MB file costs a decode of everything before it, on the touching thread: the 836 ms touches of
+section 14.
+
+### The spill (`host/hl_drop.c`, `hl::mem::Drop`)
+
+At the drop, the granule's bytes have just been compared byte for byte with the file decoded again (they are exact), and
+are written into a slot of a file of 64 KB slots in the temporary folder (`FILE_FLAG_DELETE_ON_CLOSE`, up to
+`HL_MEM_DROP_SPILL_MB`, default 4096). A touch then restores the granule touched and `HL_MEM_DROP_AHEAD` (3) after it from
+the spill, without decoding; the kernel's and the import's paths restore the run they ask for. A granule without a slot
+(the spill full) restores as before, its range decoded whole. The spill holds no commit charge; Windows may keep its pages
+in the file cache (standby memory, which anyone's demand takes). The 32 MB limit of section 14 applies only without the
+spill. `HL_MEM_DROP_CHECK` hashes every restored granule against its hash at the drop, whichever way it came back. The
+drop thread also decodes a file without holding its range's lock (a touch of the same range waited up to 308 ms for it).
+
+Note what this changes: the restore no longer reads the source; the source (the file, below the mirror) is what proves at
+the drop that the bytes are the ones it holds.
+
+### Mirrored pools' storage (`HL_MEM_DROP_POOLS`, default 0)
+
+The simplest exact class of section 9 (i): a pool with its mirror on, never bound for writing, whose import was given back
+(`RX_VK_NO_HOST_IMPORT`): only the CPU's syncs write that mirror. When its import goes, the back end tells the host
+(`hos_mirror_held`) and the pool's range becomes a candidate whose source is the mirror read back (`mkwvk_mirror_read`,
+`gpu/vk/vk_memory.cpp`: a copy into a host-visible staging buffer in a command buffer of its own, submitted after everything
+submitted before, waited for on the drop thread; `pools_mu` held only while it is recorded, and the mirror not destroyed
+under it). How the bytes are known to be in sync: they are compared with guest memory, read-only, byte for byte; a page
+the CPU wrote and that no sync has copied yet differs and is refused. Such granules are dropped only into the spill (never
+restored by reading the mirror on the touching thread, which may be the replay's, holding the back end's locks). A pool's
+`nvnMemoryPoolFinalize` cancels its candidates (`hos_memsplit_pool`); granules already dropped stay, restorable from the
+spill, which is what the memory held (it stays the game's heap's).
+
+The drop thread decides a range in batches of 32 granules (2 MB): the spill's writes are made with no lock held, and the
+range's lock and the decision's are held over one batch at a time (a touch waited 240-442 ms for a 64 MB range decided in
+one go, in the first runs with the pools).
+
+### In the game (PC 3050, one run a line, 110 s)
+
+"All" as in section 14 (`RX_VK_CAP_ONLY_GPU=1 RX_VK_NO_HOST_IMPORT=1 HOS_GUEST_PAGES=1 HL_MEM_DROP=1 HL_MEM_DROP_CHECK=1`),
+the spill on (its defaults); "+ pools" adds `HL_MEM_DROP_POOLS=1`. Base: section 14's base runs (the same tree, switches
+off). Every run reached its end with no crash line and its last shots are right; **0 mismatches in every run**, 0 granules
+restored by a decode (all from the spill).
+
+| Scene | Build | Commit (base -> this) | Dropped now | Of mirrors (in all) | Longest touch (an import's) | Restores (MB) | Mirror reads: mean / most |
+|---|---|---:|---:|---:|---:|---:|---|
+| castle-move | all, spill (`m2-i`) | 19221 -> 17817 | 1335 | - | 1.9 (2.7) | 588 (118) | - |
+| | all + pools, batches of 32 (`m2-l`) | 19221 -> 17845 | 1434 | 182 | 7.5 (3.7) | 732 (154) | 417 / 1158 ms |
+| | all + pools, batches of 8 (`m2-m`, final) | 19221 -> 16945 | 1286 | 70 | 11.8 (2.0) | 600 (123) | 187 / 310 ms |
+| kokiri-idle | all, spill (`m2-i`) | 16748 -> 15693 | 1639 | - | 1.6 (2.7) | 454 (92) | - |
+| | all + pools, batches of 32 (`m2-l`) | 16748 -> 15567 | 1508 | 268 | **25.8** (2.1) | 436 (90) | 185 / 752 ms |
+| | all + pools, batches of 8 (`m2-m`, final) | 16748 -> 15634 | 1415 | 195 | 1.6 (4.2) | 475 (96) | 380 / 1091 ms |
+| hyrule-walk | all, spill (`m2-i`) | 18735 -> 17788 | 988 | - | 4.5 (5.9) | 580 (151) | - |
+| | all + pools, batches of 32 (`m2-l`) | 18735 -> 15872 | 1397 | 43 | 0.7 (5.4) | 486 (123) | 94 / 135 ms |
+| | all + pools, batches of 8 (`m2-m`, final) | 18735 -> 15520 | 1589 | 253 | **32.2 (1573)** | 565 (404) | 239 / 1180 ms |
+
+What it says:
+
+- **The spill met the bar for the decoded resources** (`HL_MEM_DROP_POOLS=0`, `m2-i`): the longest touch 1.6-4.5 ms in
+  the three scenes (an import's 2.7-5.9 ms); with the pools on, 1.6 and 11.8 ms in kokiri and castle (`m2-m`), 0 granules decoded at a touch, 0 mismatches, and the 32 MB limit lifted (the 9 files, 854 MB, are candidates
+  again). Dropped at the end of the runs: 1.0-1.6 GB; the commit charge 0.9-1.4 GB under the base runs.
+- **Mirrored pools' storage adds 43-268 MB** in a 110 s run, **and costs a hitch: it stays off (`HL_MEM_DROP_POOLS=0`)**.
+  In the hyrule run of the final build an import of a pool's chunk (a pool imported again: its mirror given back as idle,
+  or its first written binding) met 280 MB of its dropped granules and restored them all from the spill on the back end's
+  thread: 1.57 s, and a game thread touching the same range waited for it (32 ms). A pool that may be imported again is
+  a bad candidate; the rule that would exclude it (pools whose mirror is never given back, never written) is not written. Their granules are mostly already candidates as decoded
+  resources, or in use, or still imported early in the run; a mirror read takes 94-417 ms on average and up to 1.2 s (a
+  copy of a 16-64 MB range queued behind the frame's work) on the drop thread: no game thread waits for it.
+- Restores: 436-732 a run, 90-404 MB, all from the spill, read ahead.
+
+### Not verified, and what is left
+
+- The main PC; scene changes and long sessions; a full spill (4 GB: the decode path then takes over for files under
+  32 MB, larger files and mirrors are not dropped); a disk that is slow or busy (a touch reads the spill: a cold read from
+  a hard disk would cost milliseconds a granule).
+- `HL_MEM_DROP_POOLS` restores only from the spill: reading the mirror back at the touch was not built (a touch can come
+  from the replay's thread holding the back end's locks: the readback would need its own queue or a rule for those
+  touches). Pools bound for writing, and pools whose import is kept, are not candidates.
+- The spill changes the brick's nature: the restore's bytes are a copy this module wrote at the drop (exact: compared with
+  the source, and hashed); the source (the file, the mirror) is what proves that the bytes may go. A copy on disk is held
+  for every dropped granule (1.0-1.6 GB in these runs), in the temporary folder.
