@@ -13,7 +13,7 @@
    HL_DISPATCH=1 (the default, with HL_JOBS on): the stage's work is run by the native dispatcher (hl/bridge/Dispatcher.h)
    instead of the translated 0x8004ab40, on the same scheduler (docs/native-engine/jobs-boundary.md, "The dispatcher's
    protocol"). HL_DISPATCH=0: the translated dispatcher, as before.
-   HL_DISPATCH_ALL=1 (with HL_DISPATCH=1): every other caller of the dispatcher runs the native one too, through an entry
+   HL_DISPATCH_ALL=1 (the default, with HL_DISPATCH=1): every other caller of the dispatcher runs the native one too, through an entry
    gate on 0x8004ab40 (nx2/hl_gates.py puts it in the lifted code at build time): the stage's owner taking part in the
    stage wait 0x806afc40, the frame's last stage 0x83acfb90, and so every job body that waits for a stage. HL_DISPATCH_ALL=0:
    only the worker message path is native, as before.
@@ -27,7 +27,7 @@
 
 #define HL_JOBS_DEFAULT HL_JOBS_THROUGH
 #define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
-#define HL_DISPATCH_ALL_DEFAULT 0
+#define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;

@@ -234,7 +234,8 @@ when level 2's B ring exists and the job's level is 0, level 0's when level 0's 
 work with `hl::bridge::Dispatcher` (native) instead of calling `0x8004ab40`. Job bodies, the push's hook, forwarding, events, the mutex, the timed sleep and the atomic
 wait's table are the game's own functions, called on the worker's guest context; the rings, the runner words, the counts,
 the state words and the lane status word are read and written in place. The owner's path (`0x806afc40`) and nested calls
-still run the translated dispatcher on the same scheduler. The dispatcher leaves to the translated one, as a whole call,
+reach it through the entry gate of the next section (`HL_DISPATCH_ALL`); with it off they run the translated dispatcher
+on the same scheduler. The dispatcher leaves to the translated one, as a whole call,
 when the function's one-time initialisation has not been done yet (the first call in the process). `HL_DISPATCH_CHECK=1`
 counts the invariants listed in `Dispatcher.h` and logs the first violations.
 
@@ -271,8 +272,24 @@ on the calling thread's own guest context. When the native dispatcher has to cal
 the process, before the guest has made its timed sleep's constant), it sets a per-thread bypass before the call; the
 gate takes the bypass and lets that one call into the translated body, so that calls nested inside it are native again.
 The bridge's worker path does not go through the gate. With the gate on, every context's pops, runs and finishes are the
-native dispatcher's except those of the calls let through (one a process in the runs so far), so the counts "pops not
-run" and "runs not finished" are complete.
+native dispatcher's except those of the calls let through, so the counts "pops not run" and "runs not finished" are
+complete.
+
+Validated 2026-11-13 (function and picture; no speed measured), `HL_DISPATCH_ALL=1 HL_DISPATCH_CHECK=1`: on the PC 3050
+eight runs (castle-move 4 times, kokiri-idle once, hyrule-walk 3 times; shots looked at in one hyrule run), on the main PC
+the three scenes with shots (all right against the reference shots) and castle-move 3 more times. Every invariant read
+0 in every run (pops not run, runs not finished, bad finishes, bad counts, double runs, stage ends with jobs left or
+contexts asleep); game speed ratio 57-61. One PC 3050 hyrule-walk run stayed on a menu screen for the whole run (the
+game presenting at its menu's rate, the job system running and its checks clean); the three other hyrule runs reached the
+scene. It is not attributed to the gate, which in these scenes only ever let calls through (below), but it is noted.
+
+**What the gate sees in the game**: in every run, the only calls that reached `0x8004ab40` other than through the bridge
+were the bridge's own first calls let through (2 to 6 a run, while the first threads to dispatch race to the guest's
+one-time initialisation). The stage wait and the last stage never call the dispatcher in the three scenes: none of the
+worker sets the game begins stages on has its owner taking part (W's flags bit 0), so the owner only waits for the done
+events, and every last-stage thread finds its core's worker. Every pop and run of the scenes is therefore the native
+dispatcher's after those first calls, and was already in the first session's runs; the gate makes that hold by
+construction, for any set that does have its owner take part. `HL_DISPATCH_ALL=1` is the default.
 
 ## The stages' protocol (read whole for brick 3.4)
 
