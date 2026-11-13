@@ -48,6 +48,7 @@ int hos_pools_with_flags(const uint32_t *flags, int nflags, int64_t made_before_
     AcquireSRWLockShared(&pools_lock);   /* (copied out, nothing else under the lock: pool creation waits for a memcpy only) */
     for (int i = 0; i < npools && n < cap; i++) {
         if (pools[i].made_ns >= made_before_ns || !pools[i].size) continue;
+        if (!flags) { out[n][0] = pools[i].addr, out[n][1] = pools[i].addr + pools[i].size, n++; continue; }
         for (int f = 0; f < nflags; f++)
             if (pools[i].flags == flags[f]) { out[n][0] = pools[i].addr, out[n][1] = pools[i].addr + pools[i].size, n++; break; }
     }

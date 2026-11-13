@@ -99,12 +99,67 @@ void imported_and_forget() {
     CHECK(cold.report(line, sizeof line) > 0 && std::strstr(line, "out of the working set"));
 }
 
+// With settle_passes (the heaps): a unit goes only at a look settle_passes or more after an earlier one, and only if it
+// has not gained resident pages since; a unit that gained pages waits again.
+void settle() {
+    ColdPages::Config c = small();
+    c.settle_passes = 3;
+    c.budget_pages = 1000;
+    ColdPages cold(c);
+    cold.begin_pass();
+    CHECK(!cold.look(5, 8));                     // (first look: noted)
+    cold.begin_pass();
+    CHECK(!cold.look(5, 8));                     // (one pass later: too soon)
+    cold.begin_pass();
+    cold.begin_pass();
+    CHECK(cold.look(5, 8));                      // (three passes after the first look, no growth)
+    cold.taken_out(5, 8, 0);
+    CHECK(cold.stats().out_pages == 8);
+
+    CHECK(!cold.look(6, 4));                     // (a unit being filled: 4, then 9 pages)
+    for (int i = 0; i < 3; i++) cold.begin_pass();
+    CHECK(!cold.look(6, 9));                     // (grew: waits again)
+    for (int i = 0; i < 2; i++) cold.begin_pass();
+    CHECK(!cold.look(6, 9));                     // (two passes after the growth: too soon)
+    cold.begin_pass();
+    CHECK(cold.look(6, 7));                      // (fewer pages than at the last look: still)
+    cold.taken_out(6, 7, 0);
+
+    CHECK(!cold.look(7, 0));                     // (nothing resident: nothing noted)
+    for (int i = 0; i < 5; i++) cold.begin_pass();
+    CHECK(!cold.look(7, 16));                    // (its first look with pages)
+
+    cold.begin_pass();                           // (a come-back is held as without settle, then settles again)
+    CHECK(!cold.look(5, 8));
+    CHECK(cold.stats().back_units == 1);
+    for (int i = 0; i < 4; i++) cold.begin_pass();
+    CHECK(!cold.look(5, 8));                     // (held 4 passes, then seen with more pages than noted (0): settles)
+    for (int i = 0; i < 3; i++) cold.begin_pass();
+    CHECK(cold.look(5, 8));
+    cold.forget(5, 6);
+    CHECK(!cold.look(5, 8));                     // (new data: a fresh unit, noted first)
+}
+
+// The worst come-backs between two reports are kept.
+void report_worst() {
+    ColdPages cold(small());
+    cold.begin_pass();
+    CHECK(cold.look(1, 16));
+    cold.taken_out(1, 16, 0);
+    CHECK(!cold.look(1, 16));                    // (16 pages back)
+    char line[512];
+    CHECK(cold.report(line, sizeof line) > 0 && std::strstr(line, "0.1 MB at most between two lines"));
+    CHECK(cold.report(line, sizeof line) > 0 && std::strstr(line, "0.0 MB in 0 units since the last line, 0.1 MB at most"));
+}
+
 }   // namespace
 
 int main() {
     backoff();
     budget_and_stayed();
     imported_and_forget();
+    settle();
+    report_worst();
     std::printf("mem_test: ok\n");
     return 0;
 }

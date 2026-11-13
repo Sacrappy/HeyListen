@@ -57,10 +57,12 @@ void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pag
    it first: the kernel does not come through the handler. HOS_LAZY_COMMIT=0: committed whole, as before */
 int hos_lazy_commit(void);
 /* (HeyListen) hos_memsplit.c keeps the list of NVN memory pools with storage in guest memory: the ranges [lo, hi) of
-   those with one of the flags given that were made before `made_before_ns` (hos_now_ns), sorted, those that touch merged;
-   1 while HOS_POOL_TRAP has pages NOACCESS. hl_mem.c (HL_MEM_COLD) is told of pools made and of the back end's imports. */
+   those with one of the flags given (flags NULL: every pool) that were made before `made_before_ns` (hos_now_ns), sorted,
+   those that touch merged; 1 while HOS_POOL_TRAP has pages NOACCESS. hl_mem.c (HL_MEM_COLD) is told of pools made and of
+   the back end's imports. hos_thread.c: the guest threads' and fibers' stacks as {start, end}. */
 int hos_pools_with_flags(const uint32_t *flags, int nflags, int64_t made_before_ns, uint64_t (*out)[2], int cap);
 int hos_pool_trap_active(void);
+int hos_guest_stacks(uint64_t (*out)[2], int max);
 void hl_mem_pool_made(uint64_t addr, uint64_t size);
 void hl_mem_imported(uint64_t lo, uint64_t hi);
 void hl_mem_init(void);
