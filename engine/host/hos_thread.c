@@ -339,6 +339,18 @@ int hos_thread_handles(HANDLE *out, const char **names, int max) {
     return n;
 }
 
+/* (HeyListen, hl_mem.c) The guest stacks as {start, end}: every guest thread's (the game gives them, mostly from its heaps)
+   and every fiber's that has not returned. At most max; the count is returned. Copied under the lists' locks only. */
+static int fiber_stacks(uint64_t (*out)[2], int max);
+int hos_guest_stacks(uint64_t (*out)[2], int max) {
+    int n = 0;
+    AcquireSRWLockShared(&threads_lock);
+    for (int i = 0; i < nthreads && n < max; i++)
+        if (threads[i]->stack_size) out[n][0] = threads[i]->stack, out[n][1] = threads[i]->stack + threads[i]->stack_size, n++;
+    ReleaseSRWLockShared(&threads_lock);
+    return n + fiber_stacks(out + n, max - n);
+}
+
 /* (mkw-recomp) Every guest thread's name and guest registers as of its last call out of lifted code, with its
    frame chain from x29: what each thread of a stalled game waits in (mkw_glue.c, HOS_STATS_AFTER). */
 void hos_thread_dump(void) {
@@ -1100,6 +1112,14 @@ static HosFiber *fiber_of_ctx(Ctx *c) {
     return f;
 }
 static void fiber_switch(Ctx *from, HosFiber *to);
+static int fiber_stacks(uint64_t (*out)[2], int max) {
+    int n = 0;
+    AcquireSRWLockShared(&fibers_lock);
+    for (HosFiber *f = fibers; f && n < max; f = f->next)
+        if (!f->done && f->size) out[n][0] = f->stack, out[n][1] = f->stack + f->size, n++;
+    ReleaseSRWLockShared(&fibers_lock);
+    return n;
+}
 
 static void WINAPI fiber_main(void *p) {
     HosFiber *f = (HosFiber *)p;

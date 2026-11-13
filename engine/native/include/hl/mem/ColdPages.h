@@ -8,6 +8,10 @@
 // how many pages of a unit (a fixed run of pages, 64 KB in the game) are in the working set at each look, says whether
 // to take them out, and remembers the units that came back so that pages someone keeps reading are left alone.
 //
+// The same policy serves the game's heaps (memory-boundary.md, section 12), with one more rule (`settle_passes`): a unit
+// is taken out only at a look that comes at least that many passes after an earlier look, and only if it has not gained
+// resident pages in between, so that memory being filled (a file being loaded into fresh pages) is left alone.
+//
 // It knows nothing of the guest's addresses: units are numbers in [0, units). Thread use: one thread looks and takes
 // out (the OS layer's pass); forget() and mark_imported() may come from any thread at the same time.
 #pragma once
@@ -27,6 +31,8 @@ public:
         uint32_t backoff_passes = 60;   // passes a unit that came back is left in; doubled at each further come-back
         uint32_t give_up = 4;           // a unit that came back this many times stays in for good
         uint32_t budget_pages = 16384;  // pages taken out a pass at most
+        uint32_t settle_passes = 0;     // 0: a unit may be taken out at its first look (the pools). n: only at a look n
+                                        // passes or more after the one before, with no more resident pages than then
     };
 
     struct Stats {
@@ -67,19 +73,26 @@ public:
 
     const Stats& stats() const { return stats_; }
 
-    /// One line of counters (MB and units, in all and since the last call). Returns the length written.
+    /// One line of counters (MB and units, in all and since the last call, and the most that came back between two
+    /// calls). Returns the length written.
     int report(char* out, size_t cap);
 
 private:
-    // A unit's state, one word: pages out (bits 0-4), come-backs (bits 5-8), the pass it may be taken out again (9-31).
-    static constexpr uint32_t kOutMask = 31, kLevelShift = 5, kLevelMask = 15, kHoldShift = 9, kHoldMax = (1u << 23) - 1;
+    // A unit's state, one word: pages out (bits 0-4), come-backs (bits 5-8), resident pages at the last look while not
+    // out (9-13, with settle_passes), the pass it may be taken out again (14-31: 262,143 passes, 36 h at 500 ms; past
+    // that the holds end, and units left in for good stay in).
+    static constexpr uint32_t kOutMask = 31, kLevelShift = 5, kLevelMask = 15, kSeenShift = 9, kHoldShift = 14,
+                              kHoldMax = (1u << 18) - 1;
     static uint32_t out_of(uint32_t s) { return s & kOutMask; }
     static uint32_t level_of(uint32_t s) { return s >> kLevelShift & kLevelMask; }
+    static uint32_t seen_of(uint32_t s) { return s >> kSeenShift & kOutMask; }
     static uint32_t hold_of(uint32_t s) { return s >> kHoldShift; }
-    static uint32_t make(uint32_t out, uint32_t level, uint32_t hold) {
-        return out | level << kLevelShift | (hold > kHoldMax ? kHoldMax : hold) << kHoldShift;
+    static uint32_t make(uint32_t out, uint32_t level, uint32_t hold, uint32_t seen = 0) {
+        return out | level << kLevelShift | (seen > kOutMask ? kOutMask : seen) << kSeenShift |
+               (hold > kHoldMax ? kHoldMax : hold) << kHoldShift;
     }
     uint32_t hold_after(uint32_t level) const;
+    uint32_t pass_plus(uint64_t passes) const;
 
     Config config_;
     uint32_t* state_ = nullptr;      // a word a unit (zeroed memory: only the units looked at cost RAM)
@@ -88,6 +101,7 @@ private:
     int64_t budget_ = 0;
     Stats stats_;
     uint64_t last_taken_ = 0, last_back_pages_ = 0, last_back_units_ = 0;   // (report(): since the last call)
+    uint64_t worst_back_pages_ = 0;                                          // (report(): the most between two calls)
 };
 
 }   // namespace hl::mem

@@ -30,10 +30,13 @@ void ColdPages::begin_pass() {
     stats_.passes.fetch_add(1, std::memory_order_relaxed);
 }
 
-uint32_t ColdPages::hold_after(uint32_t level) const {
-    const uint64_t wait = (uint64_t)config_.backoff_passes << (level > 1 ? level - 1 : 0);
-    const uint64_t until = pass_ + wait;
+uint32_t ColdPages::pass_plus(uint64_t passes) const {
+    const uint64_t until = pass_ + passes;
     return until > kHoldMax ? kHoldMax : (uint32_t)until;
+}
+
+uint32_t ColdPages::hold_after(uint32_t level) const {
+    return pass_plus((uint64_t)config_.backoff_passes << (level > 1 ? level - 1 : 0));
 }
 
 bool ColdPages::look(uint64_t unit, uint32_t resident) {
@@ -53,8 +56,22 @@ bool ColdPages::look(uint64_t unit, uint32_t resident) {
         store(w, make(0, level, hold_after(level)));
         return false;
     }
-    if (!resident || imported(unit) || level >= config_.give_up || pass_ < hold_of(s) || budget_ < (int64_t)resident)
+    if (!resident) {
+        if (seen_of(s)) store(w, make(0, level, hold_of(s), 0));
         return false;
+    }
+    if (imported(unit) || level >= config_.give_up) return false;
+    if (config_.settle_passes) {
+        // (a unit not seen before, or one that gained resident pages since the last look, is being filled: it waits
+        // settle_passes more, and is judged again then against what it has now)
+        if (s == 0 || resident > seen_of(s)) {
+            const uint32_t settle = pass_plus(config_.settle_passes);
+            store(w, make(0, level, hold_of(s) > settle ? hold_of(s) : settle, resident));
+            return false;
+        }
+        if (resident < seen_of(s)) store(w, make(0, level, hold_of(s), resident));
+    }
+    if (pass_ < hold_of(s) || budget_ < (int64_t)resident) return false;
     return true;
 }
 
@@ -104,16 +121,17 @@ int ColdPages::report(char* out, size_t cap) {
     const double mb = config_.page_bytes / 1048576.0;
     const uint64_t taken = stats_.taken_pages.load(), back_pages = stats_.back_pages.load(), back_units = stats_.back_units.load();
     const int64_t now_out = stats_.out_pages.load();
+    if (back_pages - last_back_pages_ > worst_back_pages_) worst_back_pages_ = back_pages - last_back_pages_;
     const int n = std::snprintf(
         out, cap,
         "%.0f MB out of the working set now; taken out %.0f MB in all (%.0f MB since the last line); came back %.1f MB in "
-        "%llu units in all (%.1f MB in %llu units since the last line); %.1f MB stayed in when taken out; %llu units left "
-        "in for good, %llu imported; %llu passes",
+        "%llu units in all (%.1f MB in %llu units since the last line, %.1f MB at most between two lines); %.1f MB stayed "
+        "in when taken out; %llu units left in for good, %llu imported; %llu passes",
         now_out * mb, (double)taken * mb, (double)(taken - last_taken_) * mb, (double)back_pages * mb,
         (unsigned long long)back_units, (double)(back_pages - last_back_pages_) * mb,
-        (unsigned long long)(back_units - last_back_units_), (double)stats_.stayed_pages.load() * mb,
-        (unsigned long long)stats_.given_up_units.load(), (unsigned long long)stats_.imported_units.load(),
-        (unsigned long long)stats_.passes.load());
+        (unsigned long long)(back_units - last_back_units_), (double)worst_back_pages_ * mb,
+        (double)stats_.stayed_pages.load() * mb, (unsigned long long)stats_.given_up_units.load(),
+        (unsigned long long)stats_.imported_units.load(), (unsigned long long)stats_.passes.load());
     last_taken_ = taken, last_back_pages_ = back_pages, last_back_units_ = back_units;
     return n < 0 ? 0 : n;
 }
