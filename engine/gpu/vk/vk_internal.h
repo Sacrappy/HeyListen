@@ -198,6 +198,12 @@ void memory_pool_created(uint64_t gpu, uint64_t size);
 void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags);
 /// (TICK-015) the CPU is about to read [guest, guest + size) (invalidate): its game pool's write-backs are made from now on
 void memory_cpu_reads(uint64_t guest, uint64_t size);
+/// (HOS_NOACCESS_RAM, on unless =0) the pools the game made without CPU access keep no zero pages in RAM (vk_memory.cpp)
+bool noaccess_ram_on();
+/// whether [guest, guest + size) lies in one game pool made with NVN's CPU_NO_ACCESS flag
+bool memory_in_noaccess_pool(uint64_t guest, uint64_t size);
+/// whether every page of [guest, guest + size) is only reserved: nobody wrote it, it reads as zeros (no page is touched)
+bool memory_all_reserved(uint64_t guest, uint64_t size);
 /// (vk_replay.cpp) whether a live texture's storage lies in [gpu, gpu + size)
 bool replay_tex_storage_in(uint64_t gpu, uint64_t size);
 /// Whether guest memory in [lo, hi) is in an imported pool, live or retired (the GPU may read or write it)

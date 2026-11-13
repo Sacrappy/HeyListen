@@ -152,16 +152,19 @@ int nvn_gpu_read(uint64_t gpu, void *dst, uint64_t n) {
     }
     return 1;
 }
+void hos_noaccess_write(int begin);   /* (hos_memsplit.c, HOS_NOACCESS_RAM: no zero page given back under this write) */
 int nvn_gpu_write(uint64_t gpu, const void *src, uint64_t n) {
     const uint8_t *s = (const uint8_t *)src;
+    hos_noaccess_write(1);
     while (n) {
         const uint64_t k = nvn_gpu_contiguous(gpu, n);
         uint8_t *d = k ? nvn_gpu_host(gpu) : NULL;
-        if (!d) return 0;
+        if (!d) { hos_noaccess_write(0); return 0; }
         memcpy(d, s, k);
         HOS_WRITTEN(d, (size_t)k);
         s += k, gpu += k, n -= k;
     }
+    hos_noaccess_write(0);
     return 1;
 }
 

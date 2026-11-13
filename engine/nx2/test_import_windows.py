@@ -58,6 +58,9 @@ void import_remember_failure(uint64_t, uint64_t) {}
     p.lo=lo;p.hi=hi;imports++;return true;
 }
 '''+prefetch+'\n'+chunking+'\n'+lookup+'\n'+cache+'''
+// (HOS_NOACCESS_RAM's diagnostic and its cut of an import around CPU_NO_ACCESS pools: none here, the fixture has no NVN pools)
+void noaccess_import_note(uint64_t,uint64_t,uint64_t,uint64_t){}
+void clip_noaccess(uint64_t&,uint64_t&,uint64_t,uint64_t){}
 int check_prefetch(int mode) {
     const uint64_t base=0x1000000000ull,chunk=16ull<<20;
     guest_pools.push_back({base,base+8*chunk});

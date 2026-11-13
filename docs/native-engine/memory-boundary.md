@@ -360,3 +360,131 @@ speed (the inline `new` is a virtual call into lifted heap code at 5,210 sites; 
 - How the 7.75 GB of resident guest memory splits by heap and pool (a measurement, not a reading).
 - The header of `gpu/vk/vk_memory.cpp` still describes the pre-mirror design ("no mirrored copies"); the mirror section further
   down is the current one.
+
+## 6. GPU pools without CPU access (2026-11-13)
+
+NVN's `CPU_NO_ACCESS` pools (flags `0x0a1` and `0x021`; 70 + 80 pools, 547 + 293 MB of storage) held 664 MB of RAM on a castle
+walk. Main PC, the three scenes, 95 s after the start, one run each unless said; the runs' logs are in `build/s5/gpr*`.
+
+### Why their pages were in RAM
+
+Measured with `HOS_POOL_TRAP_NEW=1 HOS_POOL_TRAP_FLAGS=a1,21` (`host/hos_memsplit.c`): every page of each such pool is made
+`PAGE_NOACCESS` when the pool is made, and the first touch of each is counted by who made it (castle, one run, `gpr1-new2`):
+
+| | `0x0a1` | `0x021` |
+|---|---:|---:|
+| storage of the pools made | 875 MB (render targets, made again at scene changes) | 331 MB |
+| in RAM already when the pool was made | 9 MB | 277 MB |
+| first touched by lifted code | 0 | 0 |
+| read by the back end's texture uploads (`upload_inner` -> `UnswizzleTexture`, on its threads and the Presentation Thread) | 289 MB | 6 MB (ASTC sources: `astc_pieces`) |
+| read by the capture's copies | 0 | 32 MB |
+| locked by the driver: an import of a 16 MB chunk around a binding | 137 MB | 18 MB |
+| pool ended before it was touched | 320 MB | 0 |
+
+And `HOS_MEM_SPLIT` (which now also says how much of the resident pool memory holds only zeros) on the unchanged build:
+**the 417 MB of `0x0a1` in RAM are zeros, every page**; of the 247 MB of `0x021`, 16 MB are.
+
+- `0x0a1` (render targets): the game never writes them, but the back end read their storage to upload a texture made over it
+  before the GPU had drawn it (a page nobody wrote, read, gets a zero page), and imports of 16 MB chunks (and the spans over
+  pools across their ends) around a binding of a *neighbouring* pool (`0x022`, `0x024`) took them in: the driver locks an
+  import's pages into RAM. `RX_VK_LOG_NOACCESS_IMPORT=1` (`gpu/vk/vk_memory.cpp`) logs those imports: 11 on the castle walk,
+  173 MB of no-access pools in them, all but one for a binding in another pool.
+- `0x021`: the game fills the memory before it makes the pool (277 of 331 MB in RAM at `nvnMemoryPoolInitialize`; ASTC
+  textures among them, uploaded from there by the back end). That is the textures' only copy outside VRAM, read again when an
+  evicted texture is made again: not given up here (it is the `0x024` question of the next section, for 231 MB).
+- GPU results are not written back into either: the write-backs left out for pools the CPU does not read (TICK-015) cover
+  them, and the trap saw no write by the back end.
+
+### What changed (`HOS_NOACCESS_RAM`, on; `=0` off)
+
+1. `host/hos_memsplit.c` `discard_main`: every 5 s, the resident pages of the `CPU_NO_ACCESS` pools that hold only zeros are
+   decommitted (`MEM_DECOMMIT`): they read as zeros again (`commit_on_touch` commits a zero page at a touch), so whoever reads
+   them reads what was there. Under `HOS_LAZY_COMMIT` only (the default), heap and address regions, not with large pages.
+2. `gpu/vk/vk_texture.cpp` `texture_touch`: a first upload of a texture whose storage lies in such a pool and is all reserved
+   (`VirtualQuery`, no page touched) is not read: the image is made cleared to zero, which is what the storage reads as
+   (formats stored as they are only: not BC/ASTC, not widened, not sparse).
+3. `gpu/vk/vk_memory.cpp` `clip_noaccess`: an import made for a binding leaves out the `CPU_NO_ACCESS` pools the binding is
+   not in (cut at the import alignment, never into the binding). A binding inside such a pool imports it as before.
+
+What it relies on, and how each is held:
+- the game does not touch those pools while they live (NVN's contract; the trap above: no lifted-code touch). The check and
+  the decommit are done under the pool list's lock, so a pool that ends meanwhile (its memory going back to the heap) waits;
+- the back end writes guest memory through `nvn_gpu_write` (texture write-backs before an eviction or a virtual remap, replay
+  copies and reports): it holds the discard lock shared, the check-and-decommit holds it exclusive, so no write lands between;
+- pages the driver locked are never decommitted: `import_pool` calls `hos_noaccess_import` (exported) before it commits and
+  imports, and pages of any range ever imported are left alone.
+
+The back end's other reads of that storage, checked: re-upload of an evicted texture (a render target the GPU drew is written
+back first through `nvn_gpu_write`, so its pages hold its texels, or zeros that read as zeros); the captures and
+`memory_read_as_submitted` (`guarded_copy` and plain reads of a decommitted page commit a zero page: the same bytes); copies
+between pools on the CPU (`gpu_read` + `gpu_write`, the write under the lock); `nvnMemoryPoolMap` (still NULL for these pools,
+`nvn_native.c`); virtual pools mapped onto them (`nvn_gpu_host` reaches the same guest pages: the same reads; their textures
+are never skipped by 2, which is for addresses below 1 TB); textures and buffers made later at offsets in the pool (2 is per
+texture, on its own storage; a buffer binding imports as before); mirrors and write-backs (GPU copies to and from imported
+memory only, which 1 never touches); `FreeMemoryPages` (imported pages zeroed, never decommitted by 1; others decommitted by
+the host as before).
+
+### Before and after
+
+`gpr0` is the build before, `gpr2` the change (castle: `gpr4`, the final build, with the switch on and off in turn). "Game
+RAM" and the pools are `HOS_MEM_SPLIT=95`; working set and mirrors (VRAM) are `RX_VK_RES_LOG=1`'s last lines.
+
+| Scene | Build | Game RAM | in GPU pools | `0x0a1` in RAM | `0x021` in RAM | working set | VRAM mirrors |
+|---|---|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | before | 8214 MB | 4577 MB | 417 MB | 247 MB | 13792 MB | 1632 MB |
+| | after | 7779 MB | 4151 MB | 0 | 231 MB | 13339 MB | 1462 MB |
+| castle-move | before | 8236 MB | 4577 MB | 417 MB | 247 MB | 14155 MB | 1824 MB |
+| | switch off (`gpr4`) | 8239 MB | 4578 MB | 417 MB | 247 MB | 14014 MB | 1776 MB |
+| | after (`gpr4`) | 7832 MB | 4162 MB | 0 | 231 MB | 13760 MB | 1669 MB |
+| hyrule-walk | before | 8232 MB | 4588 MB | 417 MB | 247 MB | 13971 MB | 1712 MB |
+| | after | 7789 MB | 4154 MB | 0 | 231 MB | 13511 MB | 1526 MB |
+
+- **The game's RAM: -407 to -443 MB in each scene** (433 MB of it the two pool kinds: 417 + 16). The working set moves by
+  250-460 MB (one run each, and it varies between runs). The mirrors are 100-190 MB smaller (the imports, and so the mirrors
+  made of them, no longer take the no-access pools in), one run each.
+- The decommitting thread gave back 363-385 MB in all, 14-32 ms a round; after the scene load nothing came back (0 MB a
+  round from there).
+- Picture and speed (`check.sh gprc mx gpr3`: the reference build against this change, 3 scenes, interleaved): the shots
+  match (luma differences are the camera's position at a shot; both builds' pictures correct); fps 77.8 / 79.5 (kokiri,
+  this / reference), 76.4 / 76.6 (castle), 81.0 / 77.9 (hyrule): within the runs' spread.
+- `0x021` keeps 231 MB: the game's own data, written before the pool was made.
+
+## 7. Does game code touch CPU-cached pools after upload? (measured)
+
+`HOS_POOL_TRAP=70 HOS_POOL_TRAP_REPORT=105` (`host/hos_memsplit.c`, off by default, nothing done when off): 70 s after the
+start, every resident page of the pools with flags `0x024`, `0x064` and `0x022` that exist for 2 s or more is made
+`PAGE_NOACCESS` (3.7 GB, in ~0.2 s); the first touch of each page gives it back its access and is counted by flags,
+read/write, thread and host stack; `tools/bench/pooltrap.py` resolves the stacks with `HeyListen.map` (lifted `f_<guest
+address>`) and the back end's symbols. Classes: **game** (a lifted function, or a copy routine it called), **back end** (the
+back end's threads, and its own work on guest threads: the replay and present on the Presentation Thread), **kernel/driver**
+(pages handed to `hos_commit` or to an import: given back their access first and counted). One run per scene (`gprt-*`,
+kokiri `gprt2-*`), the trap armed once, read 35 s later.
+
+| Scene | Flags | Trapped | Never touched again | Game: read / write | Back end (its threads + on guest threads) | Kernel / driver |
+|---|---|---:|---:|---:|---:|---:|
+| kokiri-idle | `0x024` | 3351 MB | 3331 MB | 0.5 / 0.4 MB | 17.6 + 0.1 MB | 1.2 MB (imports) |
+| | `0x064` | 316 MB | 315 MB | 0 / 0 | 0.8 + 0.1 MB | 0.2 MB |
+| | `0x022` | 104 MB | 75 MB | 0.8 / 24.5 MB | 1.9 + 1.5 MB | 0 |
+| castle-move | `0x024` | 3350 MB | 3119 MB | 0.5 / 0.4 MB | 148.2 + 20.4 MB | 61.6 MB (imports) |
+| | `0x064` | 316 MB | 308 MB | 0 / 0 | 6.8 + 0.6 MB | 0.7 MB |
+| | `0x022` | 104 MB | 72 MB | 1.2 / 26.1 MB | 2.3 + 1.5 MB | 0.5 MB |
+| hyrule-walk | `0x024` | 3351 MB | 3213 MB | 0.5 / 0.4 MB | 109.1 + 24.2 MB | 3.6 MB (imports) |
+| | `0x064` | 316 MB | 308 MB | 0 / 0 | 5.9 + 1.7 MB | 0.1 MB |
+| | `0x022` | 104 MB | 73 MB | 1.2 / 26.4 MB | 2.9 + 0.8 MB | 0.4 MB |
+
+Of the trapped `0x024` pages, 750-756 MB lie in chunks the back end imported (bound as buffers, mirrored).
+
+- **The game's code touched under 1 MB of the 3.35 GB of `0x024` in 35 s, in every scene**, and none of `0x064`. The same
+  ~17 functions in the three scenes, on the module system's workers and the main thread: reads by `0x80354060` (~0.2 MB),
+  `0x82c1d340`, `0x80361c80`, `0x80362ff0`, `0x82c1d750`, `0x80364080`, `0x803678e0`, `0x80365950`, `0x80357060`,
+  `0x8034f440`, `0x80586fd0`, `0x80365f00`, `0x8034cea0`, `0x82692290`, `0x80361a00`; writes by `0x80105170` (~0.2 MB) and
+  `0x8575cdc0` (~0.1 MB).
+- `0x022` (CPU uncached: per-frame data) is the game's write traffic, as expected: `0x80255be0` (7-8 MB), `0x802a8fc0` (5),
+  `0x80364ee0` (4.3), `0x80658660` (3.4), `0x8572f300` (1.5-2.4), `0x8575cdc0` (1-2); reads by `0x812f0fc0` (0.6-0.8 MB).
+- The back end reads `0x024` again: texture uploads (`UnswizzleTexture`), the BC cache's hash of a texture's source
+  (`bcc_bytes_hash`), the ASTC alpha scan: 18-170 MB in 35 s while textures are made, mostly in the moving scenes; the driver
+  locks 1-62 MB more for new imports. Those are the reads a release of these pages after upload has to serve another way
+  (a native copy, or keeping the pages of a texture not uploaded yet).
+- What this does not show: a page first touched by the back end is given back then, so a game touch after it is not seen
+  (18-170 MB of the 3.35 GB); only the pages resident at the arming, in pools older than 2 s, in one 35 s window each; no
+  scene change was in the window. `HOS_POOL_TRAP_EVERY=<s>` re-arms, for longer runs.

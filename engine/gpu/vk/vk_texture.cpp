@@ -3062,6 +3062,27 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         }
         return tex;
     }
+    // (HeyListen, HOS_NOACCESS_RAM: a first upload of storage in a pool the game made without CPU access, none of whose pages was
+    // ever committed: nobody wrote it, it reads as zeros, and the image was made cleared to zero (non-block-compressed formats
+    // stored as they are). Not read: reading it gave every such page a zero page in RAM, 289 MB of render-target storage on a
+    // castle walk. Any write since commits its pages (the host's commit on touch, the back end's write-backs), and the storage
+    // is then read as before)
+    if (!tex->uploaded && !tex->gpu_written && !tex->sparse && !tex->astc && !tex->bc && !is_bc(tex->format) &&
+        !is_astc(tex->format) && tex->gpu < (1ull << 40) && noaccess_ram_on()) {
+        int widen = 0;
+        widened(tex->d.format ? vk_format(tex->nvn_format).format : tex->format, &widen);
+        if (!widen && memory_in_noaccess_pool(tex->gpu, tex->guest_size) && memory_all_reserved(tex->gpu, tex->guest_size)) {
+            tex->uploaded = true;
+            tex->upload_gen = gen;
+            static std::atomic<int64_t> skipped{0}, skipped_bytes{0};
+            const int64_t k = ++skipped, b = skipped_bytes += (int64_t)tex->guest_size;
+            if (k <= 4 || k % 200 == 0)
+                logf("vk: texture #%u %#llx %ux%u NVN %#x over reserved storage of a pool without CPU access: left cleared, not read "
+                     "(%lld so, %lld MB)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->nvn_format,
+                     (long long)k, (long long)(b >> 20));
+            return tex;
+        }
+    }
     if (partial && getenv("RX_VK_LOG_PARTIAL")) {
         static int logged;
         if (logged++ < 200) {

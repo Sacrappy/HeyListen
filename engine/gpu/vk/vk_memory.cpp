@@ -364,6 +364,17 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
                  ms(b, c), ms(c, d), ms(d, e));
         }
     } report{t0, t1, t2, t3, t4};
+    {   // (HOS_POOL_TRAP, host/hos_memsplit.c: pages a measurement made NOACCESS get their access back before the driver
+        // locks them, which does not come through the host's handler. An exe without the export: nothing)
+        using Release = void (*)(uint64_t, uint64_t, const char*);
+        static const Release release = (Release)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_pool_trap_release");
+        if (release) release(lo, hi - lo, "import");
+        // (HOS_NOACCESS_RAM: the host never gives back pages of a range imported, from before the commit below on: the driver
+        // locks them, and a page decommitted under the import would leave the GPU on another page than the CPU)
+        using Note = void (*)(uint64_t, uint64_t);
+        static const Note note = (Note)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_noaccess_import");
+        if (note) note(lo, hi);
+    }
     // (pages the game has not touched yet may be only reserved: committed now, as the pool's memory is usable)
     // (hookshot) One commit avoids the slow query walk, but resets protection on committed pages too. Keep the walk
     // for CPU write watches: commit only reserved pages, leaving the watched pages read-only.
@@ -3434,6 +3445,8 @@ void span_game_pools(uint64_t& lo, uint64_t& hi, uint64_t chunk) {
     }
 }
 
+void noaccess_import_note(uint64_t bound_lo, uint64_t bound_hi, uint64_t lo, uint64_t hi);   // (below)
+void clip_noaccess(uint64_t& lo, uint64_t& hi, uint64_t blo, uint64_t bhi);                  // (below)
 Pool* pool_lookup(uint64_t guest, uint64_t size) {
     if (guest_pools.empty()) return nullptr;
     bg_drain();
@@ -3487,6 +3500,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         auto plan = [&](bool spanned) {   // (the range, the imported pools it takes in; spanned: span_game_pools's chunks too)
             lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
             if (spanned && chunk) span_game_pools(lo, hi, chunk);
+            if (chunk) clip_noaccess(lo, hi, range.lo, range.hi);   // (HOS_NOACCESS_RAM)
             for (bool grew = true; grew;) {
                 grew = false;
                 overlapped.clear();
@@ -3549,6 +3563,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         }
         imp = imported.emplace(p.lo, p).first;
         guest_pages_set(p.lo, p.hi, p.address);
+        noaccess_import_note(range.lo, range.hi, p.lo, p.hi);
         if (chunk) prefetch_chunks(p.lo, p.hi, chunk);
         if (overlapped.size() > 1) {
             static int logged_merge;
@@ -3733,6 +3748,45 @@ void nvn_pools_eager(uint64_t lo, uint64_t hi, bool cpu_write) {   // (nvn_pools
                  np.skipped ? " AFTER its write-backs were left out" : "");
     }
 }
+// (HOS_NOACCESS_RAM) An import [lo, hi) made for a binding [blo, bhi) leaves out the game's CPU_NO_ACCESS pools the binding is not
+// in: the 16 MB chunks (and the spans over pools across their ends) took in 173 MB of them around bindings of neighbouring pools on
+// a castle walk, and the driver locks an import's pages into RAM (zero pages, as the game never writes there). Cut at the import
+// alignment, never into the binding. A binding inside such a pool imports it as before. (pools_mu held)
+void clip_noaccess(uint64_t& lo, uint64_t& hi, uint64_t blo, uint64_t bhi) {
+    if (!noaccess_ram_on() || hi <= lo) return;
+    const uint64_t a = align ? align : 4096;
+    auto down = [a](uint64_t v) { return v / a * a; };
+    auto up = [a](uint64_t v) { return (v + a - 1) / a * a; };
+    std::lock_guard lk(nvn_pools_mu);
+    auto it = nvn_pools.upper_bound(lo);
+    if (it != nvn_pools.begin()) --it;
+    for (; it != nvn_pools.end() && it->first < hi; ++it) {
+        const uint64_t plo = it->first, phi = it->second.hi;
+        if (!(it->second.flags & 0x1) || phi <= lo) continue;
+        if (phi <= blo) lo = std::max(lo, std::min(up(phi), down(blo)));        // (below the binding)
+        else if (plo >= bhi) hi = std::min(hi, std::max(down(plo), up(bhi)));   // (above it)
+    }
+}
+// (RX_VK_LOG_NOACCESS_IMPORT=1, diagnostic: an import that takes in pages of CPU_NO_ACCESS pools, the driver locking them into
+// RAM, and the binding that asked for it, with its pool's flags. pools_mu held)
+void noaccess_import_note(uint64_t bound_lo, uint64_t bound_hi, uint64_t lo, uint64_t hi) {
+    static const bool on = getenv("RX_VK_LOG_NOACCESS_IMPORT") != nullptr;
+    if (!on) return;
+    std::lock_guard lk(nvn_pools_mu);
+    uint64_t na = 0;
+    auto it = nvn_pools.upper_bound(lo);
+    if (it != nvn_pools.begin()) --it;
+    for (; it != nvn_pools.end() && it->first < hi; ++it)
+        if ((it->second.flags & 1) && it->second.hi > lo) na += std::min(hi, it->second.hi) - std::max(lo, it->first);
+    if (!na) return;
+    const NvnPool* bp = nvn_pool_at(bound_lo, nullptr);
+    static int64_t total;
+    total += (int64_t)na;
+    logf("vk: noaccess import: %#llx..%#llx (%llu MB) for a binding %#llx+%#llx in a pool of flags %#x: %llu MB of CPU_NO_ACCESS "
+         "pools in it (%lld MB so far)", (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)((hi - lo) >> 20),
+         (unsigned long long)bound_lo, (unsigned long long)(bound_hi - bound_lo), bp ? bp->flags : 0u, (unsigned long long)(na >> 20),
+         (long long)(total >> 20));
+}
 // (a mirror sync copies a page the CPU wrote: that page is written back from now on; if its GPU writes were left out, the
 // copy from guest memory goes over them (counted). pools_mu held)
 
@@ -3880,6 +3934,41 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
     cpu_words_new.clear();
 }
 } // namespace
+// (HeyListen, 2026-11-13) HOS_NOACCESS_RAM (on; =0 off; host/hos_memsplit.c has the whole of it): the pools the game made with
+// NVN's CPU_NO_ACCESS flag keep no zero pages in RAM. The back end's part: no import of such a pool's pages for another pool's
+// binding (clip_noaccess below), and no upload of a texture whose storage lies in such a pool and is all reserved
+// (texture_touch: the image is made cleared to zero, which is what the storage reads as)
+bool noaccess_ram_on() {
+    static const bool on = [] {
+        const char* e = getenv("HOS_NOACCESS_RAM");
+        const char* lazy = getenv("HOS_LAZY_COMMIT");
+        return !(e && e[0] == '0') && !(lazy && lazy[0] == '0') && !getenv("HOS_LARGE_PAGES");
+    }();
+    return on;
+}
+bool memory_in_noaccess_pool(uint64_t guest, uint64_t size) {
+    if (!size || guest >= (1ull << 40)) return false;
+    std::lock_guard lk(nvn_pools_mu);
+    uint64_t lo = 0;
+    const NvnPool* np = nvn_pool_at(guest, &lo);
+    return np && (np->flags & 0x1) && guest + size <= np->hi;
+}
+bool memory_all_reserved(uint64_t guest, uint64_t size) {
+#ifdef _WIN32
+    if (!size || guest >= (1ull << 40) || guest + size > host->guest_size()) return false;
+    const uint8_t* p = host->guest_base() + guest;
+    const uint8_t* const end = p + size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mi{};
+        if (VirtualQuery(p, &mi, sizeof mi) != sizeof mi || mi.State != MEM_RESERVE) return false;
+        p = (const uint8_t*)mi.BaseAddress + mi.RegionSize;
+    }
+    return true;
+#else
+    (void)guest, (void)size;
+    return false;   // (linux: the window is one mapping, decommitted pages read as zero but are not told apart)
+#endif
+}
 void memory_cpu_reads(uint64_t guest, uint64_t size) {
     if (!guest || !size || !wb_lazy_on()) return;
     std::lock_guard lk(nvn_pools_mu);
