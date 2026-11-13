@@ -139,7 +139,7 @@ progress fields in the descriptor; it was not done.
 | zstd's decoder in the game's executable (the vendored `third_party/zstd`, decoder only) | `engine/nx2/build.py` |
 | Tests without the game | `engine/native/tests/stream_test.cpp` |
 
-Switches: `HL_STREAM=1` the native function (default 0), `HL_STREAM_CHECK=1` the check (the translated function answers,
+Switches: `HL_STREAM=1` the native function (the default; 0 the translated function, as before), `HL_STREAM_CHECK=1` the check (the translated function answers,
 then the same compressed bytes are decoded natively and compared), `HL_STREAM_LOG=1` the counters every 10 s.
 
 The native path takes a request when it has a file object of the usual kind, a heap, a granularity that is a multiple of
@@ -173,3 +173,27 @@ asked, in the translated function as in the native one: the game's own behaviour
 In every scene about 95% of the files and about 40% of the decompressed bytes are one-read files (native); the chunked
 files are about 5% of the files and 60% of the bytes (castle-move with `HL_STREAM=1`: 9,685 files and 2,206 MB native,
 554 files and 3,333 MB chunked, translated).
+
+### Validation (main PC, `valid.sh s6v1 s6-v1 HL_STREAM=1 HL_STREAM_LOG=1`, 2026-11-13)
+
+| Scene | Ran | Game speed ratio | Files (native / chunked) | MB decompressed (native / chunked) | Game RAM | Process RAM | Commit | VRAM |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | to the end, no crash | 59.95 | 9,407 / 482 | 2,133 / 3,112 | 5,158 | 9,686 | 19,225 | 5,979 |
+| castle-move | to the end, no crash | 61.13 | 9,488 / 584 | 2,149 / 4,206 | 5,260 | 9,921 | 20,079 | 6,857 |
+| hyrule-walk | to the end, no crash | 60.42 | 9,526 / 619 | 2,158 / 4,567 | 5,289 | 10,100 | 20,205 | 6,648 |
+
+(MB; the counts are the last 10-second line of each run.) The last shots of each scene were looked at and are right
+(kokiri-idle's matches its reference shot; the two walking scenes show the market with its geometry and textures, nothing
+black, missing or tinted). Every error path logged was the texture file of section 8 (code 4), as in the translated
+function; the runs log the first 12 only, and the count grows with time in the scene (55 to 195), so the later ones are
+not named. With this the default is on (`HL_STREAM=1`).
+
+### Not verified
+
+- The rare paths given to the translated function whole (no file object, a temporary read buffer, no heap, a bad
+  granularity) were never taken in the three scenes; the native error paths other than code 4 were never taken either:
+  they are written from the reading, not seen working.
+- The chunked case is translated, after one extra open, read and close of the file (section 5); that this extra read is
+  invisible to the game is reasoned, not shown beyond the runs being right.
+- The provenance table is recorded only: nothing reads it, so its use (decommit and restore) is not tested in the game.
+- Other scenes, a scene change, and a save loaded elsewhere than the castle town market.

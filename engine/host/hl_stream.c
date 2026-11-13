@@ -6,8 +6,8 @@
    touched). It opens the request's file object, reads the compressed file into the decompressor's read buffer, reads the
    zstd frame header, gets the destination (given, or allocated from the request's heap) and decodes the frame with the
    dictionary the frame names; a file larger than the read buffer is read chunk by chunk while a second thread decodes.
-     HL_STREAM=0  off: the translated function, as before (the default until the validation runs are clean)
-     HL_STREAM=1  native: the function's main path here, its decode by zstd's own decoder (third_party/zstd) with the
+     HL_STREAM=0  off: the translated function, as before
+     HL_STREAM=1  native (the default): the function's main path here, its decode by zstd's own decoder (third_party/zstd) with the
                   game's dictionaries (their bytes read from the game's dictionary objects); the rare paths and the
                   chunked case go to the translated function (hl::stream::choose; stream-boundary.md section 5)
    HL_STREAM_CHECK=1: the translated function answers, and after each decode the same compressed bytes are decoded here
@@ -27,7 +27,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#define HL_STREAM_DEFAULT 0
+#define HL_STREAM_DEFAULT 1   /* (validated in the three scenes, check at 0 mismatches and shots right: stream-boundary.md section 8) */
 #define HL_DECODE_FILE 0x80108da0ULL    /* the resource decompressor's decode of a file (vtable 0x84c377e8, slot 2) */
 #define HL_DECODE_CHUNK 0x80115bf0ULL   /* its parallel descriptor's step: one chunk decoded (vtable 0x84c377c0, slot 2) */
 
