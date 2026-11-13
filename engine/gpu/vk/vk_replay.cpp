@@ -991,6 +991,21 @@ uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::functio
     return at;
 }
 
+/// (HL_UBO_INLINE) the stream's uniform updates before this place over [addr, addr + n), copied onto p (an inline block's
+/// bytes): what ub_overlay puts over the bytes as submitted
+void ub_overlay_onto(uint64_t addr, uint64_t n, uint8_t* p) {
+    UbReadGuard ug;
+    const size_t lim = ub_limit ? std::min(ub_limit, ub_updates.size()) : 0;
+    static const bool cur_only = getenv("RX_VK_UB_CUR_ONLY") != nullptr;
+    const size_t first = cur_only ? std::min(ub_first_of_recording, lim) : 0;
+    if (ub_gap_holds(addr, n, first, lim) || ub_try_gap(first, lim, addr, n)) return;
+    for (size_t i = first; i < lim; i++) {
+        const UbUpdate& u = ub_updates[i];
+        const uint64_t lo = std::max(addr, u.dst), hi = std::min(addr + n, u.dst + u.bytes.size());
+        if (lo < hi) std::memcpy(p + (lo - addr), u.bytes.data() + (lo - u.dst), hi - lo);
+    }
+}
+
 /// Guest memory as the stream's place sees it: as it was at the submission (the capture), with the uniform updates
 /// the stream made before this place (a worker: before its segment) over it. For what the replay reads on the CPU for
 /// the GPU's sake (handles in uniform and storage buffers): the game's memory now may be its next frames'.
@@ -1081,6 +1096,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_END: return;
         case NOP_BEGIN:
             if (!worker && ubo_check_on()) ubo_check_begin_cmd();
+            // (HL_UBO_INLINE: an inline slot's bytes live in the recording that bound them, which may be freed once its
+            // submission is replayed; a later recording that draws without binding the slot again reads it by address,
+            // as before. Every mode: a worker's segment may cross into the next recording)
+            for (int st = 0; st < kNvnStages; st++)
+                for (int i = 0; i < 16; i++)
+                    if (s.ubo_bytes[st][i]) s.ubo_bytes[st][i] = nullptr, s.ubo_bytes_n[st][i] = 0, s.bind_gen++;
             break;
         case NOP_JUMP: case NOP_CALL: break;
         case NOP_UBO_CHECK: {   // (HL_UBO_CHECK: vk_ubo_check.cpp; the replay thread's pass only, each record once)
@@ -1408,6 +1429,8 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                     if (b.ssbo) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u.stage = b.stage, u.index = index, u.addr = b.r[i].address, u.size = b.r[i].size;
+                if (!b.ssbo && s.ubo_bytes[b.stage][index])   // (by address again: HL_UBO_INLINE's bytes go)
+                    s.ubo_bytes[b.stage][index] = nullptr, s.ubo_bytes_n[b.stage][index] = 0, s.bind_gen++;
             }
             break;
         }
@@ -1428,7 +1451,24 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                     if (h.op == NOP_BIND_SSBO) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u = b;
+                if (h.op == NOP_BIND_UBO && s.ubo_bytes[b.stage][b.index]) {   // (by address again: HL_UBO_INLINE's bytes go)
+                    s.ubo_bytes[b.stage][b.index] = nullptr, s.ubo_bytes_n[b.stage][b.index] = 0;
+                    s.bind_gen++;
+                }
             }
+            break;
+        }
+        case NOP_UBO_INLINE: {   // (HL_UBO_INLINE: the bind, and its block's bytes for the descriptor; every mode, as a state record)
+            const auto b = payload<nvn_p_ubo_inline>(a, avail);
+            if (b.stage < 0 || b.stage >= kNvnStages || b.index < 0 || b.index >= 16 || b.n > avail - sizeof b) break;
+            const uint8_t* bytes = a + sizeof b;
+            nvn_p_bind_buf& u = s.ubo[b.stage][b.index];
+            const uint8_t* had = s.ubo_bytes[b.stage][b.index];
+            const bool same = buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, b.index, b.addr, b.size) && had &&
+                              s.ubo_bytes_n[b.stage][b.index] == b.n && (had == bytes || std::memcmp(had, bytes, b.n) == 0);
+            if (!same) s.bind_gen++;   // (other bytes: the descriptors are built again)
+            u.stage = b.stage, u.index = b.index, u.addr = b.addr, u.size = b.size;
+            s.ubo_bytes[b.stage][b.index] = bytes, s.ubo_bytes_n[b.stage][b.index] = b.n;
             break;
         }
         case NOP_BIND_TEX: case NOP_BIND_SAMP: case NOP_BIND_IMG: {

@@ -157,6 +157,7 @@ enum {
     NOP_PUSH_CONST,                             /* (hookshot: nvnCommandBufferPushComputeConstants) */
     NOP_CLEAR_BUF,                              /* (hookshot: nvnCommandBufferClearBuffer) */
     NOP_UBO_CHECK,                              /* (HeyListen, HL_UBO_CHECK: a uniform block's bytes at its bind, beside the bind) */
+    NOP_UBO_INLINE,                             /* (HeyListen, HL_UBO_INLINE: a uniform bind with its block's bytes) */
     NOP_COUNT_
 };
 typedef struct { int32_t n; const nvn_tex *color[8]; nvn_view cview[8]; uint8_t has_cview[8]; const nvn_tex *depth; nvn_view dview; uint8_t has_dview; } nvn_p_set_rt;
@@ -208,6 +209,10 @@ typedef struct { int32_t stage, index; uint64_t addr, size; uint32_t flags, pad;
 #define NVN_UBO_CHECK_SUB 2u
 #define NVN_UBO_CHECK_UNREAD 4u
 #define NVN_UBO_CHECK_MAX 0x10000u
+/* (HeyListen, HL_UBO_INLINE: direct-emission.md section 10) BindUniformBuffer with the block's bytes as they were at the bind
+   (n of them, following the payload; at most 64 KB): the bind as nvn_p_bind_buf has it, and the descriptor served from the
+   bytes. Written only for the slots step 1 measured final at their bind in every scene (host/nvn_native.c ubo_inline_slot) */
+typedef struct { int32_t stage, index; uint64_t addr, size; uint32_t n, pad; /* the bytes follow */ } nvn_p_ubo_inline;
 static inline uint64_t nvn_ubo_hash(const void *p, uint64_t n) {
     const uint8_t *b = (const uint8_t *)p;
     uint64_t h = 0x243F6A8885A308D3ull ^ n;

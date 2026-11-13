@@ -2217,10 +2217,54 @@ static void bind_vbufs(nvn_cmd *o, int first, int n, const NVNbufferRange *rg) {
 }
 NV(nvnCommandBufferBindVertexBuffers) { bind_vbufs(CB(P(0)), I(1), I(2), (const NVNbufferRange *)P(3)); }
 NV(nvnCommandBufferBindVertexBuffer) { NVNbufferRange r = {U64(2), U64(3)}; bind_vbufs(CB(P(0)), I(1), 1, &r); }
+/* (HeyListen) HL_UBO_INLINE=1 (direct-emission.md section 10): a uniform bind of the slots HL_UBO_CHECK found final at their
+   bind in every scene (main PC, kokiri / castle / hyrule: every bind of them equal to what the replay read as submitted, 0
+   different, 0 updated in the stream) is recorded with the block's bytes (NOP_UBO_INLINE), which the replay's descriptor
+   serves; the address stays in the bind for the replay's other readers. The other slots carry per-draw blocks the game
+   writes after the recording ends (step 1: 99.3% of the different binds), which only the submit sees. Bit k of a stage's
+   mask: slot k */
+static const uint16_t ubo_inline_slots[8] = {
+    1u << 5 | 1u << 6 | 1u << 7 | 1u << 8 | 1u << 10 | 1u << 11 | 1u << 13,                        /* stage 0 */
+    1u << 4 | 1u << 5 | 1u << 6 | 1u << 7 | 1u << 8 | 1u << 10 | 1u << 11 | 1u << 12 | 1u << 13,   /* stage 1 */
+    (uint16_t)(0x3fffu & ~(1u << 9)),                                                            /* stage 2: 0-13 but 9 */
+    0, 0,
+    1u << 1 | 1u << 2,                                                                           /* stage 5 (compute) */
+    0, 0};
+static int ubo_inline_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HL_UBO_INLINE");
+        on = e && atoi(e) != 0;
+        if (on) hos_log("hl ubo inline: the uniform binds of the slots measured final at their bind carry their bytes (HL_UBO_INLINE=1)");
+    }
+    return on;
+}
+static volatile LONG64 ubo_inlined, ubo_inline_bytes;
+/* the bind as an inline record when it qualifies (1), with the accounting of the address record it stands for: cmd_used
+   and hw_used as BindUniformBuffer's 40-byte record hw_fix'd to 20, the rest of its size uncounted (cmd_rec.extra) */
+static int ubo_inline(nvn_cmd *o, int stage, int index, uint64_t addr, uint64_t size) {
+    if (stage < 0 || stage >= 8 || index < 0 || index >= 16 || !(ubo_inline_slots[stage] >> index & 1)) return 0;
+    if (!size || size > NVN_UBO_CHECK_MAX || !nvn_gpu_contiguous(addr, size)) return 0;
+    const uint8_t *src = nvn_gpu_host(addr);
+    if (!src) return 0;
+    const uint64_t cu = o->cmd_used, hu = o->hw_used;
+    const uint32_t payload = (uint32_t)(sizeof(nvn_p_ubo_inline) + size);
+    nvn_p_ubo_inline *r = (nvn_p_ubo_inline *)rec(o, NOP_UBO_INLINE, payload);
+    r->stage = stage, r->index = index, r->addr = addr, r->size = size, r->n = (uint32_t)size;
+    memcpy(r + 1, src, (size_t)size);
+    const uint64_t whole = (8 + payload + 7) & ~(uint64_t)7, plain = (8 + sizeof(nvn_p_bind_buf) + 7) & ~(uint64_t)7;
+    o->cmd_used = cu + plain, o->hw_used = hu + 20, o->last_rec = 20;
+    cmd_host(o)->extra += whole - plain;
+    const LONG64 k = InterlockedIncrement64(&ubo_inlined), b = InterlockedAdd64(&ubo_inline_bytes, (LONG64)size);
+    if (k % 200000 == 1) hos_log("hl ubo inline: %lld binds inlined (%.1f MB)", (long long)k, b / 1048576.0);
+    return 1;
+}
 static void bind_buf(nvn_cmd *o, uint32_t op, int stage, int index, uint64_t addr, uint64_t size) {
-    nvn_p_bind_buf *r = REC(o, op, nvn_p_bind_buf);
-    r->stage = stage, r->index = index, r->addr = addr, r->size = size;
-    hw_fix(o, 20);
+    if (!(op == NOP_BIND_UBO && ubo_inline_on() && ubo_inline(o, stage, index, addr, size))) {
+        nvn_p_bind_buf *r = REC(o, op, nvn_p_bind_buf);
+        r->stage = stage, r->index = index, r->addr = addr, r->size = size;
+        hw_fix(o, 20);
+    }
     if (op == NOP_BIND_UBO && ubo_check_on()) {   /* (the check's record, uncounted: the accounting as without it) */
         const uint64_t cu = o->cmd_used, hu = o->hw_used, lr = o->last_rec;
         nvn_p_ubo_check *k = REC(o, NOP_UBO_CHECK, nvn_p_ubo_check);

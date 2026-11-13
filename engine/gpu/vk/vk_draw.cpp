@@ -2245,6 +2245,19 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         const uint64_t want = used ? std::max<uint64_t>(used, 16) : std::max<uint64_t>(u.size, 16);
         const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
                                               dev.props.limits.maxUniformBufferRange);
+        // (HeyListen, HL_UBO_INLINE: a slot bound with its bytes: those, with the stream's updates over them as ub_overlay
+        // does, copied into the stream; past the bytes the bind carried, zeros. No guest read, no mirror)
+        if (const uint8_t* bytes = s.ubo_bytes[std::clamp(st.nvn_stage, 0, kNvnStages - 1)][index - 3]) {
+            const uint64_t have = s.ubo_bytes_n[std::clamp(st.nvn_stage, 0, kNvnStages - 1)][index - 3];
+            const uint64_t at = stream_alloc(n, align);
+            if (at == UINT64_MAX) return bi;
+            uint8_t* p = cur->mapped + at;
+            std::memcpy(p, bytes, std::min(n, have));
+            if (n > have) std::memset(p + have, 0, n - have);
+            ub_overlay_onto(u.addr, n, p);
+            FINE_N(FC_UBO_STREAM, 1);
+            return {cur->stream, at, n};
+        }
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
