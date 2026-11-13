@@ -31,12 +31,13 @@ On the framework object F, in this order:
    `+0x23a`, and `+0x23e` becomes that value times F's float `+0x240`, converted toward zero. Otherwise `+0x233` is 0.
 2. **Tasks** (`0x8348c724`): `0x802eaf10` on F's `+0x38`.
 3. **Four virtual steps** (`0x8348c72c`): F's virtual functions at `+0xf0`, `+0x70`, `+0x120`, `+0xe8`, in that order,
-   each read from F's table at its call. These are the frame's work: the framework's calc step reaches
-   `0x802eabd0` > `0x802eacc0`, which calls the frame's delegates, among them the **module system's frame** `0x80706be0`
-   (below); the draw step reaches `0x802eb020` > `0x802eacc0`.
+   each read from F's table at its call. In the game (read by the native loop's check): `0x83b6eb40` (the calc step: it
+   reaches `0x802eabd0` > `0x802eacc0`, which calls the frame's delegates, among them the **module system's frame**
+   `0x80706be0`, below), `0x8348d430`, `0x81207a50`, `0x83b6eb30` (the draw step: `0x802eb020` > `0x802eacc0`).
 4. **Present** (`0x8348c76c`): the system tick (`0x83c61fd0`) minus F's frame start `+0x108` is stored at `+0x148`; then
-   F's virtual function at `+0x110`, the present, which reaches the GPU's present and the display: **the wait for the
-   display is there**, and it is the OS layer's (below).
+   F's virtual function at `+0x110` (`0x8042cd10` in the game, then `0x8042cd20`), the present, which reaches the GPU's
+   present and the display: **the wait for the display is there**, and it is the OS layer's (below). (`0x8042cd20` also
+   runs module stages of its own, through `0x80441560` > `0x80441630` > `0x80070d30` and the wait twin.)
 5. **End** (`0x8348c78c`). The tick is read. Unless F's mode bits are both set: when the global read at the beginning is
    not 0, the frame was not over F's budget `+0x138` with F's `+0xaa` bit 0 set, and F's `+0x230` bit 0 is clear, a
    function static (`0x84e415f0`, guard `0x84e415f8`) is made if it is not yet (the code checks it twice); then F's frame
@@ -51,7 +52,8 @@ that owns the order has to write them too, in place, with the same values.
 ## The module system's frame `0x80706be0`
 
 Reached once a frame from the calc step, through a delegate (`0x80706ba0`, set up by `0x83b797e0` on the module system's
-object, which holds the delegate at `+0x258`). On that object M and the graphics module G (M's `+0xa8`, then `+0x20`):
+object, which holds the delegate at `+0x258`). On that object M and the graphics module G (M's `+0xa8`, then `+0x20`; the OS layer's "graphics module" is the framework
+object F itself, below):
 
 - a setting change between M's `+0xd4e` and G's `+0x230` is applied first (`0x83b6f370`, `0x83b6f390` or `0x83b6f2e0`
   on G's `+0x270`);
@@ -77,6 +79,11 @@ The present step reaches the GPU's present; the OS layer's side is `engine/host/
 the frame rate limit, the next frame's due time with no burst to catch up, the display queue, the real-time step's
 rate) and the frame pacer in `engine/host/nvn_native.c`. This engine already owns the pacing there; a native loop that
 calls the present step leaves it as it is.
+
+One OS-layer hook is keyed to a return address inside the frame function: the system tick read before the present (`lr
+0x8348c770`) tells `engine/host/hos_thread.c` the framework object (`hos_gfx_module`), which the real-time step needs
+(its nominal rate `+0x2c8`). A native loop reads that tick from elsewhere, so it tells the OS layer the object itself;
+without it the step stays a whole 1/60 s at any rate (seen in a first run: game speed ratio 33 at 33 fps).
 
 ## The cut (brick 3.7)
 
