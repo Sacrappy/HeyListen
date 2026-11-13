@@ -1,6 +1,7 @@
 /* Guest memory map: the system region (our own objects), the heap, address regions.
    The whole 4 GB window is committed up front (hos_main.c), so "mapping" here is only bookkeeping and zeroing. */
 #include "hos.h"
+#include "hos_guestpages.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,7 +142,9 @@ static void discard_pages(uint64_t addr, uint64_t size) {
         looked = 1;
         discard = (DiscardFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory");
     }
-    if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
+    /* (HOS_GUEST_PAGES: over dropped or restored granules, piece by piece; dropped ones wholly inside are forgotten) */
+    if (hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo))) hos_gp_reset(GP(lo), (size_t)(hi - lo));
+    else if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
         VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
 #elif !defined(__EMSCRIPTEN__)
     extern int hos_posix_guest_discard(void *p, size_t n);   /* (hos_main.c: MADV_REMOVE on the memfd window) */
@@ -334,6 +337,7 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
         extern int rx_guest_imported(uint64_t lo, uint64_t hi);
         if (hi > lo && rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
 #if defined(_WIN32)
+        else if (hi > lo && hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo))) hos_gp_decommit(GP(lo), (size_t)(hi - lo));
         else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
 #else
         else if (hi > lo) {   /* (linux: kept mapped, the pages read as zero; MADV_REMOVE on the memfd window) */
