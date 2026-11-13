@@ -38,6 +38,13 @@ enum { LOG_FIRST = 10, SNAP = 512, SPANS = 6 };
 
 typedef struct { uint64_t at; uint32_t n; } Span;   /* guest bytes a call reads, logged with a mismatch */
 
+enum { WHYS = 13, BODY_DECLINES = 6, OTHER_SHAPES = 8 };
+/* (hl::math::Why and hl::math::BodyDecline, in their order) */
+static const char *const why_name[WHYS] = {"none", "input-nan-inf", "input-subnormal", "sum-tiny", "sum-overflow",
+                                           "mul-underflow", "mul-overflow", "fma-midpoint", "fma-range", "div-range",
+                                           "sqrt-range", "narrow-tiny", "narrow-overflow"};
+static const char *const body_decline_name[BODY_DECLINES] = {"none", "values", "shape", "cast", "no-ctx", "block-full"};
+
 typedef struct {
     const char *name;
     uint64_t guest;
@@ -49,7 +56,10 @@ typedef struct {
     A64Fn translated;
     int native_on, check_on;
     volatile LONG64 calls, answered, declined_fpcr, declined_inputs, compared, mismatches, fpsr_differs;
-    volatile LONG fpcr_or, fpcr_and, logged;
+    volatile LONG64 why[WHYS];             /* declined by the value rules: which rule (hl_math_last_why) */
+    volatile LONG64 body[BODY_DECLINES];   /* (u3) declined, by reason */
+    volatile LONG64 other_fn[OTHER_SHAPES][2];   /* (u3) shape box functions not answered: address, calls */
+    volatile LONG fpcr_or, fpcr_and, logged, why_logged;
 } Unit;
 
 /* ---- the units: where their inputs and outputs are as the function receives them ---- */
@@ -97,8 +107,8 @@ static int sphere_inputs(const Ctx *c, Span *s) {
     return 6;
 }
 
-extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400;
-enum { U2, AFFINE, U1, SPHERE, UNITS };
+extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400, hl_gate_on_817d9d80;
+enum { U2, AFFINE, U1, SPHERE, U3, UNITS };
 /* validated: HL_MATH_CHECK=1 over full runs of kokiri-idle, castle-move and hyrule-walk (PC 3050, 2026-11-13) compared
    0.95 M (u2), 27 M (affine), 2.0 M (u1), 1.9 M (sphere) calls with no mismatch (physics-loops.md section 8) */
 static Unit units[UNITS] = {
@@ -110,6 +120,8 @@ static Unit units[UNITS] = {
             .inputs = u1_inputs, .gate = &hl_gate_on_81746440},
     [SPHERE] = {.name = "sphere", .guest = 0x800a8400ULL, .validated = 1, .native = sphere_native, .out_at = sphere_out,
                 .inputs = sphere_inputs, .gate = &hl_gate_on_800a8400},
+    /* (writes through pointers it computes: run_body below, not run) */
+    [U3] = {.name = "u3", .guest = 0x817d9d80ULL, .validated = 0, .gate = &hl_gate_on_817d9d80},
 };
 
 /* ---- switches ---- */
@@ -183,7 +195,31 @@ static void report(int force) {
                 u->name, (long long)u->calls, (long long)u->answered, (long long)(u->declined_fpcr + u->declined_inputs),
                 (long long)u->declined_fpcr, (long long)u->declined_inputs, (long long)u->compared,
                 (long long)u->mismatches, (long long)u->fpsr_differs, (unsigned long)u->fpcr_and, (unsigned long)u->fpcr_or);
+        char line[640];
+        int n = 0;
+        for (int w = 1; w < WHYS; w++)
+            if (u->why[w]) n += snprintf(line + n, sizeof line - n, " %s %lld", why_name[w], (long long)u->why[w]);
+        if (n) hos_log("hl math: %s: declined by rule:%s", u->name, line);
+        n = 0;
+        for (int w = 1; w < BODY_DECLINES; w++)
+            if (u->body[w]) n += snprintf(line + n, sizeof line - n, " %s %lld", body_decline_name[w], (long long)u->body[w]);
+        for (int k = 0; k < OTHER_SHAPES && n < 500; k++)
+            if (u->other_fn[k][0])
+                n += snprintf(line + n, sizeof line - n, "%s %#llx x%lld", k ? "," : "; other shape functions",
+                              (unsigned long long)u->other_fn[k][0], (long long)u->other_fn[k][1]);
+        if (n) hos_log("hl math: %s: declined:%s", u->name, line);
     }
+}
+
+/* the value rule a kernel gave up on, counted (and the first few logged with the operation's values) */
+static void count_why(Unit *u) {
+    uint64_t v[3];
+    const int w = hl_math_last_why(v);
+    if (w <= 0 || w >= WHYS) return;
+    InterlockedIncrement64(&u->why[w]);
+    if (InterlockedIncrement(&u->why_logged) <= 8)
+        hos_log("hl math: %s declined: %s, operands %#llx %#llx result %#llx", u->name, why_name[w],
+                (unsigned long long)v[0], (unsigned long long)v[1], (unsigned long long)v[2]);
 }
 static void report_at_exit(void) { report(1); }
 
@@ -248,8 +284,10 @@ static int run(Unit *u, Ctx *c) {
     uint8_t mine[32];
     int answered = 0;
     if (c->fpcr & ~FPCR_FZ) InterlockedIncrement64(&u->declined_fpcr);
-    else if (!out || (memcpy(mine, GP(out), 32), !u->native(c, mine))) InterlockedIncrement64(&u->declined_inputs);
-    else if (u->check_on) {
+    else if (!out || (memcpy(mine, GP(out), 32), !u->native(c, mine))) {
+        InterlockedIncrement64(&u->declined_inputs);
+        count_why(u);
+    } else if (u->check_on) {
         compare(u, c, out, mine);
         answered = 1;
     } else {
@@ -266,6 +304,133 @@ static int run(Unit *u, Ctx *c) {
     return answered;
 }
 
+/* ---- u3: 0x817d9d80, the per-body box update of the last substep (physics-loops.md 6.3) ----
+   Called once per body by 0x8182dc20. It writes the body (its transform, quantised speeds, flags and stored box) and
+   appends records to the thread's stream blocks, through pointers it computes: the native side makes a plan (what the
+   function would leave), which the native run writes and the check compares, byte for byte, after running the
+   translation: the body's 192 bytes, the moved-bodies block's header word, and each record and header the plan
+   appends. The shape's own box is reached through the shape-type table; the native unit answers the two shapes whose
+   box functions are native (u1's convex vertex set through 0x8173e2ac, and u2) and declines the others. */
+#define SHAPE_TABLE_PTR 0x84ca78c8ULL   /* (a pointer to the pointer to the shape-type table: 512-byte entries, box function at +24) */
+#define CONVEX_BOX_FN 0x8173e2acULL
+static int shape_kind(Unit *u, uint64_t body) {
+    if ((*(uint8_t *)GP(body + 140)) & 8) return 0;   /* (the inline path: no table) */
+    const uint64_t shape = G64(body + 120);
+    const uint64_t fn = G64(G64(G64(SHAPE_TABLE_PTR)) + ((uint64_t)(*(uint8_t *)GP(shape + 24)) << 9) + 24);
+    if (fn == CONVEX_BOX_FN) return 1;
+    if (fn == units[U2].guest) return 2;
+    for (int k = 0; k < OTHER_SHAPES; k++) {   /* (counted for the log: which functions the native unit leaves) */
+        const LONG64 was = InterlockedCompareExchange64(&u->other_fn[k][0], (LONG64)fn, 0);
+        if (was == 0 || (uint64_t)was == fn) {
+            InterlockedIncrement64(&u->other_fn[k][1]);
+            break;
+        }
+    }
+    return 0;
+}
+
+static void body_mismatch(Unit *u, const Ctx *in, const char *what, const uint8_t *theirs, const uint8_t *mine, int n,
+                          const uint8_t *before) {
+    InterlockedIncrement64(&u->mismatches);
+    if (InterlockedIncrement(&u->logged) > LOG_FIRST) return;
+    char a[400], b[400], h[400];
+    for (int off = 0; off < n; off += 64) {
+        const int k = n - off < 64 ? n - off : 64;
+        if (!memcmp(theirs + off, mine + off, k)) continue;
+        hex(a, sizeof a, theirs + off, k);
+        hex(b, sizeof b, mine + off, k);
+        hos_log("hl math: u3 MISMATCH %s +%d, fpcr %#llx: translated %s / native %s", what, off,
+                (unsigned long long)in->fpcr, a, b);
+        if (before) {
+            hex(h, sizeof h, before + off, k);
+            hos_log("hl math: u3   before %s", h);
+        }
+    }
+}
+
+static int run_body(Unit *u, Ctx *c) {
+    if (bypass) return 0;
+    if (started != 1) {
+        start();
+        if (!u->native_on && !u->check_on) return 0;
+    }
+    InterlockedIncrement64(&u->calls);
+    InterlockedOr(&u->fpcr_or, (LONG)c->fpcr);
+    InterlockedAnd(&u->fpcr_and, (LONG)c->fpcr);
+    if (log_on) {
+        static volatile LONG once;
+        if (!InterlockedExchange(&once, 1)) atexit(report_at_exit);
+        report(0);
+    }
+    if (c->fpcr & ~FPCR_FZ) {
+        InterlockedIncrement64(&u->declined_fpcr);
+        return 0;
+    }
+    const hl_math_body_args args = {.ctx = c->x[0], .motion = c->x[1], .record = c->x[2], .prev = c->x[3],
+                                    .body = c->x[4], .state = c->x[5], .global = G64(BOX_BIAS_PTR),
+                                    .start = VERTEX_START, .shape_kind = shape_kind(u, c->x[4])};
+    static _Thread_local hl_math_body_plan plan;
+    if (!hl_math_body_box(hl_host(), &args, &plan)) {
+        InterlockedIncrement64(&u->declined_inputs);
+        if (plan.decline > 0 && plan.decline < BODY_DECLINES) InterlockedIncrement64(&u->body[plan.decline]);
+        if (plan.decline == 1) count_why(u);
+        return 0;
+    }
+    uint8_t *body = (uint8_t *)GP(args.body);
+    if (u->check_on) {
+        uint8_t before[192];
+        memcpy(before, body, 192);
+        const uint64_t block1 = args.ctx ? G64(args.ctx + 1568) : 0;
+        uint32_t want1 = block1 ? G32(block1) : 0;
+        for (int i = 0; i < plan.appends; i++)
+            if (plan.add[i].block == block1) want1 = plan.add[i].header;
+        const uint64_t fpsr = c->fpsr | FPSR_IXC;
+        bypass = 1;
+        u->translated(c);
+        bypass = 0;
+        InterlockedIncrement64(&u->compared);
+        if ((c->fpsr | FPSR_IXC) != fpsr) InterlockedIncrement64(&u->fpsr_differs);
+        if (memcmp(body, plan.body, 192)) body_mismatch(u, c, "body", body, plan.body, 192, before);
+        else if (block1 && G32(block1) != want1) {
+            const uint32_t got = G32(block1);
+            body_mismatch(u, c, "block header", (const uint8_t *)&got, (const uint8_t *)&want1, 4, NULL);
+        } else
+            for (int i = 0; i < plan.appends; i++) {
+                const hl_math_body_append *a = &plan.add[i];
+                const uint8_t *at = (const uint8_t *)GP(a->block);
+                if (G32(a->block) != a->header || memcmp(at + a->at, a->rec, a->len)) {
+                    uint8_t mine[20], theirs[20];
+                    memcpy(mine, &a->header, 4);
+                    memcpy(mine + 4, a->rec, 16);
+                    memcpy(theirs, at, 4);
+                    memcpy(theirs + 4, at + a->at, 16);
+                    body_mismatch(u, c, i ? "append 2" : "append 1", theirs, mine, 4 + (int)a->len, NULL);
+                    break;
+                }
+            }
+        return 1;
+    }
+    for (int i = 0; i < 192;) {   /* (the bytes the function stores, in runs) */
+        if (!plan.written[i]) { i++; continue; }
+        int j = i;
+        while (j < 192 && plan.written[j]) j++;
+        memcpy(body + i, plan.body + i, j - i);
+        HOS_WRITTEN(body + i, j - i);
+        i = j;
+    }
+    for (int i = 0; i < plan.appends; i++) {
+        const hl_math_body_append *a = &plan.add[i];
+        uint8_t *at = (uint8_t *)GP(a->block);
+        memcpy(at + a->at, a->rec, a->len);
+        memcpy(at, &a->header, 4);
+        HOS_WRITTEN(at + a->at, a->len);
+        HOS_WRITTEN(at, 4);
+    }
+    c->fpsr |= FPSR_IXC;
+    InterlockedIncrement64(&u->answered);
+    return 1;
+}
+
 static int u2_on(void) {
     start();
     return units[U2].native_on || units[U2].check_on;
@@ -278,3 +443,4 @@ HL_ANSWER(0x81a040bcULL, u2_answer, u2_on, "a body's world box from its oriented
 HL_GATE(80ba6d80, "fc814e67d0dad1eb") { return run(&units[AFFINE], c); }
 HL_GATE(81746440, "851bc99bf31be697") { return run(&units[U1], c); }
 HL_GATE(800a8400, "42b7877d24ec9c57") { return run(&units[SPHERE], c); }
+HL_GATE(817d9d80, "fff55648d2f990a0") { return run_body(&units[U3], c); }

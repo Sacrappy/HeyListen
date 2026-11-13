@@ -23,6 +23,37 @@ int hl_math_affine_box(const void *box, const void *m, void *out);
    also when the bounds object has no record to write (the translated function then does nothing). */
 int hl_math_model_sphere(const hl_guest_host *host, uint64_t bounds, uint64_t holder, uint64_t sp, void *out);
 
+/* 0x817d9d80, the per-body box update (hl/math/BodyBox.h), with its arguments as guest addresses read through host->ptr:
+   ctx = x0 (0: none), motion = x1, record = x2, prev = x3, body = x4, state = x5; global = the physics module's global
+   object, start = the starting bound of 0x81746440; shape_kind = what the shape-type table gives for the body's shape:
+   1 the convex vertex set's function, 2 the oriented box's, 0 another. Nothing is written to the game: the plan says
+   what the function would leave (the body's 192 bytes and which it stores, and the records it appends to the thread's
+   stream blocks); the OS layer writes it, or compares it after running the translation. Returns 1, or 0 with the
+   reason in plan->decline (hl::math::BodyDecline). */
+typedef struct {
+    uint64_t ctx, motion, record, prev, body, state, global, start;
+    int shape_kind;
+} hl_math_body_args;
+typedef struct {
+    uint64_t block;            /* guest address of the block */
+    uint32_t at;               /* the record's byte offset in it */
+    uint32_t header;           /* the block's first word afterwards */
+    uint32_t len;
+    uint8_t rec[16];
+} hl_math_body_append;
+typedef struct {
+    uint8_t body[192];
+    uint8_t written[192];
+    int appends;
+    hl_math_body_append add[2];
+    int decline;
+} hl_math_body_plan;
+int hl_math_body_box(const hl_guest_host *host, const hl_math_body_args *a, hl_math_body_plan *plan);
+
+/* The calling thread's reason the last declining kernel gave up (hl::math::Why: 0 none; see hl/math/Exact.h), cleared
+   by the call; values gets the operation's operands and result (bits). */
+int hl_math_last_why(uint64_t values[3]);
+
 #ifdef __cplusplus
 }
 #endif
