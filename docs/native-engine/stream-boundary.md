@@ -260,3 +260,65 @@ not named. With this the default is on (`HL_STREAM=1`).
   invisible to the game is reasoned, not shown beyond the runs being right.
 - The provenance table is recorded only: nothing reads it, so its use (decommit and restore) is not tested in the game.
 - Other scenes, a scene change, and a save loaded elsewhere than the castle town market.
+
+## 9. A decoded resource's pages given back for good (brick 6.3)
+
+### Step 1: how much is eligible (`HL_STREAM_PAGES=1`)
+
+A page can be decommitted and made again by decoding the file again only while its bytes are exactly what the decoder
+wrote. The unit is the 4 KB page (what Windows decommits); only the whole pages inside a decoded range count (the two
+end pages are shared with the heap's other data). With the switch, every decode's whole pages are hashed when it is
+recorded (`hl::stream::page_hash`: four multiply-xor lanes over 8-byte words, a bijection per word, so one changed word
+always changes the hash), and a thread of the OS layer hashes them again when the range is 30 s old and 60 s old
+(`hl::stream::Pages`), through `VirtualQuery` first (a page of a freed region is counted as gone, not read: reading it
+would commit a zero megabyte through the commit-on-touch handler). A range given to a new decode before its second check
+is counted as replaced. The table holds at most 8 Mi page hashes (64 MB). Reading the pages brings back those the
+cold-pages thread had taken out (`memory-boundary.md` section 12): the measurement runs are measurement only.
+
+EligibilityTablePlaceholder
+
+### Step 2: the restore path
+
+The provenance table gives, for a range, the name of the file (its per-file heap's), its dictionary id and its sizes. A
+name maps to the RomFS file `<RomFS>/<name>.zs` (the mods' file first when a mod has one, as `nn_fs.c` resolves the
+game's own opens); the game's file object may be gone by then and is not needed. At its 60 s check a range is read
+whole from that file through the host's own file access, decoded in one call with the dictionary of its id, and
+compared: every page with the hash taken at decode time, and byte for byte with memory for the pages that still match
+it (a page that differs is hashed again: written since the check, it is counted apart, not as a mismatch). At most 64
+MB of ranges a second are tested, so the thread keeps up with its checks.
+
+RestoreTablePlaceholder
+
+### Step 3: decommit and restore on touch: not built, and why
+
+What it needs to coordinate, found by reading the OS layer:
+
+- **Every commit over guest memory would make a dropped page a zero page.** The heap and the address regions are
+  committed lazily (`mkw_glue.c` `commit_on_touch`: a megabyte at a time on any touch of a reserved page) and on demand
+  (`hos_commit`: before the kernel reads or writes a guest buffer, `nn_fs.c`, `hos_svc.c`, `hos_mem.c`), and the back end
+  commits the ranges it imports (`gpu/vk/vk_memory.cpp`). Each would have to ask the stream module to restore the dropped
+  pages of its range first (a megabyte committed by a touch of its neighbour included), and the decommits and resets of
+  the OS layer (`hos_mem.c` unmap and discard, `hos_svc.c`) would have to forget the dropped pages of their range (their
+  contents are given up there: zero is then right). The per-file heap's destruction reaches the OS layer as such an unmap
+  of its address region: that is the reliable signal that a dropped range is gone. A plain reuse of a dropped range by the
+  game's allocator (the heap's free `0x8021dea0`, then an allocation over it) needs no signal: the first touch restores
+  the old bytes and the new owner's write goes on, which is what the memory would have held had it not been dropped.
+- **The restore cannot be made atomic with the guest window as it is reserved today, and this is what stops the
+  brick.** A decommitted page is made again by committing it and copying its bytes in. Committing makes a zero page
+  visible to every thread at once: a thread that touches it between the commit and the end of the copy does not fault and
+  reads zeros (silent corruption). Committing it `PAGE_NOACCESS` first does not help: the copy needs the page writable,
+  and the moment it is, every thread can read it. Windows has no "commit with these contents" for plain private memory.
+  What would close it: (a) the guest window reserved as placeholders, so that a restored page is a section view filled
+  through a second view and then mapped in place in one call (`VirtualAlloc2` / `MapViewOfFile3` with
+  `MEM_REPLACE_PLACEHOLDER`: 64 KB granularity, a change to how the whole window is reserved and committed); (b) AWE
+  physical pages (`MapUserPhysicalPages`: atomic, but needs the lock-pages privilege); (c) stopping every other thread
+  of the process (game, back end, driver) for the copy, with the page committed `PAGE_NOACCESS` until all are suspended.
+  None was built in this session.
+- The rest of the races are closable and are written down for whoever builds it: two threads touching one dropped range
+  (a lock per range; the second waits, then runs its instruction again); a kernel touch (through `hos_commit`, above); the
+  back end's threads (user-mode copies come through the handler; imports through `hos_noaccess_import`, which would have
+  to restore before the driver locks the pages); a write to a dropped page (restored first, then the write goes on: the
+  handler returns to the faulting instruction); the decommit itself racing a write (pages made read-only, hashed against
+  the decode-time hash, decommitted only if equal: a writer faults on the read-only page and waits for the decision).
+
+`HL_STREAM_DROP` was therefore not added: nothing is decommitted.
