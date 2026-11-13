@@ -169,7 +169,9 @@ VmaPool images_pool() {
 // nothing. Here images go to the current generation's pool, a new generation starts once one has had RX_VK_IMAGE_GEN_MB
 // (default 512) of images made in it, and a generation that is not the current one is destroyed with its blocks when its last
 // image goes. Images made together (a zone's) mostly go together, and those that stay keep their own generation's blocks only.
-// Blocks of RX_VK_IMAGE_GEN_BLOCK_MB (default 64). Textures and render targets have their own generations. 0: as before.
+// Blocks of RX_VK_IMAGE_GEN_BLOCK_MB (default 64). Textures only: render targets in generations (tried, PC 3050 castle-move)
+// spread over 10-14 live generations of 3.4-4 GB holding 0.9-1.1 GB, as the dynamic resolution makes new ones all the time
+// and a few of each generation stay (the heaps at 97-109%, images refused); they keep their own pool as before. 0: as before.
 bool image_generations_on() {
     static const bool v = [] {
         const char* e = getenv("RX_VK_IMAGE_GENERATIONS");
@@ -263,8 +265,8 @@ static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAlloca
         }
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
-    if (!no_pool && image_generations_on() && images_pool() && image_type != UINT32_MAX) {   // (RX_VK_IMAGE_GENERATIONS, above)
-        const int family = target ? 1 : 0;
+    if (!no_pool && !target && image_generations_on() && images_pool() && image_type != UINT32_MAX) {   // (RX_VK_IMAGE_GENERATIONS, above)
+        const int family = 0;
         std::lock_guard lk(gen_mu);   // (held through the make: a generation is never destroyed under it)
         uint64_t number = 0;
         if (VmaPool gp = gen_current(family, image_type, &number)) {

@@ -6607,8 +6607,8 @@ void memory_end_submission(VkCommandBuffer cmd) {
         }
         lazy_release.clear();
         static int64_t logged_at = -1;
-        if (st_lazy_released / 8 != logged_at) {
-            logged_at = st_lazy_released / 8;
+        if (st_lazy_released != logged_at) {
+            logged_at = st_lazy_released;   // (every release: they are few, and each is worth a line)
             logf("vk: mirrors holding left-out write-backs given back: %lld (%llu MB), %.2f MB staged, %.2f MB written back into guest "
                  "memory; %llu MB of mirrors now; left-out pages at the release: %lld staged, not as the pool is gone (finalized) %lld, "
                  "written since the mirror's sync %lld, written by the CPU %lld, texture storage %lld, no staging buffer %lld; at the "
