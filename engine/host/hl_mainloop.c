@@ -22,6 +22,10 @@
 
 A64Fn a64_lookup_replaced(uint64_t addr);   /* hl_host.c */
 extern volatile int hl_gate_on_80706be0;     /* (the check's gate, below) */
+/* (hos_thread.c) The framework object, which the OS layer learns from the frame function's tick read before its present
+   (lr 0x8348c770) for the real-time step (nn_vi.c, TICK-014). The native loop's present phase reads the tick from
+   another place: the loop tells it the framework itself (the same object every frame). */
+extern volatile uint64_t hos_gfx_module;
 
 static const uint64_t loop_gates[] = {0x809667b0};
 static const uint64_t check_gates[] = {0x80706be0};
@@ -58,6 +62,7 @@ HL_GATE(809667b0, "553871e59ba31a50") {
     static int on;
     if (!InterlockedExchange(&decided, 1)) on = mainloop_on();
     if (!on || c != hos_ctx()) return 0;
+    hos_gfx_module = c->x[0];
     hl_bridge_mainloop_run(c->x[0]);
     return 1;
 }
