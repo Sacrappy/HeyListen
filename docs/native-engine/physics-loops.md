@@ -9,7 +9,8 @@ only.
 
 Status of this document: **sections 1, 2 (solver and narrow phase) and 4 are written; in section 6, U1 and U2 are
 specified completely and U3 by its structure only; the cloth loops, the ranked list of every unit and the scheduling
-study are partly written. What is left is listed in section 7.**
+study are partly written. What is left is listed in section 7. Section 8 says what is native now (U1, U2 and two
+kernels of the actor stage, checked bit for bit in the game).**
 
 Conventions, as in `critical-jobs.md`: **read** (established from the lifted code or the data), **likely** (shape plus
 strong context), **guess**. "J" is the sampled job-group chain in ms a frame (mean of three runs, 5.80 ms in all),
@@ -258,6 +259,9 @@ instance to finish (the "strict" columns of `critical-jobs.md`).
   (`0x8169d350`: FZ = bit 0 of its argument; `0x816e1944` passes "mode == 2"); `0x80ec0ea0` sets FZ unconditionally on
   the thread that runs it. Which value the executors carry while they run Havok tasks is **not established** statically
   (it is one log line: read `c->fpcr` at a task's entry in the bridge). The lift has seven FPCR writes in all (read):
+  **Settled at run time (stream 7, section 8): every call of the Havok units (u1, u2) in the three scenes had FPCR =
+  0x1000000 exactly (FZ set, nothing else); the actor stage's units (affine, sphere) saw both 0 and 0x1000000 (FZ set
+  on some threads or at some times, never another bit).** The lift has seven FPCR writes in all (read):
   the two FZ setters above, three in the SDK's context save / restore (`0x851109b8` and its neighbours), and two in
   `0x8575d1bc` / `0x8575d228` that replace the rounding-mode and FZ bits with an argument (a C library `fesetround`-like
   helper, likely; its callers `0x8338d510`, `0x83c62290`, `0x85739e50`, `0x8581d2f0` are not physics). Default NaN
@@ -358,7 +362,8 @@ Common to all three:
   `Hx, Hy, Hz, Hw` = floats at transform +48, +52, +56, +60; `Lx, Ly, Lz` = floats at +64, +68, +72.
   `Px = Hx + Lx`, `Py = Hy + Ly`, `Pz = Hz + Lz`, `Pw = Hw + Lz` (the w lane adds +72 too: read).
   For each lane k: `a = P_k + (double)min_k`; then **outward rounding**: take the 64-bit pattern of `a`; if `a > 0`
-  subtract 0x10000000 from it, otherwise (a <= 0, either zero, or NaN) add 0x10000000; convert the adjusted double to
+  (or unordered: the guest's compare-and-select takes NaN this way too, read again by stream 7) subtract 0x10000000
+  from it, otherwise (a <= 0, either zero) add 0x10000000; convert the adjusted double to
   float (round to nearest) -> out.min_k. For max: `b = P_k + (double)max_k`; if `b >= 0` add 0x10000000 to its bit
   pattern, otherwise (b < 0 or NaN) subtract it; convert -> out.max_k. (2^28 units of a double's last place is half a
   float's last place: the nudge turns round-to-nearest into rounding away from the box's inside. Note the asymmetry at
@@ -455,8 +460,7 @@ strict at 4x) need.
 - Why the step appears twice in a frame's wait (two worlds or two half-steps).
 - The number of solver tasks a step creates, what each covers (`0x819b7700` not read), and the number of islands: so
   the scheduling gain of running islands in parallel is not a number.
-- The FPCR value (FZ) on the executors while they run Havok tasks: two code paths set FZ; which one applies is a run-time
-  fact (one log line in the differential mode of section 6).
+- (Settled, section 8: FZ is set, and only FZ, whenever the Havok units ran.)
 - U3 is not specified completely (6.3): the operation order of its steps 2-4, the second half of the AABB it stores
   and its callee `0x817d8c90` must be read before coding. U1 and U2 are complete.
 - The meaning of U2's inputs (which transform x1 is, what the w lanes of the body's rows and G +80 hold) is inferred;
@@ -467,3 +471,78 @@ strict at 4x) need.
   ranking of section 5 beyond physics (cloth units, kernels of the actor jobs).
 - "Calls a frame" for each loop body: the samples give time, not call counts; no counts were taken.
 - One scene, one machine (castle-move, main PC), as in `critical-jobs.md`.
+
+## 8. What is native (stream 7, `hl::math`)
+
+Four kernels answer their guest functions natively, bit for bit, in the game (`engine/native/include/hl/math`,
+`engine/native/src/math`, the layouts in `hl/bridge/MathBridge.h`, the OS layer's side and the check in
+`engine/host/hl_math.c`). Section 6's plan is kept with two changes: the file and switch are `hl_math.c` / `HL_MATH` (not
+`hl_physics.c` / `HL_PHYS_AABB`), and the check computes the native answer first, into scratch, then runs the translated
+function for real.
+
+| unit | guest | reached | what (specification) |
+|---|---|---|---|
+| u2 | `0x81a040bc` (+ `0x8170341c`) | pointer (`HL_ANSWER`) | 6.2 (read again: right, but for NaN in the outward step, 6.1) |
+| affine | `0x80ba6d80` | direct calls (`HL_GATE`, hash `fc814e67d0dad1eb`) | `critical-jobs.md` #3 (read again: right; the two multiply-adds are fused, the first product is not) |
+| u1 | `0x81746440` | direct calls (`HL_GATE`, hash `851bc99bf31be697`) | 6.1 (read again: right, the NaN case corrected) |
+| sphere | `0x800a8400` | direct calls (`HL_GATE`, hash `42b7877d24ec9c57`) | `critical-jobs.md` #1, completed below |
+
+**The exactness rules as code** (`hl/math/Exact.h`, tested by `engine/native/tests/math_test.cpp`): every guest operation
+is one call of a `Guard`, in the guest's order, which computes it in SSE (binary32 / binary64, round to nearest, host
+MXCSR untouched) and records whether operands and result are ones on which x86 and the translation agree: inputs finite
+and not subnormal; sums finite and above the smallest normal or exactly zero; products likewise, a zero only from a zero
+operand; quotients and square roots likewise; narrowing to binary32 above the smallest normal or zero. These are the
+translated code's own fast-path tests (`a64_fpx.h`), so the native path is exact under FPCR.FZ set or clear. The guest's
+fused multiply-adds go through binary64 (the product is exact there) and are given up on a binary32 midpoint (the only
+case where rounding twice differs; a test builds one). FMIN / FMAX are Arm's (truth table tested, NaN propagation
+included); the outward step on the double's bits is the guest's, unordered compares included. A call whose FPCR has a bit
+other than FZ, or any value outside the rules, is **declined**: the translated function runs.
+
+**The sphere, completed from the code**: x0 = bounds object (+0 descriptor D, +56 the 32-byte record, none when 0), x1
++32 = the bone palette (64-byte matrices, four float4 columns). D +90 byte: 0 = one sphere under the bone at D +84; else
+the bone list at D +32 (16-bit), the count at D +88 (the first sphere is used whatever the count). Spheres at D +64 (16
+bytes: centre, radius). Per sphere: centre' = fma(fma(m0 cx, m1, cy), m2, cz) + m3 (4 lanes), the column lengths
+sqrt((z^2 + x^2) + (w^2 + y^2)), their largest by compares (first, then a larger second, then a larger third), radius' =
+r times it. The first sphere is the record. Each next one: d = centre' - C (4 lanes), d2 = (dz^2 + dx^2) + (dw^2 + dy^2),
+g = (r' - R)^2 raised to 1e-4 (bits 0x38d1b717); if d2 < g, the record is replaced by the new sphere unless R > r' (the
+copy is 32 bytes from the function's frame: centre, radius, then **12 bytes it never wrote**, the caller's stack at
+sp - 28 .. sp - 17, which the native unit copies from the same place); otherwise dist = sqrt(d2) (a NaN goes through a libm
+call: declined natively), q = d2 * (1 / dist), R' = (q + (r' + R)) * 0.5, C' = C + d * ((R' - R) / q), R' stored first.
+
+**The differential check** (`HL_MATH_CHECK=1`): every call of every unit (or those of `HL_MATH_UNITS`) computes the native
+record into scratch (holding the guest's 32 bytes on entry), runs the translated function for real (a gate calls the
+lifted function again under a per-thread bypass; the pointer-reached unit calls `hl_translated`), and compares the 32
+bytes. The game gets the translated results only. Counts every 10 s; the first ten mismatches of a unit are logged with
+their inputs and both outputs. Results, PC 3050, build of `410f88b`, full 110 s runs (the last report of each run,
+about 100 s in):
+
+| scene | u2 compared | affine compared (declined) | u1 compared | sphere compared (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|
+| castle-move | 295,625 | 8,713,228 (263,681) | 708,345 | 622,563 (24,931) | 0 |
+| kokiri-idle | 318,018 | 8,740,444 (293,034) | 639,105 | 595,751 (23,317) | 0 |
+| hyrule-walk | 338,678 | 9,549,889 (314,698) | 702,411 | 645,939 (25,238) | 0 |
+
+The same check on the main PC (build of `324e7ce`, with every unit native by default otherwise), full runs:
+
+| scene | u2 compared | affine compared (declined) | u1 compared | sphere compared (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|
+| kokiri-idle | 744,408 | 24,046,249 (788,081) | 1,779,489 | 1,644,222 (62,858) | 0 |
+| castle-move | 723,673 | 21,360,215 (668,154) | 1,696,723 | 1,522,972 (60,819) | 0 |
+| hyrule-walk | 711,221 | 21,395,643 (666,650) | 1,681,693 | 1,513,747 (58,136) | 0 |
+
+No call was declined for its FPCR. u1 and u2 decline nothing (u1: 348 calls in one native run); about 3% of affine and 4% of sphere calls are declined by
+the value rules (which value was not looked into: they run translated, as before). FPSR: in about 19 u1 calls a run the
+translated code raised a flag beyond IXC (the outward step of an exact zero gives a subnormal double, whose narrowing
+raises IDC under FZ); the native path sets only IXC. FPSR is read back only by the SDK's context save / restore (4.1):
+not a difference the game sees.
+
+**Switches**: `HL_MATH` (0: nothing native; 1, the default: the validated units native), `HL_MATH_UNITS=u1,u2,affine,
+sphere` (choose units, validated or not), `HL_MATH_CHECK=1`, `HL_MATH_LOG=1`. All four units are validated (the check
+above) and native by default.
+
+**Validation with the four units native** (main PC, `build/s5/valid.sh`, tag `s7v`): the three scenes ran to the end
+(112 s), no crash, game speed ratio 59.7 (kokiri-idle), 59.9 (castle-move), 59.9 (hyrule-walk); calls answered natively
+in the run, e.g. castle-move: u2 384,334, affine 11,894,740, u1 904,874, sphere 820,467. The last shots of each scene
+look right (no black, missing geometry or tint); what they show differs from the reference shots as the reference runs
+differ among themselves (the scenes' timing moves the characters). Memory: game RAM 2.8 / 3.2 / 3.3 GB, process RAM
+7.1 / 8.2 / 7.7 GB (kokiri-idle / castle-move / hyrule-walk): these kernels allocate nothing.
