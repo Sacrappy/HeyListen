@@ -508,7 +508,121 @@ right. **Not done: the validation runs on the main PC** (three scenes with `HL_G
 and native runs in kokiri-idle and hyrule-walk. The main PC's lock was held by other streams for more than two hours,
 so `HL_GFX_STATE` stays off by default until those runs are done.
 
-## Not read yet
+## 9. Brick 2.3: the sub-mesh submission `0x80078fc0`
+
+### Reading: what it is
+
+`0x80078fc0` (3,159 lifted lines, 1,329 guest instructions, 336-byte frame) **submits one sub-mesh of a draw**. It is a
+virtual method (slot +0x58 of the drawable's vtable): its callers compare the slot with `0x80078fc0` (the GOT slot
+`0x84cb5dc0`) and call it directly when it matches, else call the slot. Direct call sites: `0x80681320` (3), `0x80078490`,
+`0x80078800`, `0x80078ce0` (the draw function and three of its siblings) and the recording job `0x80084de0` (1).
+Arguments and result:
+
+| Register | What |
+|---|---|
+| x0 | the drawable D (the object whose vtable is checked) |
+| x1 | the render-state block B (the 352-byte block of section 8, on the caller's stack) |
+| w2 | the sub-mesh index i (signed) |
+| w3 | a mask M of draw kinds, ANDed with D's flags |
+| result | none |
+
+**What it reads** (offsets in bytes; "read" means read in the lifted code; who writes D and R was not read: they are
+the scene's drawable and its model resource):
+
+| Structure | Field | What |
+|---|---|---|
+| D | +0x1e u16 | bits 4-7: the number of sub-meshes (i at or past it: the function returns at once) |
+| | +0x54 u32 | the draw-kind flags F (bits 0, 3, 4, 5, 6, 7 select paths, with M) |
+| | +0x5c u16 | the instance count n |
+| | +0x68 | the model resource R |
+| | +0x78 | a table of 24-byte cluster entries (meshlet paths) |
+| | +0x80 | an object handed to the indirect and query paths |
+| R | +0x8 -> +0x18 | the sub-mesh descriptors: 56 bytes each (below) |
+| | +0x638 | the sub-mesh records: 0x270 bytes each (S below) |
+| | +0x69e u8 | the geometry processing mode the model needs |
+| | +0x69f u8 | the mesh kind: 0 indexed draw, 1 and 2 mesh-shader tasks, other: no draw |
+| | +0x6a4 u32 | the mesh-shader task count (kind 1), or its thread count (kind 2: rounded up to 32s) |
+| Descriptor (56 bytes) | +0x0 | the index ranges: 8-byte entries (+0 byte offset, +4 count) |
+| | +0x10 | the index buffer's holder (+8 its NVN buffer) |
+| | +0x24, +0x28, +0x30 u32 | primitive, index type (also the index size's log2), base vertex |
+| | +0x34 u16 | the number of index ranges |
+| S (0x270 bytes) | +0x50 | a pre-recorded command handle (the CallCommands path) |
+| | +0x58 u8 | bit 0: the sub-mesh has a pre-recorded handle |
+| | +0x268 u32 | its triangle count (added to the block's counter) |
+| B | +0x28 | the recording context (its +0xd8 is the NVN command buffer, its +0x8 the draw helper's view of it) |
+| | +0x38 u8, +0x63 u8, +0xe8 | the cluster entry's index, a culling slot, the culling context (meshlet paths) |
+| | +0x3b u8 | the geometry processing mode applied last (written) |
+| | +0x50 u32 | the triangles submitted (written: += S+0x268) |
+| | +0x5c u32 (the mode bits of section 8) | bit 5: pre-recorded handles allowed; bit 14: rewritten from the geometry mode |
+| Globals | `0x84ca2dd8` -> u32 | a switch: set, the CallCommands path writes the call into the command memory itself |
+| | `0x83e79c60`, `0x83e7a994` | two u32 tables: the game's primitive and index-type enums to NVN's (read by `0x812c3470` / `0x812c34e0`) |
+
+**Its order**, by path (every path is one call; K = F & M):
+
+1. **Prologue**: return when i is not below the sub-mesh count. When R+0x69e differs from B+0x3b: B+0x3b takes it,
+   **SetGeometryProcessingMode**(command buffer, mode), and B+0x5c's bit 14 becomes (mode == 1).
+2. **The callback**: `0x8008fc00`(B, D, 0) (7,134 lifted lines, 263 callers, 145 NVN call sites: program, uniform and
+   storage buffers, textures, the whole render state again; it writes block fields and command memory). Returns when its
+   bit 0 is clear. **Shared preparation**: called back into, not part of the unit.
+3. K bit 3: `0x83607fc0`(D+0x80, context, B+0x38, 0) (168 callers; a false result returns); F bit 5: `0x83607730`(D, B).
+   Both guest code before the rest; F is read again after each.
+4. **The direct paths** (K & 0x51 = 0): with n at most 1, S+0x58 bit 0 and B+0x5c bit 5 set: the byte at command
+   buffer +0x10 is set to 1 (a mark in the game's NVN object; the preparation writes the same byte at many of its call
+   sites, *(inference: a "commands recorded" flag)*), then **CallCommands**(command buffer, 1, S+0x50) (or, with the global switch, the call written
+   into the command memory directly: copies through `0x8572f020`). Otherwise by R+0x69f: kind 0, the indexed draw
+   `0x8029fef0` (below) with n instances (1 when n is 0); kind 1 or 2, **DrawMeshTasks**(command buffer, 0, count);
+   other kinds draw nothing. Then B+0x50 += S+0x268.
+5. K bit 4: the indirect draw `0x83607e80` (DrawElementsIndirect), then the counter.
+6. K bit 0 or 6: the cluster (meshlet) paths: a cluster entry from D+0x78 by B+0x38; either one cluster list
+   (`0x835b4c50`, `0x814e6dc0`, then `0x83607840` a range), or, with K bit 7, a loop over 32-byte cluster bounds with a
+   frustum test (`0x80029240`), a hierarchical-depth occlusion test against the culling context's depth pyramid
+   (B+0xe8: its matrices at +0x328..+0x354, the pyramid's levels at +0x6b0..+0x6c8, a tile grid at +0x5c0 / +0x668; with
+   box projection `0x800a7f00` when +0x6df is 1), merging runs of visible clusters into one indexed draw each
+   (`0x8002a5f0` + `0x8008f840`); without a culling context, an iterator `0x800a8120` hands out the runs. The counter
+   gets the triangles of every run (count / 3).
+
+**The indexed draw `0x8029fef0`** (44 lines; NVN-only, part of the unit) and its two helpers: from the descriptor, the
+first range's offset and the last range's offset and count give count = last count + ((last offset - first offset) >>
+index size); **BufferGetAddress**(the NVN buffer) (`0x8002a5f0`, which stores the address and a zero on the caller's
+stack); `0x8008f840` maps the primitive and the index type through the two tables (`0x812c3470`, `0x812c34e0`;
+`0x812c3500` is an identity) and tail-calls **DrawElementsInstanced**(context+8's +0xd0 = the command buffer, mode, type,
+count, address + first offset, base vertex, base instance 0, n instances).
+
+**NVN calls of the unit, in order**: SetGeometryProcessingMode (when the mode changes), then after the callback one of:
+CallCommands; BufferGetAddress and DrawElementsInstanced; DrawMeshTasks; nothing.
+
+**What it writes**: B+0x3b, B+0x5c (bit 14), B+0x50; the command buffer object's byte +0x10; on the stack below the
+caller's sp, its own frame and the draw helper's address pair (scratch, read by nobody after the call). The cluster
+paths write their own frame and the iterator's state (not in the unit).
+
+**Callees, by kind** (21 call sites): NVN-only helpers that become the unit: `0x8029fef0`, `0x8008f840`, `0x8002a5f0` (and
+`0x812c3470`, `0x812c34e0`, `0x812c3500` below them). Shared preparation called back: `0x8008fc00`. Other paths, left
+to the translation: `0x83607fc0`, `0x83607730` (guest calls before the draw), `0x83607e80` (indirect draw),
+`0x80029240`, `0x800a7f00`, `0x800a8120`, `0x835b4c50`, `0x814e6dc0`, `0x83607840` (clusters), `0x8572f020` (a 7-line
+leaf with 13,242 call sites: the copy of the inline-write path).
+
+### The unit taken, and how it is cut
+
+The function cannot be native whole in one session: its cluster paths are a culling and occlusion kernel with its own
+callees, and a guest call (`0x8008fc00`) sits between its first NVN call and the rest. **The unit is the function on its
+direct paths**: prologue, the callback through the guest runtime, and the direct paths natively. Which path a call takes
+is decided from D's flags, M and the global switch at the function's entry (none of them is written by the prologue);
+a call on any other path (K bit 3, F bit 5, K & 0x51, the switch set) is left whole to the translation. The callback
+could in principle change what the decision read: the check counts that case (below), and it is zero in the runs.
+
+Native, the gate at `0x80078fc0`'s entry: decides the prologue (`hl::gfx::SubmeshDraw::prologue`) and emits it; calls
+`0x8008fc00` on the thread's own guest context with the stack pointer lowered by the function's own 336-byte frame (so
+the callback's stack objects, whose addresses appear in its NVN calls, are where the translation puts them); then
+decides the submission (`SubmeshDraw::decide`, on what the callback left) and emits it.
+
+**The check in segments** (`HL_GFX_CHECK=1`): the gate runs the native prologue into a recording, then the translated body
+for real under the tap. A second gate, at `0x8008fc00`, armed only for the call made by a checked `0x80078fc0` on the
+same thread, is the checkpoint: it closes segment A (its NVN calls and the block's bytes compared), runs the translated
+`0x8008fc00` itself with the tap paused, then runs the native submission on what the callback left into a recording and
+lets the translation go on; at the end of the body segment B is compared (its NVN calls, the block's 352 bytes and the
+command buffer's byte +0x10). The path decided at the entry is decided again at the checkpoint: a difference is counted
+as a mismatch of segment B.
+
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
   (who fills slot +32 / +44 / +48), and when; whether gameplay reads any of them in place.
