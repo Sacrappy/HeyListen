@@ -1,36 +1,28 @@
 // HeyListen native engine: the game's job dispatcher, natively (hl/bridge/Dispatcher.h). Each step below follows a step
 // of docs/native-engine/jobs-boundary.md, "The dispatcher's protocol"; the guest instruction addresses in the comments are
-// where the reading of that step is, in the translated dispatcher 0x8004ab40 (or the push 0x8004fa40).
+// where the reading of that step is, in the translated dispatcher 0x8004ab40 (or the push 0x8004fa40). The loop around
+// the rings (entry, handed jobs, sleeping, waking, running, leave) is the one the module system's job group shares
+// (DispatchLoop.h); what is the rings' own is the policy Dispatcher::Rings below.
 #include "hl/bridge/Dispatcher.h"
 
 #include <chrono>
 #include <cstdio>
 #include <immintrin.h>
 
+#include "DispatchLoop.h"
+
 namespace hl::bridge {
+
+using loop::cas;
+using loop::ld;
+using loop::ld_acquire;
+using loop::st;
+using loop::st_release;
 
 namespace {
 
-// Every shared word is read and written as the guest does: plain loads (relaxed), acquire loads where the guest has
-// load-acquire, release stores where it has store-release, and every read-modify-write as one sequentially consistent
-// atomic operation (as the translation makes them; on x64 a locked instruction, at least as strong as the guest's).
-template <class T>
-T ld(const T* p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
-template <class T>
-T ld_acquire(const T* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
-template <class T>
-void st(T* p, T v) { __atomic_store_n(p, v, __ATOMIC_RELAXED); }
-template <class T>
-void st_release(T* p, T v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
-template <class T>
-bool cas(T* p, T& expected, T desired) {
-    return __atomic_compare_exchange_n(p, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-}
-
 constexpr uint64_t kOwned = 1ull << 63;   // a cell's sequence word while a pop owns the cell
-constexpr uint32_t kStageOver = 2;        // the scheduler's flags
-constexpr uint32_t kNotToRun = 2;         // a context's flags
-constexpr uint32_t kSentMessage = 1;
+constexpr uint32_t kStageOver = loop::kOver;
 constexpr GuestAddr kRingSize = sizeof(guest::Ring);
 
 GuestAddr ring_at(GuestAddr s_at, int index) {   // (index: 0 level 0 A, 1 level 0 B, 2 level 1 A, ... 5 level 2 B)
@@ -45,17 +37,124 @@ GuestAddr cell_at(const guest::Ring* r, uint64_t pos) {
     return cells + (GuestAddr)(int64_t)(int32_t)((uint32_t)(size - 1) & (uint32_t)pos) * sizeof(guest::Cell);
 }
 
-// The frame a tagged job's function gets as its second argument: the scheduler, the job record, 1.
-struct JobFrame {
-    GuestAddr scheduler, job;
-    uint32_t one, pad;
-};
-static_assert(sizeof(JobFrame) == 24);
-
 // Set while this host thread calls the translated dispatcher on purpose: its entry gate lets that one call through.
 thread_local bool t_bypass = false;
 
 }   // namespace
+
+// The rings as the loop's queue policy (DispatchLoop.h): one per native dispatch.
+struct Dispatcher::Rings {
+    static constexpr int32_t kIdleRounds = 9;   // (0x8004ba88: nine rounds with jobs in sight but none taken: a timed sleep)
+    static constexpr GuestAddr kKindAt = offsetof(guest::Job, kind);
+    static constexpr uint32_t kFrameWord = 1;
+
+    Dispatcher& d;
+    loop::Context& cx;
+    GuestAddr s_at;
+    guest::Scheduler* s;
+    bool single = false;   // (checking: the job taken is a one-runner job, marked as running)
+
+    GuestAddr scheduler() const { return s_at; }
+    bool over() const { return ld(&s->flags) & kStageOver; }
+    int32_t queued() const { return d.queued(s_at, 0); }
+    uint32_t poll_lane() const { return ld(&s->poll_lane); }
+    void poll() { d.timed_sleep(cx.as); }
+    int32_t context_count() const { return ld(&s->context_count); }
+    GuestAddr contexts() const { return ld(&s->contexts); }
+    void left() {
+        if (d.options_.check && over()) d.check_stage_end(s_at);
+    }
+
+    void finish(GuestAddr job) {
+        d.finish(cx.as, s_at, job);
+        if (single) {
+            std::lock_guard lock(d.single_mu_);
+            d.single_.erase(job);
+            single = false;
+        }
+    }
+
+    // Take the first job of level 0 A, 0 B, 1 A, 1 B, 2 A, 2 B (0x8004acc8).
+    loop::Taken take() {
+        Stats& stats = d.stats_;
+        guest::DispatchContext* c = cx.c;
+        for (int level = 0; level < 3; level++) {
+            const GuestAddr a_at = ring_at(s_at, level * 2), b_at = ring_at(s_at, level * 2 + 1);
+            guest::Ring* a = cx.mem<guest::Ring>(a_at);
+            guest::Ring* b = cx.mem<guest::Ring>(b_at);
+            while (ld(&a->cells)) {
+                uint64_t head = 0;
+                const GuestAddr j = d.pop(cx.as, a_at, head);
+                if (!j) break;
+                stats.pops_a.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t tail = ld(&a->tail);   // (0x8004ad74)
+                uint16_t* word = &cx.mem<guest::Job>(j)->runners;
+                uint16_t h = ld(word);
+                bool skip = false;
+                for (;;) {
+                    if (((h >> 14) & 3) > 2) { skip = true; break; }   // (not to be started: dropped)
+                    if (cas(word, h, (uint16_t)(h + 0x7f))) break;
+                }
+                const unsigned to_start = h & 0x7f;
+                if (skip || to_start == 0) {   // (pop this A ring again)
+                    stats.drops.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                const int32_t here = (int32_t)((uint32_t)tail - (uint32_t)head);
+                int32_t n;
+                if (to_start == 1) {   // (0x8004b188: its last runner)
+                    n = here + d.queued(s_at, level * 2 + 1);
+                } else {                // (0x8004b04c: put back for its next runners)
+                    if (d.ring_push(cx.as, a_at, j)) stats.requeues.fetch_add(1, std::memory_order_relaxed);
+                    else stats.full.fetch_add(1, std::memory_order_relaxed);
+                    n = here + d.queued(s_at, level * 2 + 1) + 1;
+                }
+                return taken(j, n);
+            }
+            if (!ld(&b->cells)) continue;
+            uint64_t head = 0;
+            const GuestAddr j = d.pop(cx.as, b_at, head);   // (0x8004adc0)
+            if (!j) continue;
+            stats.pops_b.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t tail = ld(&b->tail);   // (0x8004afc0)
+            uint16_t* word = &cx.mem<guest::Job>(j)->runners;
+            uint16_t h = ld(word);
+            bool blocked = false;
+            for (;;) {
+                if (((h >> 14) & 3) > 2) { blocked = true; break; }
+                if (cas(word, h, (uint16_t)(h + 0x7f))) break;
+            }
+            const int32_t here = (int32_t)((uint32_t)tail - (uint32_t)head);
+            if (blocked || (h & 0x7f) != 1) {   // (0x8004b228: into this level's A ring for its other runners, and run)
+                if (d.ring_push(cx.as, a_at, j)) stats.requeues.fetch_add(1, std::memory_order_relaxed);
+                else stats.full.fetch_add(1, std::memory_order_relaxed);
+                return taken(j, here + 1 + d.queued(s_at, level * 2 + 2));
+            }
+            const uint32_t lane = ld(&cx.mem<guest::Job>(j)->lane);
+            if (lane != kAnyLane && lane != (uint32_t)ld(&c->lane)) {   // (0x8004ec8c: tied to another executor)
+                cx.call(kForward, s_at, lane, j);
+                stats.forwards.fetch_add(1, std::memory_order_relaxed);
+                return {loop::Taken::Passed, 0, 0};
+            }
+            if (d.options_.check && (h & 0x3f80) == 0) {   // (one runner, none running before: no other may run it now)
+                std::lock_guard lock(d.single_mu_);
+                if (!d.single_.insert(j).second) {
+                    stats.double_run.fetch_add(1, std::memory_order_relaxed);
+                    d.violation("a one-runner job taken while a native context runs it", j);
+                } else {
+                    single = true;
+                }
+            }
+            return taken(j, here + d.queued(s_at, level * 2 + 2));   // (0x8004b008)
+        }
+        return {};   // (0x8004ae68: nothing found)
+    }
+
+    loop::Taken taken(GuestAddr job, int32_t wake) {
+        d.stats_.runs_from_pops.fetch_add(1, std::memory_order_relaxed);
+        return {loop::Taken::Job, job, wake};
+    }
+};
 
 Dispatcher::Dispatcher(GuestRuntime& runtime, Options options) : runtime_(runtime), options_(options) {}
 
@@ -86,7 +185,9 @@ void Dispatcher::dispatch(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
         return;
     }
     stats_.stages.fetch_add(1, std::memory_order_relaxed);
-    run_native(as, s_at, c_at);
+    loop::Context cx(runtime_, as, c_at);
+    Rings rings{*this, cx, s_at, at<guest::Scheduler>(s_at)};
+    loop::run(cx, rings, stats_);
 }
 
 bool Dispatcher::gated(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
@@ -98,181 +199,6 @@ bool Dispatcher::gated(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
     }
     dispatch(as, s_at, c_at);
     return true;
-}
-
-void Dispatcher::run_native(GuestThread as, GuestAddr s_at, GuestAddr c_at) {
-    guest::Scheduler* s = at<guest::Scheduler>(s_at);
-    guest::DispatchContext* c = at<guest::DispatchContext>(c_at);
-    lane_status(c_at, 0xf, true);   // (0x8004ab74)
-    GuestAddr job = 0;
-    bool single = false;   // (checking: the job is a one-runner job, marked as running)
-    int32_t idle = 0;      // rounds without a job since the last one ran
-    for (;;) {
-        // Finish the job just run (0x8004abe4); leave when this context is not to run or the stage is over (0x8004ac94).
-        if (job) {
-            finish(as, s_at, job);
-            if (single) {
-                std::lock_guard lock(single_mu_);
-                single_.erase(job);
-            }
-            job = 0;
-            single = false;
-        }
-        if (ld(&c->flags) & kNotToRun) break;
-        if (ld(&s->flags) & kStageOver) break;
-        idle = 0;
-        // Find a job (0x8004acb8); n is the count of jobs others could take, for waking them.
-        int32_t n = 0;
-        for (;;) {
-            const uint64_t state = ld(&c->state);
-            if (state > 1) {
-                // A job handed to this context (0x8004ecfc): the next of its own queue takes its place.
-                const GuestAddr mutex = c_at + offsetof(guest::DispatchContext, mutex);
-                call(as, kMutexLock, mutex);
-                GuestAddr next = 0;
-                const int32_t count = ld(&c->queue_count);
-                if (count) {   // (0x8004fa08)
-                    const int32_t room = ld(&c->queue_room), first = ld(&c->queue_first);
-                    const int32_t index = first - (first < room ? 0 : room);
-                    next = ld(at<GuestAddr>(ld(&c->queue) + (GuestAddr)(int64_t)index * 8));
-                    const int32_t after = first + 1 - (first + 1 < room ? 0 : room);
-                    st(&c->queue_first, after);
-                    st(&c->queue_count, count - 1);
-                }
-                __atomic_exchange_n(&c->state, next, __ATOMIC_SEQ_CST);
-                call(as, kMutexUnlock, mutex);
-                job = state;
-                stats_.handed.fetch_add(1, std::memory_order_relaxed);
-                n = queued(s_at, 0);
-                break;
-            }
-            // Take the first job of level 0 A, 0 B, 1 A, 1 B, 2 A, 2 B (0x8004acc8).
-            bool forwarded = false;
-            for (int level = 0; level < 3 && !job && !forwarded; level++) {
-                const GuestAddr a_at = ring_at(s_at, level * 2), b_at = ring_at(s_at, level * 2 + 1);
-                guest::Ring* a = at<guest::Ring>(a_at);
-                guest::Ring* b = at<guest::Ring>(b_at);
-                while (ld(&a->cells)) {
-                    uint64_t head = 0;
-                    const GuestAddr j = pop(as, a_at, head);
-                    if (!j) break;
-                    stats_.pops_a.fetch_add(1, std::memory_order_relaxed);
-                    const uint64_t tail = ld(&a->tail);   // (0x8004ad74)
-                    uint16_t* word = &at<guest::Job>(j)->runners;
-                    uint16_t h = ld(word);
-                    bool skip = false;
-                    for (;;) {
-                        if (((h >> 14) & 3) > 2) { skip = true; break; }   // (not to be started: dropped)
-                        if (cas(word, h, (uint16_t)(h + 0x7f))) break;
-                    }
-                    const unsigned to_start = h & 0x7f;
-                    if (skip || to_start == 0) {   // (pop this A ring again)
-                        stats_.drops.fetch_add(1, std::memory_order_relaxed);
-                        continue;
-                    }
-                    const int32_t here = (int32_t)((uint32_t)tail - (uint32_t)head);
-                    if (to_start == 1) {   // (0x8004b188: its last runner)
-                        n = here + queued(s_at, level * 2 + 1);
-                    } else {                // (0x8004b04c: put back for its next runners)
-                        if (ring_push(as, a_at, j)) stats_.requeues.fetch_add(1, std::memory_order_relaxed);
-                        else stats_.full.fetch_add(1, std::memory_order_relaxed);
-                        n = here + queued(s_at, level * 2 + 1) + 1;
-                    }
-                    job = j;
-                    break;
-                }
-                if (job || !ld(&b->cells)) continue;
-                uint64_t head = 0;
-                const GuestAddr j = pop(as, b_at, head);   // (0x8004adc0)
-                if (!j) continue;
-                stats_.pops_b.fetch_add(1, std::memory_order_relaxed);
-                const uint64_t tail = ld(&b->tail);   // (0x8004afc0)
-                uint16_t* word = &at<guest::Job>(j)->runners;
-                uint16_t h = ld(word);
-                bool blocked = false;
-                for (;;) {
-                    if (((h >> 14) & 3) > 2) { blocked = true; break; }
-                    if (cas(word, h, (uint16_t)(h + 0x7f))) break;
-                }
-                const int32_t here = (int32_t)((uint32_t)tail - (uint32_t)head);
-                if (blocked || (h & 0x7f) != 1) {   // (0x8004b228: into this level's A ring for its other runners, and run)
-                    if (ring_push(as, a_at, j)) stats_.requeues.fetch_add(1, std::memory_order_relaxed);
-                    else stats_.full.fetch_add(1, std::memory_order_relaxed);
-                    n = here + 1 + queued(s_at, level * 2 + 2);
-                    job = j;
-                    break;
-                }
-                const uint32_t lane = ld(&at<guest::Job>(j)->lane);
-                if (lane != kAnyLane && lane != (uint32_t)ld(&c->lane)) {   // (0x8004ec8c: tied to another executor)
-                    call(as, kForward, s_at, lane, j);
-                    stats_.forwards.fetch_add(1, std::memory_order_relaxed);
-                    forwarded = true;
-                    break;
-                }
-                n = here + queued(s_at, level * 2 + 2);   // (0x8004b008)
-                job = j;
-                if (options_.check && (h & 0x3f80) == 0) {   // (one runner, none running before: no other may run it now)
-                    std::lock_guard lock(single_mu_);
-                    if (!single_.insert(j).second) {
-                        stats_.double_run.fetch_add(1, std::memory_order_relaxed);
-                        violation("a one-runner job taken while a native context runs it", j);
-                    } else {
-                        single = true;
-                    }
-                }
-            }
-            if (job) {
-                stats_.runs_from_pops.fetch_add(1, std::memory_order_relaxed);
-                break;
-            }
-            int32_t next_idle = idle + 1;
-            if (!forwarded) {
-                next_idle = idle + 1;
-                // Nothing found (0x8004ae68).
-                if (ld(&s->poll_lane) == (uint32_t)ld(&c->lane)) {
-                    timed_sleep(as);
-                } else {
-                    bool handed = false;
-                    for (;;) {   // (asleep: 0 to 1, unless a job was handed meanwhile)
-                        const uint64_t v = ld(&c->state);
-                        if (v == 1) break;
-                        if (v != 0) { handed = true; break; }
-                        uint64_t e = 0;
-                        if (cas(&c->state, e, (uint64_t)1)) break;
-                    }
-                    if (handed) continue;   // (0x8004ecfc, from the top of the search)
-                    if (queued(s_at, 0) >= 1) {   // (0x8004ba88: jobs arrived: awake again)
-                        bool woken = false;
-                        for (;;) {
-                            if (ld(&c->state) != 1) { woken = true; break; }
-                            uint64_t e = 1;
-                            if (cas(&c->state, e, (uint64_t)0)) break;
-                        }
-                        if (woken) sleep_on_event(as, c_at);   // (0x8004e8ac: another context set it 0 and signals: take that signal)
-                        else if (idle >= 9) timed_sleep(as);
-                    } else {
-                        sleep_on_event(as, c_at);   // (0x8004af44)
-                    }
-                }
-            } else {
-                next_idle = 0;   // (0x8004eca4)
-            }
-            // (0x8004afa0)
-            if (ld(&s->flags) & kStageOver) goto leave;
-            idle = next_idle;
-        }
-        // Run it (0x8004b114), after waking contexts for the jobs left.
-        if (n >= 1) wake(as, s_at, n);
-        if (!job) break;
-        stats_.runs.fetch_add(1, std::memory_order_relaxed);
-        run_job(as, s_at, c_at, job);
-    }
-leave:
-    // Leave (0x8004d47c).
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    __atomic_fetch_and(&c->flags, ~kSentMessage, __ATOMIC_SEQ_CST);
-    lane_status(c_at, 0xf, false);
-    if (options_.check && (ld(&s->flags) & kStageOver)) check_stage_end(s_at);
 }
 
 // ---- the rings ---------------------------------------------------------------------------------------------------------
@@ -442,79 +368,6 @@ void Dispatcher::stage_over(GuestThread as, GuestAddr s_at) {
         }
         call(as, kEventSet, ctx + offsetof(guest::DispatchContext, wake_event));
     }
-}
-
-// Wakes up to `count` sleeping contexts of the scheduler's list, in its order (0x8004b11c).
-void Dispatcher::wake(GuestThread as, GuestAddr s_at, int32_t count) {
-    guest::Scheduler* s = at<guest::Scheduler>(s_at);
-    const int32_t n = ld(&s->context_count);
-    const GuestAddr list = ld(&s->contexts);
-    for (int32_t i = 0; i < n; i++) {
-        const GuestAddr ctx = ld(at<GuestAddr>(list + (GuestAddr)i * 8));
-        guest::DispatchContext* c = at<guest::DispatchContext>(ctx);
-        if (!(ld(&c->flags) & kNotToRun)) {
-            for (uint64_t v = ld(&c->state); v == 1;) {
-                if (cas(&c->state, v, (uint64_t)0)) {
-                    call(as, kEventSet, ctx + offsetof(guest::DispatchContext, wake_event));
-                    stats_.wakes.fetch_add(1, std::memory_order_relaxed);
-                    count--;
-                    break;
-                }
-            }
-        }
-        if (count <= 0) break;
-    }
-}
-
-void Dispatcher::run_job(GuestThread as, GuestAddr s_at, GuestAddr c_at, GuestAddr job) {
-    guest::Job* j = at<guest::Job>(job);
-    guest::DispatchContext* c = at<guest::DispatchContext>(c_at);
-    if (!ld(&j->object)) return;   // (0x8004b2c8: nothing to run)
-    lane_status(c_at, ld(&j->kind) ? 0xf0 : 0xf, true);
-    const GuestAddr shown = c_at + offsetof(guest::DispatchContext, shown_object);
-    if (const GuestAddr o = ld(&c->observer)) {   // (0x8004b340)
-        st(&c->shown_object, ld(&j->object));
-        st(&c->shown_begin, (uint8_t)1);
-        st(&c->shown_id, ld(&j->id));
-        call(as, ld(at<GuestAddr>(ld(at<GuestAddr>(o)))), o, shown);
-    }
-    // The job's object's third virtual function (0x8004b3b8): a tagged object gets the frame (scheduler, job, 1).
-    const GuestAddr object = ld(&j->object);
-    const GuestAddr self = object & ~(GuestAddr)1;
-    const GuestAddr fn = ld(at<GuestAddr>(ld(at<GuestAddr>(self)) + 0x10));
-    const JobFrame frame{s_at, job, 1, 0};
-    runtime_.call_with(as, fn, &self, 1, &frame, sizeof frame);
-    if (const GuestAddr o = ld(&c->observer)) {   // (0x8004b3f4)
-        st(&c->shown_begin, (uint8_t)0);
-        call(as, ld(at<GuestAddr>(ld(at<GuestAddr>(o)))), o, shown);
-    }
-    lane_status(c_at, ld(&j->kind) ? 0xf0 : 0xf, false);
-}
-
-// ---- contexts ----------------------------------------------------------------------------------------------------------
-
-// One more or one fewer in the four bits `nibble` (0xf or 0xf0) of the context's lane's byte, staying within 0..15.
-void Dispatcher::lane_status(GuestAddr c_at, uint64_t nibble, bool up) const {
-    const guest::DispatchContext* c = at<guest::DispatchContext>(c_at);
-    const GuestAddr word_at = ld(&c->lane_status);
-    const int32_t lane = ld(&c->lane);
-    if (!word_at || !lane) return;
-    const unsigned shift = ((uint32_t)lane << 3) & 63;
-    const uint64_t mask = nibble << shift, unit = (nibble == 0xf ? 1ull : 0x10ull) << shift;
-    uint64_t* word = at<uint64_t>(word_at);
-    uint64_t old = ld(word);
-    for (;;) {
-        const uint64_t part = old & mask;
-        const uint64_t next = up ? (part == mask ? part : part + unit) : (part == 0 ? 0 : part - unit);
-        if (cas(word, old, next | (old & ~mask))) return;
-    }
-}
-
-void Dispatcher::sleep_on_event(GuestThread as, GuestAddr c_at) {
-    stats_.sleeps.fetch_add(1, std::memory_order_relaxed);
-    lane_status(c_at, 0xf, false);
-    call(as, kEventWait, c_at + offsetof(guest::DispatchContext, wake_event));
-    lane_status(c_at, 0xf, true);
 }
 
 void Dispatcher::timed_sleep(GuestThread as) {
