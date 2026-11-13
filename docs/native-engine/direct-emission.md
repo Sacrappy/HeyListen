@@ -784,7 +784,8 @@ the switch (game RAM / GPU pools / process RAM / commit / VRAM, MB): castle 3,27
 
 **Default: off** (`HL_UBO_INLINE=0`). It is clean in the three scenes on the main PC, but it buys nothing yet: the capture is
 unchanged and these blocks' pages are not what it copies; it adds ~100 MB a second of block bytes copied into the recordings
-(not timed, rule 6); the PC 3050 was not run with it; and the slot list is a measurement of three scenes, not a property of the
+(not timed, rule 6); the PC 3050 was not run with it (nor with the check: its build of this branch stopped at the link on
+`hl_gate_present`, a gate another stream's tree left in that machine's lifted code, which this tree does not define); and the slot list is a measurement of three scenes, not a property of the
 game. It stays as the record kind and descriptor path brick D will use for blocks a native draw loop computes.
 
 ### What this says for the rest of the plan
