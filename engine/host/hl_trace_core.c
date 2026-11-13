@@ -205,14 +205,14 @@ int hl_trace_lookup(uint64_t addr, HlTraceRecord *live, HlTraceFree *fr) {
     HlTraceRecord lv;
     memset(&lv, 0, sizeof lv);
     if (!hl_trace_mask) return 0;
-    for (int k = 0; k < STRIPES && !(got & 1); k++) {
+    /* (the smallest live block holding it: a heap's arena is itself a block of its parent heap) */
+    for (int k = 0; k < STRIPES; k++) {
         const Stripe *s = &stripes[k];
         for (uint32_t i = 0; i < stripe_slots; i++) {
             const HlTraceRecord *r = &s->slot[i];
-            if (r->addr && addr >= r->addr && addr < r->addr + (r->size ? r->size : 1)) {
+            if (r->addr && addr >= r->addr && addr < r->addr + (r->size ? r->size : 1) && (!(got & 1) || r->size < lv.size)) {
                 lv = *r;
                 got |= 1;
-                break;
             }
         }
     }
@@ -361,7 +361,7 @@ int hl_trace_write(const char *path) {
     if (!hl_trace_mask) return -1;
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
-    const uint64_t now = hl_trace_now();
+    uint64_t now = hl_trace_now();
     const uint32_t events = ring_mask + 1, nr = atomic_load(&nrings) < MAX_RINGS ? atomic_load(&nrings) : MAX_RINGS;
     fwrite("HLTRACE1", 1, 8, fp);
     fwrite(&tick_ms, sizeof tick_ms, 1, fp);
@@ -384,5 +384,9 @@ int hl_trace_write(const char *path) {
     const uint32_t nl = stripe_slots * STRIPES;
     fwrite(&nl, 4, 1, fp);
     for (int s = 0; s < STRIPES; s++) fwrite(stripes[s].slot, sizeof(HlTraceRecord), stripe_slots, fp);
+    /* (the clock as the file ends: the threads went on while it was written, and every event is older than this) */
+    now = hl_trace_now();
+    fseek(fp, 16, SEEK_SET);
+    fwrite(&now, sizeof now, 1, fp);
     return fclose(fp) ? -1 : 0;
 }
