@@ -804,3 +804,106 @@ allocation rates (no counter: the allocation paths are lifted code and were not 
 large-allocation list (`+248`) was not walked, so its 113 MB of own pages are not split by user; in two of the three scenes the
 per-heap `heaptsv` lines were cut by the run's end (the tables above come from the `heaptop`, `heapgroup` and `heapcold`
 lines, complete in all three).
+
+## 11. Cold pages of the game's heaps leave the working set too (`HL_MEM_COLD_HEAPS`, 2026-11-13)
+
+Section 8's mechanism, extended from the CPU-cached GPU pools to the game's heap memory outside the pools (section 10: ~3.5 GB
+in RAM, ~94% of it untouched in 20 s). What section 8 says of the mechanism holds unchanged: pages are taken out of the working
+set with `VirtualUnlock` on an unlocked range, they stay committed and keep their bytes, a touch brings them back with no
+handler of ours (a soft fault; a hard one if Windows gave the RAM away), so **no one can read a wrong byte whatever the policy
+does**. **RAM is freed, the commit charge is not** (the pages are page-file-backed; the commit column below does not move).
+What it costs when RAM is short (hard faults on the threads that touch pages taken out, a scene change that reads back
+memory written to the page file) is **not measured here**.
+
+### Design (`host/hl_mem.c`, `native/src/mem/ColdPages.cpp`)
+
+- **Which ranges: the simple form.** Every committed page of the heap and of the address regions
+  (`[HOS_HEAP_BASE, HOS_GUEST_SPACE)`: the 6.9 GB heap, `NinVirtualAddressHeap`'s regions with the resource files' heaps,
+  the host's own regions there), except: any GPU pool of any flags or age (the pool policy's, or left alone on purpose:
+  `0x022` per-frame, the no-access pools the zero-page thread handles), every guest thread's stack and every live fiber's
+  stack (`hos_guest_stacks`, `host/hos_thread.c`: the game gives them, from its heaps), each widened to whole 64 KB units.
+  The thread-local blocks, the system region and the image are below the heap and never looked at; units the back end
+  imported are never taken out (as section 8). Why not "only heaps named by a resource path" through the heap walk: section 10
+  measured the general heaps (`Graphics`, `Actor`, actor heaps, `Movie`'s free block) as cold as the files, the walk races the
+  game's allocator (it cannot take the heaps' `nn::os` mutexes, section 10) and would have to run on a timer, and the back-off
+  calibrates the simple form by itself: what is touched comes back, is counted, and is left in for 30 s, 60 s, 120 s, then for
+  good.
+- **What is being written is left alone by residency, not by the write-track marks.** The marks (`A64_MARK`) are read and
+  cleared only over the GPU ranges (`host/rx_backend.c` `host_collect`, over `hos_gpu_guest_ranges`); outside them nobody
+  clears them, so a heap page's mark says "written once since the start", which every loaded file's page is. Clearing them
+  from this thread to make them say "written lately" would hide writes from the back end: when a pool is later made over
+  that memory, a new mirror takes from a retired one the pages whose page generations say unchanged (`gpu/vk/vk_memory.cpp`,
+  TICK-036 inheritance), and a mark cleared here would never become a generation: stale texels. So instead the heap policy
+  has a **settle rule** (`ColdPages::Config::settle_passes`, 20 passes = 10 s): a unit is taken out only at a look 10 s or
+  more after an earlier look, and only if it has not gained resident pages since; a unit that gained pages (memory being
+  filled: a file decoded into fresh pages) waits again. A unit rewritten in place while fully resident is not caught by this:
+  if it is taken out it comes back at once and the back-off holds it.
+- **Quiet while a scene loads.** The come-back rate is the signal: when 32 MB or more came back in the last second (pools
+  and heaps together; section 8 saw ~1 GB come back in 10-20 s at a scene's load, 0-15 MB per 10 s while playing), no heap
+  page is looked at or taken out for 5 s, renewed while it lasts. The pools' scan is unchanged (validated as it is).
+- **Budget and pacing.** The same thread and pass (500 ms) as section 8, after the pools: at most 256 MB of heap pages looked
+  at a pass, 64 MB taken out, 1,024 `VirtualQuery` calls (the address regions are ~20,000 pieces); the walk goes on from where
+  the last pass stopped and starts again at the bottom after a sweep (a sweep took ~5-6 s). No lock a game thread waits for:
+  the pool list's (shared, copied out) and the thread and fiber lists' (shared, copied out) only. Not with large pages, not
+  while `HOS_POOL_TRAP` measures (the thread is not started), and no heap work while `HOS_HEAP_SPLIT_COLD` measures.
+- **Two policies, one per kind**, each with its own counters (`hl_mem_cold_*(kind, ...)`, `HL_MEM_COLD_POOLS`,
+  `HL_MEM_COLD_HEAPS`); `forget` (a pool made over units) and the imports go to both. A pool made over heap units the heap
+  policy had taken out drops them from its "out now" count.
+- **Counters**, every 10 s, one line each: `hl mem: cold pages (pools): ...` and `hl mem: cold pages (heaps): ...`: MB out of
+  the working set now, taken out in all and since the last line, came back (MB and units, in all and since the last line,
+  and **the most that came back between two lines**: the worst 10 s), stayed in when taken out, units left in for good,
+  imported; for the heaps also the seconds spent quiet and the sweeps; the longest pass of each.
+- Switches: `HL_MEM_COLD=1` (default) now covers the pools and the heaps; `HL_MEM_COLD_HEAPS=0` keeps the pools only (the heap
+  policy is then not even made: the previous behaviour, but for the log line's name); `HL_MEM_COLD=0` turns everything off.
+  `HL_MEM_COLD_HEAPS` defaults to 1 after the validation below. Tests: `native/tests/mem_test.cpp` (`settle`,
+  `report_worst`).
+
+### Validation (main PC, `valid.sh s4h s4-heaps1` against `valid.sh s4b s4-base`, main built from the same tree, 2026-11-13)
+
+All three scenes ran to the end (112 s), no crash line, game speed ratio at the end 60.2 / 58.5 / 59.7 (kokiri, castle,
+hyrule; the base's runs 66.2 / 59.8 / 60.2, the base's kokiri line taken during a slow second). The last shots of each scene
+looked at beside the reference shots (`refshots-*`): the market complete and right in all three, no missing geometry, no
+tint, no black or white frames. No large slowdown in the runs' own speed lines.
+
+| Scene | Build | Game RAM | of it GPU pools | outside pools | Process RAM (working set) | Process commit | VRAM |
+|---|---|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | s4-base (pools only) | 5229 | 1599 | 3630 | 10821 | 19396 | 5361 |
+| | heaps too | **3298** | 1523 | **1775** | **8309** | 20130 | 5900 |
+| castle-move | s4-base | 5690 | 2044 | 3646 | 11243 | 21161 | 6935 |
+| | heaps too | **3472** | 1734 | **1738** | **8533** | 21154 | 6805 |
+| hyrule-walk | s4-base | 5308 | 1655 | 3653 | 10734 | 20430 | 6291 |
+| | heaps too | **3348** | 1754 | **1594** | **8902** | 20619 | 6188 |
+
+MB; game RAM from `HOS_MEM_SPLIT=95` (95 s), the rest from `RX_VK_RES_LOG=1`'s last lines (`tools/bench/steptable.py`); one
+run each.
+
+- **The game's RAM: -1.9 to -2.2 GB in every scene (5.2-5.7 GB to 3.3-3.5 GB); outside the pools -1.9 to -2.1 GB; the
+  process's working set: -1.8 to -2.7 GB. The commit charge does not move** (+734 / -7 / +189 MB: run-to-run noise), as it
+  should not. The pools' part is unchanged within run-to-run differences.
+- The heaps' counters at the end of each run (kokiri / castle / hyrule): taken out 2535 / 2612 / 2552 MB in all; out of the
+  working set at the end 2105 / 2137 / 2030 MB, and still growing (350 MB taken out in the last 10 s in two scenes: a
+  longer run frees more); came back 240 / 266 / 301 MB in 7,700-9,200 units (~10% of what was taken out); the worst 10 s
+  60 / 58 / 78 MB; 0.5-0.9 MB stayed in when taken out; no unit left in for good; quiet 24.5 / 32.5 / 24.5 s in all (the
+  start's loading, and the bursts in the moving scenes); 16-19 sweeps; a pass took at most 91-108 ms of its own thread (the
+  `VirtualQuery` walk of the fragmented address regions and the working-set queries; no game thread waits on it).
+- What stays outside the pools (1.6-1.8 GB): the image (96 MB), units not yet taken out at 95 s (the take-out was still
+  going on), what came back and is held, the stacks, and the host's own regions the back end touches.
+
+### Not verified
+
+- The PC 3050 was not run; long sessions, several scene changes in a row, a PC short of RAM or with a small page file or none
+  (the dirty pages taken out then cannot leave the modified list: the working set falls, the RAM in use does not).
+- The time of the soft faults on the threads that take them (no speed study by the rule of the night): the come-back counts
+  bound how many there were (60-78 MB, ~15,000-20,000 pages, in the worst 10 s).
+- `HOS_HEAP_SPLIT_COLD` and `HOS_LARGE_PAGES=1` with the switch on: by reading only.
+
+### Free blocks' insides decommitted (the brief's second item): not done
+
+Read: `0x83491650` and `0x83491690`, which section 10 took for the free path's merge helpers, are the heap's lock and unlock
+(the `nn::os` mutex at `+136`, taken when `+168` bit 0 is set); the merging is in the free function itself, and it writes
+only block headers (the size at `+24`, the `0xffff` id at `+18`, the list node). So nothing in the allocator reads a free
+block's inside. It is still **not safe from this thread**: decommitting must exclude the allocator, which can hand that block
+out and have its new owner write it between the check and the decommit (the bytes written would be lost: a zero page on
+the next touch), and a host thread cannot take the heap's `nn::os` mutex (section 10). A gate in the free path would be needed
+to do it on the game's thread under its own lock. Meanwhile section 11's take-out already moves those free blocks' pages
+(`Movie` 96 MB, `GameUIWorkHeap` 25 MB, cold) out of RAM; only their commit charge stays.
