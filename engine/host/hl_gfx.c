@@ -17,8 +17,8 @@
 
    The draw path's render-state function (guest 0x80077d60, called directly from 254 functions) is answered through an
    entry gate (HL_GATE below; nx2/hl_gates.py puts it in the lifted function at build time):
-     HL_GFX_STATE=0  off (the default): the translated function, as before
-     HL_GFX_STATE=1  the native function (hl::gfx::RenderState): it writes the block and calls the NVN procedures itself,
+     HL_GFX_STATE=0  off: the translated function, as before
+     HL_GFX_STATE=1  (the default) the native function (hl::gfx::RenderState): it writes the block and calls the NVN procedures itself,
                      through the table of NVN entry points below (the procedures the game's own globals hold, checked
                      once against them); a call that reaches the material's state callback is left to the translation
    With HL_GFX_CHECK=1 (or 2) the gate checks instead, call by call (hl/gfx/StateCheck.h): the native version runs into a
@@ -34,7 +34,7 @@
 
 #define HL_GFX_DEFAULT HL_GFX_SHELL   /* (validated in the three scenes, check and shots clean: gfx-record-job.md section 7) */
 #define HL_RECORD_PASS 0x806602e0ULL   /* (hl::bridge::kRecordPass: hl_gfx_on checks the two agree) */
-#define HL_GFX_STATE_DEFAULT 0
+#define HL_GFX_STATE_DEFAULT 1   /* (validated 2026-11-13 on both PCs: the exact check at 0 mismatches over 4.2 M NVN calls in three scenes, native runs clean) */
 #define HL_STATE_FN 0x80077d60ULL      /* (hl::bridge::kApplyRenderState: state_init checks the two agree) */
 
 typedef void (*HostFn)(Ctx *c, void *user);
