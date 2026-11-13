@@ -2,7 +2,8 @@
 //
 // Written from a reading of the guest's framework (docs/native-engine/main-loop.md): nothing here is game code. The
 // game's main thread ends in the framework's main loop (0x809667b0), which calls the framework's frame function (its
-// virtual function at +0xe0, 0x8348c680) forever. Answered here through an entry gate on the loop, the iteration and the
+// virtual function at +0xe0: the game's framework's 0x83b6ea90, a prepare and then the base framework's 0x8348c680)
+// forever. Answered here through an entry gate on the loop, the iteration and the
 // order of the frame's steps are the native loop's: each step of the frame function is one phase, run in the game's
 // order on the main thread; the game's own functions those steps call (the frame's tasks, the framework's four virtual
 // steps, its present, the SDK's tick and performance queries) are called as they are, on the main thread's own guest
@@ -22,7 +23,14 @@ namespace hl::bridge {
 
 /// Guest functions and data the frame's phases use (the supported build's; docs/native-engine/main-loop.md).
 inline constexpr GuestAddr kMainLoop = 0x809667b0;        ///< answered: run() (the framework's main loop; never returns)
-inline constexpr GuestAddr kFrameFunction = 0x8348c680;   ///< the framework's frame function, whose steps are the phases
+inline constexpr GuestAddr kGameFrameFunction = 0x83b6ea90;   ///< the game's framework's frame function: its prepare,
+                                                              ///< then the base frame function
+inline constexpr GuestAddr kFrameFunction = 0x8348c680;   ///< the base framework's frame function, whose steps are the phases
+inline constexpr GuestAddr kFrameQuery = 0x83c62b60;      ///< the prepare's two SDK queries on the +0x1a8 handle
+inline constexpr GuestAddr kFrameQuery2 = 0x83c62b70;
+inline constexpr GuestAddr kFrameRateTail = 0x83be0230;   ///< called by the prepare on the framework's +0x2f8
+inline constexpr GuestAddr kFrameRatio = 0x84d61fc8;      ///< a float the prepare sets to 60 over the nominal rate
+inline constexpr uint32_t kPrepareSlot = 0x128;           ///< the prepare's virtual step
 inline constexpr GuestAddr kModuleFrame = 0x80706be0;     ///< the module system's frame (observed by the check)
 inline constexpr GuestAddr kFrameTasks = 0x802eaf10;      ///< the frame's tasks (the framework's +0x38)
 inline constexpr GuestAddr kSystemTick = 0x83c61fd0;      ///< the system tick
@@ -55,9 +63,11 @@ struct Framework {
     int64_t before_present;   ///< +0x148: ticks from the frame's beginning to its present
     uint8_t _150[0x58];
     GuestAddr perf_handle;    ///< +0x1a8: the handle the two SDK queries are asked on
-    uint8_t _1b0[0x80];
-    uint8_t no_static;        ///< +0x230 (bit 0)
-    uint8_t _231[2];
+    uint8_t _1b0[0x7c];
+    uint32_t query_rate;      ///< +0x22c: written by the prepare's first query; 60 when it answers not 0
+    uint8_t no_static;        ///< +0x230 (bit 0); also written by the prepare's first query, 0 when it answers not 0
+    uint8_t _231;
+    uint8_t query_flag;       ///< +0x232: written by the prepare's second query, 0 when it answers not 0
     uint8_t perf_out;         ///< +0x233: written by the first query (0 when the queries are off)
     uint8_t perf_on;          ///< +0x234: 1: the queries are asked each frame
     uint8_t _235;
@@ -70,7 +80,15 @@ struct Framework {
     uint8_t _244[0xa];
     uint8_t mode_request;     ///< +0x24e
     uint8_t mode;             ///< +0x24f (bits 0 and 1)
+    uint8_t _250[0x78];
+    int32_t nominal_rate;     ///< +0x2c8: the nominal frame rate (the OS layer's real-time step writes the reached one)
+    uint8_t _2cc[0x2c];
+    uint8_t rate_object[8];   ///< +0x2f8: what the prepare's last call is given
 };
+static_assert(offsetof(Framework, query_rate) == 0x22c);
+static_assert(offsetof(Framework, query_flag) == 0x232);
+static_assert(offsetof(Framework, nominal_rate) == 0x2c8);
+static_assert(offsetof(Framework, rate_object) == 0x2f8);
 static_assert(offsetof(Framework, tasks) == 0x38);
 static_assert(offsetof(Framework, wait_mode) == 0x50);
 static_assert(offsetof(Framework, budget_flag) == 0xaa);
@@ -109,14 +127,14 @@ public:
     /// The framework's virtual steps, in the frame function's order (between the frame's tasks and its present).
     static constexpr uint32_t kSteps[4] = {0xf0, 0x70, 0x120, 0xe8};
     static constexpr uint32_t kPresentSlot = 0x110;
-    static constexpr int kPhases = 8;   ///< begin, tasks, the four steps, present, end
+    static constexpr int kPhases = 9;   ///< prepare, begin, tasks, the four steps, present, end
     // Counters. With `check`, the invariants (each should stay 0):
     //   out_of_order: a phase run out of the game's order, or not exactly once in a frame
     //   calc_twice: a frame in which the module system's frame ran more than once
     //   counter_bad: the module frame's counter not counted up by exactly one by its run
     // and observations: calc_skipped (frames whose steps did not reach the module system's frame), targets_changed (frames whose virtual steps resolved to other functions than the first frame's),
-    // function_changed (frames in which the framework's frame function, its +0xe0, was not 0x8348c680: the native loop
-    // then runs that function whole, as the game's loop would).
+    // function_changed (frames in which the framework's frame function, its +0xe0, was neither 0x83b6ea90 nor
+    // 0x8348c680: the native loop then runs that function whole, as the game's loop would).
     struct Stats {
         std::atomic<uint64_t> frames{0}, whole_frames{0}, phase_runs{0}, out_of_order{0};
         std::atomic<uint64_t> calcs{0}, calc_skipped{0}, calc_twice{0}, counter_bad{0}, targets_changed{0};
@@ -148,6 +166,7 @@ private:
     uint64_t slot(uint32_t offset) const;
     void note(int phase);
 
+    void prepare();
     void begin();
     void tasks();
     void step(int i);
@@ -166,7 +185,8 @@ private:
     int next_phase_ = 0;
     GuestAddr targets_[5] = {};
     bool targets_known_ = false;
-    bool whole_ = false;   // this frame: the frame function is another one, run whole
+    enum class Kind { Game, Base, Whole } kind_ = Kind::Game;   // this frame's frame function: 0x83b6ea90, 0x8348c680,
+                                                                // another one (run whole)
     int64_t last_log_ns_ = 0;
     int calcs_this_frame_ = 0;
     int32_t calc_counter_ = 0;

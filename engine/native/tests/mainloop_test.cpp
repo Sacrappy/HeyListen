@@ -26,13 +26,13 @@ constexpr GuestAddr kBase = 0x10000000, kSize = 1u << 20;
 constexpr GuestAddr kFw = kBase + 0x1000, kVt = kBase + 0x2000, kGlobal = kBase + 0x3000, kHandle = kBase + 0x3100,
                     kScratch = kBase + 0x3200, kTasks = kBase + 0x3300, kModule = kBase + 0x4000;
 constexpr GuestAddr kStepFn[4] = {0x70001000, 0x70001100, 0x70001200, 0x70001300};
-constexpr GuestAddr kPresentFn = 0x70001400, kOtherFrame = 0x70001500;
+constexpr GuestAddr kPresentFn = 0x70001400, kOtherFrame = 0x70001500, kPrepareFn = 0x70001600;
 // (pages of the guest's globals the frame function reads)
-constexpr GuestAddr kPageA = 0x84cb4000, kPageB = 0x84e41000;
+constexpr GuestAddr kPageA = 0x84cb4000, kPageB = 0x84e41000, kPageC = 0x84d61000;
 
 struct Model final : bridge::GuestRuntime {
     std::vector<uint8_t> memory = std::vector<uint8_t>(kSize), page_a = std::vector<uint8_t>(0x1000),
-                         page_b = std::vector<uint8_t>(0x1000);
+                         page_b = std::vector<uint8_t>(0x1000), page_c = std::vector<uint8_t>(0x1000);
     std::vector<std::string> calls;
     uint64_t tick = 1000;
     std::mt19937 rng{5};
@@ -42,6 +42,7 @@ struct Model final : bridge::GuestRuntime {
     void* ptr(GuestAddr at) const override {
         if (at >= kPageA && at < kPageA + 0x1000) return const_cast<uint8_t*>(page_a.data()) + (at - kPageA);
         if (at >= kPageB && at < kPageB + 0x1000) return const_cast<uint8_t*>(page_b.data()) + (at - kPageB);
+        if (at >= kPageC && at < kPageC + 0x1000) return const_cast<uint8_t*>(page_c.data()) + (at - kPageC);
         CHECK(at >= kBase && at < kBase + kSize);
         return const_cast<uint8_t*>(memory.data()) + (at - kBase);
     }
@@ -83,6 +84,20 @@ struct Model final : bridge::GuestRuntime {
         case bridge::kGuardRelease: *at<uint8_t>(a[0]) = 1; note("release"); return 0;
         case bridge::kStaticMake: note("make"); return 0x5151;
         case kPresentFn: CHECK(a[0] == kFw); note("present"); return 0;
+        case bridge::kFrameQuery: {
+            CHECK(a[0] == kFw + 0x22c && a[1] == kFw + 0x230 && a[2] == kHandle);
+            *at<uint32_t>(a[0]) = 30 + rng() % 40;
+            *at<uint8_t>(a[1]) = (uint8_t)(rng() % 2);
+            note("query");
+            return rng() % 3 == 0;
+        }
+        case bridge::kFrameQuery2:
+            CHECK(a[0] == kFw + 0x232 && a[1] == kHandle);
+            *at<uint8_t>(a[0]) = (uint8_t)(1 + rng() % 2);
+            note("query2");
+            return rng() % 2;
+        case kPrepareFn: CHECK(a[0] == kFw); note("prepare"); return 0;
+        case bridge::kFrameRateTail: CHECK(a[0] == kFw + 0x2f8); note("rate"); return 0;
         case kOtherFrame: CHECK(a[0] == kFw); note("other frame"); return 0;
         default:
             for (int i = 0; i < 4; i++)
@@ -111,7 +126,8 @@ struct Model final : bridge::GuestRuntime {
         f->budget_ticks = 30;
         f->perf_scale = 1.75f;
         f->frame_begin = 900;
-        *at<GuestAddr>(kVt + bridge::kFrameSlot) = bridge::kFrameFunction;
+        *at<GuestAddr>(kVt + bridge::kFrameSlot) = bridge::kGameFrameFunction;
+        *at<GuestAddr>(kVt + bridge::kPrepareSlot) = kPrepareFn;
         for (int i = 0; i < 4; i++) *at<GuestAddr>(kVt + bridge::FrameLoop::kSteps[i]) = kStepFn[i];
         *at<GuestAddr>(kVt + bridge::FrameLoop::kPresentSlot) = kPresentFn;
         *at<GuestAddr>(bridge::kFrameGlobal) = kGlobal;
@@ -121,6 +137,20 @@ struct Model final : bridge::GuestRuntime {
     // The frame function as main-loop.md reads it ("One iteration").
     void reference_frame() {
         g::Framework* f = at<g::Framework>(kFw);
+        if (vslot(bridge::kFrameSlot) == bridge::kGameFrameFunction) {   // (the game's framework's prepare)
+            const uint64_t q[4] = {kFw + 0x22c, kFw + 0x230, f->perf_handle, 0};
+            if ((uint32_t)guest(bridge::kFrameQuery, q)) {
+                f->no_static = 0;
+                f->query_rate = 60;
+            }
+            const uint64_t q2[4] = {kFw + 0x232, f->perf_handle, 0, 0};
+            if ((uint32_t)guest(bridge::kFrameQuery2, q2)) f->query_flag = 0;
+            const uint64_t a[4] = {kFw, 0, 0, 0};
+            guest(vslot(bridge::kPrepareSlot), a);
+            *at<float>(bridge::kFrameRatio) = 60.0f / (float)f->nominal_rate;
+            const uint64_t r[4] = {kFw + 0x2f8, 0, 0, 0};
+            guest(bridge::kFrameRateTail, r);
+        }
         const GuestAddr holder = *at<GuestAddr>(bridge::kFrameGlobal);
         if ((f->mode & 3) != 1 && f->wait_mode == 1) f->wait_mode = 2;
         const GuestAddr global = *at<GuestAddr>(holder);
@@ -196,6 +226,8 @@ void stir(Model& m, std::mt19937& rng) {
     f->budget_flag = (uint8_t)(rng() % 2);
     f->no_static = (uint8_t)(rng() % 4 == 0);
     f->budget_ticks = (int64_t)(rng() % 60);
+    f->nominal_rate = (int32_t)(rng() % 140);   // (0 too: the ratio is then infinite on both sides)
+    *m.at<GuestAddr>(kVt + bridge::kFrameSlot) = rng() % 8 == 0 ? bridge::kFrameFunction : bridge::kGameFrameFunction;
     *m.at<GuestAddr>(kGlobal) = rng() % 5 == 0 ? 0 : 0x4444;
     if (rng() % 6 == 0) *m.at<uint8_t>(bridge::kFrameStaticGuard) = 0;
 }
@@ -226,7 +258,8 @@ void frames_match_the_frame_function() {
                              i < ref.calls.size() ? ref.calls[i].c_str() : "");
         }
         CHECK(native.calls == ref.calls);
-        CHECK(native.memory == ref.memory && native.page_a == ref.page_a && native.page_b == ref.page_b);
+        CHECK(native.memory == ref.memory && native.page_a == ref.page_a && native.page_b == ref.page_b &&
+              native.page_c == ref.page_c);
     }
     const bridge::FrameLoop::Stats& s = loop.stats();
     CHECK(s.frames == 400 && s.phase_runs == 400 * bridge::FrameLoop::kPhases && s.out_of_order == 0);

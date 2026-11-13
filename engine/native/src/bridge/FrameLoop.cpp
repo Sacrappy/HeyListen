@@ -36,6 +36,7 @@ FrameLoop::FrameLoop(GuestRuntime& runtime, jobs::JobSystem& jobs, GuestAddr scr
     : runtime_(runtime), loop_(jobs, {.target_hz = 0, .longest_step = 1.0}), scratch_(scratch), options_(options) {
     // (the native loop keeps no time of its own for the game: no frame rate cap, its step unused; the game's step and
     // the OS layer's pacing are inside the phases)
+    loop_.add_phase({"prepare", [](void* u, const app::FrameTime&, jobs::JobSystem&) { static_cast<FrameLoop*>(u)->prepare(); }, this});
     loop_.add_phase({"begin", [](void* u, const app::FrameTime&, jobs::JobSystem&) { static_cast<FrameLoop*>(u)->begin(); }, this});
     loop_.add_phase({"tasks", [](void* u, const app::FrameTime&, jobs::JobSystem&) { static_cast<FrameLoop*>(u)->tasks(); }, this});
     for (int i = 0; i < 4; i++) {
@@ -79,17 +80,39 @@ void FrameLoop::note(int phase) {
     next_phase_ = phase + 1;
 }
 
-// (0x8348c694) The mode word, the global read for the end, and the SDK's two performance queries when they are on.
-void FrameLoop::begin() {
+// (0x83b6ea90) Which frame function the framework has now (the game's loop reads it every iteration), and the game's
+// framework's prepare: two SDK queries on the +0x1a8 handle (their answers reset +0x230 and +0x22c, or +0x232), its
+// virtual step +0x128, the float of 60 over the nominal rate, and 0x83be0230 on +0x2f8. Then the base frame function.
+void FrameLoop::prepare() {
     note(0);
-    guest::Framework* f = at<guest::Framework>(fw_);
-    whole_ = slot(kFrameSlot) != kFrameFunction;
-    if (whole_) {   // (another frame function: the game's loop calls it; so does this one, whole)
+    const GuestAddr fn = slot(kFrameSlot);
+    kind_ = fn == kGameFrameFunction ? Kind::Game : fn == kFrameFunction ? Kind::Base : Kind::Whole;
+    if (kind_ == Kind::Whole) {   // (another frame function: the game's loop calls it; so does this one, whole)
         stats_.function_changed.fetch_add(1, std::memory_order_relaxed);
         stats_.whole_frames.fetch_add(1, std::memory_order_relaxed);
-        call(slot(kFrameSlot), fw_);
+        call(fn, fw_);
         return;
     }
+    if (kind_ != Kind::Game) return;
+    guest::Framework* f = at<guest::Framework>(fw_);
+    const uint64_t q[3] = {fw_ + offsetof(guest::Framework, query_rate), fw_ + offsetof(guest::Framework, no_static),
+                           ld(&f->perf_handle)};
+    if ((uint32_t)runtime_.call_with(as_, kFrameQuery, q, 3, nullptr, 0)) {
+        st(&f->no_static, (uint8_t)0);
+        st(&f->query_rate, 60u);
+    }
+    if ((uint32_t)call(kFrameQuery2, fw_ + offsetof(guest::Framework, query_flag), ld(&f->perf_handle)))
+        st(&f->query_flag, (uint8_t)0);
+    call(slot(kPrepareSlot), fw_);
+    st(at<float>(kFrameRatio), 60.0f / (float)ld(&f->nominal_rate));
+    call(kFrameRateTail, fw_ + offsetof(guest::Framework, rate_object));
+}
+
+// (0x8348c694) The mode word, the global read for the end, and the SDK's two performance queries when they are on.
+void FrameLoop::begin() {
+    note(1);
+    if (kind_ == Kind::Whole) return;
+    guest::Framework* f = at<guest::Framework>(fw_);
     const GuestAddr holder = ld(at<GuestAddr>(kFrameGlobal));
     if ((ld(&f->mode) & 3) != 1 && ld(&f->wait_mode) == 1) st(&f->wait_mode, 2u);
     global_ = ld(at<GuestAddr>(holder));
@@ -111,15 +134,15 @@ void FrameLoop::begin() {
 
 // (0x8348c724) The frame's tasks.
 void FrameLoop::tasks() {
-    note(1);
-    if (whole_) return;
+    note(2);
+    if (kind_ == Kind::Whole) return;
     call(kFrameTasks, ld(&at<guest::Framework>(fw_)->tasks));
 }
 
 // (0x8348c72c to 0x8348c768) The framework's four virtual steps, each read from its table at its call.
 void FrameLoop::step(int i) {
-    note(2 + i);
-    if (whole_) return;
+    note(3 + i);
+    if (kind_ == Kind::Whole) return;
     const GuestAddr fn = slot(kSteps[i]);
     if (options_.check) {
         if (targets_known_ && targets_[i] != fn) stats_.targets_changed.fetch_add(1, std::memory_order_relaxed);
@@ -130,8 +153,8 @@ void FrameLoop::step(int i) {
 
 // (0x8348c76c) The ticks from the frame's beginning, then the present (the OS layer paces it).
 void FrameLoop::present() {
-    note(6);
-    if (whole_) return;
+    note(7);
+    if (kind_ == Kind::Whole) return;
     guest::Framework* f = at<guest::Framework>(fw_);
     const int64_t t = (int64_t)call(kSystemTick);
     st(&f->before_present, t - ld(&f->frame_begin));
@@ -156,7 +179,7 @@ void FrameLoop::make_static() {
 // (0x8348c78c) The frame's length and the next frame's beginning, unless the mode bits are both set; then the mode's
 // request (0x8348c7f8).
 void FrameLoop::end() {
-    note(7);
+    note(8);
     if (options_.check) {
         if (next_phase_ != kPhases) stats_.out_of_order.fetch_add(1, std::memory_order_relaxed);
         next_phase_ = 0;
@@ -173,7 +196,7 @@ void FrameLoop::end() {
             if (report(line, sizeof line)) runtime_.log(line);
         }
     }
-    if (whole_) return;
+    if (kind_ == Kind::Whole) return;
     guest::Framework* f = at<guest::Framework>(fw_);
     const int64_t t2 = (int64_t)call(kSystemTick);
     if ((ld(&f->mode) & 3) != 3) {

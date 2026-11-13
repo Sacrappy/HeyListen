@@ -10,14 +10,20 @@ guest addresses; offsets are in bytes. Nothing here is game code: what each func
 The main thread (`sead::MainThread`) runs, outermost first: the game's main `0x81222ce0` (reached from the entry through
 `0x81222cd0`), which makes the framework object and calls its run function `0x80f48c30`; that one prepares the framework
 through its virtual functions and ends in the framework's **main loop** `0x809667b0`. The main loop is two instructions
-long: it calls the framework's virtual function at `+0xe0`, the **frame function** (`0x8348c680` for the game's framework
-class, read from the object's virtual table at every iteration), and goes round. It holds no state and has **no way
-out**: the game ends by the process ending around it (the OS layer's exit), never by leaving the loop.
+long: it calls the framework's virtual function at `+0xe0`, the **frame function** (read from the object's virtual table
+at every iteration), and goes round. It holds no state and has **no way out**: the game ends by the process ending
+around it (the OS layer's exit), never by leaving the loop. The game's framework's frame function is `0x83b6ea90`: a
+prepare, then the base framework's frame function `0x8348c680` (a tail call: the sampled stacks show the loop calling
+`0x8348c680` directly).
 
-## One iteration: the frame function `0x8348c680`
+## One iteration: the frame function `0x83b6ea90`, then `0x8348c680`
 
 On the framework object F, in this order:
 
+0. **Prepare** (`0x83b6ea90`). An SDK query on F's handle `+0x1a8` writes F's `+0x22c` and `+0x230`; when it answers
+   not 0, `+0x230` becomes 0 and `+0x22c` 60. A second query writes F's `+0x232`; when it answers not 0, `+0x232` becomes
+   0. F's virtual function at `+0x128`. A float at `0x84d61fc8` becomes 60 over F's nominal frame rate `+0x2c8`.
+   `0x83be0230` on F's `+0x2f8`. Then the base frame function:
 1. **Begin** (`0x8348c694`). A global's address is read from `0x84cb4840`. When F's mode bits (`+0x24f`, bits 0-1) are
    not 1 and F's word `+0x50` is 1, that word becomes 2. The global itself is read (kept for the end). When F's `+0x234`
    is 1, two SDK queries are asked on F's handle `+0x1a8`: the first writes F's `+0x233`, a word of its own and F's
@@ -78,13 +84,13 @@ The loop function is cleanly cut: it holds nothing, and the frame function's ste
 between them. The smallest honest cut in which the native loop owns the order and the iteration:
 
 - an entry gate on the main loop `0x809667b0` hands the main thread to `hl::app::MainLoop` (through
-  `hl::bridge::FrameLoop`), whose phase list is data: **begin, tasks, the four virtual steps, present, end**, the steps
+  `hl::bridge::FrameLoop`), whose phase list is data: **prepare, begin, tasks, the four virtual steps, present, end**, the steps
   of the frame function above, each calling the game's own functions on the main thread's guest context, the words
   between them written in place with the guest's values in the guest's order;
 - the frame's time step stays the game's (inside the calc step) and the pacing the OS layer's (inside the present step);
   the native loop keeps no time of its own for the game (no cap, its own step unused);
-- when F's frame function is not `0x8348c680` (another framework class), the loop calls it whole, as the game's loop
-  would, and counts it.
+- when F's frame function is `0x8348c680` itself the prepare is left out; when it is neither (another framework class),
+  the loop calls it whole, as the game's loop would, and counts it.
 
 What this gives later: a native subsystem can be given its place in the frame as a phase of the native loop, between two
 of the game's steps, without a translated caller.
