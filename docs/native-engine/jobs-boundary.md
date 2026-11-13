@@ -72,6 +72,24 @@ id.
 4. **Sleeping contexts are woken from the scheduler's list.** A context that is not in the list is never woken.
 5. **A job may wait for its own children** (the player's update does): the waiting thread keeps running jobs.
 
+## What is switched on today
+
+`HL_JOBS` (`engine/host/hl_bridge.c`; only for the build these addresses are of):
+
+- `0`: the game's own threads, untouched.
+- `1`, through: the worker message function `0x8004aae0` is answered natively. The stage's work for that worker (the
+  dispatcher called on the worker's dispatch context) is submitted to the native job system as one guest job under the
+  lane of the worker's core, and the worker's own thread runs it while it waits for it.
+- `2`, pool: the same job is run by a thread of the native pool. That thread goes on as the worker's guest thread, on the
+  worker's own guest context (its registers, its stack from where it stands, its thread-local values, its thread id and
+  core), while the worker's host thread stands still in the wait. Nothing is copied: rule 1 and rule 2 hold because the
+  lane is held by one host thread at a time.
+
+Checked in the game (castle scene): in pool mode every stage of every job thread ran on a pool worker, hundreds of
+thousands of them, with the picture and the game running. What is still the game's own: the dispatcher picks the jobs of
+a stage from the scheduler's queues, the stages are begun, registered and waited for by the game's functions, and the
+module system's job group and the main loop do not go through the native side.
+
 ## What the native job system does with them
 
 - The six identities become six **lanes**. A native worker takes a free lane to run a gameplay job: the bridge binds the

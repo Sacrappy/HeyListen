@@ -49,6 +49,18 @@ inline constexpr uint32_t kExternalWorker = 0xFFFFFFFFu;
 
 using JobFn = void (*)(void* arg, const JobContext& ctx);
 
+/// What a waiting thread does meanwhile: nothing, only the job it waits for (when no other thread has it yet), or any
+/// ready job.
+enum class Help : uint8_t { None, Awaited, Any };
+
+/// Who makes the pool's threads, when it is not the standard library: the layer that runs guest code gives its threads
+/// the host stack that code needs. start() returns a handle for join().
+struct ThreadHost {
+    virtual ~ThreadHost() = default;
+    virtual void* start(void (*entry)(void*), void* arg, unsigned index) = 0;
+    virtual void join(void* handle) = 0;
+};
+
 struct JobDesc {
     JobFn fn = nullptr;
     void* arg = nullptr;
@@ -64,10 +76,13 @@ public:
         unsigned workers = 0;            ///< 0: the hardware's threads but one, at least one
         unsigned capacity = 1u << 14;    ///< jobs alive at once
         GuestLaneHost* lane_host = nullptr;   ///< told when a lane is taken and given back (the bridge); may be null
+        ThreadHost* thread_host = nullptr;    ///< makes the workers' threads; null: std::thread
+        bool guest_on_workers = true;         ///< false: guest jobs run only on threads that wait for them
     };
     struct Stats {
         uint64_t native_jobs = 0, guest_jobs = 0;   ///< run so far
-        uint64_t helped = 0;                        ///< of them, run by a thread that was waiting for another job
+        uint64_t helped = 0;                        ///< of them, run by a thread that was waiting for a job
+        uint64_t guest_on_workers = 0;              ///< guest jobs run by a worker of the pool
         unsigned most_lanes_at_once = 0;
     };
 
@@ -79,15 +94,15 @@ public:
     /// Queues a job once every job of `after` is done. Blocks (running other jobs) while no slot is free.
     JobHandle submit(const JobDesc& desc, std::span<const JobHandle> after = {});
     /// Returns when the job is done; the calling thread runs other jobs meanwhile.
-    void wait(JobHandle job);
-    void wait_all(std::span<const JobHandle> jobs);
+    void wait(JobHandle job, Help help = Help::Any);
+    void wait_all(std::span<const JobHandle> jobs, Help help = Help::Any);
     bool done(JobHandle job) const;
 
     /// f(begin, end) over [0, count) in pieces of at most `grain`, as native jobs; returns when all are done.
     template <class F>
     void parallel_for(size_t count, size_t grain, F&& f);
 
-    unsigned worker_count() const { return (unsigned)workers_.size(); }
+    unsigned worker_count() const { return worker_count_; }
     Stats stats() const;
 
 private:
@@ -105,12 +120,19 @@ private:
         bool found = false;
     };
 
+    struct WorkerStart {
+        JobSystem* self;
+        uint32_t worker;
+    };
+    static void worker_entry(void* start);
     void worker_main(uint32_t worker);
-    Pick take_locked(int held_lane);
+    Pick take_locked(int held_lane, bool guest_too);
+    Pick take_job_locked(uint32_t index, int held_lane);
+    bool lane_for_locked(uint32_t index, int held_lane, Pick& pick);
     void run(const Pick& pick, uint32_t worker, bool helping);
     void finish_locked(const Pick& pick);
     bool alive_locked(JobHandle job) const;
-    void help_until(std::unique_lock<std::mutex>& lock, JobHandle job);
+    void help_until(std::unique_lock<std::mutex>& lock, JobHandle job, Help help);
 
     Config config_;
     mutable std::mutex mu_;
@@ -120,6 +142,15 @@ private:
     std::deque<uint32_t> ready_[2][kPriorities];   // [class][priority]
     GuestLanes lanes_;
     std::vector<std::thread> workers_;
+    std::vector<void*> hosted_;   // (the thread host's handles, when it makes the threads)
+    std::vector<WorkerStart> starts_;
+    unsigned worker_count_ = 0;
+    // (who sleeps where, so that nobody is woken for nothing: a wake-up is a system call, and a thread woken to find no
+    // work costs a second one)
+    unsigned idle_workers_ = 0;   // workers asleep on work_cv_
+    unsigned waiters_ = 0;        // threads asleep on done_cv_
+    void wake_for_locked(JobClass cls);
+    void wait_done(std::unique_lock<std::mutex>& lock);
     bool stop_ = false;
     Stats stats_;
 };

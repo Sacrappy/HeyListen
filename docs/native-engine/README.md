@@ -61,7 +61,9 @@ There is no ABI between them: one statically linked C++ program, engine code inl
 of crossing exist, and a native module has to honour all three for the subsystem it takes over.
 
 1. **Calls** into engine functions that were not inlined. These can be answered natively at their address, the way the OS
-   layer answers the SDK (a list of addresses given to the tool; the translation itself is not touched).
+   layer answers the SDK (a list of addresses given to the tool; the translation itself is not touched). A function that
+   is reached only through a pointer (a job's body, a callback, a virtual function) needs no new lift at all: the
+   runtime's lookup asks the OS layer first (`a64_lookup_replaced`, `engine/host/hl_bridge.c`).
 2. **Calls back** from the engine into gameplay: job bodies, actors' virtual functions. The native module calls the
    translated function on a guest context.
 3. **Structures read in place** by inlined engine code. No call to answer: the native module must keep those bytes as the
@@ -71,8 +73,8 @@ of crossing exist, and a native module has to honour all three for the subsystem
 | Boundary | Status | Known crossings |
 |---|---|---|
 | OS and GPU services | **native today** | SDK entry points; NVN procedures |
-| Jobs, threads, main loop | **mapped** (`jobs-boundary.md`) | 18 entry points; worker set, worker, context and scheduler layouts; the identity table read in place at 217+ sites; per-core tables read by 193 functions |
-| Memory | partly seen | heaps reached through a virtual interface (allocation at slot 6 of a heap's table), a global allocation function; the heap classes, free and resize, and heap creation are to map |
+| Jobs, threads, main loop | **mapped** (`jobs-boundary.md`); **the stages' work runs through the native job system** (switch `HL_JOBS`) | 18 entry points, 1 answered natively; worker set, worker, context and scheduler layouts; the identity table read in place at 217+ sites; per-core tables read by 193 functions |
+| Memory | **mapped** (`memory-boundary.md`) | the global allocation functions and their call counts, the heap object and its virtual interface, thirteen heap classes, who makes which heap, the GPU pools; the resource manager's request functions are not found yet |
 | Resources | to map | below: file calls (native). Above: the resource manager's requests |
 | Graphics | to map above NVN | below: NVN (native). Above: what gameplay hands the scene (per-actor render information) |
 | Physics, navigation | to map | Havok middleware underneath: the largest block |
@@ -113,8 +115,8 @@ engine/native/
 
 | Step | Module | Switch means | State |
 |---|---|---|---|
-| 1 | Jobs and main loop | the 18 entry points answered natively, gameplay jobs run under lanes | native side written and tested without the game; bridge not on |
-| 2 | Memory | heap entry points answered by a native allocator that owns the guest address space | boundary to map |
+| 1 | Jobs and main loop | the 18 entry points answered natively, gameplay jobs run under lanes | **on in the game behind `HL_JOBS`**: each stage's work of a job thread is a job of the native job system, run by that thread (1) or by a native pool worker going on as that guest thread (2). 1 entry point of 18 answered; the dispatcher, the stages' begin and wait, the job group and the main loop are still the game's |
+| 2 | Memory | heap entry points answered by a native allocator that owns the guest address space | boundary mapped (`memory-boundary.md`); nothing native yet |
 | 3 | Resources and streaming | requests served by native loaders | boundary to map |
 | 4 | Render submission | the graphics module's passes produced natively | boundary to map |
 | 5 | Audio | voices and mixing native | boundary to map |
@@ -122,6 +124,20 @@ engine/native/
 
 Each switch is checked against the translated subsystem it replaces (same inputs, same results, picture and game speed),
 with a switch to go back, before it becomes the default.
+
+## Where the frame's time is (measured 2026-11-13, `hot-functions.md`)
+
+Three sampled runs of the castle scene, every sample resolved to its translated function:
+
+- **Not in a few functions.** Of the job threads' guest time (35.8 ms of CPU a frame over the six executors and the
+  five module workers), 73-75 functions make 50%, 380-395 make 80%, 763-832 make 90%; the largest one is 3.4%. On the
+  chain the main thread waits for, 42 functions make 50% and 162 make 80%. A hundred native kernels do not make the frame.
+- **In a few jobs.** By job (what the dispatcher calls), 6 jobs make half of the critical chain and 17 make 80%: the
+  player's job, the module job that records graphics commands, two numeric families not identified yet, the model chain.
+  The parallel bulk (models, animation: 2.4 ms of CPU) is hardly on the chain (0.08 ms).
+- Self-contained numeric kernels in the top 100: 25 functions, 15% of the job threads' guest time, 13% of the chain.
+
+So the unit to replace is a job with what it calls, starting with those on the chain, not a list of hot functions.
 
 ## What is not known yet, said plainly
 

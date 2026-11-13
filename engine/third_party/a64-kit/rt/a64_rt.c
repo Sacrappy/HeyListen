@@ -32,6 +32,10 @@ static uint64_t lookup_cache[1 << 18];
    straight to the handler. Before, every NVN call (tens of thousands a frame, on the game's recording threads) went
    site_call -> a64_lookup -> a64_call_miss -> its handler. */
 A64_WEAK A64Fn a64_lookup_host(uint64_t addr) { (void)addr; return NULL; }
+/* (HeyListen native engine) Guest functions a native module answers at their address (host/hl_bridge.c): asked once an
+   address, before the lifted table, and remembered like any other target. For functions reached by indirect calls (job
+   bodies, callbacks, virtual functions); a function called directly is answered through the lift's hook list. */
+A64_WEAK A64Fn a64_lookup_replaced(uint64_t addr) { (void)addr; return NULL; }
 
 A64Fn a64_lookup(uint64_t addr) {
     if (addr >> 32 || !addr) return NULL;
@@ -40,6 +44,13 @@ A64Fn a64_lookup(uint64_t addr) {
     const uint64_t e = __atomic_load_n(slot, __ATOMIC_RELAXED);
     const intptr_t anchor = (intptr_t)&a64_lookup;
     if ((uint32_t)(e >> 32) == a) return (int32_t)(uint32_t)e == A64_NO_FN ? NULL : (A64Fn)(anchor + (int32_t)(uint32_t)e);
+    A64Fn replaced = a64_lookup_replaced(addr);
+    if (replaced) {
+        const intptr_t delta = (intptr_t)replaced - anchor;
+        if (delta == (int32_t)delta && (int32_t)delta != A64_NO_FN)
+            __atomic_store_n(slot, (uint64_t)a << 32 | (uint32_t)(int32_t)delta, __ATOMIC_RELAXED);
+        return replaced;
+    }
     while (lo < hi) {
         uint32_t mid = (lo + hi) >> 1;
         if (a64_fn_addr[mid] < a) lo = mid + 1;

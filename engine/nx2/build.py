@@ -149,6 +149,13 @@ def HOT_ORDER():
 HOST_LIBS = ["-lpthread", "-ldl", "-lm"] if LINUX else \
     ["-lwinhttp", "-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp"]
 GPU = os.path.join(kit.HERE, "..", "gpu")
+# (HeyListen) the native engine (engine/native, C++20: docs/native-engine): its own headers and the standard library only;
+# host/hl_bridge.c is the OS layer's side of it
+NATIVE = os.path.normpath(os.path.join(kit.HERE, "..", "native"))
+
+
+def native_sources():
+    return sorted(os.path.join(d, f) for d, _, fs in os.walk(os.path.join(NATIVE, "src")) for f in fs if f.endswith(".cpp"))
 # FFmpeg (libavcodec's VP8/VP9 decoders, swscale) for nn::codec's video decoders (host/nn_video.c): the static build
 # in the Eglantine clone's package cache
 FFMPEG = None   # (found in the CPM caches below, once cpm_dirs is defined)
@@ -793,9 +800,11 @@ def main():
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-I" + os.path.join(NATIVE, "include"),
+         "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
+    host_deps += open(os.path.join(NATIVE, "include", "hl", "c", "hl_bridge.h"), "rb").read()
     if LINUX:
         host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
         host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
@@ -806,6 +815,14 @@ def main():
               (["-I" + os.path.join(FFMPEG, "include")] if FFMPEG else []) +
               (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
               ([stamp_def] if os.path.basename(s) == "hos_main.c" else []), host_deps) for s in host_srcs]
+    # (HeyListen) the native engine, in the game's executable
+    if host_srcs:
+        ncxx = toolchain.need(toolchain.find("clang++"))
+        nflags = target() + CPU + ["-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wall", "-Wextra", "-I" + os.path.join(NATIVE, "include")]
+        ndeps = tree_headers(os.path.join(NATIVE, "include"))
+        for src in native_sources():
+            name = os.path.relpath(src, os.path.join(NATIVE, "src")).replace(os.sep, "_")[:-4]
+            jobs.append((ncxx, src, os.path.join(obj_dir, "native_" + name + ".o"), nflags, ndeps))
     # libopus 1.5.2 (third_party/opus, from TOTKPort): nn::codec's hardware Opus decoder (host/nn_codec.c)
     # (hookshot: built for the same CPU target as the rest (CPU), so its float code can be vectorized where the target has
     # AVX2: the vendored copy has no x86 intrinsics files of its own)
@@ -1017,7 +1034,7 @@ def main():
         r = subprocess.run([cc] + target() + ["-fuse-ld=lld", "-o", exe, "-Wl,-Map=" + exe + ".map", "-Wl,--gc-sections",
                                               "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
                            (["-fprofile-instr-generate"] if PGO == "gen" else []) +
-                           (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS,
+                           (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS + ["-lstdc++"],   # (engine/native's C++)
                            capture_output=True, text=True)
         undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:

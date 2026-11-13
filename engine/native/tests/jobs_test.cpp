@@ -1,9 +1,12 @@
 // HeyListen native engine: the job system, the lanes and the main loop, run with no game (tests/test_native_engine.py).
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include "hl/app/MainLoop.h"
@@ -194,16 +197,146 @@ void the_main_loop_runs_its_phases_in_order() {
     CHECK(log.steps > 0 && loop.stats().mean_ms >= 1.5);   // (capped at 500 Hz: no frame under 2 ms, with slack)
 }
 
-void the_bridge_names_each_entry_once_and_is_not_on() {
+void the_bridge_names_each_entry_once() {
     std::set<uint64_t> seen;
+    unsigned native = 0;
     for (const bridge::GuestEntry& e : bridge::job_entries()) {
         CHECK(e.address >= 0x80000000ull && e.address < 0x86000000ull && e.what && *e.what);
         CHECK(seen.insert(e.address).second);
+        native += e.native;
     }
     CHECK(seen.size() >= 15);
-    CHECK(!bridge::ready().ready && bridge::ready().missing && *bridge::ready().missing);
-    CHECK(bridge::layout::worker::context + bridge::layout::context::flags == 232);   // (a worker's "sent its message" word)
-    CHECK(bridge::layout::worker_set::own_context + bridge::layout::context::lane == bridge::layout::worker_set::owner_core);
+    const bridge::Readiness none = bridge::ready(nullptr);
+    CHECK(!none.ready && none.native == native && none.total == seen.size() && none.missing && *none.missing);
+}
+
+// A stand-in for the layer that runs guest code: a small guest memory, guest threads that are only names, and a record of
+// every guest call (who made it, as whom, on which host thread). It checks what the bridge promises that layer: a guest
+// thread never runs in two places at once.
+struct FakeGuest final : bridge::GuestRuntime, jobs::ThreadHost {
+    static constexpr uint64_t kBase = 0x10000000;
+    std::vector<uint8_t> memory = std::vector<uint8_t>(1 << 16);
+    struct Call { bridge::GuestThread as; uint64_t fn, a0, a1; std::thread::id host; };
+    std::mutex mu;
+    std::vector<Call> calls;
+    std::set<bridge::GuestThread> running;
+    std::atomic<bool> clash{false};
+    std::vector<std::thread> threads;
+    static inline thread_local bridge::GuestThread tls_current = nullptr;
+
+    void* ptr(bridge::GuestAddr at) const override { return const_cast<uint8_t*>(memory.data()) + (at - kBase); }
+    bridge::GuestThread current() const override { return tls_current; }
+    void call(bridge::GuestThread as, bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override {
+        const bridge::GuestThread before = tls_current;
+        if (as != before) {
+            std::lock_guard lock(mu);
+            if (!running.insert(as).second) clash = true;
+        }
+        tls_current = as;
+        if (fn == bridge::kDispatcher) std::this_thread::sleep_for(std::chrono::milliseconds(2));   // (a stage's work)
+        {
+            std::lock_guard lock(mu);
+            calls.push_back({as, fn, a0, a1, std::this_thread::get_id()});
+            if (as != before) running.erase(as);
+        }
+        tls_current = before;
+    }
+    void* start(void (*entry)(void*), void* arg, unsigned) override {
+        threads.emplace_back(entry, arg);
+        return &threads.back();
+    }
+    void join(void* handle) override { static_cast<std::thread*>(handle)->join(); }
+
+    bridge::guest::Worker* worker(int i) { return static_cast<bridge::guest::Worker*>(ptr(worker_at(i))); }
+    static uint64_t worker_at(int i) { return kBase + 0x1000 * (uint64_t)(i + 1); }
+};
+
+// Six workers get their stage message at once, each on its own thread, as in the game.
+void a_stage_through(bridge::Mode mode) {
+    FakeGuest guest;
+    guest.threads.reserve(16);
+    jobs::JobSystem js({.workers = 6, .thread_host = &guest, .guest_on_workers = mode == bridge::Mode::Pool});
+    bridge::JobBridge br(guest, js, mode);
+    constexpr uint64_t kScheduler = FakeGuest::kBase + 0x9000;
+    for (int i = 0; i < 6; i++) {
+        guest.worker(i)->core = (uint32_t)i;
+        guest.worker(i)->scheduler = kScheduler;
+    }
+    static int names[6];
+    std::vector<std::thread> workers;
+    std::thread::id ids[6];
+    for (int round = 0; round < 3; round++) {
+        workers.clear();
+        for (int i = 0; i < 6; i++)
+            workers.emplace_back([&, i] {
+                FakeGuest::tls_current = &names[i];
+                ids[i] = std::this_thread::get_id();
+                br.on_worker_message(FakeGuest::worker_at(i), 1);
+                br.on_worker_message(FakeGuest::worker_at(i), 2);   // (another message: nothing to run)
+            });
+        for (std::thread& t : workers) t.join();
+        CHECK(!guest.clash);
+        CHECK(guest.calls.size() == 12);
+        for (int i = 0; i < 6; i++) {
+            int dispatched = -1, signalled = -1;
+            for (size_t k = 0; k < guest.calls.size(); k++) {
+                const FakeGuest::Call& c = guest.calls[k];
+                if (c.as != &names[i]) continue;
+                if (c.fn == bridge::kDispatcher) {
+                    CHECK(dispatched < 0 && c.a0 == kScheduler);
+                    CHECK(c.a1 == FakeGuest::worker_at(i) + offsetof(bridge::guest::Worker, context));
+                    // (through: on the worker's own thread; pool: on a worker of the pool, never the worker's thread)
+                    CHECK(mode == bridge::Mode::Pool ? c.host != ids[i] : c.host == ids[i]);
+                    dispatched = (int)k;
+                } else {
+                    CHECK(signalled < 0 && c.fn == bridge::kEventSignal && c.host == ids[i]);
+                    CHECK(c.a0 == FakeGuest::worker_at(i) + offsetof(bridge::guest::Worker, done_event));
+                    signalled = (int)k;
+                }
+            }
+            CHECK(dispatched >= 0 && signalled > dispatched);   // (the end is signalled after the stage's work, not before)
+        }
+        guest.calls.clear();
+    }
+    const bridge::Readiness r = bridge::ready(&br);
+    CHECK(r.ready == (mode != bridge::Mode::Off) && r.native >= 1);
+    CHECK(br.stats().messages == 36);
+    CHECK(br.stats().stages == (mode == bridge::Mode::Off ? 0u : 18u));
+    CHECK(br.stats().moved == (mode == bridge::Mode::Pool ? 18u : 0u));
+    CHECK(js.stats().guest_on_workers == (mode == bridge::Mode::Pool ? 18u : 0u));
+    if (mode != bridge::Mode::Off) CHECK(js.stats().most_lanes_at_once >= 2);   // (the six stages overlap: 2 ms each)
+    // a worker with no scheduler set: no work, no signal
+    guest.worker(0)->scheduler = 0;
+    FakeGuest::tls_current = &names[0];
+    br.on_worker_message(FakeGuest::worker_at(0), 1);
+    FakeGuest::tls_current = nullptr;
+    CHECK(guest.calls.empty());
+}
+
+void a_waiting_thread_takes_only_what_it_was_told() {
+    jobs::JobSystem js({.workers = 1, .guest_on_workers = false});
+    // the pool's only worker is kept busy; a guest job and a native job wait
+    std::atomic<bool> release{false}, guest_ran{false}, native_ran{false};
+    jobs::JobDesc hold;
+    hold.fn = [](void* arg, const jobs::JobContext&) { while (!static_cast<std::atomic<bool>*>(arg)->load()) std::this_thread::yield(); };
+    hold.arg = &release;
+    const jobs::JobHandle held = js.submit(hold);
+    jobs::JobDesc g;
+    g.fn = [](void* arg, const jobs::JobContext& ctx) { CHECK(ctx.lane == 3 && ctx.worker == jobs::kExternalWorker); static_cast<std::atomic<bool>*>(arg)->store(true); };
+    g.arg = &guest_ran;
+    g.cls = jobs::JobClass::Guest;
+    g.lanes = 1u << 3;
+    const jobs::JobHandle gh = js.submit(g);
+    jobs::JobDesc n;
+    n.fn = [](void* arg, const jobs::JobContext&) { static_cast<std::atomic<bool>*>(arg)->store(true); };
+    n.arg = &native_ran;
+    const jobs::JobHandle nh = js.submit(n);
+    js.wait(gh, jobs::Help::Awaited);   // (runs the guest job itself: the pool does not take guest jobs)
+    CHECK(guest_ran && !native_ran);     // (and nothing else)
+    release = true;
+    js.wait(held);
+    js.wait(nh);
+    CHECK(native_ran && js.stats().guest_on_workers == 0);
 }
 
 }   // namespace
@@ -215,7 +348,11 @@ int main() {
     guest_jobs_keep_to_their_lanes();
     a_guest_job_waits_for_its_children_under_its_own_lane();
     the_main_loop_runs_its_phases_in_order();
-    the_bridge_names_each_entry_once_and_is_not_on();
-    std::puts("native engine: jobs, lanes, main loop, bridge table: ok");
+    the_bridge_names_each_entry_once();
+    a_waiting_thread_takes_only_what_it_was_told();
+    a_stage_through(bridge::Mode::Off);
+    a_stage_through(bridge::Mode::Through);
+    a_stage_through(bridge::Mode::Pool);
+    std::puts("native engine: jobs, lanes, main loop, job bridge: ok");
     return 0;
 }
