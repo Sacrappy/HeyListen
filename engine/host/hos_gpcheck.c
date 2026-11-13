@@ -28,6 +28,7 @@ typedef struct { uint8_t *at; uint8_t *bytes; uint64_t hash; } Saved;
 static Saved saved[SLOTS];
 static SRWLOCK saved_lock = SRWLOCK_INIT;
 static int64_t saved_now, saved_cap;
+static int64_t sweep_imported, last_sweep_imported = -1, sweep_granules, last_sweep_granules;   /* (check thread only) */
 static volatile LONG64 t_drops, t_restored, t_mismatch, t_missing, t_refused, t_refused_imported, t_waits;
 static uint8_t *volatile sealing;   /* (the granule being saved and dropped: a write to it waits) */
 
@@ -177,20 +178,28 @@ static DWORD WINAPI check_main(void *arg) {
                 for (uint64_t a = lo; a < hi && budget > 0 && looked < 8192; a += GRAN, looked++) {
                     cursor = a + GRAN;
                     if (saved_now + (int64_t)GRAN > saved_cap) { budget = 0; break; }
+                    sweep_granules++;
+                    if (hos_gp_is_imported(GP(a))) { sweep_imported++; continue; }   /* (the driver holds it: never dropped) */
                     if (hos_gp_is_dropped(GP(a))) continue;
                     if (take((uint8_t *)GP(a), query)) budget -= (int64_t)GRAN;
                 }
             }
-            if (looked < 8192 && budget > 0) cursor = 0;   /* (the end of the pools: again from the bottom) */
+            if (looked < 8192 && budget > 0) {   /* (the end of the pools: again from the bottom) */
+                cursor = 0;
+                last_sweep_imported = sweep_imported, last_sweep_granules = sweep_granules;
+                sweep_imported = sweep_granules = 0;
+            }
         }
         if (hos_now_ns() >= next_report) {
             char line[512];
             if (hos_gp_report(line, sizeof line)) hos_log("mem: guest pages: %s", line);
             if (test)
                 hos_log("mem: guest pages test: dropped %lld granules, restored %lld, saved now %lld MB; hash mismatches %lld, "
-                        "restores refused %lld, drops refused %lld (imported %lld), writers held during a drop %lld",
+                        "restores refused %lld, drops refused %lld (imported %lld), writers held during a drop %lld; the last whole "
+                        "sweep of the pools: %lld MB of granules, %lld MB of them imported (not droppable)",
                         (long long)t_drops, (long long)t_restored, (long long)(saved_now >> 20), (long long)t_mismatch,
-                        (long long)t_missing, (long long)t_refused, (long long)t_refused_imported, (long long)t_waits);
+                        (long long)t_missing, (long long)t_refused, (long long)t_refused_imported, (long long)t_waits,
+                        (long long)(last_sweep_granules >> 4), (long long)(last_sweep_imported >> 4));
             next_report = hos_now_ns() + 10000000000LL;
         }
     }

@@ -139,6 +139,10 @@ __declspec(dllexport) int hos_gp_dropped_in(const void *p, size_t n) {
     return span(p, n, &a, &b) && any_bit(bm_dropped, a, b);
 }
 void hos_gp_set_owner(hos_gp_on_touch cb) { gp_owner = cb; }
+int hos_gp_is_imported(const void *p) {
+    uint64_t a, b;
+    return span(p, 1, &a, &b) && bit(bm_imported, a);
+}
 void hos_gp_set_on_forget(hos_gp_on_forget cb) { gp_forget = cb; }
 
 int hos_gp_reserve(void *base, size_t size) {
@@ -437,6 +441,7 @@ int hos_gp_ready(void) { return 0; }
 int hos_gp_drop(void *p, size_t size) { (void)p, (void)size; return -1; }
 int hos_gp_restore(void *p, size_t size, hos_gp_fill fill, void *user) { (void)p, (void)size, (void)fill, (void)user; return -1; }
 void hos_gp_set_owner(hos_gp_on_touch cb) { (void)cb; }
+int hos_gp_is_imported(const void *p) { (void)p; return 0; }
 void hos_gp_set_on_forget(hos_gp_on_forget cb) { (void)cb; }
 int hos_gp_is_dropped(const void *p) { (void)p; return 0; }
 int hos_gp_reserve(void *base, size_t size) { (void)base, (void)size; return 0; }

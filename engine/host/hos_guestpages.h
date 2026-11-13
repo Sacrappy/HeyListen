@@ -90,6 +90,7 @@ void hos_gp_hold(int begin);
 void hos_gp_imported(void *p, size_t n);
 /* the back end gave that import back, and no other import holds [p, p + n) (RX_VK_NO_HOST_IMPORT): droppable again */
 void hos_gp_unimported(void *p, size_t n);
+int  hos_gp_is_imported(const void *p);   /* (a granule the back end imported: never dropped) */
 /* the counters, as one line (0 when off) */
 int  hos_gp_report(char *out, size_t cap);
 

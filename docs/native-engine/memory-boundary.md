@@ -1057,3 +1057,26 @@ and restored again; a write to a dropped page (restored, then written); a failed
 granules refused, an import restores dropped granules first; commit, `ReadFile` across views and private pieces, and a
 decommit over dropped, restored and cut granules; a 4 MB region holding dropped granules given up whole, used again,
 dropped whole and restored; 20 rounds of 2 MB dropped and touched by 4 threads.
+
+### A trap found in the game: commits fail while a drop splits the reservation
+
+The first self-test runs crashed in two of four runs (castle-move): a lazy commit of a page nothing had dropped failed with
+`ERROR_INVALID_ADDRESS`. A game-free test reproduced it: **while one thread splits the private allocation (releases a
+granule inside it to a placeholder), `VirtualAlloc(MEM_COMMIT)` of reserved pages elsewhere in the same allocation fails**:
+84,561 of 479,668 page commits on two threads during 65,536 splits. First touches of pages already committed are not
+affected (no fault in the same test), and nor are restores and re-drops of views (they do not split the big allocation).
+So a drop of a private granule takes a lock exclusive (`split_lock`), and every commit, decommit and reset of the window
+by the OS layer (`commit_on_touch`'s lazy commit, `hos_commit`, `FreeMemoryPages`, `UnmapPhysicalMemory`, the freed regions'
+discard, the no-access pools' zero-page decommit, the piecewise paths) and the back end's commit before an import hold it
+shared (`hos_gp_hold`, exported; nothing when off). Never held while the owner is asked (its restore may wait for a drop).
+The game-free test has the case (9).
+
+### The self-test in the game (`HOS_GUEST_PAGES_TEST=1`, `host/hos_gpcheck.c`)
+
+No policy: every 3 s a thread takes granules of pools with flags `0x024` / `0x064` made 20 s ago or more that the cold-pages
+thread has already taken out of the working set (none of their 16 pages resident, all committed), makes each read-only,
+copies its bytes and their hash to a host buffer, drops it, and gives the write access back only by the drop (a writer
+that faults meanwhile waits for the drop, then runs its write again over the dropped granule, which restores it). It is
+the owner: a touch restores the granule from its buffer, then the granule in guest memory is hashed against the saved hash.
+At most 256 MB saved (`HOS_GUEST_PAGES_TEST_MB`), 32 MB dropped a pass. A line every 10 s: drops, restores, mismatches,
+refusals, writers held, and how much of the pools' storage imports made undroppable in the last whole sweep.
