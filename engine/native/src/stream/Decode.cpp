@@ -14,6 +14,7 @@ const char* reason_name(Reason r) {
     case Reason::NoReadBuffer: return "no-read-buffer";
     case Reason::NoHeap: return "no-heap";
     case Reason::Chunked: return "chunked";
+    case Reason::ChunkedTranslated: return "chunked-translated";
     default: return "?";
     }
 }

@@ -3,9 +3,9 @@
 // The game's decode of a resource file (docs/native-engine/stream-boundary.md) is answered natively only on its main
 // path; a request that would take a rare path is given to the translated function whole, and the choice must be made
 // before anything observable is done for it (the file opened, a byte read, memory allocated). The one decision taken
-// later is the chunked case: whether the file fits the decompressor's read buffer is known only after the first read,
-// and the native side then closes the file and gives the request to the translated function, which opens and reads it
-// again (stream-boundary.md says why that is invisible to the game).
+// later is the chunked case: whether the file fits the decompressor's read buffer is known only after the first read;
+// the native side decodes it too, chunk by chunk as it reads it, and gives it to the translated function (which opens
+// and reads the file again) only if its decoder fails, which was never seen (stream-boundary.md section 5).
 #pragma once
 
 #include <atomic>
@@ -30,7 +30,8 @@ enum class Reason : uint8_t {
     FileKind,        // a file object of another kind: an error path
     NoReadBuffer,    // a temporary read buffer would be allocated from the request's heap
     NoHeap,          // no heap in the request
-    Chunked,         // larger than the read buffer: decoded chunk by chunk on a second thread (decided after one read)
+    Chunked,         // larger than the read buffer: decoded chunk by chunk as it is read (decided after one read)
+    ChunkedTranslated,   // a chunked file the native decoder gave up on, given to the translated function
     Count
 };
 

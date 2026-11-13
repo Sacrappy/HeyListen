@@ -13,7 +13,7 @@ extern "C" {
 
 /* the reasons of hl::stream::Reason, in its order */
 enum { HL_STREAM_NATIVE = 0, HL_STREAM_SIZE_STEP, HL_STREAM_PATH_OPEN, HL_STREAM_FILE_KIND, HL_STREAM_NO_READ_BUFFER,
-       HL_STREAM_NO_HEAP, HL_STREAM_CHUNKED };
+       HL_STREAM_NO_HEAP, HL_STREAM_CHUNKED, HL_STREAM_CHUNKED_FALLBACK };
 
 typedef struct hl_stream_request {
     uint32_t size_step;
