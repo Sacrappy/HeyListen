@@ -997,3 +997,63 @@ out and have its new owner write it between the check and the decommit (the byte
 the next touch), and a host thread cannot take the heap's `nn::os` mutex (section 10). A gate in the free path would be needed
 to do it on the game's thread under its own lock. Meanwhile section 12's take-out already moves those free blocks' pages
 (`Movie` 96 MB, `GameUIWorkHeap` 25 MB, cold) out of RAM; only their commit charge stays.
+
+## 13. The guest window's substrate: granules given back and restored atomically (`HOS_GUEST_PAGES`, 2026-11-13)
+
+Section 9 and `stream-boundary.md` section 9 (step 3) found what stopped a true decommit: with the window reserved as plain
+private memory, a page made again is committed first and filled after, and every thread sees it as zeros in between. This
+brick is the substrate that closes it (`host/hos_guestpages.{h,c}`); which pages are dropped and where their bytes come back
+from is the policy's (stream M2), through the interface in the header: `hos_gp_drop`, `hos_gp_restore` with a fill
+callback, one owner hook called for touched dropped granules, `hos_gp_is_dropped`.
+
+### What Windows allows (a game-free experiment on the main PC, Windows 11 26200)
+
+| Question | Answer |
+|---|---|
+| A 448 GB placeholder at a fixed address (`VirtualAlloc2` `MEM_RESERVE_PLACEHOLDER`) | yes |
+| One private reservation over all of it (`MEM_REPLACE_PLACEHOLDER`), committed in parts later | yes: commit, decommit, `MEM_RESET`, `VirtualProtect`, `VirtualUnlock`, `ReadFile` into it work as on an ordinary reservation |
+| A 64 KB piece **inside** that private allocation released to a placeholder (`VirtualFree` `MEM_RELEASE \| MEM_PRESERVE_PLACEHOLDER`) | **yes**: the allocation splits in two around the hole, both halves keep their bytes and commit state (also with the piece only reserved) |
+| One release call over two pieces | no (`ERROR_INVALID_PARAMETER`) |
+| One `VirtualAlloc(MEM_COMMIT)`, `VirtualProtect`, `MEM_RESET` across two allocations | no (`ERROR_INVALID_ADDRESS`); `VirtualFree(MEM_DECOMMIT)` across two: no (87) |
+| `VirtualUnlock` across two allocations; `ReadFile` across two views | yes |
+| A section view mapped over a placeholder (`MapViewOfFile3` `MEM_REPLACE_PLACEHOLDER`), filled through another view first | yes, its bytes are there when it appears |
+| On a view: `VirtualProtect`, `VirtualUnlock`, `MEM_RESET`, `ReadFile` into it, `VirtualAlloc(MEM_COMMIT)` (no-op) | yes; `MEM_DECOMMIT` no |
+| Half of a view unmapped | no: a view goes whole (`UnmapViewOfFile2` `MEM_PRESERVE_PLACEHOLDER`, 5 us) |
+| Cost of a restore | 36 us per 64 KB with a section per granule; 25 us per 64 KB as one 8 MB section (copy included) |
+| Cost of a private 64 KB piece released to a placeholder | 2.5 us |
+
+So option (a) of the specification holds and nothing needed the fallback (c). The granule is 64 KB.
+
+### How (`host/hos_guestpages.c`)
+
+- **Reservation.** With `HOS_GUEST_PAGES=1`, `[0, HOS_HEAP_BASE)` (system region, image) is reserved as before and
+  `[HOS_HEAP_BASE, HOS_GUEST_SPACE)` (heap and address regions, 448 GB) as a placeholder replaced at once by one private
+  reservation (`mkw_glue.c` `hos_reserve_guest_pages`). With nothing dropped that reservation behaves as the old one in every
+  respect. Only with the soft write watch (`A64_WRITE_TRACK`, the default build): a placeholder cannot be write-watched.
+- **Drop**: each granule released to a placeholder of its own (a restored one: its view unmapped to a placeholder). No RAM,
+  no commit charge. A granule the back end ever imported is refused (the driver locks those pages).
+- **Restore**: a page-file-backed section the size of the range, mapped privately, filled by the callback, then one view per
+  dropped granule mapped in place. A view per granule so that any granule can be dropped again alone; the section's commit
+  goes with its last view.
+- **Touches.** Three bitmaps (dropped, apart from the big reservation, imported) and one of granules being worked on; a drop,
+  restore, forget or import claims its granules, and an overlapping one waits (a lock and a condition variable). The
+  exception handler (`commit_on_touch`) hands a touched dropped granule to the owner, whose restore waits for whatever holds
+  it, and runs the instruction again. Kernel and driver do not fault: `hos_commit` (before a system call gets a guest buffer)
+  and `hos_noaccess_import` (before an import) ask the owner first.
+- **Split reservation.** A dropped or restored granule splits the reservation, and one commit, decommit or reset call cannot
+  cross it: `hos_commit`, `FreeMemoryPages`, `UnmapPhysicalMemory`, the freed regions' discard and the no-access pools'
+  zero-page decommit take `hos_gp_commit` / `hos_gp_decommit` / `hos_gp_reset` (piece by piece) over a range that holds such
+  granules (`hos_gp_touches`), and the plain call of before elsewhere. The lazy commit's megabyte already falls back to 64 KB.
+  A decommit or a discard forgets the dropped granules wholly inside (a reservation of their own again: zero on the next
+  touch, the owner is not asked) and restores those it only cuts first.
+- **Back end.** `memory_all_reserved` (no upload of texture storage that is all reserved) does not take a dropped granule for
+  reserved (`hos_gp_dropped_in`, exported).
+- Linux: `hos_gp_ready()` is 0 (stubs); mmap could do the same later.
+
+Tests: `tests/test_guestpages.py` (`tests/guestpages_test.c`, Windows): a 256 MB window reserved the same way; 8 threads read
+a dropped range word by word while another restores it with a 200 ms fill (2,097,152 words read, none but the filled bytes);
+touch restores from 8 threads alone; a restore next to memory committed on first touch; a dropped range restored, dropped
+and restored again; a write to a dropped page (restored, then written); a failed fill leaves the range dropped; imported
+granules refused, an import restores dropped granules first; commit, `ReadFile` across views and private pieces, and a
+decommit over dropped, restored and cut granules; a 4 MB region holding dropped granules given up whole, used again,
+dropped whole and restored; 20 rounds of 2 MB dropped and touched by 4 threads.
