@@ -623,6 +623,40 @@ lets the translation go on; at the end of the body segment B is compared (its NV
 command buffer's byte +0x10). The path decided at the entry is decided again at the checkpoint: a difference is counted
 as a mismatch of segment B.
 
+### What is built
+
+| Piece | Where | What it does |
+|---|---|---|
+| `hl::gfx::SubmeshDraw` | `engine/native/{include,src}/hl/gfx/SubmeshDraw.*` | `prologue()` / `emit_prologue()`: the range check and the geometry processing mode; `path()`, `decide()` / `emit()`: the way (pre-recorded list, indexed instanced draw, mesh tasks, nothing), the index count, the instance and task counts, the counter, the mark, and the calls in the function's order with its arguments |
+| The NVN table | `hl/gfx/Nvn.h`, `src/gfx/Nvn.cpp` | five procedures more (34): SetGeometryProcessingMode, CallCommands, DrawMeshTasks, BufferGetAddress, DrawElementsInstanced. A `Command` now carries x0..x7 (the indexed draw takes eight). BufferGetAddress is marked a **query**: native code asks it through the entry points while deriving (`NvnEntryPoints::ask`, which returns x0) and the stream carries it for the comparison; `NvnSink` does not call a query a second time |
+| The check | `hl/gfx/StateCheck.*` | the same comparison, now named per use (its log lines begin "render state", "draw prologue", "draw submission") and with a path flag: the path decided at the entry no longer holding is a mismatch whatever the calls |
+| The bridge | `hl/bridge/GfxBridge.*` | `guest::Drawable`, `Model`, `Mesh`, `SubmeshDescriptor`, `IndexHolder`, `SubmeshRecord` and the block's +0x3b / +0x50 (each field `static_assert(offsetof)`), the addresses, `SubmitRoute` and **`DrawBridge`**: the route, the reads (in the function's order: the model only past the range check, the descriptor only on the indexed path, the two enum tables read from the game's memory), the writes in place (told to the write tracking), the bytes compared (the block's 352 and the command buffer's mark byte) |
+| C surface | `hl/c/hl_gfx.h`, `src/c/hl_gfx.cpp` | `hl_gfx_draw_start`, `_begin` / `_end` (native, around the callback), `_check_begin / _segment / _prepared / _call / _end`, `hl_gfx_draw_report`; the NVN entry points and callbacks shared by both producers |
+| OS layer | `engine/host/hl_gfx.c` | **`HL_GATE(80078fc0, "329b54a385248a34")`** (the function) and **`HL_GATE(8008fc00, "4df7e218373859d0")`** (the checkpoint, on only with the check); the preparation called natively with `a64_icall` on the gate's own context, sp lowered by 0x150, x30 the address after the function's own call, x29 / x30 put back after; the NVN table resolved once for both producers |
+| Tests | `engine/native/tests/gfx_test.cpp` | the prologue (signed range, mode bit 14), the paths and the counts (negative span, 32-bit counter, task rounding), the calls' order and arguments, the bridge's reads and writes in place against the expected bytes, the route, the sink's query and eight-register procedure, the check's path flag |
+
+Both gates are in `code_hot_7.c` (one recompile of that file when they go in). Switches: `HL_GFX_DRAW` 0 (the
+translated function, the default) or 1 (native on the direct paths); `HL_GFX_CHECK=1` (or 2) checks instead of answering
+(it checks the render state too); `HL_GFX_LOG=1` adds the line `hl gfx: draw: native pre-recorded N, indexed N, ...;
+left to the translation: query N, callback N, clusters N, inline N` every 10 s.
+
+### The check and the runs (PC 3050, 110 s a scene; function only, no speed)
+
+Counts at the run's last report (10 s before its end):
+
+| Run | Scene | Prologue: calls / NVN calls compared | Submission: calls / NVN calls compared | Mismatched | Left to the translation |
+|---|---|---:|---:|---:|---:|
+| `HL_GFX_CHECK=1` | castle-move | 117,326 / 100 | 93,580 / 93,580 | 0 | 6,464 (clusters) |
+| | kokiri-idle | 131,499 / 0 | 104,935 / 104,935 | 0 | 12 (clusters) |
+| | hyrule-walk | 119,723 / 52 | 94,045 / 94,045 | 0 | 320 (clusters) |
+
+The prologue's calls include the sub-meshes out of range (23,746 / 26,564 / 25,678: the callers ask for more sub-meshes
+than a drawable has, and the function returns at once). **Every submission in the three scenes took the pre-recorded
+path** (CallCommands): the indexed draw, the mesh tasks and the "nothing" kind were never taken, so they are checked by
+the tests only, not in the game. No call took the query, callback or inline paths; the cluster paths (left whole to the
+translation) are 0.01-6% of the calls. The render-state check ran in the same runs: 0 mismatches (castle-move 53,902
+calls, 1,767,096 NVN calls; kokiri-idle 61,777 / 2,029,526; hyrule-walk 56,788 / 1,865,084).
+
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
   (who fills slot +32 / +44 / +48), and when; whether gameplay reads any of them in place.
