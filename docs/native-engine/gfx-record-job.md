@@ -388,6 +388,111 @@ decides whether the unit is small) and the two counters around it (`0x80078b10` 
 Then viewport / scissor `0x802640a0`. The slot scan is not worth a native rewrite for time now; it is for the mutex the
 pass runs under (section 4).
 
+## 8. Brick 2.2: the render-state function native, the NVN table, the exact check
+
+### Reading: the draw function `0x80681320` and what is around it
+
+**`0x80681320` is the draw function of one draw, not a render-state function.** (2,620 lifted lines; called from the
+draw loop `0x80255be0`, `0x806688c0`, `0x8028a2a0` and `0x806811d0`.) Its arguments: x1 the recording context (its +216
+is the NVN command buffer), x2 the draw's parameters (+24 a 64-bit flag word, +0..+56 counts and indices, +120..+132
+floats), x3 the material (+8..+14 bytes and flags, +1096 / +1104 a table of 24-byte entries, +1216, +1224 polygon offsets
+by slot, +1360..+1380 floats, +1384 a state callback object), x4..x7 more of the draw. It builds a **352-byte render-state
+block on its own stack (sp+80)** from the draw and the material, records line width and point size, then chooses how to
+draw by a key made of flag bits:
+
+- a key other than 0, 64 and 128: one of **about 130 per-variant draw functions** through a table at `0x84c29878` (90-250
+  lifted lines each, template instances: `0x80517700`, `0x835c3e90`, ...). Each loops over the draw's sub-meshes; for a
+  sub-mesh whose state key differs from block+90 it calls **the render-state function `0x80077d60`**, for one whose
+  render-enable key differs from block+91 the render-enable function `0x80078b10`, and draws through virtual calls on
+  the sub-mesh's objects;
+- keys 0, 64 and 128: its own loops over the sub-meshes, with **the render-state function's calls inlined** (the same 36
+  NVN call sites, twice: 72 of its 87) and `0x80078fc0` to submit each sub-mesh.
+
+Its other NVN sites: ReportCounter 4, ResetCounter 2, SetRenderEnable 2, BufferGetAddress 2, SetLineWidth, SetPointSize,
+SetGeometryProcessingMode. Its guest calls are interleaved with its NVN calls: an SDK call `0x851095f0` twice at the start
+(*(inference)* a thread-local read), the variant table, `0x80078fc0` per sub-mesh, virtual calls on scene objects, the
+material's state callback, and after a variant returns it reads block fields the variant wrote (+139, +272, +280).
+
+**Why it is not this brick's unit.** The exact check (step 3 of the brief) runs the native version first into a recording
+with no NVN procedure called and nothing written; a function whose NVN calls depend on what guest callees did in between
+cannot be run that way, and its draws are made by guest code (the variants, `0x80078fc0`) that would have to stay
+translated inside it. It can be made native only in pieces between its guest calls. Its callee **`0x80078fc0`** (3,159
+lifted lines, 21 callees) is the per-sub-mesh submission: CallCommands, SetGeometryProcessingMode, DrawMeshTasks, and mesh
+preparation shared with the recording job `0x80084de0` (`0x8008fc00`, `0x8002a5f0`, `0x8008f840`, `0x800a8120`, ...): a
+boundary to call back into, not part of a state unit.
+
+**The unit taken: `0x80077d60`, the render-state function itself** (526 lifted lines, no direct callee, 36 NVN call sites
+of 29 procedures, 254 callers with one site each: `0x80681320` and the per-variant draws). It is what the brief's "render
+state" is: its 36 calls are the render-state calls `0x80681320` inlines, it has no guest callee in the case the game takes
+(below), so it can be cut cleanly and checked exactly. Viewport / scissor `0x802640a0` was the fallback; it has 18 direct
+callees (two SDK calls, `0x8005ed00`, `0x8025dae0` of 559 lines) around its 3 NVN calls, so it would not have been cleaner.
+Its neighbour **`0x80078b10`** (146 lines, 256 callers) is the render-enable function: it resets block fields, and calls
+SetRenderEnable or, when a global switch is set, writes the method into the command memory itself. Not taken (one NVN
+call).
+
+### The render-state function's inputs
+
+It takes x0 the block and w1 the sub-mesh's state key (its low byte), returns nothing, and keeps its five NVN state
+objects in its own 176-byte stack frame (blend at frame+8, polygon +60, depth stencil +64, color +72, channel mask +76).
+
+| Block field | Read / written | What it is (as far as read) |
+|---|---|---|
+| +0 u64 flags | read | bit 2 forces depth writes, 3 stops them, 2-3 clear mode bit 1, 4 depth clamp, 5 depth test off (depth func always), 6 reversed depth (greater / greater-or-equal instead of less / less-or-equal), 12-16 blending on, **17 record nothing** (derive and write only), 18 mode bit 0 off |
+| +24 material | read | +1224 + 8 x slot: polygon offset units and factor by slot (any 32-bit slot, signed); +1384 the state callback object |
+| +40 recording context | read | +216 the command buffer (read only when something is recorded) |
+| +57 depth mode | read | 4: not-equal, no writes; 5: writes on, the function by the channel masks; 8: the offset slot from +100 |
+| +88 offset slot | read, written | the polygon offset slot applied last: the offsets are read from the material only when it changes |
+| +90 key | written | the state key applied last: the per-variant draws skip the call when it is the sub-mesh's |
+| +92 mode bits | read, written | bits 0 and 1 rewritten from the flags and the key |
+| +97 | read | the targets blending is enabled on, when the flags or the key (bits 1, 2, 6) turn blending on |
+| +100 | read | depth mode 8: the slot is this + 4 |
+| +112 channel masks | read | 4 bits a color target, 8 targets; 0 also selects greater / less as depth function |
+| +152 | written | all ones, every call |
+| +160..+175 blend color | read | copied to +248 (the blend color call reads it there) |
+| +240, +241, +340, +350 | written | depth test, depth write, depth function, depth clamp |
+| +243, +272, +276, +343..+346 | read | stencil test, reference, value mask, operations, function |
+| +244 | written | the blend targets enabled |
+| +268 | written | the channel masks (a copy of +112) |
+| +280..+327 | read | 8 targets x 6 bytes: blend factors and equations |
+| +328..+339 | read, written | polygon offset factor, units, clamp (rewritten when the slot changes, clamp 0) |
+| +341, +347, +349 | read | cull face, polygon mode, polygon offset enable (bit 0) |
+
+**Who writes the block**: `0x80681320` builds it on its stack for one draw; the per-variant draws, this function and
+`0x80078b10` update it between sub-meshes. **What it caches**: block+90 (state key), +88 (offset slot) and +91
+(render-enable key), for the sub-meshes of one draw only. **Nothing is cached across draws**: every call records the
+whole state again, blend and color defaults, the eight channel masks, depth-stencil and polygon objects, about 33 NVN
+calls (measured below: 1,471,680 calls in 44,845 calls of the function). A later native unit that keeps the last state
+per command buffer could skip most of them; that is a change of the stream (fewer calls), not an exact replacement.
+
+**The state callback**: the material's +1384 is a function object; when its invoker (+16) is not the game's empty
+function (`0x835c3bb0`, through the GOT slot `0x84cb5d98`), the function calls it, and possibly a member function
+through material +1392..+1408, before recording: guest code whose result decides what follows. The native version
+leaves those calls to the translation (the gate answers 0). In the three scenes it never happened (counts below).
+
+### What is built
+
+| Piece | Where | What it does |
+|---|---|---|
+| `hl::gfx::RenderState` | `engine/native/{include,src}/hl/gfx/RenderState.*` | `decide()`: the function's derivations, pure (StateInputs to StateOutputs: depth, blend targets, mode bits, offset slot); `emit()`: its NVN calls, in its order with its arguments, into a CommandSink |
+| The NVN table and its sink | `hl/gfx/Nvn.h`, `src/gfx/Nvn.cpp` | `Proc`: the 29 procedures by NVN name, with each one's argument count (ints, floats); `NvnEntryPoints` (the OS layer's call); **`NvnSink`**: a CommandSink that calls each command's procedure. The seam's first real use, and still its only way out |
+| The call-by-call check | `hl/gfx/StateCheck.h`, `src/gfx/StateCheck.cpp` | compares one call's two lists of NVN calls entry by entry (procedure and each argument register the procedure reads, pointers as values) and the block's bytes after the call; counts, and logs the first eight mismatches in full |
+| The bridge | `hl/bridge/GfxBridge.h` | `guest::RenderStateBlock` (every field above, `static_assert(offsetof)`), the material, the recording context, the callback; `kApplyRenderState`, the frame's layout, `proc_global()` (the game's global of each procedure, read from the lifted function's call sites); `StateBridge`: reads a call, writes the outputs in place (and tells the OS layer's write tracking), builds the expected bytes |
+| C surface | `hl/c/hl_gfx.h`, `src/c/hl_gfx.cpp` | `hl_gfx_nvn_*` (the table's names and globals), `hl_gfx_host` (NVN call, write tracking, log), `hl_gfx_state_apply`, `hl_gfx_state_check_begin / _call / _end`, `hl_gfx_state_report` |
+| OS layer | `engine/host/hl_gfx.c` | **`HL_GATE(80077d60, "31664901fd8bc782")`**; the NVN entry points: each procedure resolved by name through the NVN layer (`nvn_native_proc`) to its host function, and **checked once against the game's own global** (the same host call, or the gate turns itself off); the tap now also feeds the call-by-call check with each procedure's native number |
+| Tests | `engine/native/tests/gfx_test.cpp` | the derivations (depth function and writes by flags, key and depth mode; blend targets; the slot in 32-bit arithmetic), the calls' order and arguments, the block read and written in place, the sink's argument counts, the check's comparison and log |
+
+**How the game reaches it.** `nx2/hl_gates.py` (run by the build scripts) puts an entry gate at the head of the lifted
+`f_80077d60` in `code_000.c` when its text hashes `31664901fd8bc782` (both machines' build logs: `hl_gates: f_80077d60
+in code_000.c: gated`; `code_000.c` is 12.5 MB and recompiles when the gate goes in or out). The gate is on from the start;
+its first call reads the switches, checks the build, resolves and checks the NVN table, and turns itself off for good when
+the brick is off. Then, on the thread running the call: `HL_GFX_STATE=1` reads the block, derives, writes the block,
+and calls the NVN procedures through the table on that thread's guest context, with the state objects at the same frame
+addresses as the translated function; `HL_GFX_CHECK=1` runs the native version into a recording, then the translated body
+itself (the gate's own call, which the gate lets through) with the tap recording, and compares.
+
+Switches: `HL_GFX_STATE` 0 (the translated function) or 1 (native); `HL_GFX_CHECK=1` (or 2) checks instead of answering;
+`HL_GFX_LOG=1` adds the line `hl gfx: render state: native calls N, left to the translation M` every 10 s.
+
 ## Not read yet
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
