@@ -134,7 +134,7 @@ static Range *inner;
 static int64_t ninner, capinner;
 static void inner_add(uint64_t lo, uint64_t hi, int heap) {
     lo = (lo + 0xFFF) & ~0xFFFull, hi &= ~0xFFFull;
-    if (hi <= lo) return;
+    if (hi <= lo || ninner >= (1 << 22)) return;
     if (ninner == capinner) {
         const int64_t cap = capinner ? capinner * 2 : 65536;
         Range *r = (Range *)realloc(inner, (size_t)cap * sizeof *r);
@@ -155,7 +155,8 @@ static void walk_freelist(Heap *h, int idx) {
         return;
     }
     const int64_t off = (int32_t)off32;
-    const uint64_t cap = (uint64_t)h->free_count * 2 + 4096;
+    /* (the heap's own count may be torn too: the cap is also absolute. A list that loops ends here) */
+    const uint64_t cap = h->free_count < (1u << 20) ? (uint64_t)h->free_count * 2 + 4096 : (1u << 21);
     int64_t sum = 0, n = 0, largest = 0;
     int torn = 0;
     for (uint64_t k = 0; node != sentinel; k++) {
@@ -242,7 +243,7 @@ static int add_heap(uint64_t obj, int parent, int depth) {
     uint32_t count = 0, off32 = 16;
     uint64_t node;
     if (!rd32(obj + 120, &count) || !rd32(obj + 124, &off32) || off32 > 4096 || !rd64(sentinel, &node)) return idx;
-    const uint64_t cap = (uint64_t)count + 256;
+    const uint64_t cap = count < 65536 ? (uint64_t)count + 256 : 65536;
     for (uint64_t k = 0; node != sentinel && node && k < cap; k++) {
         uint64_t next;
         if ((node & 7) || !rd64(node, &next)) break;
@@ -391,6 +392,8 @@ static DWORD WINAPI heapsplit_main(void *p) {
     const char *ce = getenv("HOS_HEAP_SPLIT_COLD");
     const int cold = ce ? atoi(ce) : 0;
     const int64_t t0 = hos_now_ns();
+    hos_log("heapsplit: reading the heaps");
+    hos_log_flush();
 
     /* 1. the heaps: the root arrays (the second: heaps made with no parent, sead's independent heaps), then each heap's children */
     static const uint64_t root_arrays[2] = {0x84e9f400, 0x84e9f430};
@@ -405,6 +408,9 @@ static DWORD WINAPI heapsplit_main(void *p) {
         }
     }
     const int64_t t_walk = hos_now_ns();
+    hos_log("heapsplit: %d heaps read (%lld free blocks' insides kept), %.0f ms; counting their pages", nheaps, (long long)ninner,
+            (t_walk - t0) / 1e6);
+    hos_log_flush();
 
     /* 2. the GPU pools, page aligned, sorted and merged */
     npools = hos_gpu_pools(pools, 32768);
