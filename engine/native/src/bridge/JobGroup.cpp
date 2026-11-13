@@ -52,8 +52,16 @@ struct JobGroup::Heap {
         return (int)((ld(cx.mem<uint64_t>(word_at)) >> (((uint32_t)lane << 3) & 63)) & 0xff);
     }
     void left() {
-        if (d.options_.check && lane_byte >= 0 && read_lane_byte() != lane_byte)
-            d.stats_.lane_drift.fetch_add(1, std::memory_order_relaxed);
+        if (!d.options_.check || lane_byte < 0) return;
+        const int now = read_lane_byte();
+        if (now == lane_byte) return;
+        if (d.stats_.lane_drift.fetch_add(1, std::memory_order_relaxed) < 8) {
+            char line[200];
+            std::snprintf(line, sizeof line, "hl jobgroup: lane drift: context %#llx lane %d word %#llx: byte %#x at entry, %#x at leave",
+                          (unsigned long long)cx.at, (int)ld(&cx.c->lane), (unsigned long long)ld(&cx.c->lane_status),
+                          lane_byte, now);
+            cx.rt.log(line);
+        }
     }
 
     void finish(GuestAddr job) {
