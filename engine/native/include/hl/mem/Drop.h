@@ -112,6 +112,7 @@ public:
         std::atomic<uint64_t> spilled_now{0}, from_spill{0}, from_decode{0};   // slots held; granules restored each way
         std::atomic<uint64_t> cancelled{0};                                    // candidates whose storage ended
         std::atomic<uint64_t> dropped_spill_only{0};                           // granules dropped of spill-only sources, in all
+        std::atomic<uint64_t> lock_wait_max_ns{0};                             // a touch's longest wait for its range's lock
         std::atomic<uint64_t> dropped_granules{0}, dropped_now{0};   // granules dropped in all, dropped now
         std::atomic<uint64_t> restores{0}, restored_granules{0};     // touches that restored a range; granules restored
         std::atomic<uint64_t> by_path[int(TouchPath::kCount)] = {};

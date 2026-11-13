@@ -212,10 +212,11 @@ bool Drop::decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uin
         return false;
     }
     stats_.sources.fetch_add(1, std::memory_order_relaxed);
-    // (in batches of 32 granules: the spill's writes are made with no lock held, and the range's lock and the decision's
-    // are held over 2 MB at a time, so that a touch of the range waits for one batch at most: a 64 MB range decided in one
-    // go held them for a quarter of a second)
-    constexpr size_t kBatch = 32;
+    // (in batches of 8 granules: the spill's writes are made with no lock held, and the range's lock and the decision's
+    // are held over 512 KB at a time, so that a touch of the range waits for one batch at most: a 64 MB range decided in one
+    // go held them for a quarter of a second, and 32 granules a batch still 26 ms once: the pages compared may come back from
+    // the page file)
+    constexpr size_t kBatch = 8;
     lock.unlock();
     std::vector<int64_t> pre;
     for (size_t b = 0; b < cold.size(); b += kBatch) {
@@ -358,7 +359,13 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         if (it == by_granule_.end()) return false;
         id = it->second->id;
     }
+    const int64_t w0 = host_.clock ? host_.clock(host_.ctx) : 0;
     std::lock_guard<std::mutex> l(range_lock(id));
+    if (host_.clock) {
+        const uint64_t waited = uint64_t(host_.clock(host_.ctx) - w0);
+        uint64_t was = stats_.lock_wait_max_ns.load(std::memory_order_relaxed);
+        while (waited > was && !stats_.lock_wait_max_ns.compare_exchange_weak(was, waited, std::memory_order_relaxed)) {}
+    }
     Range* r;
     {
         std::lock_guard<std::mutex> t(table_lock_);
@@ -534,7 +541,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
         "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu; "
-        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu; candidates cancelled %llu; dropped of mirrors %.1f MB in all",
+        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu; candidates cancelled %llu; dropped of mirrors %.1f MB in all; a touch waited %.2f ms at most for its range's lock",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
         (unsigned long long)restores, stats_.restored_granules.load() * mb,
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
@@ -549,7 +556,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load(),
         stats_.spilled_now.load() * mb, (unsigned long long)stats_.from_spill.load(),
         (unsigned long long)stats_.from_decode.load(), (unsigned long long)stats_.cancelled.load(),
-        stats_.dropped_spill_only.load() * mb);
+        stats_.dropped_spill_only.load() * mb, stats_.lock_wait_max_ns.exchange(0) / 1e6);
     last_dropped_report_ = dropped, last_restores_report_ = restores, last_report_ns_ = now;
     return n < 0 ? 0 : n;
 }
