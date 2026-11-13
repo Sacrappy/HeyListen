@@ -12,9 +12,11 @@
    constructor reads one variable and returns, and nothing else here runs.
 
    What it reads of the game (guest addresses of the supported build; offsets in the heap object; memory-boundary.md 2, 8):
-   - the root arrays at 0x84e9f400 and 0x84e9f430: a 32-bit count, at +8 a pointer to the heap pointers;
-   - a heap: +0 vtable, +32 its name (a C string), +40 arena start, +48 arena size; its children: a list whose sentinel is
-     at +104 (a node: +0 next, +8 previous), +120 their count, +124 the offset of the node in the child (16);
+   - the root arrays at 0x84e9f400 and 0x84e9f430: a 32-bit count, at +8 a pointer to the heap pointers; and the address
+     region heap whose pointer is at 0x84e9f460;
+   - a heap: +0 vtable, +32 its name (a C string), +40 arena start, +48 arena size; its child heaps: a list whose sentinel
+     is at +64 (a node: +0 previous, +8 next; +72 the first), +84 the offset of the node in the child (88). (The list at
+     +104 is the disposers' one: child heaps and other objects that end with the heap.)
    - the free-list heaps (vtables 0x84c172c8 and 0x84c177a8): the free blocks in a list whose sentinel is at +176 (+184 the
      first node), the node's offset in a block at +196, the free and used block counts at +192 and +216; a block has a
      32-byte header with its size after the header at +24;
@@ -240,15 +242,14 @@ static int add_heap(uint64_t obj, int parent, int depth) {
         *at = idx;
     }
     own_free(h, idx);
-    /* its children */
-    const uint64_t sentinel = obj + 104;
-    uint32_t count = 0, off32 = 16;
+    /* its child heaps: the list at +64 (the walk of 0x80503f00, which finds the heap that holds an address) */
+    const uint64_t sentinel = obj + 64;
+    uint32_t off32 = 0;
     uint64_t node;
-    if (!rd32(obj + 120, &count) || !rd32(obj + 124, &off32) || off32 > 4096 || !rd64(sentinel, &node)) return idx;
-    const uint64_t cap = count < 65536 ? (uint64_t)count + 256 : 65536;
-    for (uint64_t k = 0; node != sentinel && node && k < cap; k++) {
+    if (!rd32(obj + 84, &off32) || off32 > 4096 || !rd64(sentinel + 8, &node)) return idx;
+    for (uint64_t k = 0; node != sentinel && node && k < 65536; k++) {
         uint64_t next;
-        if ((node & 7) || !rd64(node, &next)) break;
+        if ((node & 7) || !rd64(node + 8, &next)) break;
         add_heap(node - off32, idx, depth + 1);
         node = next;
     }
@@ -409,6 +410,9 @@ static DWORD WINAPI heapsplit_main(void *p) {
             if (rd64(arr + 8ull * i, &hp) && add_heap(hp, -1, 0) >= 0) nroots++;
         }
     }
+    /* (and the address-region heap, "NinVirtualAddressHeap", made by 0x809e20c0 and kept at 0x84e9f460: in no array) */
+    uint64_t vah;
+    if (rd64(0x84e9f460, &vah) && vah && add_heap(vah, -1, 0) >= 0) nroots++;
     const int64_t t_walk = hos_now_ns();
     hos_log("heapsplit: %d heaps read (%lld free blocks' insides kept), %.0f ms; counting their pages", nheaps, (long long)ninner,
             (t_walk - t0) / 1e6);
