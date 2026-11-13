@@ -532,7 +532,9 @@ static int run_sil(Unit *u, Ctx *c) {
     const uint64_t D = G64(I + 0x10), G = G64(BOX_BIAS_PTR);
     const uint64_t pages = G64(G64(I + 0x50) + 0x10);
     const uint64_t va = G64(I + 0x68) + (uint64_t)(int64_t)first * 32, vb = G64(I + 0x80) + (uint64_t)(int64_t)first * 32;
-    static _Thread_local SilMotion snap[SIL_MAX];
+    /* (allocated by the threads that run the solver only: a thread-local array would be in every thread's block) */
+    static _Thread_local SilMotion *snap;
+    if (!snap && !(snap = (SilMotion *)malloc(sizeof(SilMotion) * SIL_MAX))) return 0;
     for (int i = 0; i < count; i++) {
         const uint32_t id = G32(vb + (uint64_t)i * 32 + 28) >> 8;
         snap[i].at = G64(pages + (uint64_t)(id >> 6) * 8) + (uint64_t)(id & 63) * 128;
