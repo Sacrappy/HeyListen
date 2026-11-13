@@ -119,9 +119,10 @@ translated code); speed is not being measured for now, by the owner's instructio
 
 | Subsystem | Brick | Switch (default) | What it does today | What is still the game's |
 |---|---|---|---|---|
-| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | the main loop, the module system's job group |
+| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | the main loop |
 | Jobs | `hl::bridge::Dispatcher` | `HL_DISPATCH` (1), `HL_DISPATCH_ALL` (1) | every caller of the dispatcher runs the native one, in place on the game's scheduler (invariants clean in 32 runs); Havok's tasks are among the jobs it runs | - |
-| Jobs | `hl::bridge::Stages` | `HL_STAGES` (1) | the stage registration, the stage wait and the frame's last stage are answered natively, together (invariants clean in 15 runs; each registration compared with the translated one in check mode) | the stages' begin forms, the module system's twins and its job group `0x8007fe60` (a second dispatcher over a priority heap: read in part) |
+| Jobs | `hl::bridge::Stages` | `HL_STAGES` (1) | the stage registration, the stage wait and the frame's last stage are answered natively, together (invariants clean in 15 runs; each registration compared with the translated one in check mode) | the stages' begin forms, the module system's twins of the registration and the wait |
+| Jobs | `hl::bridge::JobGroup` | `HL_JOBGROUP` (1) | the module system's job group `0x8007fe60` (the main thread's long wait and the five module workers' loop) runs natively over the dispatcher's loop with a heap policy (invariants clean in 11 checked runs of 12, pictures right) | its twins `0x800711c0` / `0x80070b20` |
 | Memory | no-access GPU pools out of RAM | `HOS_NOACCESS_RAM` (1) | 0.4 GB of RAM | - |
 | Memory | `hl::mem::ColdPages`, pools and heaps | `HL_MEM_COLD` (1), `HL_MEM_COLD_HEAPS` (1) | cold pages of GPU pools and of the game's heaps leave the working set: 4 to 4.5 GB of RAM (commit unchanged) | giving the pages back for good (the restore from the game's files is proven; the decommit is not built: `stream-boundary.md` 9) |
 | Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |

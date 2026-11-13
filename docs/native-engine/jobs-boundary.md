@@ -665,3 +665,16 @@ game: the heap's order against a reference heap written from this document (ties
 top), the push (a full heap, a hook's push), a cancel, and six contexts (the owner's and five workers') over 30 groups of
 500 jobs with priorities, dependencies, several runners, cancels, tied jobs (by the state word and by the queue) and a
 polling lane.
+
+Validated 2026-11-13 (function and picture; no speed measured), `HL_JOBGROUP=1 HL_JOBGROUP_CHECK=1 HL_DISPATCH_CHECK=1`:
+on the main PC the three scenes with shots (31, 30 and 24 shots; four or five looked at in each, spread over the run,
+right against the reference shots), castle-move twice more with shots (right), and one hyrule-walk run of the default-on
+build with no switch set (shots right); on the PC 3050 castle-move three times, hyrule-walk twice, kokiri-idle once: 12
+runs. Every run went to the end, game speed ratio about 60 once in the scene; in every checked run every invariant above
+read 0 (a main-PC castle run: about 470,000 calls of the group, 105,000 groups ended, 3.9 million runners taken and run,
+100,000 jobs handed to their lane's context by the state word, none by the queue, none dropped; 0 cancels, 0 polls, 0
+full heaps: those paths are covered by the model test only). The take count was never read below 0. **Lane drift** is
+counted 200 to 700 times a run: every logged case is a module worker whose lane byte was 1, 2 or 0x11 at its entry and 0
+at its leave (the lane status word is shared by the module set's contexts and other threads of the same core, and the
+guest's floor at 0 absorbs decrements, as for the stage owner above); the lane was idle at the leave in every logged
+case. `HL_JOBGROUP=1` is the default (with `HL_JOBS` on); `HL_JOBGROUP=0` leaves the gate off (the translated function).
