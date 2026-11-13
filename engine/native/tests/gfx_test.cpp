@@ -23,7 +23,15 @@ struct FakeRuntime final : bridge::GuestRuntime {
     std::vector<Call> calls;
     void* ptr(bridge::GuestAddr at) const override { return const_cast<uint8_t*>(memory) + (at - 0x1000); }
     bridge::GuestThread current() const override { return (void*)0x77; }
-    void call(bridge::GuestThread as, bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override { calls.push_back({as, fn, a0, a1}); }
+    uint64_t call(bridge::GuestThread as, bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override {
+        calls.push_back({as, fn, a0, a1});
+        return 0;
+    }
+    uint64_t call_with(bridge::GuestThread as, bridge::GuestAddr fn, const uint64_t* args, unsigned nargs, const void*, unsigned) override {
+        calls.push_back({as, fn, nargs > 0 ? args[0] : 0, nargs > 1 ? args[1] : 0});
+        return 0;
+    }
+    void log(const char*) override {}
 };
 
 void the_pass_runs_the_phase_its_mode_names() {

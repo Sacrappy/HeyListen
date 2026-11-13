@@ -4,20 +4,15 @@
 #include <cstdio>
 #include <cstring>
 
+#include "host_runtime.h"
+
 #include "hl/bridge/GfxBridge.h"
 #include "hl/gfx/PassCheck.h"
 #include "hl/gfx/RecordPass.h"
 
 namespace {
 
-struct HostRuntime final : hl::bridge::GuestRuntime {
-    hl_guest_host host;
-    void* ptr(hl::bridge::GuestAddr at) const override { return host.ptr(host.user, at); }
-    hl::bridge::GuestThread current() const override { return host.current(host.user); }
-    void call(hl::bridge::GuestThread as, hl::bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override {
-        host.call(host.user, as, fn, a0, a1);
-    }
-};
+using HostRuntime = hl::c::HostRuntime;
 
 // (made once and never destroyed, as the job bridge's)
 HostRuntime* g_runtime;
@@ -33,7 +28,7 @@ thread_local uint32_t t_mode;
 
 extern "C" int hl_gfx_start(const hl_guest_host* host, int mode, int check) {
     if (g_runtime) return g_mode != HL_GFX_OFF;
-    if (!host || !host->ptr || !host->current || !host->call) return 0;
+    if (!hl::c::complete(host)) return 0;
     g_runtime = new HostRuntime;
     g_runtime->host = *host;
     g_bridge = new hl::bridge::GfxBridge(*g_runtime);

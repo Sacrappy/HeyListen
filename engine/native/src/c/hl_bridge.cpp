@@ -3,25 +3,16 @@
 
 #include <cstdio>
 
+#include "host_runtime.h"
+
 #include "hl/bridge/Dispatcher.h"
 #include "hl/bridge/JobBridge.h"
 #include "hl/jobs/JobSystem.h"
 
 namespace {
 
-struct HostRuntime final : hl::bridge::GuestRuntime, hl::jobs::ThreadHost {
-    hl_guest_host host;
-
-    void* ptr(hl::bridge::GuestAddr at) const override { return host.ptr(host.user, at); }
-    hl::bridge::GuestThread current() const override { return host.current(host.user); }
-    uint64_t call(hl::bridge::GuestThread as, hl::bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override {
-        return host.call(host.user, as, fn, a0, a1);
-    }
-    uint64_t call_with(hl::bridge::GuestThread as, hl::bridge::GuestAddr fn, const uint64_t* args, unsigned nargs,
-                       const void* frame, unsigned frame_size) override {
-        return host.call_with(host.user, as, fn, args, nargs, frame, frame_size);
-    }
-    void log(const char* line) override { host.log(host.user, line); }
+// (the shared adapter, plus the pool's threads: made by the OS layer, with the host stack guest code needs)
+struct HostRuntime final : hl::c::HostRuntime, hl::jobs::ThreadHost {
     void* start(void (*entry)(void*), void* arg, unsigned index) override { return host.thread_start(host.user, entry, arg, index); }
     void join(void* handle) override { host.thread_join(host.user, handle); }
 };
@@ -37,7 +28,7 @@ hl::bridge::JobBridge* g_bridge;
 
 extern "C" int hl_bridge_start(const hl_guest_host* host, int mode, unsigned workers, int dispatch) {
     if (g_bridge) return g_bridge->mode() != hl::bridge::Mode::Off;
-    if (!host || !host->ptr || !host->current || !host->call || !host->call_with || !host->log || !host->thread_start || !host->thread_join) return 0;
+    if (!hl::c::complete(host) || !host->thread_start || !host->thread_join) return 0;
     const hl::bridge::Mode m = mode == HL_JOBS_POOL      ? hl::bridge::Mode::Pool
                                : mode == HL_JOBS_THROUGH ? hl::bridge::Mode::Through
                                                          : hl::bridge::Mode::Off;
