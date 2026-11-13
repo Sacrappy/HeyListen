@@ -959,6 +959,11 @@ void cond_recheck_present() {
                 (h.op == NOP_BIND_UBO ? s.ubo : s.ssbo)[b.stage][b.index] = b;
             break;
         }
+        case NOP_UBO_INLINE: {   // (HeyListen, HL_UBO_INLINE: the Vulkan back end's; here the bind by its address, as before)
+            const auto b = payload<nvn_p_ubo_inline>(a, avail);
+            if (b.stage >= 0 && b.stage < 6 && b.index >= 0 && b.index < 16) s.ubo[b.stage][b.index] = {b.stage, b.index, b.addr, b.size};
+            break;
+        }
         case NOP_BIND_TEX: case NOP_BIND_SAMP: case NOP_BIND_IMG: {
             nvn_p_bind_handles b;
             std::memset(&b, 0, sizeof b);

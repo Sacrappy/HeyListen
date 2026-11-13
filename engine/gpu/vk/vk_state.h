@@ -15,6 +15,11 @@ struct NvnState {
     nvn_prog prog{};
     bool has_prog = false;
     nvn_p_bind_buf ubo[kNvnStages][16]{}, ssbo[kNvnStages][16]{};
+    // (HeyListen, HL_UBO_INLINE) a uniform slot bound by NOP_UBO_INLINE: its bytes in the recording (alive for the replay
+    // of the submission: the handle's copy outlives it), which its descriptor is served from; null: by address, as before.
+    // ubo[][] keeps the bind's address for the other readers of a slot
+    const uint8_t* ubo_bytes[kNvnStages][16]{};
+    uint32_t ubo_bytes_n[kNvnStages][16]{};
     uint64_t tex[kNvnStages][128]{}, samp[kNvnStages][128]{}, img[kNvnStages][32]{};
     nvn_blend_st blend[8]{};
     nvn_color_st color{};
