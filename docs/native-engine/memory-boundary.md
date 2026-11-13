@@ -157,7 +157,8 @@ parent). Fields read in place by inlined code (`operator delete`, inline `new`) 
 | +56 | parent heap |
 | +64..+72 | a self-linked list head |
 | **+80** | a word `operator delete` requires to be 0 before it trusts the range test |
-| +104..+120 | children list; +120 their count (the parent's count is raised under its lock) |
+| +64..+72, +84 | the child heaps' list (node at +84 in the child; section 10) |
+| +104..+120 | the disposers' list: child heaps and other objects that end with the heap; +120 their count (raised under the parent's lock; section 10) |
 | **+128** | direction (1: the heap object sits at the arena's front) |
 | +136 | `nn::os::MutexType` (initialized in the constructor) |
 | +168 | flags: bit 0 thread-safe (lock taken), bits 16 and up an id from a global counter |
@@ -357,7 +358,7 @@ speed (the inline `new` is a virtual call into lifted heap code at 5,210 sites; 
 - Virtual calls to heap slots other than alloc from gameplay code; inlined range tests outside `operator delete`.
 - The SDK's own allocators (`nn::lmem` exp/frame/unit heaps, used by the SDK and middleware) and Havok's, audio's and the
   effect library's allocators: they sit on top of the heaps above but were not followed.
-- How the 7.75 GB of resident guest memory splits by heap and pool (a measurement, not a reading).
+- How the 7.75 GB of resident guest memory splits by heap and pool: measured in section 10.
 - The header of `gpu/vk/vk_memory.cpp` still describes the pre-mirror design ("no mirrored copies"); the mirror section further
   down is the current one.
 
@@ -657,3 +658,149 @@ What the next brick (native streaming) needs, in order:
 Not read, and needed before building: the decoding thread's body on the chunked path; the file object's read (`+144`) and
 how a request names its file; which requests allocate from `ForResourceG` (the request's heap at `+16`, by resource kind);
 where `0x80c17040`'s input comes from.
+
+## 10. What is in the heaps (measured 2026-11-13)
+
+`HOS_HEAP_SPLIT=<seconds>` (`host/hos_heapsplit.c`, off by default; with it unset a constructor reads the variable and
+returns) walks the game's heap tree once from a host thread and counts, for every heap, the resident pages that are its own
+(in its range and in no child's), outside and inside GPU pools; `HOS_HEAP_SPLIT_COLD=<seconds>` then takes every resident
+heap page outside the pools out of the working set once (`VirtualUnlock` of an unlocked range: the contents stay) and counts,
+that long after, which came back. Main PC, the three scenes (`build/s5/s4v2-*`, validation runs: no crash, game speed ratio
+59.6-60.4, the last shots of each scene looked at and right), the walk at 74 s after the start, a cold window of 20 s,
+`HL_MEM_COLD=0` (stream 1's cold-page thread off, so that the two do not take pages out at the same time). The save puts all
+three scenes in the castle town market; the scenes differ by what the player does there.
+
+### The heap tree, as read (additions to section 2)
+
+- **Three roots**: the root array at `0x84e9f400` (count `+0`, pointers at `+8`: one heap, `RootHeap`, free-list class, over
+  the 6.86 GB heap after the 36 MB `StandardAllocator`), the second array at `0x84e9f430` (empty in these runs), and the
+  pointer at `0x84e9f460`, set by `0x809e20c0`: the **`NinVirtualAddressHeap`** (class `0x84c17628`), in no array.
+- **Child heaps** are in the list whose sentinel is at `+64` (node: `+0` previous, `+8` next; `+72` the first node), the node
+  at `+84` in the child (88): this is the list `0x80503f00` walks to find the heap that holds an address. The list at `+104`
+  (node at `+16` in the child, count `+120`) is the **disposers'** list: child heaps and other objects that end with the heap
+  (section 2's table called it the children list; it holds non-heap objects too).
+- Every heap vtable has the base's `0x809dfe30` in slot 29: that is how the walk tells a heap from another object.
+- **Free-list heap blocks** (class `0x84c172c8`, alloc `0x809df950` -> `0x801e7ff0` / `0x801e8d00` / `0x801e7b90` /
+  `0x801e8b00`; `0x84c177a8` shares its free list): a 32-byte header (the list node at the offset the heap's `+196` gives;
+  `+16` a byte: the tail slack under 33 bytes left in the block; `+18` 16 bits: the heap's id, `0xffff` when free; `+20` 16
+  bits: the alignment padding; `+24` the size after the header), the data at header + 32 + padding. Free blocks are in the
+  list at `+176` (first node at `+184`, count `+192`), used blocks in the list at `+200` (node offset `+220`, count `+216`).
+  `+172` (a byte) chooses how the free list is searched *(inference: first fit, best fit)*. The free size (slot 16, `0x834916d0`) is the sum of the free blocks'
+  sizes. No fill of a block's data was seen in alloc or free (free's two helpers `0x83491650` / `0x83491690`, *(inference)* the
+  merging of neighbours, were not read).
+- **Free size of the other classes** (their slot 16): frame `0x84c17400` and `0x84c178e0`: `+184` minus `+176`;
+  `0x84c17c08`: `+192`; `0x84c1acb8`: the size minus the sizes 8 bytes before each node of a list at `+176`; `0x84c179e8`:
+  `+7912` of the object at `+176`.
+- **`NinVirtualAddressHeap`**: `+40`/`+48` are a budget (9.47 GB), not a range. Its alloc (slot 6, `0x8080fd70` ->
+  `0x8080d440`) takes an address region of its own for each large allocation (`nn::os::AllocateAddressRegion` +
+  `AllocateMemoryPages`, the import stubs `0x8510a1e0` / `0x8510a220`; a list at `+248`, count `+256`) and packs allocations
+  of 15 pages or less into 64 KB regions with a 16-bit page map (list at `+176`, count `+192`); `+264` adds up the bytes
+  mapped; `+224` / `+232` hold the lowest and highest address of its regions. Its children are the **resource files' heaps**:
+  one heap per loaded file, named after the file (`Model/<name>.bfres`, `Tex/<name>.bntx`, `Pack/...`, `Effect/...`), a frame
+  heap or a free-list heap sized to the file, in its own region. 17,300-19,600 heaps in all, ~19,000 of them resource files.
+- **Locks**: each heap has an `nn::os` mutex at `+136` (taken when `+168` bit 0 is set). The host's mutex records its owner as
+  the calling guest thread (`nn_os_sync.c`), which a host thread does not have, so the tool does not take them: a walk can race
+  a change. Every read is checked against committed readable memory, every pointer against the heap's own range, every walk is
+  capped; a walk that leaves its range is marked torn (none were in these runs). What it can miscount: blocks taken or given
+  back during the walk, heaps made or ended during the enumeration (~2 s).
+
+### Totals (MB in RAM, 74 s)
+
+| | kokiri-idle | castle-move | hyrule-walk |
+|---|---:|---:|---:|
+| the game's memory in RAM | 7775 | 7804 | 7788 |
+| in heaps, outside GPU pools | 3531 | 3535 | 3537 |
+| ... of it in the heap (the 6.9 GB `SetMemoryHeapSize` block) | 858 | 858 | 866 |
+| ... of it in address regions (`NinVirtualAddressHeap` and its children) | 2673 | 2677 | 2671 |
+| in GPU pools (all inside heaps) | 4145 | 4153 | 4151 |
+| in neither (the image 96, the system region 2, and the rest) | 99 | 116 | 100 |
+| free blocks' pages in RAM (inside free blocks of free-list heaps) | 159 | 160 | 168 |
+| heap pages outside pools taken out once | 3422 | 3413 | 3423 |
+| **... not back in the working set 20 s later (cold)** | **3328** | **3242** | **3215** |
+
+`HOS_MEM_SPLIT=70` in the same runs counted 4144-4152 MB in pools and 3627-3634 MB outside: the two tools agree. **The 3.6 GB
+outside the pools is 97% inside heaps, and 94% of it was not touched in 20 s.**
+
+### By kind (castle-move; heaps grouped by resource folder and file kind, or by name)
+
+| Group | Heaps | Size MB | RAM outside pools MB | RAM in pools MB | Cold of taken out MB | What it is |
+|---|---:|---:|---:|---:|---:|---|
+| `Tex/*.bntx` | 5,167 | 1703 | **1702** | 0 | **1702 of 1702** | texture files, each in a frame heap of its own sized to the file, in address regions; nothing of them in a GPU pool |
+| `Model/*.bfres` | 1,358 | 1522 | 467 | 1053 | 372 of 443 | model files (free-list heaps): their GPU part in pools, the rest (and the `*_Animation.anim.bfres`, 40 MB each for the player) outside |
+| `agl::TextureDataMgr::InitializeHeap` | 1 | 2443 | 1 | 2116 | - | the textures the GPU reads: a pool-backed heap |
+| `Effect/*.byml` | 174 | 134 | 102 | 31 | 102 of 102 | effect files |
+| `Graphics` (+ its sub-heap) | 2 | 1044 | 103 | 47 | 96 of 99 | the graphics module's heap (17,000 blocks) |
+| `NinVirtualAddressHeap` own | 1 | 4474 (span) | 113 | 0 | 101 of 109 | its small allocations, and *(inference)* the host's own regions in its span (the renderer's guest memory, the window image) |
+| `Movie` | 1 | 206 | 96 | 0 | 96 of 96 | **one free block of 206 MB, 96 MB of it in RAM** (a movie played at start and freed) |
+| `Npc_*_Child` actor heaps | 52 | 105 | 104 | 0 | 76 of 90 | actor instances (class `0x84c178e0`) |
+| `Actor` | 2 | 404 | 70 | 6 | 64 of 68 | |
+| `Pack/*.pack` | 1,416 | 75 | 72 | 0 | 70 of 71 | |
+| `Sound/*.bars` | 150 | 68 | 68 | 0 | 65 of 67 | |
+| `Bake/*.bkprb` | 35 | 45 | 44 | 0 | 44 of 44 | light probes |
+| `Shader/*.bfsha` | 4 | 311 | 36 | 275 | 34 of 35 | |
+| `GameUIWorkHeap` | 1 | 25 | 25 | 0 | 25 of 25 | **one free block of 25 MB, all in RAM** |
+| `ares::System` | 1 | 39 | 28 | 0 | 21 of 25 | the resource system's own |
+| everything else | | | ~420 | ~630 | | |
+
+The other two scenes give the same groups within a few MB (`Tex/*.bntx`: 1708 MB in RAM, 1708 / 1700 MB cold).
+
+### Top 15 heaps by RAM (castle-move, a heap's own pages, outside and inside pools)
+
+| # | Heap | Class | Size MB | Used / free MB | RAM own MB | RAM in pools MB | Free blocks' pages in RAM MB | Cold in 20 s (of taken out) MB |
+|---:|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | `agl::TextureDataMgr::InitializeHeap` | free-list | 2443 | 2443 / 0 | 1 | 2116 | 0 | 1 (of 1) |
+| 2 | `Shader/Model.Product.110.product.Nin_Ounce_NVN2.bfsha` | frame | 306 | 306 / 0 | 34 | 272 | | 32 (of 33) |
+| 3 | `UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx` | frame | 233 | 233 / 0 | 1 | 217 | | 1 (of 1) |
+| 4 | `Graphics` | free-list | 1044 | 1044 / 0 | 103 | 47 | 0 | 96 (of 99) |
+| 5 | `gsys::SystemTask` | free-list | 639 | 639 / 0 | 24 | 123 | 0 | 6 (of 21) |
+| 6 | `NinVirtualAddressHeap` | virt-addr | 4474 | ? | 113 | 0 | | 101 (of 109) |
+| 7 | `Foliage Scene Heap` | free-list | 248 | 98 / 150 | 7 | 97 | 6 | 7 (of 7) |
+| 8 | `Movie` | free-list | 206 | 0 / 206 | 96 | 0 | 96 | 96 (of 96) |
+| 9 | `Actor` | free-list | 399 | 399 / 0 | 68 | 6 | 0 | 62 (of 66) |
+| 10 | `CreateModelScene` | free-list | 711 | 606 / 105 | 20 | 37 | 6 | 14 (of 15) |
+| 11 | `Effect/static.Nin_Ounce_NVN2.vsetb.byml` | frame | 50 | 50 / 0 | 32 | 18 | | 32 (of 32) |
+| 12 | `Model/Player_Child_01_Animation.anim.bfres` | free-list | 42 | 42 / 0 | 42 | 0 | 0 | 42 (of 42) |
+| 13 | `Model/Player_Child_03_Animation.anim.bfres` | free-list | 42 | 42 / 0 | 42 | 0 | 0 | 42 (of 42) |
+| 14 | `ProbeHeap` | free-list | 240 | 37 / 203 | 4 | 37 | 4 | 4 (of 4) |
+| 15 | `Model/Land_HrlCastle_GardenInside_A...bfres` | free-list | 37 | 37 / 0 | 1 | 36 | 0 | 0 (of 1) |
+
+"Used" is the size minus the heap's own free count (it includes block headers and the heap object). A container heap
+(`RootHeap`, `sead::TaskMgr`, `ModuleSystem`) owns almost nothing itself: its children do. The individual `Tex/*.bntx` heaps
+are small (70 KB-1 MB each); as a group they are the largest owner of RAM outside the pools.
+
+### What it says
+
+- **A native allocator is not where the memory is.** The heaps' own slack is small: 160 MB in RAM inside free blocks (96 MB of
+  it the `Movie` heap's one free block, 25 MB `GameUIWorkHeap`'s); the large free spans (`ModuleSystem` 589 MB, `ProbeHeap` 203
+  MB, `Foliage Scene Heap` 150 MB, `CreateModelScene` 105 MB) are not in RAM (committed on first touch, never touched). What
+  is in RAM is **data the game loaded and keeps**: resource files (textures 1.7 GB, models' non-GPU part 0.47 GB, effects,
+  packs, sounds, probes: ~2.5 GB) and module heaps.
+- **1.7 GB of texture files sit in RAM outside any GPU pool and were not touched in 20 s, in every scene.** The textures the
+  GPU reads are in the `agl::TextureDataMgr` pool (2.1 GB in RAM); the `Tex/*.bntx` heaps hold the files as loaded.
+  *(inference, not established: the texture data was copied from the file into the TextureDataMgr pool and the file is kept
+  only for its metadata or until the resource is released; whether any code reads a `.bntx` file's bytes after the copy was not
+  traced.)*
+- Cold within 20 s is not "never read": the window is short, and a page read once a minute is cold here.
+
+### First recommendation for `hl::mem` (brick 4.2 specifies the rest)
+
+1. **Leave the resource files' cold pages to the system**, starting with `Tex/*.bntx`: expected **~1.7 GB** of working set
+   (1702 MB measured cold in each scene), then `Model/*.bfres` outside pools (~0.37-0.39 GB cold), `Effect`, `Pack`, `Sound`,
+   `Bake` (~0.28 GB). Mechanism: stream 1's cold-page thread (`HL_MEM_COLD`) extended from the GPU pools to the heaps whose
+   name is a resource path (the tool's walk gives their ranges; their memory is in address regions, whole pages). Pages taken
+   out stay committed and come back on a touch (a soft fault), so this needs no proof that the game never reads them, only
+   that it rarely does. Evidence: the cold column above; to settle before switching it on: a longer window (60-120 s, or
+   re-arming) and a scene change.
+2. **Decommit the inside of large free blocks** of free-list heaps: ~0.12 GB (`Movie` 96 MB, `GameUIWorkHeap` 25 MB; 160 MB
+   in all). What must stay: the first 32 bytes of each free block (its header and list node); the rest of the block's pages can
+   be decommitted, and a later allocation that touches them gets zero pages through `commit_on_touch` (`mkw_glue.c`: the heap
+   and the regions commit on first touch since `HOS_LAZY_COMMIT`). No fill was seen in alloc or free (free's merge helpers are still to
+   read). Small and low risk.
+3. Not worth acting on for RAM: shrinking heaps (their untouched free space costs commit charge, not RAM) and a native
+   allocator for a heap class (no slack in RAM to win).
+
+Not established here: whether `.bntx` file bytes are read after the texture is made (only 20 s of coldness); per-heap
+allocation rates (no counter: the allocation paths are lifted code and were not hooked); the address-region heap's
+large-allocation list (`+248`) was not walked, so its 113 MB of own pages are not split by user; in two of the three scenes the
+per-heap `heaptsv` lines were cut by the run's end (the tables above come from the `heaptop`, `heapgroup` and `heapcold`
+lines, complete in all three).
