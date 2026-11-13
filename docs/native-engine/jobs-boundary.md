@@ -639,3 +639,29 @@ state words and wake events (the twin registration resets them; the wake loops o
 lane status word. The native group therefore keeps every word in place, takes the guest's mutex for every heap change,
 and calls the guest's functions for the mutexes, the events, the timed sleep and its guard, a hook's push and the job
 bodies.
+
+### The group natively (`HL_JOBGROUP`, brick 3.5)
+
+`hl::bridge::JobGroup` (`engine/native/include/hl/bridge/JobGroup.h`, `src/bridge/JobGroup.cpp`) answers `0x8007fe60`
+through an entry gate (`HL_GATE` in `engine/host/hl_jobs.c`), which both callers reach: the module workers' message and
+the main thread's wait twin. The native dispatcher is now one loop over a queue policy (`src/bridge/DispatchLoop.h`):
+entry and leave, the lane status, handed jobs, the sleep and wake protocol and the run of a job's body with its observer
+are written once; the actors' rings (`Dispatcher::Rings`, behaviour and tests unchanged) and the group's heap
+(`JobGroup::Heap`) are its two policies, each with its take, finish, completion, end and constants (the idle rounds
+before a timed sleep: 9 for the rings, none for the heap; the job record's kind byte; the tagged frame's third word).
+Every heap change is made under the guest's mutex with the guest's order (the same sifts, ties not moved, a full heap
+counted but not filled); the take count is handed out and given back with the guest's atomic operations; a job tied to
+another lane is handed over under the mutex as the guest does it; the timed sleep's constant is made on the polling path
+with the guest's own guard functions, so no first call has to be left to the translated function. Job bodies, a hook's
+push, the mutexes, the events and the sleep are the game's functions, called on the thread's guest context.
+
+`HL_JOBGROUP_CHECK=1` counts, every 10 s in the log: takes not run (every runner taken is run, handed to its lane's
+context or dropped), passed not run (every job handed over is run by its receiver), runs not finished, finishes with no
+runner running, dependents' waiting counts below 0, jobs completed twice, one-runner jobs run by two contexts at once, the
+heap's order checked after every change, and at each group's end (under the mutex) a heap not empty, a take count not 0,
+contexts asleep with jobs left; observations beside them: the take count read below 0 (legitimate for a moment, above),
+and a context's lane byte changed between its entry and its leave (lane drift). `tests/jobgroup_test.cpp` runs it with no
+game: the heap's order against a reference heap written from this document (ties, jobs of several runners staying on
+top), the push (a full heap, a hook's push), a cancel, and six contexts (the owner's and five workers') over 30 groups of
+500 jobs with priorities, dependencies, several runners, cancels, tied jobs (by the state word and by the queue) and a
+polling lane.

@@ -25,7 +25,7 @@
    worker sets, the scheduler's list, the workers' words and the guest's events stay in place. HL_STAGES=0: the
    translated functions, as before. HL_STAGES_CHECK=1: the protocol's invariants are counted, each registration is
    compared with the translated one on the same set, and the counters are logged every 10 s.
-   HL_JOBGROUP=1 (with HL_JOBS on; off by default): the module system's job group 0x8007fe60 is native
+   HL_JOBGROUP=1 (the default, with HL_JOBS on): the module system's job group 0x8007fe60 is native
    (hl/bridge/JobGroup.h; docs/native-engine/jobs-boundary.md, "The module system's job group"): an entry gate on it, which
    both of its callers reach (the module workers' message and the main thread's stage wait twin). The group scheduler, its
    heap, mutex and take count, the contexts' words and the guest's events stay in place. HL_JOBGROUP=0: the translated
@@ -40,7 +40,7 @@
 #define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
 #define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
 #define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 15 runs over the three scenes, two PCs) */
-#define HL_JOBGROUP_DEFAULT 0
+#define HL_JOBGROUP_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 11 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;

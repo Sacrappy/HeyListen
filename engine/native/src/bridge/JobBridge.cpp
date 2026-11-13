@@ -23,7 +23,7 @@ constexpr GuestEntry kEntries[] = {
     {0x834a2e50, EntryRole::Worker, false, "a job thread's loop (outer)"},
     {kDispatcher, EntryRole::Dispatch, false, "the dispatcher: takes jobs from a scheduler's queues and runs them"},
     {0x8004fa40, EntryRole::Dispatch, false, "a job pushed to a scheduler"},
-    {0x8007fe60, EntryRole::Group, false, "a job group run and waited for (the main thread's long wait of the frame)"},
+    {0x8007fe60, EntryRole::Group, true, "a job group run and waited for (the main thread's long wait of the frame)"},
     {0x80706be0, EntryRole::Frame, false, "the frame's time step read"},
     {0x8022e220, EntryRole::Consumer, false, "an actor link followed: reads the identity table (one of hundreds of inlined readers)"},
 };
@@ -91,7 +91,7 @@ Readiness ready(const JobBridge* bridge) {
             "the game's jobs are not native jobs one by one: the native dispatcher (HL_DISPATCH=1) runs them from the game's queues\n"
             "the stage owner's wait and nested waits run the native dispatcher only with HL_DISPATCH_ALL=1 (its entry gate)\n"
             "the stages' begin forms and graph, and the worker sets' making, are the game's own functions (registration, wait and last stage: HL_STAGES)\n"
-            "the module system's job group (the main thread's long wait) runs natively only with HL_JOBGROUP=1 (its entry gate)\n"
+            "the module system's job group (the main thread's long wait) runs natively (HL_JOBGROUP), but its twins of the registration and the wait are the game's\n"
             "the identity table and the lane status word are written by the game's functions, not by the native side\n"
             "the main loop is the game's own"};
 }
