@@ -3846,6 +3846,27 @@ void lazy_filter(Pool& p, std::vector<VkBufferCopy>& runs) {
     }
     runs.swap(out);
 }
+// (2026-11-13) What the release of a mirror holding left-out write-backs does with one left-out page (TICK-023): copy the mirror's
+// bytes back into guest memory only while they are still the newest bytes of a live pool's page.
+enum { kRelCopy, kRelDead, kRelWritten, kRelCpuPage, kRelTexture, kRelKinds };
+int64_t st_release_by[kRelKinds];   // (pages, by verdict; nvn_pools_mu held)
+/// [lo, hi) inside one of the game's live pools (pools: by lo, disjoint, as memory_sync builds them from the host's list)
+bool in_live_pool(const std::vector<GuestPool>& pools, uint64_t lo, uint64_t hi) {
+    auto it = std::upper_bound(pools.begin(), pools.end(), lo, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == pools.begin()) return false;
+    --it;
+    return lo >= it->lo && hi <= it->hi;
+}
+/// live: the page's pool record is a pool the game still has (not finalized: its memory may be the game's heap again);
+/// gen: the page's write generation, synced: its mirror's (a newer one is a write since the mirror's last sync: guest
+/// memory is newer than the GPU's bytes); cpu_page: a mirror sync saw the CPU write it; texture: a live texture's storage
+int lazy_release_verdict(bool live, uint32_t gen, uint32_t synced, bool cpu_page, bool texture) {
+    if (!live) return kRelDead;
+    if (gen > synced) return kRelWritten;
+    if (cpu_page) return kRelCpuPage;
+    if (texture) return kRelTexture;
+    return kRelCopy;
+}
 // (hookshot, 11-07) The counter reports the replay writes into guest memory on the CPU (vk_replay.cpp NOP_REPORT_COUNTER), by
 // guest address: a mirrored pool's write-back copied the GPU's mirror over them at the end of the submission, the mirror's
 // stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
@@ -4735,6 +4756,9 @@ void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {   // (TICK
     auto it = nvn_pools.upper_bound(gpu);
     if (it != nvn_pools.begin() && std::prev(it)->second.hi > gpu) --it;
     while (it != nvn_pools.end() && it->first < gpu + size) it = nvn_pools.erase(it);   // (memory reused)
+    // (a new pool over memory an older one left out write-backs of: those GPU bytes are no one's now)
+    if (!skipped_pages.empty())
+        for (uint64_t q = gpu >> kPageShift; q < (gpu + size + 4095) >> kPageShift; q++) skipped_pages.erase((uint32_t)q);
     NvnPool np;
     np.hi = gpu + size, np.flags = flags;
     nvn_pools[gpu] = np;
@@ -6022,9 +6046,19 @@ void memory_end_submission(VkCommandBuffer cmd) {
             {
                 std::lock_guard nk(nvn_pools_mu);
                 for (uint64_t q = p->lo >> kPageShift; q <= (p->hi - 1) >> kPageShift; q++) {
-                    if (!skipped_pages.count((uint32_t)q) || cpu_pages.count((uint32_t)q)) continue;
+                    if (!skipped_pages.count((uint32_t)q)) continue;
                     const uint64_t a = std::max(p->lo, q << kPageShift), b = std::min(p->hi, (q + 1) << kPageShift);
-                    if (a >= b || replay_tex_storage_in(a, b - a)) continue;
+                    // (2026-11-13, the play sessions' crashes: a skipped page is checked again now, not only against
+                    // cpu_pages, which only a mirror sync of this pool feeds, and an idle pool has none. The game may have
+                    // finalized the pool since (zone changes) and given its memory back to its heap, or written the page
+                    // since the pool's last sync: the mirror's old GPU bytes then went over live game objects)
+                    uint64_t rlo = 0;
+                    const NvnPool* np = nvn_pool_at(a, &rlo);
+                    const int verdict = lazy_release_verdict(np && in_live_pool(guest_pools, rlo, np->hi), page_gen(q), p->synced_gen,
+                                                             cpu_pages.count((uint32_t)q) != 0, a < b && replay_tex_storage_in(a, b - a));
+                    st_release_by[verdict]++;
+                    if (verdict == kRelDead || verdict == kRelWritten) skipped_pages.erase((uint32_t)q);
+                    if (verdict != kRelCopy || a >= b) continue;
                     if (!runs.empty() && runs.back().srcOffset + runs.back().size == a - p->lo) runs.back().size += b - a;
                     else runs.push_back({a - p->lo, a - p->lo, b - a});
                 }
@@ -6049,8 +6083,11 @@ void memory_end_submission(VkCommandBuffer cmd) {
         if (st_lazy_released / 8 != logged_at) {
             logged_at = st_lazy_released / 8;
             logf("vk: mirrors holding left-out write-backs given back: %lld (%llu MB), %.2f MB written back into guest memory first; "
-                 "%llu MB of mirrors now", (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20),
-                 st_lazy_written_back / 1048576.0, (unsigned long long)(mirror_bytes >> 20));
+                 "%llu MB of mirrors now; left-out pages: %lld written back, not written back as the pool is gone (finalized) %lld, "
+                 "written since the mirror's sync %lld, written by the CPU %lld, texture storage %lld",
+                 (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20), st_lazy_written_back / 1048576.0,
+                 (unsigned long long)(mirror_bytes >> 20), (long long)st_release_by[kRelCopy], (long long)st_release_by[kRelDead],
+                 (long long)st_release_by[kRelWritten], (long long)st_release_by[kRelCpuPage], (long long)st_release_by[kRelTexture]);
         }
     }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
