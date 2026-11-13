@@ -111,32 +111,43 @@ table is read against them, not to argue with the goal.
   multiply-adds, NaN rules of min and max, flush-to-zero, ARM's reciprocal square root estimate), or the game's
   simulation diverges from the console's. Each replacement is compared on live inputs before it is switched on.
 
-## State of the hybrid engine (kept current; last update 2026-11-13, midday)
+## State of the hybrid engine (kept current; last update 2026-11-13, afternoon)
 
 What is native and switched on in the game today (each brick validated in the three scenes by function and picture;
 speed is not being measured for now, by the owner's instruction: it comes back when the physics loops are touched):
 
 | Subsystem | Brick | Switch (default) | What it does today | What is still the game's |
 |---|---|---|---|---|
-| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | the dispatcher that picks jobs (a native one is being written: `HL_DISPATCH`), stage begin and wait, the job group, the main loop |
+| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | stage begin, registration and wait, the job group, the main loop |
+| Jobs | `hl::bridge::Dispatcher` | `HL_DISPATCH` (1) | the stage's jobs are picked and run by the native dispatcher, in place on the game's scheduler (its invariants clean in 18 runs) | the stage owner's and nested calls still run the translated dispatcher beside it (being moved: `HL_DISPATCH_ALL`) |
 | Memory | no-access GPU pools out of RAM | `HOS_NOACCESS_RAM` (1) | 0.4 GB of RAM | - |
-| Memory | `hl::mem::ColdPages` | `HL_MEM_COLD` (1) | cold pages of CPU-cached GPU pools leave the working set: 2.1-2.5 GB of RAM (commit unchanged) | the heaps outside pools (3.5 GB, cold at 90%: being added); true decommit with restore from the game's files (specified: `memory-boundary.md` 9) |
+| Memory | `hl::mem::ColdPages`, pools and heaps | `HL_MEM_COLD` (1), `HL_MEM_COLD_HEAPS` (1) | cold pages of CPU-cached GPU pools and of the game's heaps leave the working set: 4 to 4.5 GB of RAM (commit unchanged: page-file-backed) | true decommit with restore from the game's files (specified: `memory-boundary.md` 9) |
 | Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |
+| Memory | the back end's caches | `RX_VK_BC_CACHE_LAZY` (on above 9.5 GB of VRAM), `RX_VK_CAP_FIT` (1) | Vulkan memory in system memory 1.5 GB -> 0.5 GB | the driver's own arenas |
 | Rendering | `hl::gfx::RecordPass` | `HL_GFX` (1) | the recording pass's listener is native and runs the pass's two phases | the phases themselves (translated); the first native producer of NVN calls is being written (`HL_GFX_STATE`); direct emission to Vulkan |
+| Streaming | - | - | being written: the resource files' decompression answered natively (`HL_STREAM`) | everything |
+| Physics loops | - | - | being written: the first kernels, bit-exact, through gates (`HL_MATH`) | everything; specified in `physics-loops.md` |
 | OS layer | a mutex finds its host object from itself | `HOS_NO_MUTEX_IX` unset | 0.5 ms a frame of lookups gone from the chain | - |
-| Streaming | - | - | - | everything; the per-file heaps (one heap a loaded resource file, named by its path) are the handle for it |
-| Physics loops | - | - | - | everything; specified in `physics-loops.md` (the step as a task graph, first units) |
 
-Measured with all of the above on (main PC, validation runs, MB): the game's memory in RAM 5,040-5,515 (it was
-8,200), the process's RAM 10,400-11,000 (it was 14,100), commit 19,900-21,600 (it was 24,900), VRAM 6,000-7,100.
+Measured with the memory bricks above on (main PC, validation runs of main at `458ee6af`, MB):
+
+| | Game's memory in RAM | Process RAM | Process commit | VRAM |
+|---|---:|---:|---:|---:|
+| at the start of the day | 8,200 | 14,100 | 24,900 | 6,600-7,300 |
+| now | 3,050-3,620 | 7,060-8,080 | 19,300-20,500 | 6,000-6,900 |
+
+The game's own memory is under the 4 GB aimed at, as RAM occupied; the commit charge is not, because cold pages are left
+to the system rather than given back (giving them back needs a restore source: the game's files, through the native
+streaming module). The process holds about 4 GB beyond the game's memory (the GPU driver's arenas, this engine's
+objects and caches, the executable).
 
 Tools that measure it: `HOS_MEM_SPLIT` (RAM by part and by GPU pool flags), `HOS_HEAP_SPLIT[_COLD]` (the heaps as a tree,
 their RAM and coldness), `HOS_POOL_TRAP` (who touches GPU pool pages), `RX_VK_RES_LOG` (the process and VRAM),
 `tools/bench/steptable.py` (the table of a set of runs).
 
-To look at when speed is measured again: in one validation run of the castle walk the cold-pages thread saw 222 MB come
-back within 10 s while the scene streamed, and that run's frame count was low; whether the two are linked is not
-established (other work was running on the PC).
+To look at when speed is measured again: the cold-pages thread sees up to a few hundred MB come back within 10 s while
+a scene streams (the castle walk), and single validation runs have shown low frame counts that were not reproduced by
+their repeats (other streams' tests were running on the PC): neither is established as a cost of a brick.
 
 ## Rules
 
