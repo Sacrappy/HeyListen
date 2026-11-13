@@ -37,7 +37,7 @@ static void rec_rewind(void *user, void *cmd, const hl_rec_mark *m) { (void)user
 static const void *rec_guest(void *user, uint64_t a, uint64_t n) { (void)user; return nvn_rec_guest(a, n); }
 static void rec_log(void *user, const char *line) { (void)user; hos_log("%s", line); }
 
-#define HL_GFX_REC_DEFAULT 1   /* (validated 2026-11-13 on both PCs: the record check at 0 mismatches over ~280,000 calls in
+#define HL_GFX_REC_DEFAULT 1   /* (validated 2026-11-13 on both PCs: the record check at 0 mismatches over ~350,000 calls in
                                   three scenes, the native records alone run in three scenes with the shots right) */
 
 static int switch_of(const char *name, int dflt) {
