@@ -400,3 +400,5 @@ What it needs to coordinate, found by reading the OS layer:
   the decode-time hash, decommitted only if equal: a writer faults on the read-only page and waits for the decision).
 
 `HL_STREAM_DROP` was therefore not added: nothing is decommitted.
+
+Built since over the substrate of `memory-boundary.md` section 13 (placeholders, option (a)): `HL_MEM_DROP`, section 14 there.
