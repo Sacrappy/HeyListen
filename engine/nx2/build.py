@@ -150,7 +150,7 @@ HOST_LIBS = ["-lpthread", "-ldl", "-lm"] if LINUX else \
     ["-lwinhttp", "-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp"]
 GPU = os.path.join(kit.HERE, "..", "gpu")
 # (HeyListen) the native engine (engine/native, C++20: docs/native-engine): its own headers and the standard library only;
-# host/hl_bridge.c is the OS layer's side of it
+# host/hl_host.c and one host/hl_<module>.c a module are the OS layer's side of it
 NATIVE = os.path.normpath(os.path.join(kit.HERE, "..", "native"))
 
 
@@ -804,7 +804,9 @@ def main():
          "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
-    host_deps += open(os.path.join(NATIVE, "include", "hl", "c", "hl_bridge.h"), "rb").read()
+    # (the native engine's C surface, hl/c: what host/hl_*.c include)
+    host_deps += b"".join(open(os.path.join(NATIVE, "include", "hl", "c", f), "rb").read()
+                          for f in sorted(os.listdir(os.path.join(NATIVE, "include", "hl", "c"))) if f.endswith(".h"))
     if LINUX:
         host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
         host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()

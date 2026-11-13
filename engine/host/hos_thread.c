@@ -75,7 +75,7 @@ static int nthreads;
 static volatile LONG64 next_id = 0x50;
 
 HosThread *hos_self(void) { return cur; }
-/* (HeyListen native engine, host/hl_bridge.c) The calling host thread goes on as guest thread t, on t's own guest context
+/* (HeyListen native engine, host/hl_host.c) The calling host thread goes on as guest thread t, on t's own guest context
    (hos_ctx()), and back: returns who it was before. t's own host thread must stand still in host code meanwhile, as it
    does inside the bridge's wait; every per-thread thing the OS layer keeps is in the HosThread, so it follows. */
 HosThread *hos_thread_act_as(HosThread *t) {

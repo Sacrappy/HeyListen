@@ -32,7 +32,7 @@ static uint64_t lookup_cache[1 << 18];
    straight to the handler. Before, every NVN call (tens of thousands a frame, on the game's recording threads) went
    site_call -> a64_lookup -> a64_call_miss -> its handler. */
 A64_WEAK A64Fn a64_lookup_host(uint64_t addr) { (void)addr; return NULL; }
-/* (HeyListen native engine) Guest functions a native module answers at their address (host/hl_bridge.c): asked once an
+/* (HeyListen native engine) Guest functions a native module answers at their address (host/hl_host.c): asked once an
    address, before the lifted table, and remembered like any other target. For functions reached by indirect calls (job
    bodies, callbacks, virtual functions); a function called directly is answered through the lift's hook list. */
 A64_WEAK A64Fn a64_lookup_replaced(uint64_t addr) { (void)addr; return NULL; }

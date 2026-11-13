@@ -87,6 +87,7 @@ ARGS = {
     "tests/test_menu_utf8.py": ["--cxx", "{cxx}"],
     "tests/test_menu_keys.py": ["--cxx", "{cxx}"],
     "tests/test_prompt_font_bind.py": ["--cc", "gcc"],
+    "tests/test_hl_gates.py": ["--cc", "gcc"],
     "tests/test_stick_dead_zone.py": ["--cc", "gcc", "--cxx", "g++"],
     "tests/test_menu_restart.py": ["--cxx", "g++", "--cc", "gcc"],
     "tests/test_output_resolution.py": ["--cxx", "{cxx}"],

@@ -169,7 +169,7 @@ of crossing exist, and a native module has to honour all three for the subsystem
 1. **Calls** into engine functions that were not inlined. These can be answered natively at their address, the way the OS
    layer answers the SDK (a list of addresses given to the tool; the translation itself is not touched). A function that
    is reached only through a pointer (a job's body, a callback, a virtual function) needs no new lift at all: the
-   runtime's lookup asks the OS layer first (`a64_lookup_replaced`, `engine/host/hl_bridge.c`).
+   runtime's lookup asks the OS layer first (`a64_lookup_replaced`, `engine/host/hl_host.c`).
 2. **Calls back** from the engine into gameplay: job bodies, actors' virtual functions. The native module calls the
    translated function on a guest context.
 3. **Structures read in place** by inlined engine code. No call to answer: the native module must keep those bytes as the

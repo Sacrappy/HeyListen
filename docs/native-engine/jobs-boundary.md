@@ -74,7 +74,7 @@ id.
 
 ## What is switched on today
 
-`HL_JOBS` (`engine/host/hl_bridge.c`; only for the build these addresses are of):
+`HL_JOBS` (`engine/host/hl_jobs.c`; only for the build these addresses are of):
 
 - `0`: the game's own threads, untouched.
 - `1`, through: the worker message function `0x8004aae0` is answered natively. The stage's work for that worker (the

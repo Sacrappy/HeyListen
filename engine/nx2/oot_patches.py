@@ -262,6 +262,8 @@ def apply(gen, *, protect_hearts=False, required=False):
     oot_native_resolution.apply(gen)
     import native_replace   # (TICK-026: native replacements of hot guest blocks, each behind HOS_NR_<NAME>, host/hos_native.c)
     native_replace.apply(gen)
+    import hl_gates   # (HeyListen native engine: entry gates of the guest functions host/hl_*.c answers, nx2/hl_gates.py)
+    hl_gates.apply(gen)
     job_order = os.environ.get("OOT_JOB_ORDER") == "1"   # (TICK-047, lift time; off: no job order statements)
     done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0}
     if job_order:
