@@ -91,7 +91,10 @@ public:
     // sets). Their own counters: mod_* beside the actors' ones; mod_checked / mod_diff the twin registration compared with
     // the translated twin, mod_skipped the registrations the check could not compare without side effects (a root job
     // with a pre-push hook, whose hook the translated twin would call a second time; a worker whose message function is
-    // not the usual one, which the translated twin would start; a heap larger than the check's copy).
+    // not the usual one, which the translated twin would start; a heap larger than the check's copy). The module system
+    // starts some twin stages and never waits for them (their workers end on their own): such a set registered again is
+    // an overlap only when a worker that stage started is still in the group; otherwise it is counted as mod_unwaited
+    // (an observation).
     struct Stats {
         std::atomic<uint64_t> registrations{0}, own_registered{0}, workers_registered{0};
         std::atomic<uint64_t> started{0}, started_virtual{0}, not_queued{0};
@@ -101,7 +104,7 @@ public:
         std::atomic<uint64_t> mod_waits{0}, mod_waits_empty{0}, mod_owner_runs{0};
         std::atomic<uint64_t> overlap{0}, unstarted{0}, double_start{0}, still_in{0}, not_over{0}, changed{0};
         std::atomic<uint64_t> below_zero{0}, reg_checked{0}, reg_diff{0}, untracked{0}, lane_drift{0}, violations_logged{0};
-        std::atomic<uint64_t> mod_checked{0}, mod_diff{0}, mod_skipped{0};
+        std::atomic<uint64_t> mod_checked{0}, mod_diff{0}, mod_skipped{0}, mod_unwaited{0};
     };
 
     /// `dispatcher`: who runs the owner's part of a stage (null: the translated dispatcher, called). `group`: the native
@@ -174,7 +177,8 @@ private:
     void snapshot(GuestAddr set, bool module, Snapshot& out) const;
     bool compare_module(GuestThread as, GuestAddr set, GuestAddr group, Snapshot& translated);
     uint64_t lane_byte(GuestThread as, GuestAddr set);
-    void note_registered(GuestAddr set, uint64_t send, uint64_t lanes, bool module);
+    void note_registered(GuestAddr set, uint64_t send, uint64_t lanes, bool module, bool previous_over);
+    bool stage_left(GuestAddr set);
     bool note_started(GuestAddr set, int32_t index);   // index -1: the own context; false when started before
     void check_done(GuestAddr worker);
     void check_stage_end(GuestAddr set, bool last, uint64_t lanes);

@@ -843,6 +843,22 @@ void module_edges() {
         w.check_ran(want);
     }
     CHECK(w.stages.stats().mod_skipped == 3 && w.stages.stats().mod_hooks == 9);
+    // A stage started and never waited for (the module system does that): once its group is over and its workers have
+    // left it, the set registered again is no overlap.
+    for (int round = 0; round < 2; round++) {
+        const std::vector<int> want = w.make_graph(80);
+        set->stage_cores = 0x3f;
+        w.stages.register_module(t, kSet, kGroup);
+        for (bool left = false; !left;) {
+            left = (__atomic_load_n(&gr->flags, __ATOMIC_ACQUIRE) & 2) != 0;
+            for (int i = 0; i < kCores; i++)
+                left = left && !(__atomic_load_n(&m.at<g::Worker>(worker(i))->context.flags, __ATOMIC_ACQUIRE) & 1);
+            std::this_thread::yield();
+        }
+        w.check_ran(want);
+    }
+    w.stages.wait_module(t, kSet);
+    CHECK(w.stages.stats().mod_unwaited == 1 && w.stages.stats().overlap == 0);
     w.make_graph(40);
     set->stage_cores = 0;
     set->flags = 0;

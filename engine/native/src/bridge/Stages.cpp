@@ -209,7 +209,7 @@ void Stages::register_workers(GuestThread as, GuestAddr set, uint64_t send) {
             stats_.reg_diff.fetch_add(1, std::memory_order_relaxed);
             violation("the registration's writes differ from the translated registration's", set);
         }
-        note_registered(set, send, lanes, false);
+        note_registered(set, send, lanes, false, false);
     }
     if (send & 1) send_messages(as, set);
 }
@@ -233,6 +233,7 @@ void Stages::register_module(GuestThread as, GuestAddr set, GuestAddr g_at) {
         stats_.mod_empty.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    const bool previous_over = options_.check && stage_left(set);
     Snapshot translated;
     const bool compared = options_.check && compare_module(as, set, g_at, translated);
     const uint64_t lanes = options_.check ? lane_byte(as, set) : 0;
@@ -256,7 +257,7 @@ void Stages::register_module(GuestThread as, GuestAddr set, GuestAddr g_at) {
                 violation("the twin registration's writes differ from the translated twin's", set);
             }
         }
-        note_registered(set, 1, lanes, true);
+        note_registered(set, 1, lanes, true, previous_over);
     }
     // (0x800714ec) always with the message
     send_messages(as, set);
@@ -515,11 +516,28 @@ void Stages::snapshot(GuestAddr set, bool module, Snapshot& out) const {
     }
 }
 
-void Stages::note_registered(GuestAddr set, uint64_t send, uint64_t lanes, bool module) {
+// (checking) A twin stage that nobody waited for (the module system starts some stages and never waits for them: their
+// workers end on their own) is over when every worker it started has left the group (a context leaves only once the
+// group is over; the group's own flag cannot tell, the graph's making clears it before the next registration).
+bool Stages::stage_left(GuestAddr set) {
+    std::lock_guard lock(records_mu_);
+    const auto it = records_.find(set);
+    if (it == records_.end() || !it->second.open || !it->second.module) return false;
+    const Record& r = it->second;
+    if (r.own_started && (ld(&at<guest::WorkerSet>(set)->own_context.flags) & kSentMessage)) return false;
+    const int32_t n = (int32_t)ld(&at<guest::WorkerSet>(set)->count);
+    for (int32_t i = 0; i < n && i < 32; i++)
+        if (((r.started >> i) & 1) && (ld(&at<guest::Worker>(worker_at(set, i))->context.flags) & kSentMessage)) return false;
+    return true;
+}
+
+void Stages::note_registered(GuestAddr set, uint64_t send, uint64_t lanes, bool module, bool previous_over) {
     const guest::WorkerSet* w = at<guest::WorkerSet>(set);
     std::lock_guard lock(records_mu_);
     Record& r = records_[set];
-    if (r.open) {
+    if (r.open && previous_over) {
+        stats_.mod_unwaited.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.open) {
         stats_.overlap.fetch_add(1, std::memory_order_relaxed);
         violation("a set registered again before its previous stage was over", set);
     }
@@ -621,10 +639,11 @@ int Stages::report(char* out, size_t cap) const {
     if (!options_.check) return n;
     const int m = std::snprintf(out + n, cap - (size_t)n,
                                 "; CHECK: registrations compared %llu (differ %llu), twins compared %llu (differ %llu, not "
-                                "compared %llu), overlaps %llu, unstarted %llu, double starts %llu, done while in %llu, not "
-                                "over %llu, changed %llu, below zero %llu; untracked %llu, lane drift %llu",
+                                "compared %llu, stages over and not waited for %llu), overlaps %llu, unstarted %llu, double "
+                                "starts %llu, done while in %llu, not over %llu, changed %llu, below zero %llu; untracked "
+                                "%llu, lane drift %llu",
                                 v(s.reg_checked), v(s.reg_diff), v(s.mod_checked), v(s.mod_diff), v(s.mod_skipped),
-                                v(s.overlap), v(s.unstarted), v(s.double_start), v(s.still_in), v(s.not_over), v(s.changed),
+                                v(s.mod_unwaited), v(s.overlap), v(s.unstarted), v(s.double_start), v(s.still_in), v(s.not_over), v(s.changed),
                                 v(s.below_zero), v(s.untracked), v(s.lane_drift));
     if (m < 0) return n;
     return (size_t)(n + m) >= cap ? (int)cap - 1 : n + m;
