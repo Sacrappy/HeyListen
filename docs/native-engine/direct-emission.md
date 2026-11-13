@@ -602,3 +602,31 @@ once for the switches.
 The pass check's tap (`HL_GFX_CHECK`) sees NVN calls; with it set the gate compares the translated function instead of
 answering, so the records path is not used then. The parallel replay and its dry pass read the same bytes; no consumer
 was found that keys on anything the procedures did beyond their records.
+
+### Switches
+
+`HL_GFX_REC=1` the render state written as records (default 0 until the main PC's validation runs);
+`HL_GFX_REC_CHECK=1` the record check (with `HL_GFX_REC=1`: the native records live, the procedures' compared and
+dropped, the spec's `HL_GFX_REC_CHECK=2` folded into the same switch). Both act only where the render-state function is
+answered natively (`HL_GFX_STATE=1` and no `HL_GFX_CHECK`). The line `hl gfx rec: calls written as records N (records R),
+left to NVN F, commands not written S; check: calls compared C, records, bytes, mismatched calls M (accounting A)` every
+10 s; the first eight mismatches in full (both sides' first differing record, in hex).
+
+### The check and the runs
+
+PC 3050, 110 s a scene (function only; last counter line of each run):
+
+| Run | Scene | Calls compared | Records | Bytes | Mismatched calls (accounting) | Left to NVN | Commands not written |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `HL_GFX_REC_CHECK=1` (brick A) | castle-move | 40,857 | 325,274 | 10,722,968 | 0 (0) | 0 | 0 |
+| | kokiri-idle | 62,359 | 497,132 | 16,393,176 | 0 (0) | 0 | 0 |
+| | hyrule-walk | 57,711 | 459,565 | 15,150,784 | 0 (0) | 0 | 0 |
+| `HL_GFX_REC=1 HL_GFX_REC_CHECK=1` (brick B, checked) | castle-move | 51,955 | 413,282 | 13,621,800 | 0 (0) | 0 | 0 |
+
+| Run | Scene | Ran | Calls written as records (records) | Left to NVN | Shots |
+|---|---|---|---:|---:|---|
+| `HL_GFX_REC=1` (brick B), PC 3050 | castle-move | to the end, save unchanged | 46,420 (369,038) | 0 | right after loading |
+| | kokiri-idle | to the end | 65,851 (525,004) | 0 | right |
+| | hyrule-walk | to the end | 64,993 (518,147) | 0 | right |
+
+About eight records a call: of the ~33 commands, the 18 setters write no record (they set the objects the binds copy).
