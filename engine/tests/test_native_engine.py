@@ -5,13 +5,22 @@ standard library only, nothing of the lifted code or of the OS layer.
 python -I -B tests/test_native_engine.py --cxx <compiler> [--only <name of a test file>]
 """
 import argparse
+import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = ROOT / "native"
+sys.path.insert(0, str(ROOT / "nx2"))
+from host_cpu import host_march  # noqa: E402
+
+# (the game's flags for the tree, nx2/build.py's CPU: this PC's x86-64 level and no contraction of a * b + c into a fused
+# multiply-add. -mavx2 -mfma before let GCC (whose default is -ffp-contract=fast) fuse what the game computes in two
+# roundings, so a math test could pass on code the game never runs; and the programs did not run on a CPU without AVX2)
+GAME_FLAGS = ["-march=" + (os.environ.get("RX_MARCH") or host_march()), "-ffp-contract=off"]
 
 
 def check_tree():
@@ -41,12 +50,12 @@ def main():
         objects = []
         for src in sources:
             obj = Path(tmp) / (Path(src).relative_to(NATIVE / "src").as_posix().replace("/", "_")[:-4] + ".o")
-            subprocess.run([args.cxx, "-std=c++20", "-O1", "-mavx2", "-mfma", "-Wall", "-Wextra", "-Werror", "-pthread",
+            subprocess.run([args.cxx, "-std=c++20", "-O1", *GAME_FLAGS, "-Wall", "-Wextra", "-Werror", "-pthread",
                             "-I", str(NATIVE / "include"), "-c", src, "-o", str(obj)], check=True)
             objects.append(str(obj))
         for test in tests:
             exe = Path(tmp) / (test.stem + ".exe")
-            subprocess.run([args.cxx, "-std=c++20", "-O1", "-mavx2", "-mfma", "-Wall", "-Wextra", "-Werror", "-pthread",
+            subprocess.run([args.cxx, "-std=c++20", "-O1", *GAME_FLAGS, "-Wall", "-Wextra", "-Werror", "-pthread",
                             "-I", str(NATIVE / "include"), str(test), *objects, "-o", str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=600)
 

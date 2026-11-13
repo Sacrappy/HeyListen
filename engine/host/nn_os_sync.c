@@ -233,7 +233,9 @@ static Obj *obj(uint64_t key, int kind) {
     }
     Obj *o = obj_any(key, kind);
     uint32_t mine = __atomic_load_n(&o->ix, __ATOMIC_RELAXED);
-    if (!mine) {
+    /* (once the table is full no number is taken any more: an increment on every lookup of an unnumbered mutex would
+       wrap the 32-bit counter negative within an hour and index the table below its start) */
+    if (!mine && __atomic_load_n(&mx_next, __ATOMIC_RELAXED) < (long)MX_IX_CAP) {
         const long n = __sync_fetch_and_add(&mx_next, 1);
         if (n < (long)MX_IX_CAP) {
             uint32_t none = 0;

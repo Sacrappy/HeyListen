@@ -112,7 +112,10 @@ int main() {
         sync_order_mu.unlock();
         poller.join();
     }
-    // many sections and polls: a readback after its ticket sees its section's registrations
+    // many sections and polls: a readback after its ticket sees its section's registrations. (The sections above made
+    // none: noted as made, or a poll that ran before the first replay section, as under a loaded parallel suite, took the
+    // last of them as its ticket, rightly did not wait, and found "registered" behind it: the test's own flake)
+    { std::lock_guard lk(sync_order_mu); registered.store(sync_order_mu.entered.load(), std::memory_order_relaxed); }
     std::atomic<bool> stop{false};
     std::vector<std::thread> replays;
     for (int k = 0; k < 2; k++)
