@@ -34,7 +34,7 @@
 #define HL_JOBS_DEFAULT HL_JOBS_THROUGH
 #define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
 #define HL_DISPATCH_ALL_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
-#define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 14 runs over the three scenes, two PCs) */
+#define HL_STAGES_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 15 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;

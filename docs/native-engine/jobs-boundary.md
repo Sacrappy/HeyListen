@@ -485,15 +485,18 @@ the wait (the OS core read when the thread-local one is 0, an owner inside a job
 with and without the own context, no stage, no stage cores, another message function, a worker not running.
 
 Validated 2026-11-13 (function and picture; no speed measured), `HL_STAGES=1 HL_STAGES_CHECK=1 HL_DISPATCH_CHECK=1`:
-on the main PC the three scenes with shots (pictures right), castle-move 4 more times and hyrule-walk once more, and one
-castle-move run of the default-on build with no `HL_STAGES` set; on the PC 3050 castle-move 3 times, hyrule-walk twice
-and kokiri-idle once. Every run went to the end with the game speed ratio 58-63; in every run every count above read 0
+on the main PC the three scenes with shots (pictures right), castle-move 3 more times and hyrule-walk once more (shots
+right), and one castle-move run of the default-on build with no `HL_STAGES` set (shots right); on the PC 3050
+castle-move 3 times, hyrule-walk twice, kokiri-idle once, and one hyrule-walk run of the default-on build (shots right):
+15 runs. Every run went to the end with the game speed ratio 58-63; in every run every count above read 0
 (a main-PC castle run: about 57,000 registrations, each compared with the translated one, about 340,000 workers started
 and waited for, 38,000 waits and 19,000 last stages ended), and the dispatcher's invariants stayed 0. What the scenes
 exercise: every registration has stage cores and an owner that does not take part (own context registered 0 times,
 owner's part run 0 times), every worker message is the usual one and is queued, no lane drift: the owner's path through
 the set's own context, the other message function and the not-running worker are covered by the model test only.
-`HL_STAGES=1` is the default (with `HL_JOBS` on); `HL_STAGES=0` leaves the three gates off (the translated functions).
+In two of the three hyrule-walk runs with shots the walk ends in a town girl's dialogue, where the reference shots end
+by the fountain; the walk's end point already differs from one reference run to another, so this is noted, not
+attributed. `HL_STAGES=1` is the default (with `HL_JOBS` on); `HL_STAGES=0` leaves the three gates off (the translated functions).
 
 ## The module system's job group (`0x8007fe60`, a first reading)
 
