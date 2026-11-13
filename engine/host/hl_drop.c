@@ -27,6 +27,8 @@
      HL_MEM_DROP_MAX_MB=<MB>  without the spill, larger decodes are left out (default 32, 0: any): a touch decodes the file
      HL_MEM_DROP_SPILL_MB=<MB>  the spill file's size at most (default 4096; 0: no spill)
      HL_MEM_DROP_AHEAD=<n>  granules restored after the one touched, from the spill (default 3)
+     HL_MEM_DROP_POOLS=1  mirrored pools' storage too (default 0; needs the spill and RX_VK_NO_HOST_IMPORT=1): checked at the
+                          drop against the VRAM mirror read back, restored from the spill
      HL_MEM_DROP_CHECK=1  a hash of each granule at its drop, compared at its restore (counted)
      HL_MEM_DROP_LOG=1  the counters every 10 s */
 #include "hos.h"
@@ -67,8 +69,35 @@ static int cb_restore(void *ctx, uint64_t a, uint64_t n, hl_drop_fill fill, void
     return hos_gp_restore(GP(a), (size_t)n, fill_adapter, &f);
 }
 
-static const uint8_t *cb_source(void *ctx, const char *name, uint32_t dict_id, uint64_t size, uint64_t compressed) {
+/* HL_MEM_DROP_POOLS: a mirrored pool's storage, read back from its VRAM mirror by the back end (gpu/vk/vk_memory.cpp
+   memory_mirror_read), at the drop only: its granules restore from the spill. The source's name is "(mirror)" */
+static int pools_on;
+typedef int (*MirrorRead)(uint64_t, uint64_t, void *);
+static volatile LONG64 mirror_reads, mirror_read_ns, mirror_read_max_ns;
+static const uint8_t *mirror_source(uint64_t dest, uint64_t size) {
+    static MirrorRead read;
+    if (!read) {
+        HMODULE m = GetModuleHandleA("hookshot_vk.dll");
+        read = m ? (MirrorRead)(void *)GetProcAddress(m, "mkwvk_mirror_read") : NULL;
+        if (!read) return NULL;
+    }
+    uint8_t *b = (uint8_t *)malloc((size_t)size);
+    if (!b) return NULL;
+    const int64_t t0 = hos_now_ns();
+    if (!read(dest, size, b)) {
+        free(b);
+        return NULL;
+    }
+    const int64_t took = hos_now_ns() - t0;
+    InterlockedIncrement64(&mirror_reads);
+    InterlockedAdd64(&mirror_read_ns, took);
+    if (took > mirror_read_max_ns) InterlockedExchange64(&mirror_read_max_ns, took);
+    return b;
+}
+static const uint8_t *cb_source(void *ctx, const char *name, uint32_t dict_id, uint64_t dest, uint64_t size,
+                                uint64_t compressed) {
     (void)ctx;
+    if (!strcmp(name, "(mirror)")) return mirror_source(dest, size);
     return hl_stream_decode_again(name, dict_id, size, compressed);
 }
 static void cb_release(void *ctx, const uint8_t *bytes) { (void)ctx; free((void *)bytes); }
@@ -227,6 +256,15 @@ void hl_drop_import(uint64_t lo, uint64_t hi) {
     in_kernel = 2;
 }
 void hl_drop_import_end(void) { in_kernel = 0; }
+/* (the back end, gpu/vk/vk_memory.cpp imports_release) the import of [lo, hi) was given back: the pool's bytes are in its
+   VRAM mirror. HL_MEM_DROP_POOLS=1: a candidate, checked against the mirror read back at its drop */
+__declspec(dllexport) void hos_mirror_held(uint64_t lo, uint64_t hi) {
+    if (drop_on && pools_on && hi > lo) hl_drop_mirrored(lo, hi - lo, hos_now_ns());
+}
+/* (hos_memsplit.c, nvnMemoryPoolFinalize) a pool's storage ended: its candidates go (what is dropped stays restorable) */
+void hl_drop_pool_gone(uint64_t lo, uint64_t hi) {
+    if (drop_on && pools_on) hl_drop_cancel(lo, hi);
+}
 /* (hos_memsplit.c hos_noaccess_unimport) the back end gave its import of [lo, hi) back */
 void hl_drop_unimport(uint64_t lo, uint64_t hi) {
     if (drop_on) hl_drop_unimported(lo, hi);
@@ -255,6 +293,10 @@ static DWORD WINAPI drop_main(void *unused) {
                              mx = InterlockedExchange64(&restore_ns_max, 0), mi = InterlockedExchange64(&restore_ns_max_import, 0);
                 hos_log("hl drop: %s; a touch took %.2f ms on average, %.2f ms at most (an import's %.2f ms at most) (since the "
                         "last line); a pass %.1f ms at most", line, n ? sum / 1e6 / n : 0.0, mx / 1e6, mi / 1e6, worst_ms);
+                if (pools_on)
+                    hos_log("hl drop: pools (HL_MEM_DROP_POOLS): %lld mirror reads, %.2f ms on average, %.2f ms at most",
+                            (long long)mirror_reads, mirror_reads ? mirror_read_ns / 1e6 / mirror_reads : 0.0,
+                            mirror_read_max_ns / 1e6);
             }
         }
         worst_ms = 0;
@@ -304,6 +346,10 @@ void hl_drop_init(void) {
     hl_drop_host host = {NULL, cb_is_dropped, cb_drop, cb_restore, cb_source, cb_release, cb_view, cb_resident,
                          cb_protect, cb_plain, cb_clock, NULL, NULL, NULL};
     if (spill) host.spill_put = cb_spill_put, host.spill_get = cb_spill_get, host.spill_free = cb_spill_free;
+    {   /* (HL_MEM_DROP_POOLS=1, default 0: mirrored pools' storage too; their granules restore from the spill only) */
+        const char *pe = getenv("HL_MEM_DROP_POOLS");
+        pools_on = pe && atoi(pe) == 1 && spill;
+    }
     if (!hl_drop_start(&config, &host)) {
         hos_log("hl drop: off (the policy could not be made)");
         return;
@@ -325,6 +371,7 @@ void hl_drop_kernel_begin(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_kernel_end(void) {}
 void hl_drop_import(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_import_end(void) {}
+void hl_drop_pool_gone(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_unimport(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_decode(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name) {
     (void)dest; (void)size; (void)compressed; (void)dict_id; (void)name;

@@ -12,7 +12,7 @@ hl_drop_host g_host;
 
 const uint8_t* source_of(void* ctx, const hl::mem::DropSource& s) {
     (void)ctx;
-    return g_host.source(g_host.ctx, s.name.c_str(), s.dict_id, s.size, s.compressed);
+    return g_host.source(g_host.ctx, s.name.c_str(), s.dict_id, s.dest, s.size, s.compressed);
 }
 }   // namespace
 

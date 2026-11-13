@@ -22,7 +22,7 @@ typedef struct hl_drop_host {
     int (*drop)(void *ctx, uint64_t addr, uint64_t size);
     int (*restore)(void *ctx, uint64_t addr, uint64_t size, hl_drop_fill fill, void *fill_ctx);
     /* the file decoded again: `size` bytes, or NULL; given back with release() */
-    const uint8_t *(*source)(void *ctx, const char *name, uint32_t dict_id, uint64_t size, uint64_t compressed);
+    const uint8_t *(*source)(void *ctx, const char *name, uint32_t dict_id, uint64_t dest, uint64_t size, uint64_t compressed);
     void (*release)(void *ctx, const uint8_t *bytes);
     const uint8_t *(*view)(void *ctx, uint64_t addr);
     uint32_t (*resident)(void *ctx, uint64_t granule);
