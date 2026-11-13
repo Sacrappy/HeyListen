@@ -790,38 +790,88 @@ BindTexturesDeferred 4, DeviceGetTextureHandle 1, texture view 2), CallCommands 
 ### The cut, and why
 
 The function cannot be cut at a point in its middle and the rest left to the translation: an entry gate answers the
-whole call or none of it. So the native version takes **whole calls on one path**, decided before anything is written,
-and leaves every other call whole to the translated body (as the sub-mesh submission does with its paths). The path
-taken is the **cached path**: the material entry not empty, the state key and the material state already applied, the
-program already bound, the pending bits already applied, the drawable block unchanged (or none), the list present.
-That call reads about twenty fields, writes at most B+0xb2 and the mark byte, and makes at most one NVN call (the list's
-CallCommands): it has no guest callee, so it is exact by construction and fully checkable. Every other route is a
-step of the order above that it leaves to the translation, and the route is counted (`hl::gfx::PrepareRoute`: state,
-program, pending bits, drawable block, streams, inline, clusters). An empty material entry (return 0, nothing else) is
-answered natively too.
+whole call or none of it. So the native version takes **whole calls on chosen paths**, decided before anything is
+written, and leaves every other call whole to the translated body (as the sub-mesh submission does with its paths).
+`decide()` follows the function's order and stops at the first step that leaves the native paths; that step is the
+call's **route** (`hl::gfx::PrepareRoute`), counted for every call. The paths taken natively:
 
-What comes next, by the histogram below: the state step (36 calls that `RecordSink` already writes as records), then the
-program step, whose binds (uniform blocks: the procedures stream 8 is turning into inline records) and guest callees
-(buffer objects' methods) need the bind handlers' side effects read first.
+- **cached** (step 2 and 3 already applied): the material entry not empty, the state key and the material state
+  applied, the program bound, the pending bits applied, the drawable block unchanged (or none), the list present. The
+  call reads about twenty fields, writes at most B+0xb2 and the mark byte, makes at most one NVN call (the list's
+  CallCommands);
+- **program bound** (step 3 without a bind): another program whose interface's three parts have the ids, or the
+  binding words, the block already applied (or whose texture part has no slot): BindProgram, the block's copies of the
+  program and of the ids, mode bits 12 / 13, the per-drawable block's binding word when only it changed (no bind: the
+  entry is then marked to be bound, and the call goes on to step 5, which the translation does when it binds), the
+  applied bits cleared when an id changed; then the rest as on the cached path;
+- **no material**: return 0, nothing else.
+
+None of them reaches a guest callee, so each is exact by construction and checkable call by call. They were chosen from
+the histogram below: the cached path is two thirds of the calls, the program bound alone one tenth. The other routes:
+**state** (the render state recorded again, 28 calls, and in its frequent shapes another program too: 7% of the
+calls, 56% of the function's NVN calls), **program** (another program with buffers or textures to bind: 12%), **drawable block** (1.5%).
+The pending-bits, streams, inline and clusters routes were never taken in the three scenes.
+
+What comes next: the state step (its 28 calls are the render-state function's set, which `RecordSink` already writes
+as records; the step's derivations read the material state at D+0x70 field by field), then the program step's binds
+(uniform blocks and textures: the procedures stream 8 is turning into records, and the buffer objects' virtual methods,
+which need their classes read first).
 
 ### What is built
 
 | Piece | Where | What it does |
 |---|---|---|
-| `hl::gfx::Prepare` | `engine/native/{include,src}/hl/gfx/Prepare.*` | `decide()`: the route, in the function's order, and on the cached path the result, the bits written and the list call; `emit()`: the CallCommands |
-| The bridge | `hl/bridge/GfxBridge.*` | `guest::MaterialEntry`, the drawable's and the block's new fields (each `static_assert(offsetof)`), `PrepareBridge`: the material entry chosen, the reads in the function's order (nothing past the point where a call leaves the path, as the function), the writes (told to the write tracking), the bytes compared |
+| `hl::gfx::Prepare` | `engine/native/{include,src}/hl/gfx/Prepare.*` | `decide()`: the route in the function's order, and on the native paths the result, the program step's writes, the bits written and the list call; `emit()`: BindProgram and CallCommands |
+| The NVN table | `hl/gfx/Nvn.h`, `src/gfx/Nvn.cpp` | one procedure more (35): BindProgram (its global `0x84d67c60`, checked against the game's at start like the others) |
+| The bridge | `hl/bridge/GfxBridge.*` | `guest::MaterialEntry`, `guest::Program`, the drawable's and the block's new fields (each `static_assert(offsetof)`), `PrepareBridge`: the material entry chosen, the reads (the program's parts only where the function dereferences them: a part both the block and the program say is the defaults is not read, the texture part not under mode bit 15), the writes (told to the write tracking), the bytes compared |
 | C surface | `hl/c/hl_gfx.h`, `src/c/hl_gfx.cpp` | `hl_gfx_prep_start / _apply / _check_begin / _check_call / _check_end / _report / _shapes`; the paths' histogram |
-| OS layer | `engine/host/hl_gfx.c` | the gate `HL_GATE(8008fc00, "4df7e218373859d0")` (already in `code_hot_7.c` as section 9's checkpoint: no new gate, no recompile of the lifted file) now also answers the preparation; the tap now tells each procedure's kind |
-| Tests | `engine/native/tests/gfx_test.cpp` | each route in order, the bits, the call; the bridge's reads (the slot through the pass, a signed slot to the default entry, the list), its stop points, its writes against the expected bytes |
+| OS layer | `engine/host/hl_gfx.c` | the gate `HL_GATE(8008fc00, "4df7e218373859d0")` (already in `code_hot_7.c` as section 9's checkpoint: no new gate, no recompile of the lifted file) now also answers the preparation; the checkpoint's call of the translated preparation goes through it, so it is checked too; the tap now tells each procedure's kind |
+| Tests | `engine/native/tests/gfx_test.cpp` | each route in order, the bits, the calls; the program step's parts, defaults, bit 15 and the third word; the bridge's reads (the slot through the pass, a signed slot to the default entry, the list, the program's parts), its stop points, its writes against the expected bytes |
 
-Switches: `HL_GFX_PREP` 0 (the translated function; the default) or 1 (native on the cached path); `HL_GFX_CHECK=1`
-checks every call instead (the route counted, the cached path compared call by call: the NVN calls with their
-arguments, the block's 352 bytes, the mark byte and the result) and files every call's translated NVN calls by kind
-in the histogram; `HL_GFX_LOG=1` the lines `hl gfx: preparation: ...` and `hl gfx: preparation shapes ...` every 10 s.
-No new NVN procedure: CallCommands is in the table since section 9. `RecordSink` is not extended: the cached path makes
-no bind, and its one call (CallCommands) copies the called recording in the NVN layer (`inline_recording` under the copy
-lock), which is not a record a sink can write without that host surface.
+Switches: `HL_GFX_PREP` 0 (the translated function) or 1 (native on the paths above); `HL_GFX_CHECK=1` checks every
+call instead (the route counted; on the native paths the call compared: the NVN calls with their arguments, the block's
+352 bytes, the mark byte and the result) and files every call's translated NVN calls by kind in the histogram;
+`HL_GFX_LOG=1` the lines `hl gfx: preparation: ...` and `hl gfx: preparation shapes ...` every 10 s. `RecordSink` is not
+extended: the native paths' two procedures are not record-only: BindProgram's handler and CallCommands' (which copies
+the called recording into the caller under the copy lock, `inline_recording`) are left to the NVN layer, through
+`NvnSink` as the sub-mesh submission does.
 
+### The paths' histogram and the check (main PC, `HL_GFX_CHECK=1`, 110 s a scene; counts at the last report)
+
+Calls by route (translated NVN calls of those calls in brackets):
+
+| Scene | Calls | cached | program bound | state | program | drawable block | Native share of calls |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | 7,084,588 | 4,811,097 (4.81 M) | 787,010 (1.57 M) | 520,237 (18.0 M) | 860,266 (7.36 M) | 105,978 (0.35 M) | 79.0% |
+| castle-move | 2,720,759 | 1,845,849 (1.85 M) | 287,908 (0.58 M) | 190,999 (6.70 M) | 356,605 (3.03 M) | 39,398 (0.13 M) | 78.4% |
+| hyrule-walk | 6,351,935 | 4,268,874 (4.27 M) | 693,836 (1.39 M) | 474,877 (16.5 M) | 820,113 (6.98 M) | 94,235 (0.31 M) | 78.1% |
+
+No call took the no-material, pending-bits, streams, inline or clusters routes. Every call ends with the list's
+CallCommands in every frequent shape. The most frequent shapes (kokiri-idle; state, program, uniform, storage,
+texture, call NVN calls): cached 0 0 0 0 0 1 (4.81 M); program bound 0 1 0 0 0 1 (787 k); state 28 1 1 0 0 1 (195 k);
+program with 7, 8 or 5 textures 0 1 0 0 n 1 (124 k, 120 k, 107 k); state 28 1 0 0 0 1 (117 k); drawable block 0 1 1 0 0 1
+(72 k); 121 shapes in all, 171-176 in the two other scenes, the same leaders in the same order. None of the sixteen most frequent shapes binds a storage buffer.
+
+**Check**: 0 mismatched calls in the three scenes: 5,598,107 / 2,133,757 / 4,962,710 calls compared (6,385,120 /
+2,421,671 / 5,656,549 NVN calls compared), and the same build's sections 8 and 9 checks at 0 too (render state 65,958 /
+5,605 / 57,603 calls; submission 262,340 / 76,875 / 220,675). The castle-move run reached the scene late (seven reports
+of 10 s), hence its smaller counts. The first build (cached path only) gave the same at its own share: 4,681,192 /
+5,013,227 / 5,533,572 calls compared, 0 mismatched (67-68% of 6.9-8.3 M calls).
+
+### Validation on the main PC (`build/s5/valid.sh`, 110 s a scene, with the other gfx bricks at their defaults)
+
+| Build | Scene | Ran | Game speed ratio | Native calls (cached / program bound; left: state / program / drawable block) | Shots |
+|---|---|---|---|---|---|
+| cached path only (`s2d-prep`) | kokiri-idle | to the end, no crash | 60.33 | 5,924,364 / -; 640,627 / 2,226,150 / 0 | right (the Market square, characters, shadows, HUD, as `refshots-kokiri-idle`) |
+| | castle-move | to the end, no crash | 60.36 | 5,022,907 / -; 544,776 / 1,878,600 / 0 | right (a street of the castle town: the door, the stalls, the tent) |
+| | hyrule-walk | to the end, no crash | 60.11 | 5,150,875 / -; 599,831 / 2,032,596 / 0 | right (the fountain, villagers in close-up, the "Parler" prompt) |
+| both paths (`s2e-prep`) | kokiri-idle | to the end, no crash | 59.86 | 6,218,365 / 1,023,371; 676,265 / 1,123,664 / 137,640 | right (the square with speech text) |
+| | castle-move | to the end, no crash | 59.61 | 4,977,569 / 808,904; 536,099 / 960,090 / 107,131 | right (the square at 16,800; barrels and crates close-up at the end; a loading screen at 13,800 as in the scene's own transition) |
+| | hyrule-walk | to the end, no crash | 59.98 | 5,120,562 / 866,131; 581,282 / 970,557 / 109,534 | right (the fountain square, characters) |
+
+Memory with both paths (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 2,319 / 1,303 / 5,817 /
+17,822 / 5,604; castle-move 2,923 / 1,526 / 6,525 / 18,916 / 6,363; hyrule-walk 2,517 / 1,440 / 6,248 / 18,443 / 5,995
+(the brick allocates nothing: these are the build's figures).
 ## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
