@@ -10,7 +10,8 @@
    function) the report says which block the faulting address and each register are in, live or freed, allocated and
    freed by whom and when, then the last 200 events of the crashing thread and the last 50 of every other thread merged
    by time; and hl_trace.bin is written in the game's folder.
-   HL_TRACE_DUMP=<s>: also write hl_trace.bin <s> seconds after the start (runs that end by being stopped), after a report as a crash prints it (with the last 3 events of each thread). */
+   HL_TRACE_DUMP=<s>: also write hl_trace.bin <s> seconds after the start (runs that end by being stopped), after a
+   report as a crash prints it (with the last 3 events of each thread). */
 #include "hl_host.h"
 #include "hl_trace.h"
 #include <stdio.h>
