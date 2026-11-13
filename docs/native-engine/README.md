@@ -197,6 +197,37 @@ So, in this order:
 steps 1 and 2 and the kernels, for about 1 ms of the chain if every estimate holds, none of them measured yet. Physics
 as a native module is the plan's step 6 and the largest block of the game; it is what stands between 4.5 ms and 3.2 ms.
 
+### The graphics front end and the memory target (owner's direction, 2026-11-13 night)
+
+The owner's direction: the native graphics front end is what should remove the copies between RAM and VRAM, with the
+game's RAM brought towards 2-4 GB. What the measurements allow, and how the front end gets there:
+
+| What is in RAM today (castle scene) | MB | What removes it |
+|---|---:|---|
+| CPU-side storage of GPU pools the game declared without CPU access | 664 | the back end alone: it is the only one that touches them (in progress) |
+| CPU-side storage of CPU-cached GPU pools (textures, vertex and index data, shader code) | 3,770 | a native resource path: file -> decompression -> VRAM, the bytes never placed in the game's memory; until then, pages dropped after upload where a page trap shows game code does not come back to them (being measured) |
+| The game's own heaps, outside any pool | 3,662 | not the graphics front end: this is the gameplay's and the engine's CPU data; it shrinks only as subsystems leave the translation |
+| Image, system region | 97 | - |
+
+So the graphics front end, with the resource path under it, is worth up to about 4.4 GB of the 8.2 GB, which would
+leave the game's memory near 3.8 GB: the upper end of the 2-4 GB aimed at. Below that needs the heaps themselves
+(resources' CPU side, actors), which is the memory module and the resource module of this plan. The process holds more
+than the game's memory: the GPU driver's own arenas (2.8-5 GB resident) and this engine's caches are counted apart in
+`memory-boundary.md` and are not touched by any of this.
+
+The front end is built from the bottom, each step on in the game before the next:
+
+1. **GPU-only storage stays on the GPU** (the 664 MB): no write-back into memory the game cannot read.
+2. **Static GPU data is owned by the native side after upload**: the game's pages are released once the data is in
+   VRAM, and given back from VRAM if game code ever asks (the trap). This is the step that ends the double copy without
+   the resource manager's functions being known.
+3. **The recording pass `0x806602e0` natively (`hl::gfx`)**: the first native producer of NVN calls
+   (`gfx-record-job.md`); then the whole recording job and its two sister items.
+4. **Draw lists straight to Vulkan**: once the passes are native they stop going through NVN command memory and its
+   capture (the 46 MB a frame the capture copies), which is where the back end's replay time and its mirrors go.
+5. **The resource path**: textures and geometry decoded from the file into VRAM by native loaders. Needs the resource
+   manager's request functions (not found yet).
+
 ## What is not known yet, said plainly
 
 - The main module is 15.4 M instructions with no names. Items 5 to 7 are each tens of thousands of functions, part of
