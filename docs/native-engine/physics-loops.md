@@ -605,7 +605,15 @@ Check, main PC, build of `2f924ae` (`HL_MATH_CHECK=1`, every unit checked), full
 | kokiri-idle | 404,355 (33,863) | 761,782 | 23,947,254 (2) | 1,634,748 | 1,647,810 (25) | 0 |
 | hyrule-walk | 360,135 (15,742) | 648,559 | 21,404,529 (0) | 1,525,367 | 1,524,230 (13) | 0 |
 
-u3's declines by reason (castle-move / kokiri-idle / hyrule-walk): shape 8,673 / 32,957 / 14,728, cast 338 / 250 /
+The same check on the PC 3050 (build of `8b2bf47`, u3 native by default otherwise), full runs:
+
+| scene | u3 compared (declined) | u2 | affine (declined) | u1 | sphere (declined) | mismatches |
+|---|---:|---:|---:|---:|---:|---:|
+| castle-move | 147,621 (8,035) | 215,680 | 7,297,090 (0) | 507,015 | 513,282 (13) | 0 |
+| kokiri-idle | 138,276 (6,121) | 219,947 | 7,958,830 (0) | 530,411 | 545,122 (13) | 0 |
+| hyrule-walk | 167,551 (15,558) | 279,215 | 9,036,233 (0) | 606,182 | 619,576 (13) | 0 |
+
+u3's declines by reason on the main PC (castle-move / kokiri-idle / hyrule-walk): shape 8,673 / 32,957 / 14,728, cast 338 / 250 /
 317, values 983 / 656 / 697; none for FPCR (every u3 call ran with FZ set and nothing else). An earlier check build
 (before the segment shape) compared 150,959 u3 calls in castle-move with no mismatch. FPSR: in 3 to 5 u3 calls a run
 the translation raised a flag beyond IXC (as u1's, 8: not read back by the game).
