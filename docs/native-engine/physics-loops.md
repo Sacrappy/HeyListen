@@ -811,8 +811,8 @@ contact solver's vtable only (no direct caller).
 - **The record header** (read): +0 16-bit flags (bit 0 the velocity set, 0x30 the friction kind, bit 6 "two bodies
   move" (the rows subtract the second body's velocity), bit 7 a record handled by `0x81785c00` (the "second Jacobian type"
   of 2.1), 0x300 the form of the normal rows (0, 0x100, 0x200; another value traps), bit 10, 11, 13, bit 14: set bit 5 of
-  both bodies' entry flags word at +28); +2 a byte (bits 0-2 extra row kinds through `0x8178413c`, bit 0 of the whole byte a
-  path at `0x8177c968`); +4 the number of contact points; +5 a byte (bits 1-3 material scaling of the rows from tables at
+  both bodies' entry flags word at +28); +2 a byte (bits 0-2: the record and its impulse pointer are appended to one, two or three of
+  the frame's deferred lists, solved later through `0x81785c00`; bit 0 also a path at `0x8177c968`); +4 the number of contact points; +5 a byte (bits 1-3 material scaling of the rows from tables at
   `*0x84cc1a80` / `*0x84cc1a88`, bit 4 a path at `0x8177ce38`, bit 6 kept); +6 a byte (0xe0 = 0x60 with flag bit 10: a
   separate path); +7 a byte (a count scaled by I's pair at +0x200); +8 and +12 the two bodies' ids (compared with the
   previous record's); +16 a float4 (the normal, and in w a factor); +40 and +44 the two velocity slots; +64 on, 32 bytes a
@@ -823,6 +823,10 @@ contact solver's vtable only (no direct caller).
   (V and W.z at +0, W.x, W.y at +16), and at the end of the walk. So **the entries in memory are behind the solver while a
   run of records on the same pair lasts**: a native version must keep exactly this write-back order only where something
   reads the entries in between (`0x81785c00` and the modifiers do: they get the frame block).
+- **After the normal rows**, with friction (flags 0x30) and P +16 bit 3 clear: the friction rows use integer "magic"
+  steps (`0x7ef504f3`, `0x5f2fed52`, with `0xbf0e425b`, `0x3fc6fa83`: reciprocal and reciprocal square-root
+  approximations by an integer subtraction and a polynomial refinement, exact operations a native version can
+  reproduce), and FMIN / FMAX clamps against the globals' +0x1c0 and +0x260 pairs; not read further.
 - **The normal rows** (each point in record order, Gauss-Seidel: each point's impulse changes the cached velocities
   before the next point is solved): the relative velocity along the point's Jacobians, `(J.ang0 · V0 + J.ang1 · W0) +
   n · (W0 - W1)` summed as `z + (x + y)`, plus the point's right-hand side; the impulse `Δ = max(-acc, eff · (rhs - v))` (a
@@ -832,7 +836,8 @@ contact solver's vtable only (no direct caller).
   solver step data's +0 and +0xd0 factors in the 0x100 and 0x200 forms).
 - **Calls** (48 sites): `0x81775920` (set-up of the frame's modifier lists), `0x8169ed90` / `0x8169e414` / `0x8169d98c` /
   `0x8169e0cc` / `0x8169e1ec` (Havok's monitor / timer helpers, likely: not read), `0x81785c00` (5 sites: the records with
-  bit 7, solved with the frame's cached velocities), `0x8178413c` (6: extra rows by byte +2), `0x81784840`, `0x81784a80`,
+  bit 7 and the deferred lists, with the frame's cached velocities), `0x8178413c` (6: an array's reserve, when a deferred
+  list is full), `0x81784840`, `0x81784a80`,
   `0x81784260`, `0x81784460`, `0x81784620` (row kinds of the paths not read), `0x8178d820` / `0x8178d870`, `0x816ef7bc`
   (the block allocator: an output stream), the profiler set (`0x816e09e0`, `0x800430a0`, `0x800431c8`, `0x816e23f0`,
   `0x816e2558`, the static-init guards), `0x8017188c` (phive), and 7 indirect calls (the modifiers' callbacks, "fire
