@@ -39,6 +39,9 @@ struct GuestRuntime {
                                unsigned frame_size) = 0;
     /// One line for the game's log.
     virtual void log(const char* line) = 0;
+    /// Tells the layer that `n` bytes of guest memory at `at` were written from native code (its write tracking, which
+    /// lifted code feeds on its own stores). Nothing by default.
+    virtual void written(GuestAddr at, uint64_t n) { (void)at, (void)n; }
 };
 
 // ---- the game's structures, in place -------------------------------------------------------------------------------

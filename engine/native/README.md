@@ -23,6 +23,7 @@ Rules of this tree:
 | Memory: which cold pages of static GPU data and of the game's heaps leave the working set | `hl/mem/ColdPages.h` | in the game behind `HL_MEM_COLD` (on) and `HL_MEM_COLD_HEAPS`, through `engine/host/hl_mem.c` (`docs/native-engine/memory-boundary.md`, sections 8 and 11) |
 | Graphics front end: the recording pass, its check, the output seam | `hl/gfx/RecordPass.h`, `hl/gfx/PassCheck.h`, `hl/gfx/Commands.h`, `hl/bridge/GfxBridge.h` | in the game behind `HL_GFX` (the listener `0x806602e0` native, its phases translated) and `HL_GFX_CHECK` |
 | Streaming: which resource decodes are native, the provenance of decoded ranges | `hl/stream/Decode.h`, `hl/stream/Provenance.h` | in the game behind `HL_STREAM` and `HL_STREAM_CHECK`, through `engine/host/hl_stream.c` (the zstd calls are there; `docs/native-engine/stream-boundary.md`) |
+| Graphics front end: the render-state function, the NVN entry points and their sink, the call-by-call check | `hl/gfx/RenderState.h`, `hl/gfx/Nvn.h`, `hl/gfx/StateCheck.h`, `hl/bridge/GfxBridge.h` | in the game behind `HL_GFX_STATE` (`0x80077d60` through an entry gate) and `HL_GFX_CHECK` |
 | C surface for the layer that runs guest code | `hl/c/hl_bridge.h`, `hl/c/hl_mem.h`, `hl/c/hl_gfx.h`, `hl/c/hl_stream.h` | used by `engine/host/hl_host.c` and one `hl_<module>.c` a module (`hl_jobs.c`, `hl_mem.c`, `hl_gfx.c`, `hl_stream.c`) |
 
 Test (no game, no GPU):
