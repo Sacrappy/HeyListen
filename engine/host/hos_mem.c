@@ -111,7 +111,9 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
         if (found < region_floor && found >= HOS_HEAP_BASE) region_floor = found;   /* (not the holes below) */
     }
     UNLOCK();
-    if (found) hos_commit(found, size);
+    /* (HeyListen) a region above the heap is address space: the game maps what it uses of it (AllocateMemoryPages
+       commits), and a touch of the rest commits it there. The holes below the heap are committed as before */
+    if (found && !(found >= HOS_HEAP_BASE && hos_lazy_commit())) hos_commit(found, size);
     if (!found) hos_fatal(NULL, "address space exhausted (%#llx bytes asked, heap %#llx)", (unsigned long long)size,
                           (unsigned long long)hos_heap_size);
     return found;
@@ -230,9 +232,12 @@ HLE(_ZN2nn2os17SetMemoryHeapSizeEm) {
         for (uint64_t a = HOS_HEAP_BASE + hos_heap_size; a < HOS_HEAP_BASE + size; a += 4096) *(volatile uint8_t *)GP(a) = 0;
         hos_log("heap: %llu MB prefaulted in %.0f ms", (unsigned long long)((size - hos_heap_size) >> 20), (hos_now_ns() - t0) / 1e6);
     }
-    if (size > hos_heap_size) hos_commit(HOS_HEAP_BASE + hos_heap_size, size - hos_heap_size);
+    /* (HeyListen) the game takes the whole budget as its heap (6.9 GB) and never touches about half of it: committed
+       where it is first touched, unless HOS_LAZY_COMMIT=0 */
+    if (size > hos_heap_size && !hos_lazy_commit()) hos_commit(HOS_HEAP_BASE + hos_heap_size, size - hos_heap_size);
     hos_heap_size = size;
-    hos_log("heap: %llu MB at %#llx", (unsigned long long)(size >> 20), (unsigned long long)HOS_HEAP_BASE);
+    hos_log("heap: %llu MB at %#llx%s", (unsigned long long)(size >> 20), (unsigned long long)HOS_HEAP_BASE,
+            hos_lazy_commit() ? ", committed on first touch" : "");
     RET(0);
 }
 

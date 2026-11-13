@@ -15,6 +15,19 @@
    The runtime commits what it hands out (image, system region, heap, address regions: hos_commit), because host
    APIs given guest buffers (ReadFile into a game buffer) fail on reserved pages without raising an exception. A
    guest or host access to a page nothing committed is committed on first touch, 64 KB at a time, by the handler. */
+int hos_lazy_commit(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_LAZY_COMMIT");
+#ifdef _WIN32
+        on = !(e && e[0] == '0');
+#else
+        on = e && e[0] == '1';   /* (the POSIX window has no commit-on-touch handler of this kind: off unless asked) */
+#endif
+    }
+    return on;
+}
+
 void hos_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
     if (!hos_guest_range(addr, size)) {   /* (hookshot: guest pages only; the posix layer's commit changes any page's protection) */
@@ -57,6 +70,17 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     if (guest < 0x100000) return EXCEPTION_CONTINUE_SEARCH;   /* (a null pointer: the game's own fault) */
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    /* (HeyListen) the heap and the address regions, left reserved (hos_lazy_commit): 1 MB at a time, so that a heap
+       the game fills takes a fault a megabyte and not one every 64 KB */
+    if (guest >= HOS_HEAP_BASE && hos_lazy_commit()) {
+        static volatile LONG64 lazy_bytes;
+        static volatile LONG said;
+        const LONG64 total = InterlockedAdd64(&lazy_bytes, 0x100000);
+        if (total >> 30 > said && InterlockedExchange(&said, (LONG)(total >> 30)) < (LONG)(total >> 30))
+            hos_log("mem: %lld MB of the game's memory committed on first touch", (long long)(total >> 20));
+        return VirtualAlloc(GP(guest & ~0xFFFFFULL), 0x100000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                                            : EXCEPTION_CONTINUE_SEARCH;
+    }
     static volatile LONG touched;
     if (InterlockedIncrement(&touched) <= 16)
         hos_log("mem: %#llx committed on first touch (nothing handed it out)", (unsigned long long)guest);

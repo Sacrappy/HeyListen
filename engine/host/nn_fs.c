@@ -322,6 +322,7 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         if (fs_trace()) hos_log("fs: read %s at %lld, %llu bytes", fh->path, (long long)off, (unsigned long long)size);
         hos_sleep_ns(delay_ns);
     }
+    hos_commit(buf, size);   /* (the kernel writes it: pages the game has not touched yet may be only reserved) */
     const int away = hos_vcore_away();   /* (as OpenFile: no core held through the read) */
     while (done < size) {
         OVERLAPPED ov = {0};
@@ -373,6 +374,7 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.Offset = (DWORD)ARG(1);
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
+    hos_commit(ARG(2), ARG(3));   /* (the kernel reads it) */
     WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }

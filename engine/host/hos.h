@@ -52,6 +52,10 @@ extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main
 int hos_game_is_mkw(void);
 #define HOS_GAME_TITLE "HeyListen"
 void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
+/* (HeyListen) 1: the heap and the address regions are reserved when the game asks for them and committed where they are
+   first touched (mkw_glue.c commit_on_touch), instead of whole. A system call given a guest buffer needs hos_commit on
+   it first: the kernel does not come through the handler. HOS_LAZY_COMMIT=0: committed whole, as before */
+int hos_lazy_commit(void);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))

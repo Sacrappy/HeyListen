@@ -139,6 +139,34 @@ Three sampled runs of the castle scene, every sample resolved to its translated 
 
 So the unit to replace is a job with what it calls, starting with those on the chain, not a list of hot functions.
 
+## Decisions (2026-11-13, after the measurements above)
+
+The project owner set the targets: the critical chain under 3.2 ms, memory halved; the architecture is decided here.
+
+1. **`HL_JOBS=1` stays the default.** The pool mode (2) is kept as an experiment until its stall is found; nothing below
+   depends on it.
+2. **The unit of replacement is a job, not a function.** A job's body is reached through a pointer, so it is answered
+   natively with no new lift (`a64_lookup_replaced`); a function called directly goes through the lift's hook list.
+   Order: the jobs that bound the chain first. Each replacement runs beside the translated job on live inputs and is
+   compared before it is switched on (the differential mode of `host/hos_native.c` is the model).
+3. **The graphics-command recording job (`0x8006cd60`) is where the graphics front end and the critical path meet**:
+   it becomes `hl::gfx`, the first native module that produces NVN calls itself. Its specification is
+   `gfx-record-job.md`.
+4. **Gameplay jobs are not rewritten.** The player's job is gameplay logic: what is replaced inside it is its numeric
+   kernels, and what is changed around it is when it runs. `critical-jobs.md` classes each job of the chain: replaceable
+   whole, kernels only, or a matter of scheduling.
+5. **Memory is cut from the host side first**, where nothing of the game has to be found:
+   - the heap and the address regions are committed where they are first touched, not whole (`HOS_LAZY_COMMIT`, default
+     on, Windows). Measured, castle scene, same build: the process's commit 24.9 GB -> 21.9 GB; the working set does not
+     move (13.9-14.0 GB), since pages never touched were never in RAM;
+   - RAM itself is the resident guest memory (9.2 GB in this scene) and the back end's copies. Next: measure how the
+     resident guest memory splits (heaps, GPU pools, resources), then drop the guest copy of static GPU data after upload
+     behind a page trap, and shrink the back end's caches (the BC cache, the texture shadows, the pool mirrors).
+
+Said plainly about the 3.2 ms: the chain is 5.8 ms sampled (about 7 ms of wait) and its six largest jobs are half of it.
+Native jobs and kernels shorten those; whether what is left fits under 3.2 ms depends on the order the jobs run in, which
+`critical-jobs.md` has to settle with numbers before it is promised.
+
 ## What is not known yet, said plainly
 
 - The main module is 15.4 M instructions with no names. Items 5 to 7 are each tens of thousands of functions, part of
