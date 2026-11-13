@@ -7,6 +7,8 @@
      affine  0x80ba6d80  a centre / half-extents box under a 3x4 matrix, called directly: HL_GATE
      u1      0x81746440  the box of a convex vertex set under a precise transform, called directly: HL_GATE
      sphere  0x800a8400  a model's bounding sphere over its bones' spheres, called directly: HL_GATE
+     u3      0x817d9d80  the per-body box update of the solver's last substep (u1, u2 and the segment's box inside),
+                         called directly: HL_GATE; it writes through pointers it computes (run_body)
    A call takes the native path only when the thread's guest FPCR has no bit but FZ set and the kernel finds every value
    ordinary (hl/math/Exact.h); otherwise ("declined") the translated function runs, as before.
 
@@ -110,7 +112,8 @@ static int sphere_inputs(const Ctx *c, Span *s) {
 extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400, hl_gate_on_817d9d80;
 enum { U2, AFFINE, U1, SPHERE, U3, UNITS };
 /* validated: HL_MATH_CHECK=1 over full runs of kokiri-idle, castle-move and hyrule-walk (PC 3050, 2026-11-13) compared
-   0.95 M (u2), 27 M (affine), 2.0 M (u1), 1.9 M (sphere) calls with no mismatch (physics-loops.md section 8) */
+   0.95 M (u2), 27 M (affine), 2.0 M (u1), 1.9 M (sphere) calls with no mismatch (physics-loops.md section 8); u3 over
+   the three scenes on the main PC (2026-11-14): 1.01 M calls compared, no mismatch */
 static Unit units[UNITS] = {
     [U2] = {.name = "u2", .guest = 0x81a040bcULL, .validated = 1, .native = u2_native, .out_at = u2_out,
             .inputs = u2_inputs},
@@ -121,7 +124,7 @@ static Unit units[UNITS] = {
     [SPHERE] = {.name = "sphere", .guest = 0x800a8400ULL, .validated = 1, .native = sphere_native, .out_at = sphere_out,
                 .inputs = sphere_inputs, .gate = &hl_gate_on_800a8400},
     /* (writes through pointers it computes: run_body below, not run) */
-    [U3] = {.name = "u3", .guest = 0x817d9d80ULL, .validated = 0, .gate = &hl_gate_on_817d9d80},
+    [U3] = {.name = "u3", .guest = 0x817d9d80ULL, .validated = 1, .gate = &hl_gate_on_817d9d80},
 };
 
 /* ---- switches ---- */
