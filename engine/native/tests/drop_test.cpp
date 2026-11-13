@@ -322,6 +322,12 @@ void partial() {
     CHECK(w.read(d, BASE + 61 * G + 3) == w.file[61 * G + 3]);
     CHECK(!w.dropped[58] && !w.dropped[60] && !w.dropped[61] && d.stats().dropped_now == 0);
     CHECK(w.mem == w.file && d.stats().mismatches == 0);
+    // (a decode larger than max_range_bytes is not a candidate: its touch would decode the whole file)
+    Drop::Config small = config();
+    small.max_range_bytes = 2 * G;
+    Drop d2(small, host_of(w));
+    d2.decoded(range(58, 4), 0);
+    CHECK(d2.pass(30 * S) == 0 && d2.stats().too_large == 1 && d2.stats().ranges == 0);
 }
 
 }   // namespace

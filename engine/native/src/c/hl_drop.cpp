@@ -30,6 +30,7 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     config.give_up = c->give_up;
     config.pass_bytes = c->pass_bytes;
     if (c->pass_ns) config.pass_ns = c->pass_ns;
+    config.max_range_bytes = c->max_range_bytes;
     config.require_cold = c->require_cold != 0;
     config.check = c->check != 0;
     hl::mem::Drop::Host host;

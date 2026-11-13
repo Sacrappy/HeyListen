@@ -218,6 +218,12 @@ void hl_drop_init(void) {
     /* (cold pages off: nothing leaves the working set, so "cold" cannot be told; the age alone then) */
     config.require_cold = !(cold && cold[0] == '0');
     config.check = chk && atoi(chk) == 1;
+    /* (a touch decodes the whole file on the touching thread, ~1.8 ms a MB on the PC 3050: one of 836 ms at the castle's
+       load. Larger files are left out: HL_MEM_DROP_MAX_MB, default 32, 0 for any) */
+    {
+        const char *mx = getenv("HL_MEM_DROP_MAX_MB");
+        config.max_range_bytes = (uint64_t)(mx && *mx ? atoi(mx) : 32) << 20;
+    }
     config.pass_ns = 250000000;   /* (a pass once took 19 s on the PC 3050 at a scene's load: pages read back, files decoded) */
     const hl_drop_host host = {NULL, cb_is_dropped, cb_drop, cb_restore, cb_source, cb_release, cb_view, cb_resident,
                                cb_protect, cb_plain, cb_clock};

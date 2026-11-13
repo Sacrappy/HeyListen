@@ -70,6 +70,7 @@ public:
         bool require_cold = true;              // only granules with no page in the working set
         bool check = false;                    // a hash of each granule at its drop, compared at its restore
         size_t max_ranges = 65536;             // candidate ranges held at most (the oldest without drops go first)
+        uint64_t max_range_bytes = 0;          // larger decodes are not candidates (0: any): a touch decodes the whole file
     };
 
     // The OS layer: every callback gets `ctx`.
@@ -96,6 +97,7 @@ public:
 
     struct Stats {
         std::atomic<uint64_t> ranges{0}, replaced{0}, passes{0};
+        std::atomic<uint64_t> too_large{0}, too_large_bytes{0};     // decodes left out by max_range_bytes
         std::atomic<uint64_t> dropped_granules{0}, dropped_now{0};   // granules dropped in all, dropped now
         std::atomic<uint64_t> restores{0}, restored_granules{0};     // touches that restored a range; granules restored
         std::atomic<uint64_t> by_path[int(TouchPath::kCount)] = {};

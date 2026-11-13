@@ -36,6 +36,11 @@ void Drop::decoded(DropSource src, int64_t now) {
         }
     }
     if (end <= first) return;   // (no whole granule: nothing to drop)
+    if (config_.max_range_bytes && src.size > config_.max_range_bytes) {
+        stats_.too_large.fetch_add(1, std::memory_order_relaxed);
+        stats_.too_large_bytes.fetch_add(src.size, std::memory_order_relaxed);
+        return;
+    }
     if (by_dest_.size() >= config_.max_ranges) evict_locked();
     auto* r = new Range;
     r->src = std::move(src);
@@ -443,7 +448,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         "%.1f MB dropped now; dropped %.1f MB in all (%.1f MB since the last line); %llu restores of %.1f MB (%llu since "
         "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
-        "%llu), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu",
+        "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
         (unsigned long long)restores, stats_.restored_granules.load() * mb,
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
@@ -453,6 +458,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)stats_.restore_failed.load(),
         (unsigned long long)stats_.checked.load(), (unsigned long long)stats_.mismatches.load(), refused,
         (unsigned long long)stats_.ranges.load(), (unsigned long long)stats_.replaced.load(),
+        (unsigned long long)stats_.too_large.load(), stats_.too_large_bytes.load() / 1048576.0,
         (unsigned long long)stats_.sources.load(), (unsigned long long)stats_.source_failed.load(),
         (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load());
     last_dropped_report_ = dropped, last_restores_report_ = restores, last_report_ns_ = now;

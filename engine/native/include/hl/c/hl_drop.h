@@ -37,6 +37,7 @@ typedef struct hl_drop_config {
     uint32_t give_up;
     uint64_t pass_bytes;
     int64_t pass_ns;
+    uint64_t max_range_bytes;
     int require_cold, check;
 } hl_drop_config;
 
