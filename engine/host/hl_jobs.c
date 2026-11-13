@@ -10,8 +10,9 @@
                 (hos_thread_act_as) on that thread's own guest context, while the worker's host thread stands still.
                 It ran every stage on the pool in the castle scene, but one run of four stalled: not for use yet
    HL_JOBS_WORKERS=<n>: the pool's threads (default 6). HL_JOBS_LOG=1: the counters every 10 s.
-   HL_DISPATCH=1 (with HL_JOBS on): the stage's work is run by the native dispatcher (hl/bridge/Dispatcher.h) instead of the
-   translated 0x8004ab40, on the same scheduler (docs/native-engine/jobs-boundary.md, "The dispatcher's protocol").
+   HL_DISPATCH=1 (the default, with HL_JOBS on): the stage's work is run by the native dispatcher (hl/bridge/Dispatcher.h)
+   instead of the translated 0x8004ab40, on the same scheduler (docs/native-engine/jobs-boundary.md, "The dispatcher's
+   protocol"). HL_DISPATCH=0: the translated dispatcher, as before.
    HL_DISPATCH_CHECK=1: its invariants are counted (and, with HL_DISPATCH=0, those that can be read after the translated
    dispatcher), and the counters are logged every 10 s. */
 #include "hl_host.h"
@@ -21,7 +22,7 @@
 #include <windows.h>
 
 #define HL_JOBS_DEFAULT HL_JOBS_THROUGH
-#define HL_DISPATCH_DEFAULT 0
+#define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;

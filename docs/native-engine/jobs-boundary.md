@@ -230,10 +230,25 @@ when level 2's B ring exists and the job's level is 0, level 0's when level 0's 
 
 ### The native dispatcher in the game (`HL_DISPATCH`)
 
-`HL_DISPATCH=1` (with `HL_JOBS` on): the job bridge runs a stage's work with `hl::bridge::Dispatcher` (native) instead
-of calling `0x8004ab40`. Job bodies, the push's hook, forwarding, events, the mutex, the timed sleep and the atomic
+`HL_DISPATCH=1` (the default, with `HL_JOBS` on; `0` calls the translated one as before): the job bridge runs a stage's
+work with `hl::bridge::Dispatcher` (native) instead of calling `0x8004ab40`. Job bodies, the push's hook, forwarding, events, the mutex, the timed sleep and the atomic
 wait's table are the game's own functions, called on the worker's guest context; the rings, the runner words, the counts,
 the state words and the lane status word are read and written in place. The owner's path (`0x806afc40`) and nested calls
 still run the translated dispatcher on the same scheduler. The dispatcher leaves to the translated one, as a whole call,
 when the function's one-time initialisation has not been done yet (the first call in the process). `HL_DISPATCH_CHECK=1`
 counts the invariants listed in `Dispatcher.h` and logs the first violations.
+
+Validated 2026-11-13 (function and picture; no speed measured): 18 runs of 110 s with `HL_DISPATCH=1
+HL_DISPATCH_CHECK=1`, 11 on the PC 3050 (the three scenes, castle-move 6 times) and 7 on the main PC (the three scenes
+with shots, castle-move 4 more times): every run to the end, game speed ratio 56-61, pictures right, and in every run
+zero on each invariant (pops not run, runs not finished, finishes with no runner, waiting counts below zero, one-runner
+jobs run twice, stage ends with jobs left or contexts asleep with jobs queued). A main-PC castle run is about 320,000
+native dispatches and 6.4-7.5 million jobs run; forwarding to an executor and handed jobs happen a few times a run, the
+dispatcher's wait on a ring word 3 to 27 times. The same stage-end checks after the translated dispatcher
+(`HL_DISPATCH=0 HL_DISPATCH_CHECK=1`, one castle run) also read zero. `tests/dispatch_test.cpp` runs it with no game: the
+order of service, a parallel job's runners, the observer, a full ring, the first-call fallback, and six contexts with
+two pushers over 30 stages of 600 jobs (dependencies, parallel and tied jobs, a polling lane).
+
+What the checks do not see: the translated contexts' own pops and runs (the owner's path and nested calls), so "every
+job popped is run once" is counted for the native side only; the shared words' conservation (rings empty, no context
+left asleep with work, no waiting count below zero) covers both.
