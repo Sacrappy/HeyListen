@@ -60,6 +60,8 @@ int hl_bridge_stages_start(int stages);
 int hl_bridge_stage_register(uint64_t set, uint64_t send);
 void hl_bridge_stage_wait(uint64_t set);
 void hl_bridge_stage_last(uint64_t manager);
+/* The stages' counters, one line (0 when they are not native). Returns the length written. */
+int hl_bridge_stages_report(char *out, size_t cap);
 
 /* One line of counters for the log. Returns the length written. */
 int hl_bridge_report(char *out, size_t cap);

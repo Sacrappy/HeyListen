@@ -43,8 +43,9 @@ static void hl_report(void) {
     const int64_t now = hos_now_ns();
     const int64_t was = last;
     if (now - was < 10000000000LL || InterlockedCompareExchange64(&last, now, was) != was) return;
-    char line[4096];
+    char line[2048];
     if (hl_bridge_report(line, sizeof line)) hos_log("hl jobs: %s", line);
+    if (hl_bridge_stages_report(line, sizeof line)) hos_log("hl %s", line);
 }
 
 static void hl_worker_message(Ctx *c) {
@@ -120,7 +121,7 @@ static int hl_jobs_on(void) {
     hl_gate_on_806afc40 = stages;
     hl_gate_on_83acfb90 = stages;
     hl_gate_on_806b0260 = stages;
-    char line[4096];
+    char line[2048];
     hl_bridge_report(line, sizeof line);
     hos_log("hl jobs: %s%s%s: %s", on ? "on" : "not started",
             all ? ", every caller of the dispatcher native (HL_DISPATCH_ALL=1)" : "",

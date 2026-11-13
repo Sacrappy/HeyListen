@@ -86,15 +86,12 @@ extern "C" int hl_bridge_report(char* out, size_t cap) {
                                 (unsigned long long)j.guest_on_workers, j.most_lanes_at_once);
     if (n < 0) return 0;
     if ((size_t)n >= cap) return (int)cap - 1;
-    if (g_dispatcher && (size_t)n + 2 < cap) {
-        out[n++] = ';';
-        out[n++] = ' ';
-        n += g_dispatcher->report(out + n, cap - (size_t)n);
-    }
-    if (g_stages && (size_t)n + 2 < cap) {
-        out[n++] = ';';
-        out[n++] = ' ';
-        n += g_stages->report(out + n, cap - (size_t)n);
-    }
-    return n;
+    if (!g_dispatcher || (size_t)n + 2 >= cap) return n;
+    out[n++] = ';';
+    out[n++] = ' ';
+    return n + g_dispatcher->report(out + n, cap - (size_t)n);
+}
+
+extern "C" int hl_bridge_stages_report(char* out, size_t cap) {
+    return g_stages && cap ? g_stages->report(out, cap) : 0;
 }
