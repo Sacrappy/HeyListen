@@ -102,12 +102,15 @@ static int cb_plain(void *ctx, uint64_t a) {
 static _Thread_local int in_kernel;   /* (hos_commit is handing guest memory to the kernel on this thread) */
 static volatile LONG64 restore_ns_max, restore_ns_sum, restore_count;
 static int on_touch(void *p, size_t size, int write) {
-    (void)size;
     const int path = in_kernel ? HL_DROP_KERNEL
                      : hos_ctx() ? (write ? HL_DROP_GUEST_WRITE : HL_DROP_GUEST_READ)
                                  : (write ? HL_DROP_HOST_WRITE : HL_DROP_HOST_READ);
     const int64_t t0 = hos_now_ns();
-    const int ok = hl_drop_touch(guest_of(p), path, t0);
+    /* (the substrate gives a run of dropped granules, which may belong to several ranges: each one still dropped is
+       restored with its range) */
+    int ok = 1;
+    for (uint64_t a = guest_of(p), end = a + size; a < end && ok; a += granule)
+        if (hos_gp_is_dropped(GP(a))) ok = hl_drop_touch(a, path, t0);
     const int64_t took = hos_now_ns() - t0;
     InterlockedAdd64(&restore_ns_sum, took);
     InterlockedIncrement64(&restore_count);
