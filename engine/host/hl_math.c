@@ -279,10 +279,10 @@ static void compare(Unit *u, Ctx *c, uint64_t out, const uint8_t mine[32]) {
 /* 1 when the call was answered (natively, or by the check's run of the translated function); 0: run the translation */
 static int run(Unit *u, Ctx *c) {
     if (bypass) return 0;
-    if (started != 1) {
-        start();
-        if (!u->native_on && !u->check_on) return 0;
-    }
+    /* (start() is safe from any thread; the unit's state is tested on every call, after it: a thread that read the gate's
+       switch before another thread's start() turned the unit off must not go on, review B3) */
+    if (started != 1) start();
+    if (!u->native_on && !u->check_on) return 0;
     InterlockedIncrement64(&u->calls);
     InterlockedOr(&u->fpcr_or, (LONG)c->fpcr);
     InterlockedAnd(&u->fpcr_and, (LONG)c->fpcr);
@@ -359,10 +359,10 @@ static void body_mismatch(Unit *u, const Ctx *in, const char *what, const uint8_
 
 static int run_body(Unit *u, Ctx *c) {
     if (bypass) return 0;
-    if (started != 1) {
-        start();
-        if (!u->native_on && !u->check_on) return 0;
-    }
+    /* (start() is safe from any thread; the unit's state is tested on every call, after it: a thread that read the gate's
+       switch before another thread's start() turned the unit off must not go on, review B3) */
+    if (started != 1) start();
+    if (!u->native_on && !u->check_on) return 0;
     InterlockedIncrement64(&u->calls);
     InterlockedOr(&u->fpcr_or, (LONG)c->fpcr);
     InterlockedAnd(&u->fpcr_and, (LONG)c->fpcr);
@@ -497,10 +497,7 @@ typedef struct {
 
 static int run_sil(Unit *u, Ctx *c) {
     if (bypass) return 0;
-    if (started != 1) {
-        start();
-        if (!u->check_on) return 0;
-    }
+    if (started != 1) start();
     if (!u->check_on) return 0;
     InterlockedIncrement64(&u->calls);
     sil_count(H_CALLS);
