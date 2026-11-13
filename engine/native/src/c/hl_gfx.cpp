@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "gfx_rec.h"
 #include "host_runtime.h"
 
 #include "hl/bridge/GfxBridge.h"
@@ -159,8 +160,7 @@ extern "C" int hl_gfx_state_apply(uint64_t block, uint64_t key, uint64_t sp) {
     const hl::gfx::StateOutputs out = hl::gfx::RenderState::decide(in, g_state->offsets(block));
     // (the block first: the blend color call reads it from there)
     g_state->write(block, out);
-    hl::gfx::NvnSink sink(g_nvn);
-    hl::gfx::RenderState::emit(in, out, at, sink);
+    hl::c::gfx_rec_emit(in, out, at, g_nvn);   // (the NVN procedures, or the records directly: hl_gfx_rec.cpp)
     g_state_answered.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
