@@ -5908,10 +5908,10 @@ bool mirror_make(Pool& pool) {
             }
         }
         p->mstate = Pool::MIRROR_ON;
-        p->fill_value = mem_rec_value;   // (RX_VK_NO_HOST_IMPORT: its import may go once this recording is done)
         p->mirror_id = ++diff_mirror_ids;   // (TICK-048: the diff's hashes of another mirror do not hold for this one)
         if (!p->mirror_id) p->mirror_id = ++diff_mirror_ids;
         pools_gen.fetch_add(1, std::memory_order_relaxed);   // (the binding's buffer changes: guest memory, then this mirror)
+        p->fill_value = mem_rec_value;   // (RX_VK_NO_HOST_IMPORT: its import may go once this recording is done)
         p->synced_gen = gen_now;
         p->synced_epoch = mirror_epoch;
         p->sync_seg = texture_segment();

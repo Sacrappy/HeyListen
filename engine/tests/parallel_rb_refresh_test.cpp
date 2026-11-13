@@ -75,6 +75,9 @@ bool memory_rb_refresh(VkCommandBuffer up);
 #include "rb_bufferref.inc"
 std::mutex pools_mu;
 #include "rb_pool.inc"
+// (RX_VK_NO_HOST_IMPORT: every pool of the model keeps its import, so it is never imported again)
+enum { kAgainRb = 4 };
+bool import_again(Pool&, int) { return true; }
 std::map<uint64_t, Pool> imported;
 uint64_t mirror_epoch = 0;
 bool mirror_upload = false;
