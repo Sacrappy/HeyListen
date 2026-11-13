@@ -4027,6 +4027,11 @@ bool memory_all_reserved(uint64_t guest, uint64_t size) {
     if (!size || guest >= (1ull << 40) || guest + size > host->guest_size()) return false;
     const uint8_t* p = host->guest_base() + guest;
     const uint8_t* const end = p + size;
+    // (HOS_GUEST_PAGES, host/hos_guestpages.c: a dropped granule is reserved to VirtualQuery but holds bytes, given back on
+    // the next touch: not "all reserved". An exe without the export: nothing)
+    using Dropped = int (*)(const void*, size_t);
+    static const Dropped dropped = (Dropped)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gp_dropped_in");
+    if (dropped && dropped(p, size)) return false;
     while (p < end) {
         MEMORY_BASIC_INFORMATION mi{};
         if (VirtualQuery(p, &mi, sizeof mi) != sizeof mi || mi.State != MEM_RESERVE) return false;

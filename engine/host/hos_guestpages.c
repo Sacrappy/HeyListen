@@ -71,7 +71,8 @@ static hos_gp_on_touch volatile gp_owner;
 static _Thread_local int gp_path = HOS_GP_PATH_DIRECT;
 
 static volatile LONG64 n_drops, n_restores[HOS_GP_PATHS], n_restore_calls, n_fill_failed, n_map_failed, n_forgets,
-    n_declined, n_refused, n_drop_failed, n_waits;
+    n_declined, n_refused, n_refused_imported, n_drop_failed, n_waits;
+static hos_gp_on_forget volatile gp_forget;
 
 static inline int bit(volatile LONG64 *bm, uint64_t i) { return (int)((bm[i >> 6] >> (i & 63)) & 1); }
 static inline void bit_set(volatile LONG64 *bm, uint64_t i) { InterlockedOr64(&bm[i >> 6], (LONG64)(1ULL << (i & 63))); }
@@ -133,6 +134,7 @@ __declspec(dllexport) int hos_gp_dropped_in(const void *p, size_t n) {
     return span(p, n, &a, &b) && any_bit(bm_dropped, a, b);
 }
 void hos_gp_set_owner(hos_gp_on_touch cb) { gp_owner = cb; }
+void hos_gp_set_on_forget(hos_gp_on_forget cb) { gp_forget = cb; }
 
 int hos_gp_reserve(void *base, size_t size) {
     if (gp_on || !base || !size || ((uintptr_t)base | size) & (GP_GRAN - 1)) return 0;
@@ -177,8 +179,8 @@ int hos_gp_drop(void *p, size_t size) {
     claim(a, b);
     if (any_bit(bm_imported, a, b)) {
         unclaim(a, b);
-        InterlockedIncrement64(&n_refused);
-        return -1;
+        InterlockedIncrement64(&n_refused_imported);
+        return -2;
     }
     HANDLE self = GetCurrentProcess();
     int rc = 0;
@@ -351,6 +353,7 @@ static int give_up(void *p, size_t n, PieceFn fn) {
     if (b - 1 > a && b - 1 >= in_b && bit(bm_dropped, b - 1)) ask_owner(b - 1, b, 1, HOS_GP_PATH_COMMIT);
     claim(a, b);
     HANDLE self = GetCurrentProcess();
+    uint64_t forgot = 0;
     for (uint64_t i = in_a; i < in_b; i++) {
         if (!bit(bm_apart, i)) continue;
         MEMORY_BASIC_INFORMATION m;
@@ -363,10 +366,12 @@ static int give_up(void *p, size_t n, PieceFn fn) {
             if (view) bit_set(bm_dropped, i);   /* (a placeholder now: a touch must find it dropped) */
             continue;
         }
-        if (dropped) bit_clear(bm_dropped, i), InterlockedIncrement64(&n_forgets);
+        if (dropped) bit_clear(bm_dropped, i), InterlockedIncrement64(&n_forgets), forgot++;
     }
     const int ok = each_piece(lo, hi, fn);
     unclaim(a, b);
+    const hos_gp_on_forget cb = gp_forget;
+    if (forgot && cb) cb(at(in_a), (size_t)((in_b - in_a) << GP_SHIFT));   /* (no claim held: it may drop or restore) */
     return ok;
 }
 int hos_gp_decommit(void *p, size_t n) { return give_up(p, n, decommit_piece); }
@@ -386,12 +391,14 @@ int hos_gp_report(char *out, size_t cap) {
     const LONG64 restored = n_restores[0] + n_restores[1] + n_restores[2] + n_restores[3];
     snprintf(out, cap,
              "dropped now %lld MB; drops %lld granules, restores %lld (handler %lld, commit %lld, import %lld, direct %lld) "
-             "in %lld calls, forgotten %lld; failed: drops %lld, fills %lld, maps %lld, declined %lld, refused %lld; waits %lld",
+             "in %lld calls, forgotten %lld; failed: drops %lld, fills %lld, maps %lld, declined %lld, refused %lld (imported %lld); "
+             "waits %lld",
              (long long)((n_drops - restored - n_forgets) >> 4), (long long)n_drops, (long long)restored,
              (long long)n_restores[HOS_GP_PATH_HANDLER], (long long)n_restores[HOS_GP_PATH_COMMIT],
              (long long)n_restores[HOS_GP_PATH_IMPORT], (long long)n_restores[HOS_GP_PATH_DIRECT], (long long)n_restore_calls,
              (long long)n_forgets, (long long)n_drop_failed, (long long)n_fill_failed, (long long)n_map_failed,
-             (long long)n_declined, (long long)n_refused, (long long)n_waits);
+             (long long)n_declined, (long long)n_refused, (long long)n_refused_imported,
+             (long long)n_waits);
     return 1;
 }
 
@@ -402,6 +409,7 @@ int hos_gp_ready(void) { return 0; }
 int hos_gp_drop(void *p, size_t size) { (void)p, (void)size; return -1; }
 int hos_gp_restore(void *p, size_t size, hos_gp_fill fill, void *user) { (void)p, (void)size, (void)fill, (void)user; return -1; }
 void hos_gp_set_owner(hos_gp_on_touch cb) { (void)cb; }
+void hos_gp_set_on_forget(hos_gp_on_forget cb) { (void)cb; }
 int hos_gp_is_dropped(const void *p) { (void)p; return 0; }
 int hos_gp_reserve(void *base, size_t size) { (void)base, (void)size; return 0; }
 int hos_gp_fault(void *p, int write) { (void)p, (void)write; return 0; }

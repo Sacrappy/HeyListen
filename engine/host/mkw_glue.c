@@ -2,6 +2,7 @@
    commit (TOTK commits its whole 4 GB window up front; MKW's 512 GB window is only reserved), and stand-ins for the
    hooks of files not taken into host/ (the renderer and display, the profiler, mods, TOTK's own patches). */
 #include "hos.h"
+#include "hos_guestpages.h"
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -41,7 +42,10 @@ void hos_commit(uint64_t addr, uint64_t size) {
     /* (HL_MEM_DROP, hl_drop.c: a decision under way over these pages ends first, and they are not dropped for a while:
        the kernel must not meet a read-only page; a restore made from here is counted as the kernel's) */
     hl_drop_kernel_begin(lo, hi);
-    if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
+    /* (HOS_GUEST_PAGES: dropped granules the kernel is given are restored by their owner first, and the commit goes piece
+       by piece over a range the drops split) */
+    if (hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo)) ? !hos_gp_commit(GP(lo), (size_t)(hi - lo))
+                                                                     : !VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
         const DWORD err = GetLastError();
         hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
                 (unsigned long long)lo, err);
@@ -55,6 +59,33 @@ void hos_commit(uint64_t addr, uint64_t size) {
         }
     }
     hl_drop_kernel_end();
+}
+
+/* HOS_GUEST_PAGES=1 (hos_guestpages.c): the window in two reservations, the system region and the image below
+   HOS_HEAP_BASE as before, the heap and the address regions over a placeholder, so that their granules can be given back
+   and restored atomically. 0 (the default, and whenever this fails): the one reservation of before. Not with the
+   hardware write watch (a placeholder cannot be write-watched) */
+int hos_reserve_guest_pages(int write_watch) {
+    if (!hos_gp_wanted()) return 0;
+    if (write_watch) {
+        hos_log("mem: guest pages: off (HOS_GUEST_PAGES needs the soft write watch build)");
+        return 0;
+    }
+    if (VirtualAlloc(GP(0), (SIZE_T)HOS_HEAP_BASE, MEM_RESERVE, PAGE_NOACCESS) != GP(0)) {
+        hos_log("mem: guest pages: off (the window's low part was not reserved, error %lu)", GetLastError());
+        return 0;
+    }
+    if (!hos_gp_reserve(GP(HOS_HEAP_BASE), (size_t)(HOS_GUEST_SPACE - HOS_HEAP_BASE))) {
+        VirtualFree(GP(0), 0, MEM_RELEASE);
+        hos_log("mem: guest pages: off (the placeholder was not made: the window is reserved as before)");
+        return 0;
+    }
+    hos_log("mem: guest pages: on: the heap and the address regions (%llu GB) over a placeholder, granules of %zu KB can be "
+            "dropped and restored (HOS_GUEST_PAGES=0: not)", (unsigned long long)((HOS_GUEST_SPACE - HOS_HEAP_BASE) >> 30),
+            hos_gp_granule() >> 10);
+    void hos_gp_check_start(void);   /* (hos_gpcheck.c: the counters, and HOS_GUEST_PAGES_TEST) */
+    hos_gp_check_start();
+    return 1;
 }
 
 DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
@@ -75,12 +106,21 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     if (p < A64_MEM || p >= A64_MEM + HOS_GUEST_SPACE) return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t guest = (uint64_t)(p - A64_MEM);
     if (guest < 0x100000) return EXCEPTION_CONTINUE_SEARCH;   /* (a null pointer: the game's own fault) */
+    /* (HOS_GUEST_PAGES: a dropped granule goes to its owner, which restores it; one it declines is a crash) */
+    if (hos_gp_ready()) {
+        const int r = hos_gp_fault((void *)p, rec->ExceptionInformation[0] == 1);
+        if (r > 0) return EXCEPTION_CONTINUE_EXECUTION;
+        if (r < 0) {
+            hos_log("mem: %#llx is in a dropped granule that was not restored", (unsigned long long)guest);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
-    /* (committed by another thread between the fault and here, two threads touching the same fresh megabyte: run the
-       instruction again) */
+    /* (committed by another thread between the fault and here, two threads touching the same fresh megabyte, or a granule
+       restored by another thread: run the instruction again) */
     if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mbi.Protect & PAGE_GUARD) &&
-        guest >= HOS_HEAP_BASE && hos_lazy_commit()) {
+        guest >= HOS_HEAP_BASE && (hos_lazy_commit() || hos_gp_ready())) {
         static _Thread_local const uint8_t *again;
         if (again != p) { again = p; return EXCEPTION_CONTINUE_EXECUTION; }   /* (once an address: a real fault goes on to the report) */
     }

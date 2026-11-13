@@ -4,7 +4,7 @@
 // memory for as long as they live, while the back end has its own copy in VRAM. Cold pages (ColdPages.h) take such
 // pages out of the working set, but they stay committed: the commit charge keeps them, and the page file holds them.
 // This module gives them back to the system for good (no RAM, no commit) when their bytes can be had again exactly,
-// and makes them again, atomically, when anything touches them (docs/native-engine/memory-boundary.md section 13).
+// and makes them again, atomically, when anything touches them (docs/native-engine/memory-boundary.md section 14).
 //
 // The source this version knows: a resource file's decode (docs/native-engine/stream-boundary.md section 9). A range a
 // decode wrote is recorded with what makes it again (the file's name, its dictionary, its sizes). A whole granule (the

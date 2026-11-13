@@ -4,6 +4,7 @@
    data, uniform blocks), by the pool's flags. A measurement for docs/native-engine/memory-boundary.md: RAM is the
    resident pages, not the committed ones. Windows only. */
 #include "hos.h"
+#include "hos_guestpages.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -619,6 +620,8 @@ static int discard_on(void) {
 __declspec(dllexport) void hos_noaccess_import(uint64_t lo, uint64_t hi) {
     hl_mem_imported(lo, hi);   /* (HL_MEM_COLD: pinned pages are never taken out of the working set) */
     hl_drop_import(lo, hi);    /* (HL_MEM_DROP: never dropped; a decision under way there ends first) */
+    /* (HOS_GUEST_PAGES: pinned granules are never dropped, and dropped ones are restored before the driver locks them) */
+    if (hos_gp_ready() && hi > lo) hos_gp_imported(GP(lo), (size_t)(hi - lo));
     if (!discard_on() || hi <= lo) return;
     AcquireSRWLockExclusive(&discard_lock);   /* (the list changes: exclusive; imports are rare) */
     int merged = 0;
@@ -688,7 +691,10 @@ static DWORD WINAPI discard_main(void *unused) {
                         int e = k + 1;
                         while (e < m && (info[e].attr & 1) && page_is_zero(info[e].va)) e++;
                         const uint64_t a = (q + k) << 12, b = (q + e) << 12;
-                        if (!ever_imported(a, b) && VirtualFree(GP(a), (SIZE_T)(b - a), MEM_DECOMMIT)) got += e - k;
+                        if (!ever_imported(a, b) && (hos_gp_ready() && hos_gp_touches(GP(a), (size_t)(b - a))
+                                                         ? hos_gp_decommit(GP(a), (size_t)(b - a))
+                                                         : VirtualFree(GP(a), (SIZE_T)(b - a), MEM_DECOMMIT)))
+                            got += e - k;
                         k = e;
                     }
                 }

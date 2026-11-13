@@ -3,6 +3,7 @@
    (debug output, ticks, info queries) or a sign that an SDK function above it wants an HLE. Unknown ones stop the
    run with the svc number and the caller, so the log says what to do next. Numbers: switchbrew.org "SVC". */
 #include "hos.h"
+#include "hos_guestpages.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -484,6 +485,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
         {   /* (pages under a Vulkan import stay committed, zeroed: hos_mem.c FreeMemoryPages) */
             extern int rx_guest_imported(uint64_t lo, uint64_t hi);
             if (rx_guest_imported(c->x[0], c->x[0] + c->x[1])) memset(GP(c->x[0]), 0, (size_t)c->x[1]);
+            else if (hos_gp_ready() && hos_gp_touches(GP(c->x[0]), (size_t)c->x[1])) hos_gp_decommit(GP(c->x[0]), (size_t)c->x[1]);
             else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT);
         }
         c->x[0] = R_OK;
