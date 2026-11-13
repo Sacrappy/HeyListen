@@ -486,7 +486,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
             extern int rx_guest_imported(uint64_t lo, uint64_t hi);
             if (rx_guest_imported(c->x[0], c->x[0] + c->x[1])) memset(GP(c->x[0]), 0, (size_t)c->x[1]);
             else if (hos_gp_ready() && hos_gp_touches(GP(c->x[0]), (size_t)c->x[1])) hos_gp_decommit(GP(c->x[0]), (size_t)c->x[1]);
-            else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT);
+            else hos_gp_hold(1), VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT), hos_gp_hold(0);
         }
         c->x[0] = R_OK;
         return;

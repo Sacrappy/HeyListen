@@ -29,6 +29,16 @@ int hos_lazy_commit(void) {
     return on;
 }
 
+/* (HOS_GUEST_PAGES: not while a drop splits the reservation; the error kept for the caller) */
+static int hos_plain_commit(void *p, size_t n) {
+    hos_gp_hold(1);
+    const int ok = VirtualAlloc(p, (SIZE_T)n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    const DWORD err = GetLastError();
+    hos_gp_hold(0);
+    SetLastError(err);
+    return ok;
+}
+
 void hos_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
     if (!hos_guest_range(addr, size)) {   /* (hookshot: guest pages only; the posix layer's commit changes any page's protection) */
@@ -45,7 +55,7 @@ void hos_commit(uint64_t addr, uint64_t size) {
     /* (HOS_GUEST_PAGES: dropped granules the kernel is given are restored by their owner first, and the commit goes piece
        by piece over a range the drops split) */
     if (hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo)) ? !hos_gp_commit(GP(lo), (size_t)(hi - lo))
-                                                                     : !VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
+                                                                     : !hos_plain_commit(GP(lo), (size_t)(hi - lo))) {
         const DWORD err = GetLastError();
         hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
                 (unsigned long long)lo, err);
@@ -134,7 +144,9 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
         const LONG64 total = InterlockedAdd64(&lazy_bytes, 0x100000);
         if (total >> 30 > said && InterlockedExchange(&said, (LONG)(total >> 30)) < (LONG)(total >> 30))
             hos_log("mem: %lld MB of the game's memory committed on first touch", (long long)(total >> 20));
-        if (VirtualAlloc(GP(guest & ~0xFFFFFULL), 0x100000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
+        /* (HOS_GUEST_PAGES: not while a drop splits the reservation, which fails commits in it meanwhile) */
+        hos_gp_hold(1);
+        if (VirtualAlloc(GP(guest & ~0xFFFFFULL), 0x100000, MEM_COMMIT, PAGE_READWRITE)) return hos_gp_hold(0), EXCEPTION_CONTINUE_EXECUTION;
         /* (the megabyte around it cannot be committed as one: a part of it is not this reservation's to commit, as
            memory the renderer has mapped over the window. The 64 KB around the touch then, and the page alone: a
            run crashed here on 2026-11-13 with the megabyte alone tried) */
@@ -143,10 +155,16 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
         if (InterlockedIncrement(&told) <= 8)
             hos_log("mem: the megabyte at %#llx was not committed as one (error %lu): the 64 KB around %#llx",
                     (unsigned long long)(guest & ~0xFFFFFULL), err, (unsigned long long)guest);
-        if (VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
-        if (VirtualAlloc(GP(guest & ~0xFFFULL), 0x1000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
-        hos_log("mem: %#llx could not be committed on first touch (error %lu, state %#lx, protection %#lx)",
-                (unsigned long long)guest, GetLastError(), mbi.State, mbi.Protect);
+        if (VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return hos_gp_hold(0), EXCEPTION_CONTINUE_EXECUTION;
+        if (VirtualAlloc(GP(guest & ~0xFFFULL), 0x1000, MEM_COMMIT, PAGE_READWRITE)) return hos_gp_hold(0), EXCEPTION_CONTINUE_EXECUTION;
+        hos_gp_hold(0);
+        if (hos_gp_is_dropped(p)) return EXCEPTION_CONTINUE_EXECUTION;   /* (dropped since the look above: its owner next time) */
+        hos_log("mem: %#llx could not be committed on first touch (error %lu, state %#lx, protection %#lx, type %#lx, region "
+                "%#llx+%#llx, allocation %#llx with %#lx%s)",
+                (unsigned long long)guest, GetLastError(), mbi.State, mbi.Protect, mbi.Type,
+                (unsigned long long)((uint8_t *)mbi.BaseAddress - A64_MEM), (unsigned long long)mbi.RegionSize,
+                (unsigned long long)((uint8_t *)mbi.AllocationBase - A64_MEM), mbi.AllocationProtect,
+                hos_gp_ready() ? (hos_gp_is_dropped(p) ? ", dropped" : ", not dropped") : "");
         return EXCEPTION_CONTINUE_SEARCH;
     }
     static volatile LONG touched;

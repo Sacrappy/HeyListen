@@ -73,6 +73,11 @@ static _Thread_local int gp_path = HOS_GP_PATH_DIRECT;
 static volatile LONG64 n_drops, n_restores[HOS_GP_PATHS], n_restore_calls, n_fill_failed, n_map_failed, n_forgets,
     n_declined, n_refused, n_refused_imported, n_drop_failed, n_waits;
 static hos_gp_on_forget volatile gp_forget;
+/* (splits of the reservation, exclusive: while Windows splits a private allocation around a granule released to a
+   placeholder, a VirtualAlloc(MEM_COMMIT) of a reserved page elsewhere in that allocation fails with ERROR_INVALID_ADDRESS:
+   84,561 of 479,668 commits in a game-free test with 65,536 splits going on; first touches of committed pages are not
+   affected (0 faults). The OS layer's commits and decommits hold it shared: hos_gp_hold) */
+static SRWLOCK split_lock = SRWLOCK_INIT;
 
 static inline int bit(volatile LONG64 *bm, uint64_t i) { return (int)((bm[i >> 6] >> (i & 63)) & 1); }
 static inline void bit_set(volatile LONG64 *bm, uint64_t i) { InterlockedOr64(&bm[i >> 6], (LONG64)(1ULL << (i & 63))); }
@@ -190,8 +195,13 @@ int hos_gp_drop(void *p, size_t size) {
         bit_set(bm_dropped, i);
         MEMORY_BASIC_INFORMATION m;
         const int view = VirtualQuery(at(i), &m, sizeof m) && m.Type == MEM_MAPPED;
-        const BOOL ok = view ? uv2(self, at(i), MEM_PRESERVE_PLACEHOLDER)
-                             : VirtualFree(at(i), (SIZE_T)GP_GRAN, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        BOOL ok;
+        if (view) ok = uv2(self, at(i), MEM_PRESERVE_PLACEHOLDER);   /* (a view of its own: nothing else is split) */
+        else {
+            AcquireSRWLockExclusive(&split_lock);
+            ok = VirtualFree(at(i), (SIZE_T)GP_GRAN, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            ReleaseSRWLockExclusive(&split_lock);
+        }
         if (!ok) {
             bit_clear(bm_dropped, i);
             if (InterlockedIncrement64(&n_drop_failed) <= 8)
@@ -333,11 +343,19 @@ static int reset_piece(uint8_t *lo, uint8_t *hi, const MEMORY_BASIC_INFORMATION 
     return VirtualAlloc(lo, (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE) != NULL;
 }
 
+void hos_gp_hold(int begin) {
+    if (!gp_on) return;
+    if (begin) AcquireSRWLockShared(&split_lock);
+    else ReleaseSRWLockShared(&split_lock);
+}
+
 int hos_gp_commit(void *p, size_t n) {
     uint8_t *lo = (uint8_t *)p, *hi = lo + n;
-    hos_gp_prepare(p, n, HOS_GP_PATH_COMMIT);
-    if (VirtualAlloc(p, n, MEM_COMMIT, PAGE_READWRITE)) return 1;
-    return each_piece(lo, hi, commit_piece);
+    hos_gp_prepare(p, n, HOS_GP_PATH_COMMIT);   /* (not held: the owner's restore may wait for a drop) */
+    hos_gp_hold(1);
+    const int ok = VirtualAlloc(p, n, MEM_COMMIT, PAGE_READWRITE) || each_piece(lo, hi, commit_piece);
+    hos_gp_hold(0);
+    return ok;
 }
 
 /* granules wholly inside [lo, hi) that are dropped or views become reservations of their own (they read as zero after
@@ -368,7 +386,9 @@ static int give_up(void *p, size_t n, PieceFn fn) {
         }
         if (dropped) bit_clear(bm_dropped, i), InterlockedIncrement64(&n_forgets), forgot++;
     }
+    hos_gp_hold(1);
     const int ok = each_piece(lo, hi, fn);
+    hos_gp_hold(0);
     unclaim(a, b);
     const hos_gp_on_forget cb = gp_forget;
     if (forgot && cb) cb(at(in_a), (size_t)((in_b - in_a) << GP_SHIFT));   /* (no claim held: it may drop or restore) */
@@ -423,6 +443,7 @@ int hos_gp_reserve(void *base, size_t size) { (void)base, (void)size; return 0; 
 int hos_gp_fault(void *p, int write) { (void)p, (void)write; return 0; }
 void hos_gp_prepare(void *p, size_t n, int path) { (void)p, (void)n, (void)path; }
 int hos_gp_touches(const void *p, size_t n) { (void)p, (void)n; return 0; }
+void hos_gp_hold(int begin) { (void)begin; }
 int hos_gp_commit(void *p, size_t n) { (void)p, (void)n; return 0; }
 int hos_gp_decommit(void *p, size_t n) { (void)p, (void)n; return 0; }
 int hos_gp_reset(void *p, size_t n) { (void)p, (void)n; return 0; }
