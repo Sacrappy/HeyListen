@@ -7702,7 +7702,7 @@ void mesh_conv_stats(int64_t out[7]) {
 // with no error. They are most of the game's vegetation: the forest's trees, ferns and grass (GPU culling writes their counts, so they can only
 // be moved on the GPU): each count is copied into this buffer of (count, 1, 1) just before its draw. The GPU runs the copies and draws in
 // order, so a slot used again is safe. A first other than 0 has no Vulkan counterpart.
-constexpr uint32_t kMeshArgs = 1u << 18;   // (a ring: entries are reused 262144 draws on, frames after the GPU read them)
+constexpr uint32_t kMeshArgs = 1u << 19;   // (a ring: entries are reused 262144 draws on, frames after the GPU read them; ranges start in its first half)
 VkBuffer mesh_args_buffer = VK_NULL_HANDLE;
 VmaAllocation mesh_args_alloc = nullptr;
 uint32_t* mesh_args_words = nullptr;
@@ -7737,9 +7737,11 @@ bool mesh_args_ready() {
     }();
     return ok;
 }
-uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0; n below kMeshArgs: % 0 otherwise)
+uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0; n at most kMeshArgs / 2)
+    // (a fixed modulus: with one that changed with n, two draws close together could be given overlapping entries)
     static std::atomic<uint32_t> next{1};
-    const uint32_t at = next.fetch_add(n) % (kMeshArgs - n);
+    n = std::clamp<uint32_t>(n, 1, kMeshArgs / 2);
+    const uint32_t at = next.fetch_add(n) % (kMeshArgs / 2);
     return at + 1;
 }
 
@@ -8861,7 +8863,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // draw has no stride of its own: its entry is NVN's 16 bytes, taken as 8 the first was never copied)
     static const bool mesh_rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
     if (mesh_rewrite && d.mesh && d.indirect) {   // (out of the pass: a copy cannot be made in one)
-        const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)kMeshArgs - 1), stride = d.stride ? (uint32_t)d.stride : 16u;
+        const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)(kMeshArgs / 2)), stride = d.stride ? (uint32_t)d.stride : 16u;
         BufferRef src = gpu_buffer_bind(d.indirect, (uint64_t)n * stride, false);
         if (!src) SKIP_HERE();
         if (mesh_args_ready()) {
