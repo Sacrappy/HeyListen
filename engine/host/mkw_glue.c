@@ -265,6 +265,10 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
                         (unsigned long long)peek_guest(base + row + 16), (unsigned long long)peek_guest(base + row + 24));
         }
     }
+    {   /* (HL_TRACE: the blocks the fault and the registers are in, the last events; hl_trace.c) */
+        void hl_trace_on_crash(Ctx *, uint64_t);
+        hl_trace_on_crash(c, addr - (uint64_t)A64_MEM);
+    }
     hos_log_flush();
     void hos_hostcall_stats(void);
     hos_hostcall_stats();   /* (HOS_HOSTCALL_STATS=1: the host calls made, and the last 256 of them) */
@@ -316,6 +320,7 @@ void hos_commit_init(void) {
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
     { void hos_memsplit_init(void); hos_memsplit_init(); }   /* (HOS_MEM_SPLIT, hos_memsplit.c) */
+    { void hl_trace_gates(void); hl_trace_gates(); }         /* (HL_TRACE, hl_trace.c) */
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */

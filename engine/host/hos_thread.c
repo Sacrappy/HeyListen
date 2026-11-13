@@ -293,8 +293,9 @@ void hos_fatal(Ctx *c, const char *fmt, ...) {
     if (c) fprintf(stderr, " (lr %#llx sp %#llx)", (unsigned long long)c->x[30], (unsigned long long)c->x[31]);
     fprintf(stderr, "\n");
     fflush(stderr);
-    void hos_backtrace(void), hos_hostcall_stats(void);
+    void hos_backtrace(void), hos_hostcall_stats(void), hl_trace_on_crash(Ctx *, uint64_t);
     hos_backtrace();
+    hl_trace_on_crash(c, 0);   /* (HL_TRACE: hl_trace.c) */
     hos_hostcall_stats();
     ExitProcess(3);
 }
