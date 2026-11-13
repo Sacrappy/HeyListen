@@ -30,6 +30,7 @@ void hos_memsplit_pool(uint64_t addr, uint64_t size, uint32_t flags, int add) {
             if (pools[i].addr == addr) { pools[i] = pools[--npools]; break; }
     }
     ReleaseSRWLockExclusive(&pools_lock);
+    if (add) hl_mem_pool_made(addr, size);
     if (add) trap_new_pool(addr, size, flags);
     else trap_pool_gone(addr, size, flags);
 }
@@ -37,6 +38,28 @@ void hos_memsplit_pool(uint64_t addr, uint64_t size, uint32_t flags, int add) {
 static int by_addr(const void *a, const void *b) {
     const uint64_t x = ((const Pool *)a)->addr, y = ((const Pool *)b)->addr;
     return x < y ? -1 : x > y;
+}
+static int by_lo(const void *a, const void *b) {
+    const uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? -1 : x > y;
+}
+int hos_pools_with_flags(const uint32_t *flags, int nflags, int64_t made_before_ns, uint64_t (*out)[2], int cap) {
+    int n = 0;
+    AcquireSRWLockShared(&pools_lock);   /* (copied out, nothing else under the lock: pool creation waits for a memcpy only) */
+    for (int i = 0; i < npools && n < cap; i++) {
+        if (pools[i].made_ns >= made_before_ns || !pools[i].size) continue;
+        for (int f = 0; f < nflags; f++)
+            if (pools[i].flags == flags[f]) { out[n][0] = pools[i].addr, out[n][1] = pools[i].addr + pools[i].size, n++; break; }
+    }
+    ReleaseSRWLockShared(&pools_lock);
+    qsort(out, (size_t)n, sizeof out[0], by_lo);
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (m && out[i][0] <= out[m - 1][1]) {
+            if (out[i][1] > out[m - 1][1]) out[m - 1][1] = out[i][1];
+        } else out[m][0] = out[i][0], out[m][1] = out[i][1], m++;
+    }
+    return m;
 }
 
 typedef struct { void *va; ULONG_PTR attr; } WsInfo;   /* PSAPI_WORKING_SET_EX_INFORMATION (bit 0: valid) */
@@ -169,6 +192,7 @@ static volatile LONG64 trap_faults, trap_races;
 static uintptr_t trap_exe_lo, trap_exe_hi, trap_vk_lo, trap_vk_hi;
 
 static int split_no_read(void) { return trap_mode != 0; }
+int hos_pool_trap_active(void) { return trap_mode != 0; }
 static int trap_flag_index(uint32_t flags) {
     for (int i = 0; i < trap_nflags; i++)
         if (trap_flag_list[i] == flags) return i;
@@ -592,6 +616,7 @@ static int discard_on(void) {
 }
 /* (the back end, before it commits and imports [lo, hi)) */
 __declspec(dllexport) void hos_noaccess_import(uint64_t lo, uint64_t hi) {
+    hl_mem_imported(lo, hi);   /* (HL_MEM_COLD: pinned pages are never taken out of the working set) */
     if (!discard_on() || hi <= lo) return;
     AcquireSRWLockExclusive(&discard_lock);   /* (the list changes: exclusive; imports are rare) */
     int merged = 0;
@@ -686,10 +711,16 @@ void hos_memsplit_init(void) {
         hos_log("mem: zero pages of pools without CPU access given back every 5 s (HOS_NOACCESS_RAM=0: not)");
         CloseHandle(CreateThread(NULL, 0, discard_main, NULL, 0, NULL));
     }
+    hl_mem_init();   /* (HL_MEM_COLD, hl_mem.c: after the trap, which it stays off for) */
 }
 #else
 void hos_memsplit_pool(uint64_t addr, uint64_t size, uint32_t flags, int add) { (void)addr; (void)size; (void)flags; (void)add; }
 void hos_memsplit_init(void) {}
+int hos_pools_with_flags(const uint32_t *flags, int nflags, int64_t made_before_ns, uint64_t (*out)[2], int cap) {
+    (void)flags; (void)nflags; (void)made_before_ns; (void)out; (void)cap;
+    return 0;
+}
+int hos_pool_trap_active(void) { return 0; }
 void hos_pool_trap_release(uint64_t addr, uint64_t size, const char *who) { (void)addr; (void)size; (void)who; }
 void hos_noaccess_import(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hos_noaccess_write(int begin) { (void)begin; }

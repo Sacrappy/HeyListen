@@ -56,6 +56,14 @@ void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pag
    first touched (mkw_glue.c commit_on_touch), instead of whole. A system call given a guest buffer needs hos_commit on
    it first: the kernel does not come through the handler. HOS_LAZY_COMMIT=0: committed whole, as before */
 int hos_lazy_commit(void);
+/* (HeyListen) hos_memsplit.c keeps the list of NVN memory pools with storage in guest memory: the ranges [lo, hi) of
+   those with one of the flags given that were made before `made_before_ns` (hos_now_ns), sorted, those that touch merged;
+   1 while HOS_POOL_TRAP has pages NOACCESS. hl_mem.c (HL_MEM_COLD) is told of pools made and of the back end's imports. */
+int hos_pools_with_flags(const uint32_t *flags, int nflags, int64_t made_before_ns, uint64_t (*out)[2], int cap);
+int hos_pool_trap_active(void);
+void hl_mem_pool_made(uint64_t addr, uint64_t size);
+void hl_mem_imported(uint64_t lo, uint64_t hi);
+void hl_mem_init(void);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))
