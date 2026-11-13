@@ -214,7 +214,7 @@ when level 2's B ring exists and the job's level is 0, level 0's when level 0's 
      round. Otherwise C's state is set from 0 to 1 by compare-and-swap (a handed job found there instead is taken as
      above). Then every ring's count of jobs is summed again: if there are jobs, C's state is set back from 1 to 0 (when
      another context has already set it to 0 it will signal: C first consumes that signal by waiting on its event, its lane
-     status down by one around the wait); when this happened 9 times in a row, C sleeps about 100 microseconds before going
+     status down by one around the wait); after 9 or more such rounds without a job, C sleeps about 100 microseconds before going
      round. If there are none: the lane status goes down by one, C waits on its wake event, the lane status goes up by one,
      and the loop goes round.
 3. **Leave**: a full barrier, C's flags lose bit 0, the lane status of C's lane goes down by one, return.
