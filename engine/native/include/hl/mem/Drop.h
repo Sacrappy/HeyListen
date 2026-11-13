@@ -48,10 +48,12 @@ struct DropSource {
     uint64_t compressed = 0;       // the compressed file's size (the restore checks it)
     uint32_t dict_id = 0;          // the frame's dictionary (0: none)
     std::string name;              // the file, as the game's per-file heap names it
+    bool spill_only = false;       // its bytes are had again only at the drop (a VRAM mirror read back): a granule is
+                                   // dropped only into the spill, and a source that fails is tried again later
 };
 
 /// Why a granule was not dropped.
-enum class Refuse : int { Imported, KernelUse, Resident, Changed, NoSource, NotPlain, Substrate, GivenUp, kCount };
+enum class Refuse : int { Imported, KernelUse, Resident, Changed, NoSource, NotPlain, Substrate, GivenUp, NoSpill, kCount };
 
 /// Who touched a dropped granule (the restore's path).
 enum class TouchPath : int { GuestRead, GuestWrite, HostRead, HostWrite, Kernel, Import, kCount };
@@ -70,7 +72,10 @@ public:
         bool require_cold = true;              // only granules with no page in the working set
         bool check = false;                    // a hash of each granule at its drop, compared at its restore
         size_t max_ranges = 65536;             // candidate ranges held at most (the oldest without drops go first)
-        uint64_t max_range_bytes = 0;          // larger decodes are not candidates (0: any): a touch decodes the whole file
+        uint64_t max_range_bytes = 0;          // without a spill, larger decodes are not candidates (0: any): a touch would
+                                               // decode the whole file; with one, their granules go only into the spill
+        uint32_t ahead = 3;                    // a touch restores the granule touched and this many after it, when they are
+                                               // in the spill (a decode restores every dropped granule of the range)
     };
 
     // The OS layer: every callback gets `ctx`.
@@ -93,11 +98,21 @@ public:
         int (*plain)(void* ctx, uint64_t addr) = nullptr;
         // the time now, in ns (the pass's time budget; none without it)
         int64_t (*clock)(void* ctx) = nullptr;
+        // the spill: each dropped granule's verified bytes stored where a touch reads them back without decoding the
+        // file again (a zstd frame cannot be entered in its middle). put returns a slot, -1 when full; get fills a
+        // granule's bytes, 0 when done; free gives a slot back. None: every touch decodes the file again.
+        int64_t (*spill_put)(void* ctx, const uint8_t* bytes) = nullptr;
+        int (*spill_get)(void* ctx, int64_t slot, uint8_t* buf) = nullptr;
+        void (*spill_free)(void* ctx, int64_t slot) = nullptr;
     };
 
     struct Stats {
         std::atomic<uint64_t> ranges{0}, replaced{0}, passes{0};
         std::atomic<uint64_t> too_large{0}, too_large_bytes{0};     // decodes left out by max_range_bytes
+        std::atomic<uint64_t> spilled_now{0}, from_spill{0}, from_decode{0};   // slots held; granules restored each way
+        std::atomic<uint64_t> cancelled{0};                                    // candidates whose storage ended
+        std::atomic<uint64_t> dropped_spill_only{0};                           // granules dropped of spill-only sources, in all
+        std::atomic<uint64_t> lock_wait_max_ns{0};                             // a touch's longest wait for its range's lock
         std::atomic<uint64_t> dropped_granules{0}, dropped_now{0};   // granules dropped in all, dropped now
         std::atomic<uint64_t> restores{0}, restored_granules{0};     // touches that restored a range; granules restored
         std::atomic<uint64_t> by_path[int(TouchPath::kCount)] = {};
@@ -136,6 +151,9 @@ public:
     void unmark_imported(uint64_t lo, uint64_t hi);
     /// [lo, hi) was unmapped: its ranges and dropped granules are forgotten (their bytes were given up).
     void forget(uint64_t lo, uint64_t hi);
+    /// The candidates overlapping [lo, hi) stop being candidates (their storage ended: an NVN pool finalized). Granules
+    /// already dropped stay: their bytes come back from the spill, which is what the memory held.
+    void cancel(uint64_t lo, uint64_t hi);
 
     /// Dropped granules whose substrate says they are not dropped any more (unmapped by the OS layer meanwhile) are
     /// forgotten. Returns how many.
@@ -154,6 +172,7 @@ private:
         bool candidate = true;            // false once replaced, forgotten, or given up
         std::vector<uint8_t> state;       // a GState a whole granule, from `first`
         std::vector<uint64_t> hash;       // (check) the hash of each dropped granule
+        std::vector<int64_t> slot;        // its spill slot (-1: none)
         uint64_t first = 0;               // the first whole granule's address
         uint32_t dropped = 0;
     };
@@ -163,7 +182,10 @@ private:
     bool imported(uint64_t granule) const;
     bool kernel_busy(uint64_t granule, int64_t now) const;
     // (returns false when the range has nothing left to try: it stops being a candidate)
-    bool decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped);
+    bool decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uint64_t& looked, uint64_t& dropped);
+    static int fill(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size);   // (a restore's bytes: the spill, else a decode)
+    bool decide_one(Range& r, uint32_t i, const uint8_t* src, int64_t& slot, int64_t now, uint64_t& looked, bool& waiting);
+    void free_slot(Range& r, uint32_t k);
 
     Config config_;
     Host host_;

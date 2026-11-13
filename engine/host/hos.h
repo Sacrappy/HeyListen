@@ -76,6 +76,7 @@ void hl_drop_kernel_end(void);
 void hl_drop_import(uint64_t lo, uint64_t hi);
 void hl_drop_import_end(void);
 void hl_drop_unimport(uint64_t lo, uint64_t hi);
+void hl_drop_pool_gone(uint64_t lo, uint64_t hi);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))

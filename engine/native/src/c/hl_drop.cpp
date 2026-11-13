@@ -12,7 +12,7 @@ hl_drop_host g_host;
 
 const uint8_t* source_of(void* ctx, const hl::mem::DropSource& s) {
     (void)ctx;
-    return g_host.source(g_host.ctx, s.name.c_str(), s.dict_id, s.size, s.compressed);
+    return g_host.source(g_host.ctx, s.name.c_str(), s.dict_id, s.dest, s.size, s.compressed);
 }
 }   // namespace
 
@@ -31,6 +31,7 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     config.pass_bytes = c->pass_bytes;
     if (c->pass_ns) config.pass_ns = c->pass_ns;
     config.max_range_bytes = c->max_range_bytes;
+    config.ahead = c->ahead;
     config.require_cold = c->require_cold != 0;
     config.check = c->check != 0;
     hl::mem::Drop::Host host;
@@ -45,6 +46,8 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     host.protect = h->protect;
     host.plain = h->plain;
     host.clock = h->clock;
+    if (h->spill_put && h->spill_get && h->spill_free)
+        host.spill_put = h->spill_put, host.spill_get = h->spill_get, host.spill_free = h->spill_free;
     g_drop.store(new hl::mem::Drop(config, host));
     return 1;
 }
@@ -85,6 +88,16 @@ extern "C" void hl_drop_imported(uint64_t lo, uint64_t hi) {
 }
 extern "C" void hl_drop_unimported(uint64_t lo, uint64_t hi) {
     if (auto* d = g_drop.load()) d->unmark_imported(lo, hi);
+}
+extern "C" void hl_drop_mirrored(uint64_t dest, uint64_t size, int64_t now_ns) {
+    auto* d = g_drop.load();
+    if (!d) return;
+    hl::mem::DropSource s;
+    s.dest = dest, s.size = size, s.name = "(mirror)", s.spill_only = true;
+    d->decoded(std::move(s), now_ns);
+}
+extern "C" void hl_drop_cancel(uint64_t lo, uint64_t hi) {
+    if (auto* d = g_drop.load()) d->cancel(lo, hi);
 }
 extern "C" void hl_drop_forget(uint64_t lo, uint64_t hi) {
     if (auto* d = g_drop.load()) d->forget(lo, hi);

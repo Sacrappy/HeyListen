@@ -36,7 +36,7 @@ void Drop::decoded(DropSource src, int64_t now) {
         }
     }
     if (end <= first) return;   // (no whole granule: nothing to drop)
-    if (config_.max_range_bytes && src.size > config_.max_range_bytes) {
+    if (!host_.spill_put && config_.max_range_bytes && src.size > config_.max_range_bytes) {
         stats_.too_large.fetch_add(1, std::memory_order_relaxed);
         stats_.too_large_bytes.fetch_add(src.size, std::memory_order_relaxed);
         return;
@@ -49,6 +49,7 @@ void Drop::decoded(DropSource src, int64_t now) {
     r->first = first;
     r->state.assign((end - first) / g, kCandidate);
     if (config_.check) r->hash.assign(r->state.size(), 0);
+    r->slot.assign(r->state.size(), -1);
     by_dest_[r->src.dest] = r;
     all_[r->id] = r;
     stats_.ranges.fetch_add(1, std::memory_order_relaxed);
@@ -134,7 +135,53 @@ bool Drop::wait_pending(uint64_t addr) {
 }
 
 // one range's granules: the checks of the header in order, then the drop of those that pass (range lock held)
-bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
+// one granule of a range under decision (range lock and decision lock held); slot is its spill slot written ahead (-1:
+// none), set to -1 when the granule took it. True when it was dropped
+bool Drop::decide_one(Range& r, uint32_t i, const uint8_t* src, int64_t& slot, int64_t now, uint64_t& looked, bool& waiting) {
+    const uint64_t g = config_.granule;
+    const uint64_t a = r.first + uint64_t(i) * g;
+    if (r.state[i] != kCandidate) return false;   // (forgotten or restored meanwhile)
+    looked += g;
+    if (imported(a)) { refuse(Refuse::Imported), waiting = true; return false; }   // (until its import goes, if it does)
+    if (kernel_busy(a, now)) { refuse(Refuse::KernelUse), waiting = true; return false; }
+    if (host_.protect(host_.ctx, a, g, 1)) { refuse(Refuse::NotPlain), waiting = true; return false; }
+    const uint8_t* now_bytes = host_.view(host_.ctx, a);
+    const uint8_t* want = src + (a - r.src.dest);
+    if (!now_bytes || std::memcmp(now_bytes, want, g) != 0) {
+        // (written since the decode: it stays as it is, for good)
+        host_.protect(host_.ctx, a, g, 0);
+        r.state[i] = kNever, refuse(Refuse::Changed);
+        return false;
+    }
+    const uint64_t h = config_.check ? hl::stream::page_hash(want, g) : 0;
+    if ((r.src.spill_only && slot < 0) ||
+        (host_.spill_put && slot < 0 && config_.max_range_bytes && r.src.size > config_.max_range_bytes)) {
+        // (a large file's granule, or a mirror's, restores from the spill only: no room, not dropped now)
+        host_.protect(host_.ctx, a, g, 0);
+        refuse(Refuse::NoSpill), waiting = true;
+        return false;
+    }
+    if (const int why = host_.drop(host_.ctx, a, g)) {
+        host_.protect(host_.ctx, a, g, 0);
+        // (-2: the substrate knows the back end imported it, which this module may not have been told yet)
+        refuse(why == -2 ? Refuse::Imported : Refuse::Substrate), waiting = true;
+        return false;
+    }
+    if (config_.check) r.hash[i] = h;
+    if (slot >= 0) r.slot[i] = slot, slot = -1, stats_.spilled_now.fetch_add(1, std::memory_order_relaxed);
+    if (r.src.spill_only) stats_.dropped_spill_only.fetch_add(1, std::memory_order_relaxed);
+    r.state[i] = kDropped;
+    r.dropped++;
+    {
+        std::lock_guard<std::mutex> t(table_lock_);
+        by_granule_[a] = &r;
+    }
+    stats_.dropped_granules.fetch_add(1, std::memory_order_relaxed);
+    stats_.dropped_now.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool Drop::decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uint64_t& looked, uint64_t& dropped) {
     const uint64_t g = config_.granule;
     std::vector<uint32_t> cold;   // granule indexes that passed every check but the comparison
     bool waiting = false;          // some granule may pass later (in use now)
@@ -152,56 +199,51 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
     }
     r.next_ns = now + config_.retry_ns;
     if (cold.empty()) return waiting || r.dropped;   // (a range with granules dropped may drop them again after a restore)
+    // (the file is decoded without the range's lock: a touch of the range's dropped granules does not wait for it, which
+    // took up to half a second for the largest files. What changed meanwhile is looked at again below)
+    lock.unlock();
     const uint8_t* src = host_.source(host_.ctx, r.src);
+    lock.lock();
     if (!src) {
         stats_.source_failed.fetch_add(1, std::memory_order_relaxed);
         refuse(Refuse::NoSource, cold.size());
+        if (r.src.spill_only) return true;   // (a mirror not readable now: its import taken again, or given back as idle)
         for (uint32_t i : cold) r.state[i] = kNever;
         return false;
     }
     stats_.sources.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t lo = r.first + uint64_t(cold.front()) * g, hi = r.first + uint64_t(cold.back() + 1) * g;
-    {
-        // (the decision: writers of these granules fault on the read-only pages and wait in wait_pending; the kernel
-        // and the driver wait in kernel_use / mark_imported, and their marks are looked at again here)
-        std::unique_lock<std::shared_mutex> p(pending_lock_);
-        pending_lo_.store(lo, std::memory_order_release);
-        pending_hi_.store(hi, std::memory_order_release);
-        for (uint32_t i : cold) {
-            const uint64_t a = r.first + uint64_t(i) * g;
-            looked += g;
-            if (imported(a)) { refuse(Refuse::Imported), waiting = true; continue; }   // (until its import goes, if it does)
-            if (kernel_busy(a, now)) { refuse(Refuse::KernelUse), waiting = true; continue; }
-            if (host_.protect(host_.ctx, a, g, 1)) { refuse(Refuse::NotPlain), waiting = true; continue; }
-            const uint8_t* now_bytes = host_.view(host_.ctx, a);
-            const uint8_t* want = src + (a - r.src.dest);
-            if (!now_bytes || std::memcmp(now_bytes, want, g) != 0) {
-                // (written since the decode: it stays as it is, for good)
-                host_.protect(host_.ctx, a, g, 0);
-                r.state[i] = kNever, refuse(Refuse::Changed);
-                continue;
+    // (in batches of 8 granules: the spill's writes are made with no lock held, and the range's lock and the decision's
+    // are held over 512 KB at a time, so that a touch of the range waits for one batch at most: a 64 MB range decided in one
+    // go held them for a quarter of a second, and 32 granules a batch still 26 ms once: the pages compared may come back from
+    // the page file)
+    constexpr size_t kBatch = 8;
+    lock.unlock();
+    std::vector<int64_t> pre;
+    for (size_t b = 0; b < cold.size(); b += kBatch) {
+        const size_t e = std::min(cold.size(), b + kBatch);
+        pre.assign(e - b, -1);
+        if (host_.spill_put)
+            for (size_t j = b; j < e; j++) pre[j - b] = host_.spill_put(host_.ctx, src + (r.first + uint64_t(cold[j]) * g - r.src.dest));
+        lock.lock();
+        const uint64_t lo = r.first + uint64_t(cold[b]) * g, hi = r.first + uint64_t(cold[e - 1] + 1) * g;
+        {
+            // (the decision: writers of these granules fault on the read-only pages and wait in wait_pending; the kernel
+            // and the driver wait in kernel_use / mark_imported, and their marks are looked at again here)
+            std::unique_lock<std::shared_mutex> p(pending_lock_);
+            pending_lo_.store(lo, std::memory_order_release);
+            pending_hi_.store(hi, std::memory_order_release);
+            for (size_t j = b; j < e; j++) {
+                const uint32_t i = cold[j];
+                int64_t& slot = pre[j - b];
+                if (decide_one(r, i, src, slot, now, looked, waiting)) dropped++;
+                if (slot >= 0) host_.spill_free(host_.ctx, slot);   // (written for a granule not dropped)
             }
-            const uint64_t h = config_.check ? hl::stream::page_hash(want, g) : 0;
-            if (const int why = host_.drop(host_.ctx, a, g)) {
-                host_.protect(host_.ctx, a, g, 0);
-                // (-2: the substrate knows the back end imported it, which this module may not have been told yet)
-                refuse(why == -2 ? Refuse::Imported : Refuse::Substrate), waiting = true;
-                continue;
-            }
-            if (config_.check) r.hash[i] = h;
-            r.state[i] = kDropped;
-            r.dropped++;
-            dropped++;
-            {
-                std::lock_guard<std::mutex> t(table_lock_);
-                by_granule_[a] = &r;
-            }
-            stats_.dropped_granules.fetch_add(1, std::memory_order_relaxed);
-            stats_.dropped_now.fetch_add(1, std::memory_order_relaxed);
+            pending_lo_.store(0, std::memory_order_release);
+            pending_hi_.store(0, std::memory_order_release);
         }
-        pending_lo_.store(0, std::memory_order_release);
-        pending_hi_.store(0, std::memory_order_release);
+        lock.unlock();
     }
+    lock.lock();
     host_.release(host_.ctx, src);
     if (waiting) return true;
     // (granules dropped now become candidates again after a restore: the range stays while it has any)
@@ -244,7 +286,7 @@ uint64_t Drop::pass(int64_t now) {
     for (auto& [id, dest] : due) {
         if (looked >= config_.pass_bytes) break;
         if (host_.clock && host_.clock(host_.ctx) - t0 > config_.pass_ns) break;
-        std::lock_guard<std::mutex> l(range_lock(id));
+        std::unique_lock<std::mutex> l(range_lock(id));
         Range* r;
         {
             std::lock_guard<std::mutex> t(table_lock_);
@@ -257,7 +299,7 @@ uint64_t Drop::pass(int64_t now) {
                 continue;
             }
         }
-        if (!decide(*r, now, looked, dropped)) {
+        if (!decide(*r, l, now, looked, dropped)) {
             std::lock_guard<std::mutex> t(table_lock_);
             r->candidate = false;
             auto it = by_dest_.find(r->src.dest);
@@ -269,15 +311,43 @@ uint64_t Drop::pass(int64_t now) {
 
 namespace {
 struct FillCtx {
-    const uint8_t* src;
-    uint64_t src_dest;
+    Drop* self;
+    void* range;
+    const uint8_t* src = nullptr;   // (the file decoded again, only when a granule has no spill slot)
 };
-int fill_from_source(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size) {
+}   // namespace
+
+int Drop::fill(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size) {
     auto* f = static_cast<FillCtx*>(ctx);
-    std::memcpy(buf, f->src + (addr - f->src_dest), size);
+    Drop& d = *f->self;
+    Range& r = *static_cast<Range*>(f->range);
+    const uint64_t g = d.config_.granule;
+    for (uint64_t at = 0; at < size; at += g) {
+        const uint32_t k = uint32_t((addr + at - r.first) / g);
+        if (r.slot[k] >= 0 && d.host_.spill_get(d.host_.ctx, r.slot[k], buf + at) == 0) {
+            d.stats_.from_spill.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!f->src) {
+            f->src = d.host_.source(d.host_.ctx, r.src);
+            if (!f->src) {
+                d.stats_.source_failed.fetch_add(1, std::memory_order_relaxed);
+                return 1;
+            }
+            d.stats_.sources.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::memcpy(buf + at, f->src + (addr + at - r.src.dest), g);
+        d.stats_.from_decode.fetch_add(1, std::memory_order_relaxed);
+    }
     return 0;
 }
-}   // namespace
+
+void Drop::free_slot(Range& r, uint32_t k) {
+    if (r.slot[k] < 0) return;
+    host_.spill_free(host_.ctx, r.slot[k]);
+    r.slot[k] = -1;
+    stats_.spilled_now.fetch_sub(1, std::memory_order_relaxed);
+}
 
 bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64_t hi) {
     const uint64_t g = config_.granule;
@@ -289,7 +359,13 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         if (it == by_granule_.end()) return false;
         id = it->second->id;
     }
+    const int64_t w0 = host_.clock ? host_.clock(host_.ctx) : 0;
     std::lock_guard<std::mutex> l(range_lock(id));
+    if (host_.clock) {
+        const uint64_t waited = uint64_t(host_.clock(host_.ctx) - w0);
+        uint64_t was = stats_.lock_wait_max_ns.load(std::memory_order_relaxed);
+        while (waited > was && !stats_.lock_wait_max_ns.compare_exchange_weak(was, waited, std::memory_order_relaxed)) {}
+    }
     Range* r;
     {
         std::lock_guard<std::mutex> t(table_lock_);
@@ -301,27 +377,25 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         r = it->second;
     }
     if (!host_.is_dropped(host_.ctx, granule)) return true;
-    const uint8_t* src = host_.source(host_.ctx, r->src);
-    if (!src) {
-        stats_.restore_failed.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    stats_.sources.fetch_add(1, std::memory_order_relaxed);
-    // every dropped granule of the range, in runs of neighbours: one restore a run
-    FillCtx f{src, r->src.dest};
+    // what comes back: the kernel's and the import's paths, the run they ask for; a touch of a granule in the spill, it
+    // and `ahead` granules after it (from the spill: no decode); otherwise every dropped granule of the range, as one
+    // decode of the file serves them all. In runs of neighbours: one atomic restore a run
+    FillCtx f{this, r};
     bool ok = true;
     uint32_t n = 0;
     const bool part = hi > lo && (path == TouchPath::Kernel || path == TouchPath::Import);
+    const uint32_t k0 = uint32_t((granule - r->first) / g);
+    const bool near = !part && host_.spill_get && r->slot[k0] >= 0;
     auto wanted = [&](uint32_t k) {
         const uint64_t a = r->first + uint64_t(k) * g;
-        return r->state[k] == kDropped && (!part || (a + g > lo && a < hi));
+        return r->state[k] == kDropped && (part ? a + g > lo && a < hi : !near || (k >= k0 && k <= k0 + config_.ahead));
     };
     for (uint32_t i = 0; i < r->state.size();) {
         if (!wanted(i)) { i++; continue; }
         uint32_t e = i;
         while (e < r->state.size() && wanted(e)) e++;
         const uint64_t a = r->first + uint64_t(i) * g, size = uint64_t(e - i) * g;
-        if (host_.restore(host_.ctx, a, size, fill_from_source, &f)) {
+        if (host_.restore(host_.ctx, a, size, fill, &f)) {
             stats_.restore_failed.fetch_add(1, std::memory_order_relaxed);
             ok = false;
             i = e;
@@ -333,6 +407,7 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
                 stats_.checked.fetch_add(1, std::memory_order_relaxed);
                 if (!got || hl::stream::page_hash(got, g) != r->hash[k]) stats_.mismatches.fetch_add(1, std::memory_order_relaxed);
             }
+            free_slot(*r, k);
             r->state[k] = kCandidate;
             r->dropped--;
             n++;
@@ -341,7 +416,7 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         }
         i = e;
     }
-    host_.release(host_.ctx, src);
+    if (f.src) host_.release(host_.ctx, f.src);
     stats_.dropped_now.fetch_sub(n, std::memory_order_relaxed);
     stats_.restored_granules.fetch_add(n, std::memory_order_relaxed);
     stats_.restores.fetch_add(1, std::memory_order_relaxed);
@@ -360,6 +435,21 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         }
     }
     return ok;
+}
+
+void Drop::cancel(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    std::lock_guard<std::mutex> t(table_lock_);
+    auto it = by_dest_.upper_bound(lo);
+    if (it != by_dest_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second->src.dest + prev->second->src.size > lo) it = prev;
+    }
+    while (it != by_dest_.end() && it->first < hi) {
+        it->second->candidate = false;
+        stats_.cancelled.fetch_add(1, std::memory_order_relaxed);
+        it = by_dest_.erase(it);
+    }
 }
 
 void Drop::forget(uint64_t lo, uint64_t hi) {
@@ -390,6 +480,7 @@ void Drop::forget(uint64_t lo, uint64_t hi) {
         for (uint32_t k = 0; k < r->state.size(); k++) {
             const uint64_t a = r->first + uint64_t(k) * config_.granule;
             if (r->state[k] != kDropped || a < lo || a >= hi) continue;
+            free_slot(*r, k);
             r->state[k] = kNever;
             r->dropped--;
             by_granule_.erase(a);
@@ -421,6 +512,7 @@ uint64_t Drop::reconcile() {
         auto it = by_granule_.find(a);
         if (it == by_granule_.end() || it->second->id != id) continue;
         Range* r = it->second;
+        free_slot(*r, uint32_t((a - r->first) / config_.granule));
         r->state[(a - r->first) / config_.granule] = kNever;
         r->dropped--;
         by_granule_.erase(it);
@@ -437,7 +529,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
     const uint64_t dropped = stats_.dropped_granules.load(), restores = stats_.restores.load();
     const double secs = last_report_ns_ && now > last_report_ns_ ? (now - last_report_ns_) / 1e9 : 0;
     static const char* const kRefuse[] = {"imported", "kernel", "in use", "changed", "no source", "not plain",
-                                          "substrate", "given up"};
+                                          "substrate", "given up", "no spill room"};
     char refused[256];
     int k = 0;
     for (int i = 0; i < int(Refuse::kCount); i++)
@@ -448,7 +540,8 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         "%.1f MB dropped now; dropped %.1f MB in all (%.1f MB since the last line); %llu restores of %.1f MB (%llu since "
         "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
-        "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu",
+        "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu; "
+        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu; candidates cancelled %llu; dropped of mirrors %.1f MB in all; a touch waited %.2f ms at most for its range's lock",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
         (unsigned long long)restores, stats_.restored_granules.load() * mb,
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
@@ -460,7 +553,10 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)stats_.ranges.load(), (unsigned long long)stats_.replaced.load(),
         (unsigned long long)stats_.too_large.load(), stats_.too_large_bytes.load() / 1048576.0,
         (unsigned long long)stats_.sources.load(), (unsigned long long)stats_.source_failed.load(),
-        (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load());
+        (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load(),
+        stats_.spilled_now.load() * mb, (unsigned long long)stats_.from_spill.load(),
+        (unsigned long long)stats_.from_decode.load(), (unsigned long long)stats_.cancelled.load(),
+        stats_.dropped_spill_only.load() * mb, stats_.lock_wait_max_ns.exchange(0) / 1e6);
     last_dropped_report_ = dropped, last_restores_report_ = restores, last_report_ns_ = now;
     return n < 0 ? 0 : n;
 }

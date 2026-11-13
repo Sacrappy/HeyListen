@@ -22,13 +22,17 @@ typedef struct hl_drop_host {
     int (*drop)(void *ctx, uint64_t addr, uint64_t size);
     int (*restore)(void *ctx, uint64_t addr, uint64_t size, hl_drop_fill fill, void *fill_ctx);
     /* the file decoded again: `size` bytes, or NULL; given back with release() */
-    const uint8_t *(*source)(void *ctx, const char *name, uint32_t dict_id, uint64_t size, uint64_t compressed);
+    const uint8_t *(*source)(void *ctx, const char *name, uint32_t dict_id, uint64_t dest, uint64_t size, uint64_t compressed);
     void (*release)(void *ctx, const uint8_t *bytes);
     const uint8_t *(*view)(void *ctx, uint64_t addr);
     uint32_t (*resident)(void *ctx, uint64_t granule);
     int (*protect)(void *ctx, uint64_t addr, uint64_t size, int read_only);
     int (*plain)(void *ctx, uint64_t addr);
     int64_t (*clock)(void *ctx);
+    /* the spill (hl/mem/Drop.h Host): NULL for none */
+    int64_t (*spill_put)(void *ctx, const uint8_t *bytes);
+    int (*spill_get)(void *ctx, int64_t slot, uint8_t *buf);
+    void (*spill_free)(void *ctx, int64_t slot);
 } hl_drop_host;
 
 typedef struct hl_drop_config {
@@ -38,6 +42,7 @@ typedef struct hl_drop_config {
     uint64_t pass_bytes;
     int64_t pass_ns;
     uint64_t max_range_bytes;
+    uint32_t ahead;
     int require_cold, check;
 } hl_drop_config;
 
@@ -57,6 +62,10 @@ void hl_drop_kernel_use(uint64_t lo, uint64_t hi, int64_t now_ns);
 void hl_drop_imported(uint64_t lo, uint64_t hi);
 void hl_drop_unimported(uint64_t lo, uint64_t hi);
 void hl_drop_forget(uint64_t lo, uint64_t hi);
+/* HL_MEM_DROP_POOLS: [dest, dest + size) is a mirrored pool's storage whose bytes the VRAM mirror holds (a candidate
+   whose source, "(mirror)", is read back at the drop only); a pool's storage ended: its candidates cancelled */
+void hl_drop_mirrored(uint64_t dest, uint64_t size, int64_t now_ns);
+void hl_drop_cancel(uint64_t lo, uint64_t hi);
 uint64_t hl_drop_reconcile(void);
 /* Granules dropped now; one line of counters. */
 uint64_t hl_drop_dropped_now(void);

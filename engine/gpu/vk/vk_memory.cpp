@@ -4100,6 +4100,27 @@ void lazy_filter(Pool& p, std::vector<VkBufferCopy>& runs) {
     }
     runs.swap(out);
 }
+// (2026-11-13) What the release of a mirror holding left-out write-backs does with one left-out page (TICK-023): copy the mirror's
+// bytes back into guest memory only while they are still the newest bytes of a live pool's page.
+enum { kRelCopy, kRelDead, kRelWritten, kRelCpuPage, kRelTexture, kRelKinds };
+int64_t st_release_by[kRelKinds];   // (pages, by verdict; nvn_pools_mu held)
+/// [lo, hi) inside one of the game's live pools (pools: by lo, disjoint, as memory_sync builds them from the host's list)
+bool in_live_pool(const std::vector<GuestPool>& pools, uint64_t lo, uint64_t hi) {
+    auto it = std::upper_bound(pools.begin(), pools.end(), lo, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == pools.begin()) return false;
+    --it;
+    return lo >= it->lo && hi <= it->hi;
+}
+/// live: the page's pool record is a pool the game still has (not finalized: its memory may be the game's heap again);
+/// gen: the page's write generation, synced: its mirror's (a newer one is a write since the mirror's last sync: guest
+/// memory is newer than the GPU's bytes); cpu_page: a mirror sync saw the CPU write it; texture: a live texture's storage
+int lazy_release_verdict(bool live, uint32_t gen, uint32_t synced, bool cpu_page, bool texture) {
+    if (!live) return kRelDead;
+    if (gen > synced) return kRelWritten;
+    if (cpu_page) return kRelCpuPage;
+    if (texture) return kRelTexture;
+    return kRelCopy;
+}
 // (hookshot, 11-07) The counter reports the replay writes into guest memory on the CPU (vk_replay.cpp NOP_REPORT_COUNTER), by
 // guest address: a mirrored pool's write-back copied the GPU's mirror over them at the end of the submission, the mirror's
 // stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
@@ -5043,6 +5064,9 @@ void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {   // (TICK
     auto it = nvn_pools.upper_bound(gpu);
     if (it != nvn_pools.begin() && std::prev(it)->second.hi > gpu) --it;
     while (it != nvn_pools.end() && it->first < gpu + size) it = nvn_pools.erase(it);   // (memory reused)
+    // (a new pool over memory an older one left out write-backs of: those GPU bytes are no one's now)
+    if (!skipped_pages.empty())
+        for (uint64_t q = gpu >> kPageShift; q < (gpu + size + 4095) >> kPageShift; q++) skipped_pages.erase((uint32_t)q);
     NvnPool np;
     np.hi = gpu + size, np.flags = flags;
     nvn_pools[gpu] = np;
@@ -5315,6 +5339,7 @@ uint64_t st_mirror_bytes_freed = 0;
 // a culling or fog compute pass already running read a mirror destroyed under it (device lost in 53caac5f and ee7764a6,
 // issues 132 and 195, AMD after a scene change). The table goes back to guest memory at once, as before
 struct DeadMirror { VkBuffer buffer; VmaAllocation alloc; uint64_t value; };
+std::atomic<int> mirror_reads{0};   // (HL_MEM_DROP_POOLS: copies out of a mirror under way, memory_mirror_read)
 std::deque<DeadMirror> dead_mirrors;
 // A retired pool's import, given back the same way. Each import is a userptr buffer object to amdgpu, and RADV lists every
 // buffer object in every submission (buffer device addresses): the kernel checks every page of every userptr object at each
@@ -5330,7 +5355,8 @@ std::deque<DeadImport> dead_imports;
 uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
 void import_unpinned(uint64_t lo, uint64_t hi);   // (below)
 void reap_mirrors() {   // (pools_mu held)
-    while (!dead_mirrors.empty() && dead_mirrors.front().value <= mem_completed) {
+    // (a mirror read back for the drop policy (memory_mirror_read) is not destroyed under its copy)
+    while (!dead_mirrors.empty() && dead_mirrors.front().value <= mem_completed && !mirror_reads.load()) {
         if (getenv("RX_VK_LOG_ADDR")) {
             VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             da.buffer = dead_mirrors.front().buffer;
@@ -5446,6 +5472,12 @@ void imports_release() {
         dead_imports.push_back(std::move(d));
         p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0;
         st_released++, st_released_bytes += (int64_t)(p.hi - p.lo);
+        {   // (HL_MEM_DROP_POOLS, host/hl_drop.c: its storage's bytes are in the mirror now, a candidate to drop. An exe
+            // without the export: nothing)
+            using Held = void (*)(uint64_t, uint64_t);
+            static const Held held = (Held)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_mirror_held");
+            if (held) held(p.lo, p.hi);
+        }
         pools_gen++;
     }
     static int64_t logged_at = -1;
@@ -6452,9 +6484,19 @@ void memory_end_submission(VkCommandBuffer cmd) {
             {
                 std::lock_guard nk(nvn_pools_mu);
                 for (uint64_t q = p->lo >> kPageShift; q <= (p->hi - 1) >> kPageShift; q++) {
-                    if (!skipped_pages.count((uint32_t)q) || cpu_pages.count((uint32_t)q)) continue;
+                    if (!skipped_pages.count((uint32_t)q)) continue;
                     const uint64_t a = std::max(p->lo, q << kPageShift), b = std::min(p->hi, (q + 1) << kPageShift);
-                    if (a >= b || replay_tex_storage_in(a, b - a)) continue;
+                    // (2026-11-13, the play sessions' crashes: a skipped page is checked again now, not only against
+                    // cpu_pages, which only a mirror sync of this pool feeds, and an idle pool has none. The game may have
+                    // finalized the pool since (zone changes) and given its memory back to its heap, or written the page
+                    // since the pool's last sync: the mirror's old GPU bytes then went over live game objects)
+                    uint64_t rlo = 0;
+                    const NvnPool* np = nvn_pool_at(a, &rlo);
+                    const int verdict = lazy_release_verdict(np && in_live_pool(guest_pools, rlo, np->hi), page_gen(q), p->synced_gen,
+                                                             cpu_pages.count((uint32_t)q) != 0, a < b && replay_tex_storage_in(a, b - a));
+                    st_release_by[verdict]++;
+                    if (verdict == kRelDead || verdict == kRelWritten) skipped_pages.erase((uint32_t)q);
+                    if (verdict != kRelCopy || a >= b) continue;
                     if (!runs.empty() && runs.back().srcOffset + runs.back().size == a - p->lo) runs.back().size += b - a;
                     else runs.push_back({a - p->lo, a - p->lo, b - a});
                 }
@@ -6481,8 +6523,11 @@ void memory_end_submission(VkCommandBuffer cmd) {
         if (st_lazy_released / 8 != logged_at) {
             logged_at = st_lazy_released / 8;
             logf("vk: mirrors holding left-out write-backs given back: %lld (%llu MB), %.2f MB written back into guest memory first; "
-                 "%llu MB of mirrors now", (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20),
-                 st_lazy_written_back / 1048576.0, (unsigned long long)(mirror_bytes >> 20));
+                 "%llu MB of mirrors now; left-out pages: %lld written back, not written back as the pool is gone (finalized) %lld, "
+                 "written since the mirror's sync %lld, written by the CPU %lld, texture storage %lld",
+                 (long long)st_lazy_released, (unsigned long long)(st_lazy_released_bytes >> 20), st_lazy_written_back / 1048576.0,
+                 (unsigned long long)(mirror_bytes >> 20), (long long)st_release_by[kRelCopy], (long long)st_release_by[kRelDead],
+                 (long long)st_release_by[kRelWritten], (long long)st_release_by[kRelCpuPage], (long long)st_release_by[kRelTexture]);
         }
     }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
@@ -6593,4 +6638,105 @@ extern "C" __declspec(dllexport) void mkwvk_pool_flags(uint64_t gpu, uint64_t si
 extern "C" __attribute__((visibility("default"))) void mkwvk_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
 #endif
     mkwvk::memory_pool_flags(gpu, size, flags);
+}
+
+namespace mkwvk {
+// ---- (HeyListen, HL_MEM_DROP_POOLS: host/hl_drop.c) a mirrored pool's bytes read back from its VRAM mirror ----
+// The drop policy compares a cold granule of a pool's storage with what the mirror holds, and drops it (into its spill)
+// only if equal. Only the simplest exact class: a pool with its mirror on, never bound for writing, whose import was given
+// back (RX_VK_NO_HOST_IMPORT): nothing but the CPU's syncs writes that mirror, and a page the CPU wrote and that is not
+// synced yet differs from guest memory and is refused by the comparison. The copy goes in a command buffer of its own,
+// submitted on the queue after everything submitted before (the queue's order: the syncs already recorded land first),
+// waited for on the calling thread (the drop thread). pools_mu is held only while the copy is recorded; the mirror is not
+// destroyed meanwhile (reap_mirrors waits on mirror_reads). 1: [guest, guest + size) is in out.
+int memory_mirror_read(uint64_t guest, uint64_t size, void* out) {
+    static std::mutex one;   // (one read at a time: its command buffer, fence and staging are shared)
+    std::lock_guard ok_one(one);
+    static VkCommandPool cpool = VK_NULL_HANDLE;
+    static VkCommandBuffer cmd = VK_NULL_HANDLE;
+    static VkFence fence = VK_NULL_HANDLE;
+    static VkBuffer stage = VK_NULL_HANDLE;
+    static VmaAllocation stage_alloc = nullptr;
+    static void* stage_map = nullptr;
+    static uint64_t stage_size = 0;
+    if (!cpool) {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.queueFamilyIndex = dev.queue_family;
+        pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (vkCreateCommandPool(dev.device, &pi, nullptr, &cpool) != VK_SUCCESS) return cpool = VK_NULL_HANDLE, 0;
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = cpool, ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, ai.commandBufferCount = 1;
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkAllocateCommandBuffers(dev.device, &ai, &cmd) != VK_SUCCESS || vkCreateFence(dev.device, &fi, nullptr, &fence) != VK_SUCCESS)
+            return 0;
+    }
+    if (size > stage_size) {
+        if (stage) destroy_buffer(stage, stage_alloc), stage = VK_NULL_HANDLE, stage_size = 0;
+        const uint64_t want = std::max<uint64_t>(size, 16ull << 20);
+        if (!create_buffer(want, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stage, stage_alloc, &stage_map)) return 0;
+        stage_size = want;
+    }
+    vkResetCommandPool(dev.device, cpool, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return 0;
+    {
+        std::lock_guard lk(pools_mu);
+        auto it = imported.upper_bound(guest);
+        if (it == imported.begin()) return vkEndCommandBuffer(cmd), 0;
+        Pool& p = (--it)->second;
+        if (guest < p.lo || guest + size > p.hi || p.mstate != Pool::MIRROR_ON || !p.mirror || p.memory || p.gpu_written ||
+            p.lazy_held)
+            return vkEndCommandBuffer(cmd), 0;
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (after every write submitted before: the syncs)
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &di);
+        const VkBufferCopy r{guest - p.lo, 0, size};
+        vkCmdCopyBuffer(cmd, p.mirror, stage, 1, &r);
+        mirror_reads.fetch_add(1);
+    }
+    VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    hb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    hb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    hb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    hb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    hd.memoryBarrierCount = 1, hd.pMemoryBarriers = &hb;
+    vkCmdPipelineBarrier2(cmd, &hd);
+    bool done = vkEndCommandBuffer(cmd) == VK_SUCCESS;
+    if (done) {
+        VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cb.commandBuffer = cmd;
+        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cb;
+        vkResetFences(dev.device, 1, &fence);
+        {
+            late_fix_wait_unlocked();
+            std::lock_guard qk(dev.present_mu);   // (one queue: submits and presents take turns)
+            queue_flush_locked();
+            done = vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS;
+        }
+        done = done && vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+    }
+    mirror_reads.fetch_sub(1);
+    if (!done) return 0;
+    invalidate_mapped(stage_alloc, size);
+    std::memcpy(out, stage_map, size);
+    return 1;
+}
+}   // namespace mkwvk
+
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+int mkwvk_mirror_read(uint64_t guest, uint64_t size, void* out) {
+    return mkwvk::memory_mirror_read(guest, size, out);
 }
