@@ -166,6 +166,28 @@ void hos_gpu_track(uint64_t guest, uint64_t size, int on) {
     UNLOCK();
 }
 
+/* (HeyListen, 2026-11-14) The Vulkan back end's release of a mirror holding left-out write-backs (gpu/vk/vk_memory.cpp,
+   lazy_apply): n bytes of GPU results into guest memory at guest (within one page), only if the range lies in a native NVN
+   pool that is live now and the soft write watch has no CPU write of the page since its last collection. Under the lock
+   nvnMemoryPoolFinalize's untrack takes (hos_gpu_track), so a pool cannot be finalized and its memory handed back to the
+   game between the check and the copy. 1: written; 0: no live pool there (finalized: the game's memory again); 2: the CPU
+   wrote the page since (its bytes are newer). The write is not marked: it is the GPU's, as a write-back's copy is. */
+__declspec(dllexport) int hos_gpu_write_live(uint64_t guest, const void *src, uint64_t n) {
+    if (!n || (guest >> 12) != ((guest + n - 1) >> 12)) return 0;
+    LOCK();
+    int live = 0;
+    for (int i = 0; i < ntracked && !live; i++) live = guest >= tracked[i].lo && guest + n <= tracked[i].hi;
+    int r = 0;
+    if (live) {
+#if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
+        if (__atomic_load_n(&a64_dirty[(uint32_t)guest >> 12], __ATOMIC_ACQUIRE)) r = 2;
+#endif
+        if (!r) memcpy(GP(guest), src, (size_t)n), r = 1;
+    }
+    UNLOCK();
+    return r;
+}
+
 /* The guest memory the GPU can reach (every mapping's guest range, merged, page aligned), for the renderer's change
    tracking: GetWriteWatch over the whole guest arena cost ~2.5 ms a call, and the GPU only reads these. Returns
    the number of ranges (at most max) written to out as {start, end} pairs. */
