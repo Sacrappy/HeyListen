@@ -1362,6 +1362,15 @@ def main(a=None):
     else:
         fail("The translated game came out cut short twice (%s). Check that the drive with %s has free space, and that no antivirus "
              "and no second Hookshot Builder is working in that folder, then update again." % (", ".join(cut[:6]), work))
+    # (HeyListen native engine) the entry gates host/hl_*.c asks for (nx2/hl_gates.py), whether the lift ran or was skipped:
+    # the lift puts them in, but its key does not cover the HL_GATE lines of host/, so an update that adds a gate would
+    # leave it out, and one that drops a gate would leave a gate line calling a function no host file defines any more (an
+    # undefined symbol at every link). A change here rewrites the key: the files were as it vouched for just before
+    import hl_gates
+    before = gen_print(gen_dir)
+    hl_gates.apply(gen_dir, quiet=True)
+    if gen_print(gen_dir) != before:
+        write_lift_key(work, key)
 
     if LINUX:
         check_linux_compiler()
