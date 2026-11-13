@@ -313,7 +313,7 @@ branches of the same phase.
 | The check | `hl/gfx/PassCheck.h` | below |
 | C surface, OS layer | `hl/c/hl_gfx.h`, `engine/host/hl_gfx.c`; a hook in `nvn_native.c` (`nvn_native_proc`) | `HL_ANSWER(0x806602e0)`: no lifted code changes. The phases are the translated `0x80660320` / `0x8065fe30`, called with the listener's two arguments (both read x0 and x1 only, read in the lifted text) |
 
-Switches: `HL_GFX=1` the native pass (default 0, off: the answer is not installed, the translation runs as before),
+Switches: `HL_GFX=1` the native pass (the default since its validation; `HL_GFX=0`: the answer is not installed, the translation runs as before),
 `HL_GFX_CHECK=1` the check (`=2` its control), `HL_GFX_LOG=1` the counters every 10 s.
 
 ### The check (step 1)
@@ -354,6 +354,19 @@ the start of a scene) in every run, the control included. The native shell's dif
 the check sees no difference between the shell and the translated listener. It would see a native part that changes
 which procedures a pass calls, or how many, by more than ~5% for any procedure called once a pass or more; smaller or
 argument-only differences need the call-by-call check described above.
+
+### Validation (main PC, `build/s5/valid.sh`, 110 s a scene)
+
+| Run | Scene | Ran | Game speed ratio | Native passes | Shots |
+|---|---|---|---|---|---|
+| `HL_GFX=1` | kokiri-idle | to the end, no crash | 59.74 | 34,731 | right (compared with `refshots-kokiri-idle`) |
+| | castle-move | to the end, no crash | 59.71 | 35,531 | right |
+| | hyrule-walk | to the end, no crash | 62.96 | 35,751 | right |
+| `HL_GFX=1 HL_GFX_CHECK=1` | the three | to the end, no crash | 59.59 / 59.97 / 59.90 | half of the passes | right |
+
+Memory with `HL_GFX=1` (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 7,780 / 4,143 / 13,455 /
+19,759 / 5,732; castle-move 7,816 / 4,155 / 13,814 / 21,451 / 6,812; hyrule-walk 7,818 / 4,171 / 13,666 / 20,654 /
+6,274. The shell changes no memory: these are the game's figures.
 
 ### Where the pass's time is, and what step 3 should take first
 

@@ -5,7 +5,7 @@
    listener is the scene's recording pass (guest 0x806602e0, reached only through a pointer), answered here instead of by
    its translation (hl_host.h HL_ANSWER: the lifted code is not touched).
      HL_GFX=0  off: the translated listener, as before
-     HL_GFX=1  the native pass (hl::gfx::RecordPass): its own level native, its phases still the translated functions
+     HL_GFX=1  the native pass (hl::gfx::RecordPass; the default): its own level native, its phases still translated
    HL_GFX_CHECK=1: the pass check. Every NVN procedure the game is given goes through a tap that, while a pass runs on the
    calling thread, adds the call to that pass's recording; with HL_GFX=1 each pass takes the native or the translated path
    at random, and the counters compare the two (hl/gfx/PassCheck.h says what that proves). With HL_GFX=0 every pass is the
@@ -22,7 +22,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#define HL_GFX_DEFAULT HL_GFX_OFF
+#define HL_GFX_DEFAULT HL_GFX_SHELL   /* (validated in the three scenes, check and shots clean: gfx-record-job.md section 7) */
 #define HL_RECORD_PASS 0x806602e0ULL   /* (hl::bridge::kRecordPass: hl_gfx_on checks the two agree) */
 
 typedef void (*HostFn)(Ctx *c, void *user);
