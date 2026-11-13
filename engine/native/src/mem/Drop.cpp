@@ -206,6 +206,7 @@ bool Drop::decide(Range& r, std::unique_lock<std::mutex>& lock, int64_t now, uin
             }
             if (config_.check) r.hash[i] = h;
             if (slot >= 0) r.slot[i] = slot, stats_.spilled_now.fetch_add(1, std::memory_order_relaxed);
+            if (r.src.spill_only) stats_.dropped_spill_only.fetch_add(1, std::memory_order_relaxed);
             r.state[i] = kDropped;
             r.dropped++;
             dropped++;
@@ -510,7 +511,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
         "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu; "
-        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu; candidates cancelled %llu",
+        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu; candidates cancelled %llu; dropped of mirrors %.1f MB in all",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
         (unsigned long long)restores, stats_.restored_granules.load() * mb,
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
@@ -524,7 +525,8 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)stats_.sources.load(), (unsigned long long)stats_.source_failed.load(),
         (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load(),
         stats_.spilled_now.load() * mb, (unsigned long long)stats_.from_spill.load(),
-        (unsigned long long)stats_.from_decode.load(), (unsigned long long)stats_.cancelled.load());
+        (unsigned long long)stats_.from_decode.load(), (unsigned long long)stats_.cancelled.load(),
+        stats_.dropped_spill_only.load() * mb);
     last_dropped_report_ = dropped, last_restores_report_ = restores, last_report_ns_ = now;
     return n < 0 ? 0 : n;
 }
