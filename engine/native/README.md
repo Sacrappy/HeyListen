@@ -20,6 +20,7 @@ Rules of this tree:
 | Job system: workers, dependencies, lanes for gameplay jobs | `hl/jobs/JobSystem.h`, `hl/jobs/GuestLanes.h` | first version, tested; runs the game's stages behind `HL_JOBS` |
 | Main loop: phases, frame step, pacing | `hl/app/MainLoop.h` | first version, tested; not in the game yet |
 | Job bridge: the game's job entry points and the structures read in place | `hl/bridge/JobBridge.h` | in the game behind `HL_JOBS`: 1 entry point of 18 answered (`hl::bridge::ready()` lists what is left) |
+| Memory: which cold pages of static GPU data leave the working set | `hl/mem/ColdPages.h` | in the game behind `HL_MEM_COLD` (on), through `engine/host/hl_mem.c` (`docs/native-engine/memory-boundary.md`, section 8) |
 | C surface for the layer that runs guest code | `hl/c/hl_bridge.h` | used by `engine/host/hl_host.c` and one `hl_<module>.c` a module (`hl_jobs.c`) |
 
 Test (no game, no GPU):
