@@ -275,7 +275,40 @@ would commit a zero megabyte through the commit-on-touch handler). A range given
 is counted as replaced. The table holds at most 8 Mi page hashes (64 MB). Reading the pages brings back those the
 cold-pages thread had taken out (`memory-boundary.md` section 12): the measurement runs are measurement only.
 
-EligibilityTablePlaceholder
+PC 3050, build `s6b-3`, `HL_STREAM_PAGES=1 HL_MEM_COLD_HEAPS=0` (the heaps' cold pages off, so that the checks do not
+read pages back from the page file: a first form that hashed 1 GB a pass with them on froze a run for a minute; the
+measurement now hashes at most 128 MB a pass, so the checks lag behind a scene's load: "at 30 s" and "at 60 s" mean
+that age or more, and the ranges loaded in the last 40-50 s of the 110 s run never reached their second check). One run
+a scene; MB of whole pages; the end of each run.
+
+| Kind | Scene | Decoded MB | at 30 s: checked MB | equal MB | at 60 s: checked MB | equal MB | gone MB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `Tex/*.bntx` | castle-move | 2076 | 1285 | 1243 | 865 | **831** | 8 |
+| | kokiri-idle | 2065 | 1638 | 1593 | 1228 | **1190** | 9 |
+| | hyrule-walk | 2065 | 1636 | 1592 | 1228 | **1190** | 8 |
+| `Model/*.bfres` | castle-move | 1468 | 1059 | 720 | 665 | **634** | 0 |
+| | kokiri-idle | 1248 | 1246 | 901 | 721 | **686** | 0 |
+| | hyrule-walk | 1248 | 1246 | 901 | 721 | **686** | 0 |
+| `Shader/*.bfsha` | all three | 311 | 311 | 293 | 311 | **293** | 0 |
+| `UI/*.bntx` | all three | 278 | 274-278 | 252-255 | 233 | **217** | 15 |
+| `Effect/*.byml` | castle / kokiri / hyrule | 105 | 96 / 105 / 105 | 63 / 71 / 71 | 82 / 89 / 89 | **47 / 54 / 54** | 0 |
+| `Pack/*.pack` | castle / kokiri / hyrule | 73 / 72 / 72 | 55 / 66 / 66 | 53 / 63 / 63 | 38 / 52 / 52 | **35 / 49 / 49** | 0 |
+| `Sound/*.bars` | all three | 68 | 67 | 67 | 9 | 9 | 0 |
+| `Lib/*.sarc` | all three | 26 | 26 | 22 | 26 | 22 | 0 |
+| `Bake/*.bkprb` | all three | 20 | 20 | 20 | - | - | - |
+| `Font2/*.bfotf`, `AnimationEvent/*.baev` | all three | 9, 6 | 9, 6 | **0**, **0** | | | |
+
+(The other kinds are under 10 MB each.) What it says:
+
+- **Texture files keep 96-97% of their pages as the decoder wrote them** (1190 of 1228 MB at 60 s in the two scenes that
+  reached it, 831 of 865 in castle-move): they are the first candidates, as section 10 of `memory-boundary.md` expected.
+  Under 1% of their pages were gone (freed) by then; 590-607 of ~5,250 texture ranges were given to another decode
+  before their second check.
+- Models keep 68-72% at 30 s over all their ranges and 95% of the ranges that reached 60 s (a different, earlier-loaded
+  subset: the second figure is not a trend), shader archives 94%, the UI textures 93%. Effects keep 60%, font files and
+  animation events nothing (relocated or rebuilt in place right after loading).
+- Over the scene, at 60 s about **2.5 GB** of decoded pages (kokiri-idle, hyrule-walk) still equal the decode; castle-move,
+  which loads more while moving, had fewer ranges at their second check by the end (about 2.1 GB).
 
 ### Step 2: the restore path
 
@@ -287,7 +320,20 @@ compared: every page with the hash taken at decode time, and byte for byte with 
 it (a page that differs is hashed again: written since the check, it is counted apart, not as a mismatch). At most 64
 MB of ranges a second are tested, so the thread keeps up with its checks.
 
-RestoreTablePlaceholder
+PC 3050, the same three runs (build `s6b-3`). Every range at its second check, 16 MB of ranges a second at most:
+
+| Scene | Ranges decoded again | MB | Pages unlike their decode-time hash | Pages compared byte for byte with memory | **Mismatches** | No RomFS file | Size differs | Decode failed | A restore: mean / per MB / at most |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| castle-move | 872 | 505 | 0 | 117,437 | **0** | 1 | 0 | 0 | 1.03 ms / 1.78 ms / 332 ms |
+| kokiri-idle | 1,360 | 623 | 0 | 146,093 | **0** | 1 | 0 | 0 | 0.85 ms / 1.87 ms / 369 ms |
+| hyrule-walk | 1,179 | 667 | 0 | 154,470 | **0** | 1 | 0 | 0 | 1.02 ms / 1.81 ms / 346 ms |
+
+The one range with no RomFS file is the resource system's own archive, whose heap is named `ares::System` (not a path);
+it would need its own name to file rule and is not a candidate. The size on disk equalled the recorded compressed size
+for every file. A restore costs the whole file (read and decode, ~1.8 ms a MB on this PC): a few ms for a texture, up to
+a third of a second for the largest files (the 310 MB shader archive's range class); a touch of one page of a large range
+would pay that unless restores keep a cache of the last files or decode only up to the touched page (zstd decodes a frame
+in order: a page near the start is cheaper).
 
 ### Step 3: decommit and restore on touch: not built, and why
 
