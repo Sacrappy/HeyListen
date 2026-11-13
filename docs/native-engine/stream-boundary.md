@@ -247,7 +247,21 @@ The native function itself in the game (`HL_STREAM_CHECK=2`: it answers, chunked
 it decoded is decoded again in one call from the bytes it read and compared): castle-move on the PC 3050, ran to the end,
 514 chunked files (2,927 MB) decoded natively, **0 mismatches**, no fallback to the translated function.
 
-ValidationPlaceholder
+Validation (main PC, `valid.sh s6v2 s6-v2 HL_STREAM=1 HL_STREAM_LOG=1`, the chunked case native, 2026-11-13):
+
+| Scene | Ran | Game speed ratio | Files (one read / chunked) | MB decompressed (one read / chunked) | Fallbacks | Game RAM | Process RAM | Commit | VRAM |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | to the end, no crash | 59.84 | 9,199 / 453 | 2,090 / 2,976 | 0 | 3,252 | 7,365 | 18,811 | 5,747 |
+| castle-move | to the end, no crash | 59.99 | 9,486 / 617 | 2,149 / 4,563 | 0 | 3,401 | 7,788 | 20,162 | 6,589 |
+| hyrule-walk | to the end, no crash | 60.02 | 9,476 / 586 | 2,142 / 4,228 | 0 | 2,842 | 7,453 | 19,525 | 6,209 |
+
+(MB; the counts are the last 10-second line of each run; the memory from `HOS_MEM_SPLIT=95 RX_VK_RES_LOG=1` as
+`valid.sh` reports it; main moved since section 8's runs, with the heaps' cold pages: the memory columns are not a
+comparison.) Every decode now goes through the native path: no file was given to the translated function. Every error
+path logged was the texture file named above (code 4, as in the translated function). The last shots of each scene were
+looked at: castle-move's matches its reference (the stall in the market), kokiri-idle shows the market square with its
+fountain and characters, hyrule-walk the flower beds by the fountain; nothing black, missing, flickering or tinted.
+With this, the chunked case is on by default with `HL_STREAM=1`.
 
 ### Share of the native path
 
