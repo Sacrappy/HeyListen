@@ -68,68 +68,74 @@ bool motion_step(const MotionStepIn& in, MotionStepOut& out, MotionDecline& why)
     }
     float dv[3] = {g.sub(a[0], b[0]), g.sub(a[1], b[1]), g.sub(a[2], b[2])};
     float dw[3] = {g.sub(a[4], b[4]), g.sub(a[5], b[5]), g.sub(a[3], b[3])};
-    const float max_w = g.in(packed15(in.max_w)), max_v = g.in(packed15(in.max_v));
-    const float mw = g.mul(max_w, max_w), mv = g.mul(max_v, max_v);
-    const float lv = len2(g, dv);
-    if (!g.ok) return values();
-
-    // 2. V clamped
-    if (!(mv >= lv)) {
-        clamp(g, dv, lv, max_v, c);
-        out.clamp_v = true;
-    }
-    // 3. the n path
-    const float lw = len2(g, dw);
-    if (const uint32_t n = in.b28 & 31) {
-        out.n_path = 1;
-        const float nf = (float)n;
-        const float e = g.mul(g.mul(nf, f32(0x3a800000u)), nf);
-        const float s3 = g.mul(e, g.in(in.d32));
-        float t0 = s3, t1 = s3, test = g.mul(s3, s3);
-        if (in.b28 & 0x40) {
-            const float hs = high_half(get<uint16_t>(in.motion, kHalf120));
-            if (hs == 1.0f) {
-            } else if (hs == 0.0f) {
-                t0 = g.in(in.g50[0]);
-                t1 = g.in(in.g50[1]);
-                test = g.mul(t0, t0);
-            } else {
-                const float mm = fabs_bits(g.in(hs));
-                const float ms = g.mul(mm, s3);
-                const float r = rs(mm);
-                t0 = t1 = g.mul(ms, r);
-                test = g.mul(ms, ms);
-            }
-        }
-        if (!g.ok) return values();
-        if (!(lw >= test)) {
-            const float u0 = g.mul(g.in(in.d144[0]), t0), u1 = g.mul(g.in(in.d144[1]), t1);
-            const float e2 = g.add(g.mul(e, g.mul(e, 0.75f)), 0.25f);
-            const float uu = g.mul(u0, u0);
-            if (!g.ok) return values();
-            if (g.mul(lw, e2) > uu) {
-                const float r = rs(lw);
-                const float f0 = fmax(g.in(in.g50[0]), g.sub(c[0], g.mul(r, u0)));
-                const float f1 = fmax(g.in(in.g50[1]), g.sub(c[1], g.mul(r, u1)));
-                dw[0] = g.mul(dw[0], f0);
-                dw[1] = g.mul(dw[1], f1);
-                dw[2] = g.mul(dw[2], f0);
-                out.n_path = 2;
-            } else {
-                out.n_path = 3;
-                if (uu > g.mul(len2(g, dv), e2)) {
-                    dv[0] = dv[1] = dv[2] = 0.0f;
-                    out.n_path = 4;
-                }
-                dw[0] = dw[1] = dw[2] = 0.0f;
-            }
-        }
-    }
-    // 4. W clamped (against the square length from before step 3)
     float cw[3] = {dw[0], dw[1], dw[2]};
-    if (!(mw >= lw)) {
-        clamp(g, cw, lw, max_w, c);
-        out.clamp_w = true;
+    // steps 2 to 4 only when A's word at +24 is set (0x8182e2e0: otherwise straight to step 5)
+    if (in.a24) {
+        const float max_w = g.in(packed15(in.max_w)), max_v = g.in(packed15(in.max_v));
+        // (the squares are only compared: one that overflows is +inf on both, one that underflows is below every
+        // non-zero square length on both, flushed or not; the game's maxima are often 0x7f7f0000, whose square overflows)
+        const float mw = max_w * max_w, mv = max_v * max_v;
+        const float lv = len2(g, dv);
+        if (!g.ok) return values();
+
+        // 2. V clamped
+        if (!(mv >= lv)) {
+            clamp(g, dv, lv, max_v, c);
+            out.clamp_v = true;
+        }
+        // 3. the n path
+        const float lw = len2(g, dw);
+        if (const uint32_t n = in.b28 & 31) {
+            out.n_path = 1;
+            const float nf = (float)n;
+            const float e = g.mul(g.mul(nf, f32(0x3a800000u)), nf);
+            const float s3 = g.mul(e, g.in(in.d32));
+            float t0 = s3, t1 = s3, test = g.mul(s3, s3);
+            if (in.b28 & 0x40) {
+                const float hs = high_half(get<uint16_t>(in.motion, kHalf120));
+                if (hs == 1.0f) {
+                } else if (hs == 0.0f) {
+                    t0 = g.in(in.g50[0]);
+                    t1 = g.in(in.g50[1]);
+                    test = g.mul(t0, t0);
+                } else {
+                    const float mm = fabs_bits(g.in(hs));
+                    const float ms = g.mul(mm, s3);
+                    const float r = rs(mm);
+                    t0 = t1 = g.mul(ms, r);
+                    test = g.mul(ms, ms);
+                }
+            }
+            if (!g.ok) return values();
+            if (!(lw >= test)) {
+                const float u0 = g.mul(g.in(in.d144[0]), t0), u1 = g.mul(g.in(in.d144[1]), t1);
+                const float e2 = g.add(g.mul(e, g.mul(e, 0.75f)), 0.25f);
+                const float uu = g.mul(u0, u0);
+                if (!g.ok) return values();
+                if (g.mul(lw, e2) > uu) {
+                    const float r = rs(lw);
+                    const float f0 = fmax(g.in(in.g50[0]), g.sub(c[0], g.mul(r, u0)));
+                    const float f1 = fmax(g.in(in.g50[1]), g.sub(c[1], g.mul(r, u1)));
+                    dw[0] = g.mul(dw[0], f0);
+                    dw[1] = g.mul(dw[1], f1);
+                    dw[2] = g.mul(dw[2], f0);
+                    out.n_path = 2;
+                } else {
+                    out.n_path = 3;
+                    if (uu > g.mul(len2(g, dv), e2)) {
+                        dv[0] = dv[1] = dv[2] = 0.0f;
+                        out.n_path = 4;
+                    }
+                    dw[0] = dw[1] = dw[2] = 0.0f;
+                }
+            }
+        }
+        // 4. W clamped (against the square length from before step 3)
+        for (int k = 0; k < 3; k++) cw[k] = dw[k];
+        if (!(mw >= lw)) {
+            clamp(g, cw, lw, max_w, c);
+            out.clamp_w = true;
+        }
     }
     if (!g.ok) return values();
     if (in.a24 && (get<uint16_t>(in.motion, kMod) & 0x7fff)) {

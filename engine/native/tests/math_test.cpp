@@ -952,12 +952,16 @@ void motion_step_moving() {
     in = motion_in();
     in.a[4] = 3, in.a[5] = 4;
     in.max_w = 0x8040;
+    in.a24 = 1;   // (the clamps and the n path only with A's word at +24 set)
     CHECK(math::motion_step(in, out, why) && out.clamp_w && !out.clamp_v);
     CHECK(at_off<float>(out.motion, 56) == 1.5f && at_off<float>(out.motion, 60) == 2);
+    in.a24 = 0;
+    CHECK(math::motion_step(in, out, why) && !out.clamp_w && at_off<float>(out.motion, 56) == 3);
     // the n path: a slow W under the threshold is zeroed, and V with it
     in = motion_in();
     in.a[4] = 0.001f;
     in.b28 = 4;
+    in.a24 = 1;
     CHECK(math::motion_step(in, out, why) && out.n_path == 4 && !out.moving);
 }
 

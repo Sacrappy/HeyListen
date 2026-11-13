@@ -695,7 +695,9 @@ Notation: `|x|²` of a 3-vector is `z² + (x² + y²)` (the pair sum first; lane
 bits are `h << 16`, `rs(x)` the integer step `0x5f375a86 - (bits(x) >> 1)` taken as a float (0 when x's exponent field is
 0): an exact integer operation, not an estimate instruction.
 
-1. `dV = A.V - B.V`, `dW = A.W - B.W` (lane by lane). `mV = maxV² `, `mW = maxW²`. `LV = |dV|²`.
+1. `dV = A.V - B.V`, `dW = A.W - B.W` (lane by lane). **Steps 2 to 4 run only when A +24 is not zero** (`0x8182e2e0`:
+   otherwise `cV = dV`, `cW = dW`, `r = C.lo`, straight to step 5). `mV = maxV²`, `mW = maxW²` (the game's maxima are
+   often `0x7f7f0000`, whose square is +inf: harmless, the squares are only compared). `LV = |dV|²`.
 2. **Clamp V.** If `mV >= LV`: `cV = dV`, `k = C.lo`. Otherwise: if any lane of `(dV, A.s12 - B.s12)` is NaN, `cV = 0`,
    `k = C.lo`; else `k = (LV's exponent field 0 ? 0 : C.lo / sqrt(LV))` (two lanes, the pair C.x, C.y), `cV = dV · (k ·
    maxV)` (lanes x, z by the first lane of the pair, y by the second); then a **clamp record** is appended (9.4, kind 0),
