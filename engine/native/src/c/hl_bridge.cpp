@@ -6,6 +6,7 @@
 #include "host_runtime.h"
 
 #include "hl/bridge/Dispatcher.h"
+#include "hl/bridge/FrameLoop.h"
 #include "hl/bridge/JobBridge.h"
 #include "hl/bridge/JobGroup.h"
 #include "hl/bridge/Stages.h"
@@ -27,6 +28,7 @@ hl::bridge::Dispatcher* g_dispatcher;
 hl::bridge::JobBridge* g_bridge;
 hl::bridge::Stages* g_stages;
 hl::bridge::JobGroup* g_group;
+hl::bridge::FrameLoop* g_frames;
 
 }   // namespace
 
@@ -115,6 +117,24 @@ extern "C" int hl_bridge_report(char* out, size_t cap) {
     out[n++] = ';';
     out[n++] = ' ';
     return n + g_dispatcher->report(out + n, cap - (size_t)n);
+}
+
+extern "C" int hl_bridge_mainloop_start(int flags, uint64_t scratch) {
+    if (g_frames) return 1;
+    if (!g_bridge || !(flags & HL_MAINLOOP_NATIVE) || !scratch) return 0;
+    g_frames = new hl::bridge::FrameLoop(*g_runtime, *g_jobs, scratch,
+                                         {.check = (flags & HL_MAINLOOP_CHECK) != 0, .log = (flags & HL_MAINLOOP_LOG) != 0});
+    return 1;
+}
+
+extern "C" void hl_bridge_mainloop_run(uint64_t framework) { g_frames->run(g_runtime->current(), framework); }
+
+extern "C" void hl_bridge_mainloop_calc_begin(uint64_t object) {
+    if (g_frames) g_frames->calc_begin(object);
+}
+
+extern "C" void hl_bridge_mainloop_calc_end(uint64_t object) {
+    if (g_frames) g_frames->calc_end(object);
 }
 
 extern "C" int hl_bridge_stages_report(char* out, size_t cap) {

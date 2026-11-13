@@ -82,6 +82,17 @@ int hl_bridge_jobgroup_report(char *out, size_t cap);
 /* One line of counters for the log. Returns the length written. */
 int hl_bridge_report(char *out, size_t cap);
 
+enum { HL_MAINLOOP_NATIVE = 1, HL_MAINLOOP_CHECK = 2, HL_MAINLOOP_LOG = 4 };
+
+/* After hl_bridge_start: the game's main loop driven by the native one (hl::bridge::FrameLoop) with HL_MAINLOOP_* bits.
+   scratch: 32 bytes of guest memory for the frame's SDK queries' answers. Returns 1 when it is (the bridge started). */
+int hl_bridge_mainloop_start(int flags, uint64_t scratch);
+/* The entry gate of the framework's main loop (hl::bridge::kMainLoop), on the main thread: frames forever. */
+void hl_bridge_mainloop_run(uint64_t framework);
+/* (HL_MAINLOOP_CHECK) the module system's frame (hl::bridge::kModuleFrame) about to run and having run. */
+void hl_bridge_mainloop_calc_begin(uint64_t object);
+void hl_bridge_mainloop_calc_end(uint64_t object);
+
 #ifdef __cplusplus
 }
 #endif

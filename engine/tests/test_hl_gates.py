@@ -2,7 +2,7 @@
 the function a host source asks for when its text hashes as recorded, the hash is the same with and without the gate, a
 second run changes nothing and reads nothing, another hash leaves the function alone, and a gate nobody asks for any more
 is taken out; and the gated file compiles, says at start that the gate is in, and the gate answers (with a C compiler).
-And host/hl_jobs.c switches its modules' gates on all together, only when every one is in the lifted code.
+And host/hl_jobs.c and hl_mainloop.c switch their modules' gates on all together, only when every one is in the lift.
 
 python -I -B tests/test_hl_gates.py [--cc gcc]
 """
@@ -114,19 +114,20 @@ def main():
 
 
 def jobs_gates_all_or_nothing():
-    """host/hl_jobs.c switches each module's gates on together, and only when all are in the lifted code: every HL_GATE
-    there is in one of its gate lists and every list is asked about (GATES_IN) (review 2026-11-13, B2)."""
+    """host/hl_jobs.c and hl_mainloop.c switch each module's gates on together, and only when all are in the lifted code:
+    every HL_GATE there is in one of its gate lists and every list is asked about (GATES_IN) (review 2026-11-13, B2)."""
     import re
-    src = (ROOT / "host" / "hl_jobs.c").read_text(encoding="utf-8")
-    gated = set(re.findall(r'^HL_GATE\(([0-9a-f]{8}),', src, re.M))
-    lists = {name: set(re.findall(r"0x([0-9a-f]{8})", body))
-             for name, body in re.findall(r"static const uint64_t (\w+_gates)\[\] = \{([^}]*)\};", src)}
-    check(gated and lists, "hl_jobs.c's gates and gate lists")
-    listed = set().union(*lists.values())
-    check(gated == listed, "every gate of hl_jobs.c in exactly the gate lists: %s" % sorted(gated ^ listed))
-    for name in lists:
-        check(re.search(r"GATES_IN\(\"\w+\", %s\)" % name, src), "the list %s asked about" % name)
-    check("hl_gates_in(" in src, "hl_jobs.c asks hl_gates_in")
+    for module in ("hl_jobs.c", "hl_mainloop.c"):
+        src = (ROOT / "host" / module).read_text(encoding="utf-8")
+        gated = set(re.findall(r'^HL_GATE\(([0-9a-f]{8}),', src, re.M))
+        lists = {name: set(re.findall(r"0x([0-9a-f]{8})", body))
+                 for name, body in re.findall(r"static const uint64_t (\w+_gates)\[\] = \{([^}]*)\};", src)}
+        check(gated and lists, "%s's gates and gate lists" % module)
+        listed = set().union(*lists.values())
+        check(gated == listed, "every gate of %s in exactly the gate lists: %s" % (module, sorted(gated ^ listed)))
+        for name in lists:
+            check(re.search(r"GATES_IN\(\"\w+\", %s\)" % name, src), "the list %s of %s asked about" % (name, module))
+        check("hl_gates_in(" in src, "%s asks hl_gates_in" % module)
 
 
 if __name__ == "__main__":
