@@ -5264,6 +5264,7 @@ void retired_imports_give_back() {   // (pools_mu held)
 // everything that used it; the host is told then, so its pages are no longer counted pinned), and any of the uses above
 // imports it again first (import_again: counted by why). A pool imported again is kept 600 submissions before its import may
 // go again, and for good after its third time: a pool whose live pages come every frame keeps its import, as before.
+namespace {   // (with import_again's declaration above)
 bool no_host_import_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_NO_HOST_IMPORT");
@@ -5297,6 +5298,8 @@ bool import_again(Pool& p, int why) {   // (pools_mu held)
     pools_gen++;   // (bindings remembered with the pool's old state are looked up again)
     return true;
 }
+
+}   // namespace
 
 /// At a submission's start: the mirrored pools' imports that may go, given back (pools_mu held)
 void imports_release() {
