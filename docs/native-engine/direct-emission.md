@@ -768,7 +768,24 @@ and per-pass constants. Built:
 
 The capture is not changed: 93-95% of the captured pages are read by no record at all and are still needed (they are read, if at
 all, through pointers in other data), so "needed by no record" is not a safe test, and the pages only these slots' blocks hold
-are a few at most. The switch is off by default; its validation is below.
+are a few at most.
+
+**Validation (main PC, function and picture).** `valid.sh s8i1 s8-ubo3 HL_UBO_INLINE=1`: castle-move and hyrule-walk ran to the
+end, no crash line, game speed ratio 60.18 / 59.75; kokiri-idle's first run spent its 110 s compiling the predicted pipelines
+again (0 frames: the new `NvnState` fields change the replay's state stamp, which keys the pipeline cache, so the first start
+after this build re-predicts ~25,500 pipelines) and was run again (`s8i2-kokiri-idle`): to the end, ratio 59.87. Shots looked
+at (the last three to four of each scene): complete and right, the same market scenes as the reference, no flicker between
+shots. Inlined in a run: 2.4-2.8 million binds, 9.6-11.3 GB of block bytes (~4 KB a block) copied into the records.
+`HL_UBO_INLINE=1 HL_UBO_CHECK=1` in the castle (`s8i3-castle`, the check compares the inline bytes, hashed at the bind, with what
+the replay reads as submitted): **every inlined slot 0 different** (e.g. fragment slot 4: 482,653 equal of 482,653; vertex slot 11
+181,484 of 181,484); compute slots 3-8 and 10-13 were also all equal in that run (a fourth scene run, not inlined). Memory with
+the switch (game RAM / GPU pools / process RAM / commit / VRAM, MB): castle 3,279 / 1,535 / 7,791 / 20,414 / 6,905; hyrule 2,454
+/ 1,499 / 6,775 / 18,349 / 5,281; kokiri (game RAM / pools) 2,283 / 1,299.
+
+**Default: off** (`HL_UBO_INLINE=0`). It is clean in the three scenes on the main PC, but it buys nothing yet: the capture is
+unchanged and these blocks' pages are not what it copies; it adds ~100 MB a second of block bytes copied into the recordings
+(not timed, rule 6); the PC 3050 was not run with it; and the slot list is a measurement of three scenes, not a property of the
+game. It stays as the record kind and descriptor path brick D will use for blocks a native draw loop computes.
 
 ### What this says for the rest of the plan
 
