@@ -31,6 +31,7 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     config.pass_bytes = c->pass_bytes;
     if (c->pass_ns) config.pass_ns = c->pass_ns;
     config.max_range_bytes = c->max_range_bytes;
+    config.ahead = c->ahead;
     config.require_cold = c->require_cold != 0;
     config.check = c->check != 0;
     hl::mem::Drop::Host host;
@@ -45,6 +46,8 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     host.protect = h->protect;
     host.plain = h->plain;
     host.clock = h->clock;
+    if (h->spill_put && h->spill_get && h->spill_free)
+        host.spill_put = h->spill_put, host.spill_get = h->spill_get, host.spill_free = h->spill_free;
     g_drop.store(new hl::mem::Drop(config, host));
     return 1;
 }

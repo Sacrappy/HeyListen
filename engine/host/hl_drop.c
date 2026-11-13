@@ -24,7 +24,9 @@
      and the dictionary is the host's own copy, made at the decode and kept.
      HL_MEM_DROP=0  off (the default): nothing here runs, as before    HL_MEM_DROP=1  on
      HL_MEM_DROP_AGE=<seconds>  a range is looked at that long after its decode (default 30)
-     HL_MEM_DROP_MAX_MB=<MB>  larger decodes are left out (default 32, 0: any): a touch decodes the whole file
+     HL_MEM_DROP_MAX_MB=<MB>  without the spill, larger decodes are left out (default 32, 0: any): a touch decodes the file
+     HL_MEM_DROP_SPILL_MB=<MB>  the spill file's size at most (default 4096; 0: no spill)
+     HL_MEM_DROP_AHEAD=<n>  granules restored after the one touched, from the spill (default 3)
      HL_MEM_DROP_CHECK=1  a hash of each granule at its drop, compared at its restore (counted)
      HL_MEM_DROP_LOG=1  the counters every 10 s */
 #include "hos.h"
@@ -91,6 +93,71 @@ static int cb_protect(void *ctx, uint64_t a, uint64_t n, int read_only) {
     return VirtualProtect(GP(a), (SIZE_T)n, read_only ? PAGE_READONLY : PAGE_READWRITE, &was) ? 0 : 1;
 }
 static int64_t cb_clock(void *ctx) { (void)ctx; return hos_now_ns(); }
+
+/* ---- the spill: a file of granule-sized slots in the temporary folder (deleted when the process ends) ----
+   A dropped granule's verified bytes are written to a slot at its drop, so that a touch reads that granule back (and a few
+   after it) instead of decoding its file from the start: a resource file is one zstd frame with an 8 MB window, entropy
+   tables carried from block to block and no seek point, so a granule deep in a 300 MB file cost a 300 MB decode on the
+   touching thread (836 ms once). The file holds no commit charge; Windows may keep its pages in its file cache (standby
+   memory, given to anyone who needs it). Its bytes are checked like any restore (HL_MEM_DROP_CHECK). */
+static HANDLE spill_file = INVALID_HANDLE_VALUE;
+static SRWLOCK spill_lock = SRWLOCK_INIT;
+static int64_t *spill_free_slots, spill_nfree, spill_next, spill_max;
+static volatile LONG64 spill_io_failed;
+static int spill_io(int write, int64_t slot, void *buf) {
+    OVERLAPPED o;
+    memset(&o, 0, sizeof o);
+    const uint64_t at = (uint64_t)slot * granule;
+    o.Offset = (DWORD)at, o.OffsetHigh = (DWORD)(at >> 32);
+    DWORD done = 0;
+    const BOOL ok = write ? WriteFile(spill_file, buf, (DWORD)granule, &done, &o) : ReadFile(spill_file, buf, (DWORD)granule, &done, &o);
+    if (ok && done == granule) return 0;
+    InterlockedIncrement64(&spill_io_failed);
+    return 1;
+}
+static int64_t cb_spill_put(void *ctx, const uint8_t *bytes) {
+    (void)ctx;
+    int64_t slot = -1;
+    AcquireSRWLockExclusive(&spill_lock);
+    if (spill_nfree) slot = spill_free_slots[--spill_nfree];
+    else if (spill_next < spill_max) slot = spill_next++;
+    ReleaseSRWLockExclusive(&spill_lock);
+    if (slot >= 0 && spill_io(1, slot, (void *)bytes)) {
+        AcquireSRWLockExclusive(&spill_lock);
+        spill_free_slots[spill_nfree++] = slot;
+        ReleaseSRWLockExclusive(&spill_lock);
+        slot = -1;
+    }
+    return slot;
+}
+static int cb_spill_get(void *ctx, int64_t slot, uint8_t *buf) { (void)ctx; return spill_io(0, slot, buf); }
+static void cb_spill_free(void *ctx, int64_t slot) {
+    (void)ctx;
+    AcquireSRWLockExclusive(&spill_lock);
+    spill_free_slots[spill_nfree++] = slot;
+    ReleaseSRWLockExclusive(&spill_lock);
+}
+/* the file, HL_MEM_DROP_SPILL_MB of slots at most (default 4096; 0: no spill, every touch decodes its file) */
+static int spill_open(void) {
+    const char *e = getenv("HL_MEM_DROP_SPILL_MB");
+    const int64_t mb = e && *e ? atoll(e) : 4096;
+    if (mb <= 0 || !granule) return 0;
+    wchar_t dir[MAX_PATH], path[MAX_PATH + 64];
+    const DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (!n || n >= MAX_PATH) return 0;
+    _snwprintf(path, MAX_PATH + 64, L"%lsheylisten-drop-%lu.bin", dir, GetCurrentProcessId());
+    spill_file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (spill_file == INVALID_HANDLE_VALUE) return 0;
+    spill_max = (mb << 20) / (int64_t)granule;
+    spill_free_slots = (int64_t *)malloc((size_t)spill_max * sizeof *spill_free_slots);
+    if (!spill_free_slots) {
+        CloseHandle(spill_file);
+        spill_file = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    return 1;
+}
 /* committed read-write memory over the whole granule, one allocation (what a lazy commit or hos_commit made) */
 static int cb_plain(void *ctx, uint64_t a) {
     (void)ctx;
@@ -219,15 +286,22 @@ void hl_drop_init(void) {
     /* (cold pages off: nothing leaves the working set, so "cold" cannot be told; the age alone then) */
     config.require_cold = !(cold && cold[0] == '0');
     config.check = chk && atoi(chk) == 1;
-    /* (a touch decodes the whole file on the touching thread, ~1.8 ms a MB on the PC 3050: one of 836 ms at the castle's
-       load. Larger files are left out: HL_MEM_DROP_MAX_MB, default 32, 0 for any) */
+    /* (without the spill a touch decodes the whole file on the touching thread, ~1.8 ms a MB on the PC 3050: one of 836 ms
+       at the castle's load; larger files are then left out: HL_MEM_DROP_MAX_MB, default 32, 0 for any. With the spill they
+       are candidates, and their granules are dropped only into it) */
     {
         const char *mx = getenv("HL_MEM_DROP_MAX_MB");
         config.max_range_bytes = (uint64_t)(mx && *mx ? atoi(mx) : 32) << 20;
     }
     config.pass_ns = 250000000;   /* (a pass once took 19 s on the PC 3050 at a scene's load: pages read back, files decoded) */
-    const hl_drop_host host = {NULL, cb_is_dropped, cb_drop, cb_restore, cb_source, cb_release, cb_view, cb_resident,
-                               cb_protect, cb_plain, cb_clock};
+    const int spill = spill_open();
+    {
+        const char *ah = getenv("HL_MEM_DROP_AHEAD");
+        config.ahead = (uint32_t)(ah && *ah ? atoi(ah) : 3);
+    }
+    hl_drop_host host = {NULL, cb_is_dropped, cb_drop, cb_restore, cb_source, cb_release, cb_view, cb_resident,
+                         cb_protect, cb_plain, cb_clock, NULL, NULL, NULL};
+    if (spill) host.spill_put = cb_spill_put, host.spill_get = cb_spill_get, host.spill_free = cb_spill_free;
     if (!hl_drop_start(&config, &host)) {
         hos_log("hl drop: off (the policy could not be made)");
         return;
@@ -238,9 +312,10 @@ void hl_drop_init(void) {
     hos_gp_set_on_forget(on_forget);
     drop_on = 1;
     hos_log("hl drop: on: whole %zu KB granules of decoded resources, %lld s old or more%s, never imported, unchanged "
-            "(compared with the file decoded again), given back for good; restored from the file on touch%s "
-            "(HL_MEM_DROP=0: not)", granule >> 10, (long long)(config.age_ns / 1000000000LL),
-            config.require_cold ? ", out of the working set" : "", config.check ? "; HL_MEM_DROP_CHECK=1: every restore hashed" : "");
+            "(compared with the file decoded again), given back for good; restored on touch %s%s (HL_MEM_DROP=0: not)",
+            granule >> 10, (long long)(config.age_ns / 1000000000LL), config.require_cold ? ", out of the working set" : "",
+            spill ? "from the spill file (the granule and the next few)" : "from the file decoded again (no spill)",
+            config.check ? "; HL_MEM_DROP_CHECK=1: every restore hashed" : "");
     CloseHandle(CreateThread(NULL, 0, drop_main, NULL, 0, NULL));
 }
 #else

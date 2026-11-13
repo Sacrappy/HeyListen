@@ -29,6 +29,10 @@ typedef struct hl_drop_host {
     int (*protect)(void *ctx, uint64_t addr, uint64_t size, int read_only);
     int (*plain)(void *ctx, uint64_t addr);
     int64_t (*clock)(void *ctx);
+    /* the spill (hl/mem/Drop.h Host): NULL for none */
+    int64_t (*spill_put)(void *ctx, const uint8_t *bytes);
+    int (*spill_get)(void *ctx, int64_t slot, uint8_t *buf);
+    void (*spill_free)(void *ctx, int64_t slot);
 } hl_drop_host;
 
 typedef struct hl_drop_config {
@@ -38,6 +42,7 @@ typedef struct hl_drop_config {
     uint64_t pass_bytes;
     int64_t pass_ns;
     uint64_t max_range_bytes;
+    uint32_t ahead;
     int require_cold, check;
 } hl_drop_config;
 

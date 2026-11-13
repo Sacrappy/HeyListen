@@ -36,7 +36,7 @@ void Drop::decoded(DropSource src, int64_t now) {
         }
     }
     if (end <= first) return;   // (no whole granule: nothing to drop)
-    if (config_.max_range_bytes && src.size > config_.max_range_bytes) {
+    if (!host_.spill_put && config_.max_range_bytes && src.size > config_.max_range_bytes) {
         stats_.too_large.fetch_add(1, std::memory_order_relaxed);
         stats_.too_large_bytes.fetch_add(src.size, std::memory_order_relaxed);
         return;
@@ -49,6 +49,7 @@ void Drop::decoded(DropSource src, int64_t now) {
     r->first = first;
     r->state.assign((end - first) / g, kCandidate);
     if (config_.check) r->hash.assign(r->state.size(), 0);
+    r->slot.assign(r->state.size(), -1);
     by_dest_[r->src.dest] = r;
     all_[r->id] = r;
     stats_.ranges.fetch_add(1, std::memory_order_relaxed);
@@ -182,13 +183,22 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
                 continue;
             }
             const uint64_t h = config_.check ? hl::stream::page_hash(want, g) : 0;
+            int64_t slot = host_.spill_put ? host_.spill_put(host_.ctx, want) : -1;
+            if (host_.spill_put && slot < 0 && config_.max_range_bytes && r.src.size > config_.max_range_bytes) {
+                // (a large file's granule restores from the spill only: no room, not dropped now)
+                host_.protect(host_.ctx, a, g, 0);
+                refuse(Refuse::NoSpill), waiting = true;
+                continue;
+            }
             if (const int why = host_.drop(host_.ctx, a, g)) {
+                if (slot >= 0) host_.spill_free(host_.ctx, slot);
                 host_.protect(host_.ctx, a, g, 0);
                 // (-2: the substrate knows the back end imported it, which this module may not have been told yet)
                 refuse(why == -2 ? Refuse::Imported : Refuse::Substrate), waiting = true;
                 continue;
             }
             if (config_.check) r.hash[i] = h;
+            if (slot >= 0) r.slot[i] = slot, stats_.spilled_now.fetch_add(1, std::memory_order_relaxed);
             r.state[i] = kDropped;
             r.dropped++;
             dropped++;
@@ -269,15 +279,43 @@ uint64_t Drop::pass(int64_t now) {
 
 namespace {
 struct FillCtx {
-    const uint8_t* src;
-    uint64_t src_dest;
+    Drop* self;
+    void* range;
+    const uint8_t* src = nullptr;   // (the file decoded again, only when a granule has no spill slot)
 };
-int fill_from_source(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size) {
+}   // namespace
+
+int Drop::fill(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size) {
     auto* f = static_cast<FillCtx*>(ctx);
-    std::memcpy(buf, f->src + (addr - f->src_dest), size);
+    Drop& d = *f->self;
+    Range& r = *static_cast<Range*>(f->range);
+    const uint64_t g = d.config_.granule;
+    for (uint64_t at = 0; at < size; at += g) {
+        const uint32_t k = uint32_t((addr + at - r.first) / g);
+        if (r.slot[k] >= 0 && d.host_.spill_get(d.host_.ctx, r.slot[k], buf + at) == 0) {
+            d.stats_.from_spill.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!f->src) {
+            f->src = d.host_.source(d.host_.ctx, r.src);
+            if (!f->src) {
+                d.stats_.source_failed.fetch_add(1, std::memory_order_relaxed);
+                return 1;
+            }
+            d.stats_.sources.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::memcpy(buf + at, f->src + (addr + at - r.src.dest), g);
+        d.stats_.from_decode.fetch_add(1, std::memory_order_relaxed);
+    }
     return 0;
 }
-}   // namespace
+
+void Drop::free_slot(Range& r, uint32_t k) {
+    if (r.slot[k] < 0) return;
+    host_.spill_free(host_.ctx, r.slot[k]);
+    r.slot[k] = -1;
+    stats_.spilled_now.fetch_sub(1, std::memory_order_relaxed);
+}
 
 bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64_t hi) {
     const uint64_t g = config_.granule;
@@ -301,27 +339,25 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         r = it->second;
     }
     if (!host_.is_dropped(host_.ctx, granule)) return true;
-    const uint8_t* src = host_.source(host_.ctx, r->src);
-    if (!src) {
-        stats_.restore_failed.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    stats_.sources.fetch_add(1, std::memory_order_relaxed);
-    // every dropped granule of the range, in runs of neighbours: one restore a run
-    FillCtx f{src, r->src.dest};
+    // what comes back: the kernel's and the import's paths, the run they ask for; a touch of a granule in the spill, it
+    // and `ahead` granules after it (from the spill: no decode); otherwise every dropped granule of the range, as one
+    // decode of the file serves them all. In runs of neighbours: one atomic restore a run
+    FillCtx f{this, r};
     bool ok = true;
     uint32_t n = 0;
     const bool part = hi > lo && (path == TouchPath::Kernel || path == TouchPath::Import);
+    const uint32_t k0 = uint32_t((granule - r->first) / g);
+    const bool near = !part && host_.spill_get && r->slot[k0] >= 0;
     auto wanted = [&](uint32_t k) {
         const uint64_t a = r->first + uint64_t(k) * g;
-        return r->state[k] == kDropped && (!part || (a + g > lo && a < hi));
+        return r->state[k] == kDropped && (part ? a + g > lo && a < hi : !near || (k >= k0 && k <= k0 + config_.ahead));
     };
     for (uint32_t i = 0; i < r->state.size();) {
         if (!wanted(i)) { i++; continue; }
         uint32_t e = i;
         while (e < r->state.size() && wanted(e)) e++;
         const uint64_t a = r->first + uint64_t(i) * g, size = uint64_t(e - i) * g;
-        if (host_.restore(host_.ctx, a, size, fill_from_source, &f)) {
+        if (host_.restore(host_.ctx, a, size, fill, &f)) {
             stats_.restore_failed.fetch_add(1, std::memory_order_relaxed);
             ok = false;
             i = e;
@@ -333,6 +369,7 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
                 stats_.checked.fetch_add(1, std::memory_order_relaxed);
                 if (!got || hl::stream::page_hash(got, g) != r->hash[k]) stats_.mismatches.fetch_add(1, std::memory_order_relaxed);
             }
+            free_slot(*r, k);
             r->state[k] = kCandidate;
             r->dropped--;
             n++;
@@ -341,7 +378,7 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64
         }
         i = e;
     }
-    host_.release(host_.ctx, src);
+    if (f.src) host_.release(host_.ctx, f.src);
     stats_.dropped_now.fetch_sub(n, std::memory_order_relaxed);
     stats_.restored_granules.fetch_add(n, std::memory_order_relaxed);
     stats_.restores.fetch_add(1, std::memory_order_relaxed);
@@ -390,6 +427,7 @@ void Drop::forget(uint64_t lo, uint64_t hi) {
         for (uint32_t k = 0; k < r->state.size(); k++) {
             const uint64_t a = r->first + uint64_t(k) * config_.granule;
             if (r->state[k] != kDropped || a < lo || a >= hi) continue;
+            free_slot(*r, k);
             r->state[k] = kNever;
             r->dropped--;
             by_granule_.erase(a);
@@ -421,6 +459,7 @@ uint64_t Drop::reconcile() {
         auto it = by_granule_.find(a);
         if (it == by_granule_.end() || it->second->id != id) continue;
         Range* r = it->second;
+        free_slot(*r, uint32_t((a - r->first) / config_.granule));
         r->state[(a - r->first) / config_.granule] = kNever;
         r->dropped--;
         by_granule_.erase(it);
@@ -437,7 +476,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
     const uint64_t dropped = stats_.dropped_granules.load(), restores = stats_.restores.load();
     const double secs = last_report_ns_ && now > last_report_ns_ ? (now - last_report_ns_) / 1e9 : 0;
     static const char* const kRefuse[] = {"imported", "kernel", "in use", "changed", "no source", "not plain",
-                                          "substrate", "given up"};
+                                          "substrate", "given up", "no spill room"};
     char refused[256];
     int k = 0;
     for (int i = 0; i < int(Refuse::kCount); i++)
@@ -448,7 +487,8 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         "%.1f MB dropped now; dropped %.1f MB in all (%.1f MB since the last line); %llu restores of %.1f MB (%llu since "
         "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
-        "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu",
+        "%llu; %llu larger than the limit, %.0f MB), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu; "
+        "spill: %.1f MB held, granules restored from it %llu, from a decode %llu",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
         (unsigned long long)restores, stats_.restored_granules.load() * mb,
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
@@ -460,7 +500,9 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)stats_.ranges.load(), (unsigned long long)stats_.replaced.load(),
         (unsigned long long)stats_.too_large.load(), stats_.too_large_bytes.load() / 1048576.0,
         (unsigned long long)stats_.sources.load(), (unsigned long long)stats_.source_failed.load(),
-        (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load());
+        (unsigned long long)stats_.forgotten.load(), (unsigned long long)stats_.waited.load(),
+        stats_.spilled_now.load() * mb, (unsigned long long)stats_.from_spill.load(),
+        (unsigned long long)stats_.from_decode.load());
     last_dropped_report_ = dropped, last_restores_report_ = restores, last_report_ns_ = now;
     return n < 0 ? 0 : n;
 }
