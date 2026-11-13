@@ -358,7 +358,8 @@ Common to all three:
   `Hx, Hy, Hz, Hw` = floats at transform +48, +52, +56, +60; `Lx, Ly, Lz` = floats at +64, +68, +72.
   `Px = Hx + Lx`, `Py = Hy + Ly`, `Pz = Hz + Lz`, `Pw = Hw + Lz` (the w lane adds +72 too: read).
   For each lane k: `a = P_k + (double)min_k`; then **outward rounding**: take the 64-bit pattern of `a`; if `a > 0`
-  subtract 0x10000000 from it, otherwise (a <= 0, either zero, or NaN) add 0x10000000; convert the adjusted double to
+  (or unordered: the guest's compare-and-select takes NaN this way too, read again by stream 7) subtract 0x10000000
+  from it, otherwise (a <= 0, either zero) add 0x10000000; convert the adjusted double to
   float (round to nearest) -> out.min_k. For max: `b = P_k + (double)max_k`; if `b >= 0` add 0x10000000 to its bit
   pattern, otherwise (b < 0 or NaN) subtract it; convert -> out.max_k. (2^28 units of a double's last place is half a
   float's last place: the nudge turns round-to-nearest into rounding away from the box's inside. Note the asymmetry at

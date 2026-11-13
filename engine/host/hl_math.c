@@ -99,13 +99,16 @@ static int sphere_inputs(const Ctx *c, Span *s) {
 
 extern volatile int hl_gate_on_80ba6d80, hl_gate_on_81746440, hl_gate_on_800a8400;
 enum { U2, AFFINE, U1, SPHERE, UNITS };
+/* validated: HL_MATH_CHECK=1 over full runs of kokiri-idle, castle-move and hyrule-walk (PC 3050, 2026-11-13) compared
+   0.95 M (u2), 27 M (affine), 2.0 M (u1), 1.9 M (sphere) calls with no mismatch (physics-loops.md section 8) */
 static Unit units[UNITS] = {
-    [U2] = {.name = "u2", .guest = 0x81a040bcULL, .native = u2_native, .out_at = u2_out, .inputs = u2_inputs},
-    [AFFINE] = {.name = "affine", .guest = 0x80ba6d80ULL, .native = affine_native, .out_at = affine_out,
+    [U2] = {.name = "u2", .guest = 0x81a040bcULL, .validated = 1, .native = u2_native, .out_at = u2_out,
+            .inputs = u2_inputs},
+    [AFFINE] = {.name = "affine", .guest = 0x80ba6d80ULL, .validated = 1, .native = affine_native, .out_at = affine_out,
                 .inputs = affine_inputs, .gate = &hl_gate_on_80ba6d80},
-    [U1] = {.name = "u1", .guest = 0x81746440ULL, .native = u1_native, .out_at = u1_out, .inputs = u1_inputs,
-            .gate = &hl_gate_on_81746440},
-    [SPHERE] = {.name = "sphere", .guest = 0x800a8400ULL, .native = sphere_native, .out_at = sphere_out,
+    [U1] = {.name = "u1", .guest = 0x81746440ULL, .validated = 1, .native = u1_native, .out_at = u1_out,
+            .inputs = u1_inputs, .gate = &hl_gate_on_81746440},
+    [SPHERE] = {.name = "sphere", .guest = 0x800a8400ULL, .validated = 1, .native = sphere_native, .out_at = sphere_out,
                 .inputs = sphere_inputs, .gate = &hl_gate_on_800a8400},
 };
 

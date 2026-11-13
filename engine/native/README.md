@@ -22,7 +22,8 @@ Rules of this tree:
 | Job bridge: the game's job entry points and the structures read in place | `hl/bridge/JobBridge.h` | in the game behind `HL_JOBS`: 1 entry point of 18 answered (`hl::bridge::ready()` lists what is left) |
 | Memory: which cold pages of static GPU data and of the game's heaps leave the working set | `hl/mem/ColdPages.h` | in the game behind `HL_MEM_COLD` (on) and `HL_MEM_COLD_HEAPS`, through `engine/host/hl_mem.c` (`docs/native-engine/memory-boundary.md`, sections 8 and 11) |
 | Graphics front end: the recording pass, its check, the output seam | `hl/gfx/RecordPass.h`, `hl/gfx/PassCheck.h`, `hl/gfx/Commands.h`, `hl/bridge/GfxBridge.h` | in the game behind `HL_GFX` (the listener `0x806602e0` native, its phases translated) and `HL_GFX_CHECK` |
-| C surface for the layer that runs guest code | `hl/c/hl_bridge.h`, `hl/c/hl_mem.h`, `hl/c/hl_gfx.h` | used by `engine/host/hl_host.c` and one `hl_<module>.c` a module (`hl_jobs.c`, `hl_mem.c`, `hl_gfx.c`) |
+| Math: bit-exact kernels of the physics and actor loops, the exactness rules they are written with | `hl/math/Exact.h`, `hl/math/Bounds.h`, `hl/bridge/MathBridge.h` | in the game behind `HL_MATH` (`engine/host/hl_math.c`, its differential check `HL_MATH_CHECK`; `docs/native-engine/physics-loops.md` section 8) |
+| C surface for the layer that runs guest code | `hl/c/hl_bridge.h`, `hl/c/hl_mem.h`, `hl/c/hl_gfx.h`, `hl/c/hl_math.h` | used by `engine/host/hl_host.c` and one `hl_<module>.c` a module (`hl_jobs.c`, `hl_mem.c`, `hl_gfx.c`, `hl_math.c`) |
 
 Test (no game, no GPU):
 
