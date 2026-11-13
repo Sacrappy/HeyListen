@@ -314,7 +314,7 @@ branches of the same phase.
 | C surface, OS layer | `hl/c/hl_gfx.h`, `engine/host/hl_gfx.c`; a hook in `nvn_native.c` (`nvn_native_proc`) | `HL_ANSWER(0x806602e0)`: no lifted code changes. The phases are the translated `0x80660320` / `0x8065fe30`, called with the listener's two arguments (both read x0 and x1 only, read in the lifted text) |
 
 Switches: `HL_GFX=1` the native pass (default 0, off: the answer is not installed, the translation runs as before),
-`HL_GFX_CHECK=1` the check, `HL_GFX_LOG=1` the counters every 10 s.
+`HL_GFX_CHECK=1` the check (`=2` its control), `HL_GFX_LOG=1` the counters every 10 s.
 
 ### The check (step 1)
 
@@ -336,16 +336,24 @@ with the same registers; for a native hot part (step 3) it is not: that needs a 
 the native part run first into a recording sink with its writes kept aside, then the translated part for real under the
 tap (an entry gate can run its translated body itself), comparing calls with their arguments and the bytes written.
 
-Measured on the PC 3050 (`HL_GFX=1 HL_GFX_CHECK=1`, 110 s runs):
+`HL_GFX_CHECK=2` is the check's control: the passes drawn for the native path run the translated pass too, so what it
+shows between the two paths is the check's own noise. Measured on the main PC (110 s runs, all passes mode 0; mode 1 was
+never seen in these scenes):
 
-| Scene | Passes (translated / native) | NVN calls a pass (translated / native) | Unmatched shapes (passes) | Largest difference of a procedure's calls a pass |
-|---|---|---|---|---|
-| kokiri-idle | 7,475 / 7,626 (all mode 0) | 1,604 / 1,624 | 17.1% / 17.1% | 5.6% (`nvnBufferFinalize`, of 91 procedures compared) |
-| castle-move (before the per-procedure counter) | 5,584 / 5,717 | 1,467 / 1,506 | 18.6% / 19.0% | |
+| Run | Scene | Passes (translated / native) | NVN calls a pass (translated / native) | Unmatched passes (translated / native) | Largest difference of a procedure's calls a pass (of 91 compared) |
+|---|---|---|---|---|---|
+| `HL_GFX=1 HL_GFX_CHECK=1` | kokiri-idle | 14,668 / 14,803 | 1,578 / 1,628 | 17.9% / 18.7% | 5.8% (`DrawElementsInstanced`) |
+| | castle-move | 13,553 / 13,678 | 1,304 / 1,345 | 18.9% / 19.7% | 5.8% (`DrawElementsInstanced`) |
+| | hyrule-walk | 17,317 / 17,324 | 1,473 / 1,501 | 18.5% / 19.0% | 4.4% (`DrawElementsInstanced`) |
+| control, `HL_GFX_CHECK=2` | kokiri-idle | 15,658 / 15,742 | 1,597 / 1,635 | 17.6% / 18.2% | 4.7% (`DrawElementsInstanced`) |
+| | castle-move | 17,616 / 17,595 | 1,411 / 1,437 | 18.2% / 18.8% | 4.6% (`DrawElementsInstanced`) |
 
-Shapes vary from pass to pass even standing still (one pass in six has a shape not seen elsewhere), equally on both
-paths: the check's unmatched counts are read as "the same on both sides", not as zero. Mode 1 was never seen in these
-scenes.
+Read: shapes vary from pass to pass even standing still (about one pass in six has a shape seen nowhere else), and the
+fixed sequence of draws gives the "native" side a few percent more calls a pass and one huge pass (~41,000 calls, at
+the start of a scene) in every run, the control included. The native shell's differences are of the control's size:
+the check sees no difference between the shell and the translated listener. It would see a native part that changes
+which procedures a pass calls, or how many, by more than ~5% for any procedure called once a pass or more; smaller or
+argument-only differences need the call-by-call check described above.
 
 ### Where the pass's time is, and what step 3 should take first
 
