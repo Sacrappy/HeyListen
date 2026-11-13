@@ -8,7 +8,7 @@
    pools is taken out of the working set once (VirtualUnlock of a range that is not locked: the contents stay, a touch brings
    the page back as a soft fault), and that long after, the pages back in the working set are counted by heap. Those not back
    were not touched in the window.
-   A measurement for docs/native-engine/memory-boundary.md section 8, off unless asked: with HOS_HEAP_SPLIT unset the
+   A measurement for docs/native-engine/memory-boundary.md section 10, off unless asked: with HOS_HEAP_SPLIT unset the
    constructor reads one variable and returns, and nothing else here runs.
 
    What it reads of the game (guest addresses of the supported build; offsets in the heap object; memory-boundary.md 2, 8):

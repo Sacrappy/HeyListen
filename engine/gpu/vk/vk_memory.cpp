@@ -869,7 +869,8 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
 struct CapHash { std::vector<uint64_t> h; std::vector<uint8_t> ok; };   // (TICK-060: a kept capture's slot hashes, see Capture)
 struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0;
                 std::shared_ptr<CapHash> hash = {};
-                std::shared_ptr<std::vector<uint8_t>> gmask = {}; };   // (sprint 5: see Capture::gmask; null: every slot whole)
+                std::shared_ptr<std::vector<uint8_t>> gmask = {};   // (sprint 5: see Capture::gmask; null: every slot whole)
+                uint64_t used = 0; };   // (the bytes its capture filled, for RX_VK_RES_LOG)
 // ---- (HeyListen, sprint 5) RX_VK_CAPTURE_GRAN=1, with a game built with A64_GRAN=1 (off): the capture by written granules ----
 // A capture copied every page the game wrote since the last submit, whole: ~11,900 pages a frame at the Market (46 MB, at the
 // memory bus's speed: 1.3-1.9 ms on the frame's loop), of which ~1 MB of words differs from their last copy. The lifted stores
@@ -911,11 +912,11 @@ inline uint32_t gran_chunk_mask(uint8_t m8) {   // (a granule is two of the diff
 }
 std::vector<std::shared_ptr<CapHash>> cap_hash_free;   // (pools_mu: retired captures' hash arrays, their capacity kept)
 std::map<uint32_t, CapBuf> cap_bufs;
-uint64_t cap_bytes = 0;
+uint64_t cap_bytes = 0, cap_used = 0;   // (pools_mu: the kept buffers' sizes, and what their captures filled of them)
 constexpr size_t kKeep = 24;
 constexpr uint64_t kCapBytesMax = 768ull << 20;   // (and no more than this in them: loads capture hundreds of MB)
 // (retired buffers, for the next captures: making and freeing a 5 MB buffer every submit cost the replay too)
-struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; uint64_t at = 0; };
+struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; uint64_t at = 0; uint64_t ms = 0; };
 std::vector<FreeBuf> cap_free;
 uint64_t cur_cap_value = 0;   // (the submission being recorded: what its syncs' copies wait for)
 uint32_t cur_cap_gen = 0;     // (its capture's generation)
@@ -944,11 +945,43 @@ uint64_t cap_spare_age() {
     return v;
 }
 uint64_t cap_spares_aged = 0;   // (cap_free_mu)
+// (HeyListen, 2026-11-14) RX_VK_CAP_SPARE_SECS=<s> (20 by default; 0: kept, as before): a spare no capture took for that long is
+// freed. The spares are what a load's captures left (40-64 MB each): after the scene had loaded, 10 of the 11 were never taken
+// again (the fewest spares left after a take, RX_VK_RES_LOG), 276-400 MB of host-cached memory in the three scenes on the RTX
+// 5070. Unlike RX_VK_CAP_SPARE_AGE (counted in takes, ~1000 a second: 600 freed spares the next frames took again) it is time:
+// a spare left unused for 20 s is not part of the scene's steady need
+uint64_t cap_spare_ms() {
+    static const uint64_t v = (getenv("RX_VK_CAP_SPARE_SECS") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_CAP_SPARE_SECS"))) : 20) * 1000;
+    return v;
+}
+// (HeyListen, 2026-11-14) RX_VK_CAP_FIT=1 (default; 0: as before): a capture takes a spare at most twice its need's size class
+// (cap_buf_size), else a buffer of its size is made; and a spare returned when 12 are kept takes the largest one's place if it is
+// smaller. Best fit alone gave the load's 40-64 MB spares to captures of a few MB: 68-886 such takes per 600 frames on the RTX
+// 5070, and the 25 kept buffers (each held for 24 captures, for the mirror syncs) were 283-309 MB of which their captures filled
+// 150-171 MB
+bool cap_fit() {
+    static const bool v = !getenv("RX_VK_CAP_FIT") || atoi(getenv("RX_VK_CAP_FIT")) != 0;
+    return v;
+}
+uint64_t cap_now_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
     FreeBuf old[12];
     int n_old = 0;
+    const uint64_t now = cap_now_ms();
     {
         std::lock_guard lk(cap_free_mu);
+        if (const uint64_t ms = cap_spare_ms())
+            for (size_t i = 0; i < cap_free.size();)
+                if (now - cap_free[i].ms > ms && n_old < 12) {
+                    old[n_old++] = cap_free[i];
+                    cap_free_bytes -= cap_free[i].size;
+                    cap_free.erase(cap_free.begin() + (ptrdiff_t)i);
+                    cap_spares_aged++;
+                } else {
+                    i++;
+                }
         if (const uint64_t age = cap_spare_age())
             for (size_t i = 0; i < cap_free.size();)
                 if (cap_gets - cap_free[i].at > age && n_old < 12) {
@@ -959,8 +992,20 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
                 } else {
                     i++;
                 }
+        // (RX_VK_CAP_FIT: a smaller one takes the place of the largest spare left untaken for 2 s. Not any largest: a castle walk's
+        // ~50 MB capture a frame lost its spare to the small ones and made a buffer every frame, ~1000 in a run)
+        if (cap_fit() && cap_free.size() >= 12 && size <= (64ull << 20)) {
+            size_t big = cap_free.size();
+            for (size_t i = 0; i < cap_free.size(); i++)
+                if (now - cap_free[i].ms > 2000 && (big == cap_free.size() || cap_free[i].size > cap_free[big].size)) big = i;
+            if (big < cap_free.size() && cap_free[big].size > size && n_old < 12) {
+                old[n_old++] = cap_free[big];
+                cap_free_bytes -= cap_free[big].size;
+                cap_free.erase(cap_free.begin() + (ptrdiff_t)big);
+            }
+        }
         if (cap_free.size() < 12 && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
-            cap_free.push_back({buffer, alloc, map, size, cap_gets});
+            cap_free.push_back({buffer, alloc, map, size, cap_gets, now});
             cap_free_bytes += size;
             buffer = VK_NULL_HANDLE;
         }
@@ -971,6 +1016,7 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
     if (it->second.hash && cap_hash_free.size() < 32) cap_hash_free.push_back(std::move(it->second.hash));
     cap_bytes -= it->second.size;
+    cap_used -= it->second.used;
     cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
     cap_bufs.erase(it);
 }
@@ -984,18 +1030,27 @@ uint64_t cap_buf_size(uint64_t need) {
     return s >= need ? s : (need + (1u << 20) - 1) & ~((1ull << 20) - 1);
 }
 uint64_t cap_bufs_made = 0;   // (TICK-038: capture buffers made, for the log: a spare that was missed)
+// (cap_free_mu; RX_VK_RES_LOG, since its last line) the largest need, the takes of a spare over twice the need's size class,
+// and the fewest spares left after a take
+uint64_t cap_need_max = 0, cap_taken_over = 0, cap_free_low = ~0ull;
 bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& map, uint64_t& size) {
     std::lock_guard lk(cap_free_mu);
     cap_gets++;
+    cap_need_max = std::max(cap_need_max, need);
     size_t best = cap_free.size();
     for (size_t i = 0; i < cap_free.size(); i++)
         if (cap_free[i].size >= need && (best == cap_free.size() || cap_free[i].size < cap_free[best].size)) best = i;
+    if (best < cap_free.size() && cap_fit() && cap_free[best].size > 2 * cap_buf_size(need))   // (RX_VK_CAP_FIT: counted as over)
+        best = cap_free.size(), cap_taken_over++;
     if (best < cap_free.size()) {
         buffer = cap_free[best].buffer, alloc = cap_free[best].alloc, map = cap_free[best].map, size = cap_free[best].size;
         cap_free_bytes -= size;
         cap_free.erase(cap_free.begin() + (ptrdiff_t)best);
+        if (size > 2 * cap_buf_size(need)) cap_taken_over++;
+        cap_free_low = std::min<uint64_t>(cap_free_low, cap_free.size());
         return map != nullptr;
     }
+    cap_free_low = 0;
     size = cap_buf_size(need);
     map = nullptr;
     cap_bufs_made++;
@@ -3111,6 +3166,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     bool split_done = false;
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
         CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
+        b.used = std::min<uint64_t>(c->nbytes, c->bsize);
         if (c->hok.size() == c->pages.size() && !c->hok.empty()) {   // (TICK-060: the copy's slot hashes kept with it)
             if (late_defer)
                 for (uint32_t i : c->late) c->hok[i] = 0;   // (copied again at its fix: hashed by the sync as before)
@@ -3129,7 +3185,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         }
         c->buffer = VK_NULL_HANDLE, c->alloc = nullptr, c->map = nullptr, c->bsize = 0;
         cap_bufs.emplace(g, b);
-        cap_bytes += b.size;
+        cap_bytes += b.size, cap_used += b.used;
         cur_cap_gen = g;
         // (TICK-053: a late page merged at its sync carries kCapLateBit; a slot is the page's index in c->pages, as c->late)
         static thread_local std::vector<uint8_t> late_mark;
@@ -6181,11 +6237,23 @@ void memory_res_log() {
     }
     size_t chunks = 0;   // (the capture table's chunks made: the replay's, read racily, for the count only)
     for (const auto& c : cap_table) chunks += c != nullptr;
-    uint64_t free_n = 0, free_b = 0, made = 0, aged = 0, gets = 0;
+    uint64_t free_n = 0, free_b = 0, made = 0, aged = 0, gets = 0, need_max = 0, taken_over = 0, free_low = 0, used_b = 0;
+    char spare_sizes[160] = "";
     {
         std::lock_guard lk(cap_free_mu);
         free_n = cap_free.size(), free_b = cap_free_bytes, made = cap_bufs_made, aged = cap_spares_aged, gets = cap_gets;
+        need_max = cap_need_max, taken_over = cap_taken_over, free_low = cap_free_low == ~0ull ? cap_free.size() : cap_free_low;
+        cap_need_max = 0, cap_taken_over = 0, cap_free_low = ~0ull;
+        int n = 0;
+        for (const FreeBuf& f : cap_free)
+            if (n < 150) n += snprintf(spare_sizes + n, sizeof spare_sizes - n, " %llu", (unsigned long long)(f.size >> 20));
     }
+    used_b = cap_used;   // (the replay's, read racily, for the count only)
+    logf("vk: capture buffers since the last line: largest need %llu KB, %llu spares over twice the need's size class (refused with "
+         "RX_VK_CAP_FIT, else taken), fewest "
+         "spares left after a take %llu; kept buffers filled %llu MB of %llu; spare sizes (MB):%s",
+         (unsigned long long)(need_max >> 10), (unsigned long long)taken_over, (unsigned long long)free_low,
+         (unsigned long long)(used_b >> 20), (unsigned long long)(cap_bytes >> 20), spare_sizes);
     logf("vk: process memory: private %llu MB, working set %llu MB (peak %llu); C heaps (%lu) %llu MB in use of %llu committed; "
          "captures: %zu queued, %zu buffers kept %llu MB, %llu spare buffers %llu MB (%llu made, %llu spares aged out of %llu asked), "
          "%zu spare records; texture shadow %zu pages "
