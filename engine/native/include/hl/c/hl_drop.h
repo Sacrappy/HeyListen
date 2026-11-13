@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 /* who touched a dropped granule (hl::mem::TouchPath, in its order) */
-enum { HL_DROP_GUEST_READ = 0, HL_DROP_GUEST_WRITE, HL_DROP_HOST_READ, HL_DROP_HOST_WRITE, HL_DROP_KERNEL };
+enum { HL_DROP_GUEST_READ = 0, HL_DROP_GUEST_WRITE, HL_DROP_HOST_READ, HL_DROP_HOST_WRITE, HL_DROP_KERNEL, HL_DROP_IMPORT };
 
 typedef int (*hl_drop_fill)(void *fill_ctx, uint8_t *buf, uint64_t addr, uint64_t size);
 

@@ -420,7 +420,7 @@ int Drop::report(char* out, size_t cap, int64_t now) {
     const int n = std::snprintf(
         out, cap,
         "%.1f MB dropped now; dropped %.1f MB in all (%.1f MB since the last line); %llu restores of %.1f MB (%llu since "
-        "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu; "
+        "the last line, %.1f a second): guest read %llu, guest write %llu, host read %llu, host write %llu, kernel %llu, import %llu; "
         "failed %llu; check: %llu granules hashed, %llu MISMATCHES; refused (granules): %s; ranges %llu (replaced "
         "%llu), sources decoded %llu (failed %llu), forgotten %llu, writers waited %llu",
         stats_.dropped_now.load() * mb, dropped * mb, (dropped - last_dropped_report_) * mb,
@@ -428,7 +428,8 @@ int Drop::report(char* out, size_t cap, int64_t now) {
         (unsigned long long)(restores - last_restores_report_), secs > 0 ? (restores - last_restores_report_) / secs : 0.0,
         (unsigned long long)stats_.by_path[0].load(), (unsigned long long)stats_.by_path[1].load(),
         (unsigned long long)stats_.by_path[2].load(), (unsigned long long)stats_.by_path[3].load(),
-        (unsigned long long)stats_.by_path[4].load(), (unsigned long long)stats_.restore_failed.load(),
+        (unsigned long long)stats_.by_path[4].load(), (unsigned long long)stats_.by_path[5].load(),
+        (unsigned long long)stats_.restore_failed.load(),
         (unsigned long long)stats_.checked.load(), (unsigned long long)stats_.mismatches.load(), refused,
         (unsigned long long)stats_.ranges.load(), (unsigned long long)stats_.replaced.load(),
         (unsigned long long)stats_.sources.load(), (unsigned long long)stats_.source_failed.load(),

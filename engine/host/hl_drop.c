@@ -99,10 +99,10 @@ static int cb_plain(void *ctx, uint64_t a) {
 }
 
 /* ---- the substrate's hook: a dropped granule touched ---- */
-static _Thread_local int in_kernel;   /* (hos_commit is handing guest memory to the kernel on this thread) */
+static _Thread_local int in_kernel;   /* (1: hos_commit is handing guest memory to the kernel on this thread; 2: the back end imports it) */
 static volatile LONG64 restore_ns_max, restore_ns_sum, restore_count;
 static int on_touch(void *p, size_t size, int write) {
-    const int path = in_kernel ? HL_DROP_KERNEL
+    const int path = in_kernel == 2 ? HL_DROP_IMPORT : in_kernel ? HL_DROP_KERNEL
                      : hos_ctx() ? (write ? HL_DROP_GUEST_WRITE : HL_DROP_GUEST_READ)
                                  : (write ? HL_DROP_HOST_WRITE : HL_DROP_HOST_READ);
     const int64_t t0 = hos_now_ns();
@@ -151,8 +151,11 @@ void hl_drop_kernel_begin(uint64_t lo, uint64_t hi) {
 void hl_drop_kernel_end(void) { in_kernel = 0; }
 /* (hos_memsplit.c hos_noaccess_import) the back end imports [lo, hi) */
 void hl_drop_import(uint64_t lo, uint64_t hi) {
-    if (drop_on) hl_drop_imported(lo, hi);
+    if (!drop_on) return;
+    hl_drop_imported(lo, hi);
+    in_kernel = 2;
 }
+void hl_drop_import_end(void) { in_kernel = 0; }
 /* (hl_stream.c) a decode wrote [dest, dest + size) */
 void hl_drop_decode(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name) {
     if (drop_on) hl_drop_decoded(dest, size, compressed, dict_id, name, hos_now_ns());
@@ -231,6 +234,7 @@ void hl_drop_init(void) {
 void hl_drop_kernel_begin(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 void hl_drop_kernel_end(void) {}
 void hl_drop_import(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
+void hl_drop_import_end(void) {}
 void hl_drop_decode(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name) {
     (void)dest; (void)size; (void)compressed; (void)dict_id; (void)name;
 }

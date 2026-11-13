@@ -54,7 +54,7 @@ struct DropSource {
 enum class Refuse : int { Imported, KernelUse, Resident, Changed, NoSource, NotPlain, Substrate, GivenUp, kCount };
 
 /// Who touched a dropped granule (the restore's path).
-enum class TouchPath : int { GuestRead, GuestWrite, HostRead, HostWrite, Kernel, kCount };
+enum class TouchPath : int { GuestRead, GuestWrite, HostRead, HostWrite, Kernel, Import, kCount };
 
 class Drop {
 public:

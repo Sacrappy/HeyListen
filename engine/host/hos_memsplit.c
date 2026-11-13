@@ -622,6 +622,7 @@ __declspec(dllexport) void hos_noaccess_import(uint64_t lo, uint64_t hi) {
     hl_drop_import(lo, hi);    /* (HL_MEM_DROP: never dropped; a decision under way there ends first) */
     /* (HOS_GUEST_PAGES: pinned granules are never dropped, and dropped ones are restored before the driver locks them) */
     if (hos_gp_ready() && hi > lo) hos_gp_imported(GP(lo), (size_t)(hi - lo));
+    hl_drop_import_end();
     if (!discard_on() || hi <= lo) return;
     AcquireSRWLockExclusive(&discard_lock);   /* (the list changes: exclusive; imports are rare) */
     int merged = 0;
