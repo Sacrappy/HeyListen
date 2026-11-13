@@ -777,3 +777,66 @@ With x7 not zero (not `0x8182f860`'s calls) the function also closes and reopens
 .. +0x73c, the stream array T +0x768 / +0x770 of 80-byte entries) around each chunk and appends a 48-byte record per
 chunk to the x7 array. No lock is taken by the function itself (the listener bits are atomic ORs; "locks" in 2.1's
 summary were these and the dealer's atomic add).
+
+### 9.6 The check of the motions' step, and the paths' histogram (unit `sil`)
+
+The native step of one motion (9.3, steps 1 to 9 and the cell position of step 11) is `hl::math::motion_step`
+(`hl/math/MotionStep.h`, `src/math/MotionStep.cpp`; the layouts in `hl/bridge/MathBridge.h`: the solver step data, the
+velocity entries, the globals' new fields; the C surface `hl_math_motion_step`). It declines on values outside the
+exactness rules and on the modifier's path. Its bridge in `engine/host/hl_math.c` (`run_sil`, gate `0x8182dc20`) is a
+check only: with `HL_MATH_CHECK=1` (unit `sil`) every call from `0x8182f860` (return address `0x8182f958`, x7 = 0) copies
+the motions of slots `first .. first + count - 1` at entry, runs the translated function for real, then compares each
+motion's 128 bytes with the native step's and walks the records the call appended to the writer at T +0x520 (two clamp
+records and a cell record per motion at most, in that order; a cell record's new cell, from the lookup the native side
+does not answer, is taken as written). Motions with a callback (their M124 | 2 meets a list's mask) or a declined step
+are counted and not compared, and the records after them are not walked. Nothing is native: the unit has no native mode
+yet (9.7).
+
+## 10. The contact solver's `solveJacobians` `0x8177b2a0` (stream 7, third session: partial)
+
+Read: the entry, the walk over the Jacobian stream, the record header, the cache of the two bodies' velocities, the
+three forms of the normal rows' loop (0x8177b9e0 .. 0x8177c634); not read: the friction and angular parts after the
+normal rows (0x8177c634 .. 0x8177e0ec), the modifier and "fire modifiers" paths, the tail. Reached through the stream
+contact solver's vtable only (no direct caller).
+
+- **Arguments**: x1 the solver thread context (kept at sp +0x7b8), x2 the step info I (the same object as 9.1's x1:
+  its +0x68 and +0x80 velocity arrays), x3 the solver parameters P (+0 an int, +8 a pair, +16 a flags byte: bit 1, 2, 3
+  choose paths), x4 the first range of the Jacobian stream, x5 a pointer to the impulses' output (the accumulated
+  impulse of each contact point is stored there, 4 bytes a point, in record order), x6 and x7 pointers to two ints,
+  the first slots of the two velocity sets (`(I +0x68) + 32 · *x6` and `+ 32 · *x7`, the same for +0x80): a record's
+  flag bit 0 chooses the set of its first body, the set after it holds its second.
+- **The walk**: a range is (+0 block, +8 16-bit offset of the first record from block +32, +12 record count, +16 the next
+  range, +24 a byte, the stream id, which must stay the one of the first range); records follow one another in the block
+  (their size from their header and point count, not read).
+- **The record header** (read): +0 16-bit flags (bit 0 the velocity set, 0x30 the friction kind, bit 6 "two bodies
+  move" (the rows subtract the second body's velocity), bit 7 a record handled by `0x81785c00` (the "second Jacobian type"
+  of 2.1), 0x300 the form of the normal rows (0, 0x100, 0x200; another value traps), bit 10, 11, 13, bit 14: set bit 5 of
+  both bodies' entry flags word at +28); +2 a byte (bits 0-2 extra row kinds through `0x8178413c`, bit 0 of the whole byte a
+  path at `0x8177c968`); +4 the number of contact points; +5 a byte (bits 1-3 material scaling of the rows from tables at
+  `*0x84cc1a80` / `*0x84cc1a88`, bit 4 a path at `0x8177ce38`, bit 6 kept); +6 a byte (0xe0 = 0x60 with flag bit 10: a
+  separate path); +7 a byte (a count scaled by I's pair at +0x200); +8 and +12 the two bodies' ids (compared with the
+  previous record's); +16 a float4 (the normal, and in w a factor); +40 and +44 the two velocity slots; +64 on, 32 bytes a
+  point (two float4: the point's angular Jacobians, the w lanes the right-hand side and the effective mass); after the
+  points, the friction rows (+0x9c + 32 · points: a factor; +0xc0 + 32 · points: a float4).
+- **The velocities' cache**: the two bodies' entries (A: V, W as in 9.2, and their packed maxima as floats) are loaded
+  into a frame block when a record's bodies differ from the previous record's; the previous pair is written back then
+  (V and W.z at +0, W.x, W.y at +16), and at the end of the walk. So **the entries in memory are behind the solver while a
+  run of records on the same pair lasts**: a native version must keep exactly this write-back order only where something
+  reads the entries in between (`0x81785c00` and the modifiers do: they get the frame block).
+- **The normal rows** (each point in record order, Gauss-Seidel: each point's impulse changes the cached velocities
+  before the next point is solved): the relative velocity along the point's Jacobians, `(J.ang0 · V0 + J.ang1 · W0) +
+  n · (W0 - W1)` summed as `z + (x + y)`, plus the point's right-hand side; the impulse `Δ = max(-acc, eff · (rhs - v))` (a
+  pair through FMAX against the accumulated impulse, the guest's operands in that order), the accumulated impulse at
+  `*x5` updated, the velocities changed by `Δ` times the Jacobians and the inverse masses (4-lane products, then sums in
+  the guest's order). The three forms differ in which body moves and in a clamp of the target velocity (`FMIN` with the
+  solver step data's +0 and +0xd0 factors in the 0x100 and 0x200 forms).
+- **Calls** (48 sites): `0x81775920` (set-up of the frame's modifier lists), `0x8169ed90` / `0x8169e414` / `0x8169d98c` /
+  `0x8169e0cc` / `0x8169e1ec` (Havok's monitor / timer helpers, likely: not read), `0x81785c00` (5 sites: the records with
+  bit 7, solved with the frame's cached velocities), `0x8178413c` (6: extra rows by byte +2), `0x81784840`, `0x81784a80`,
+  `0x81784260`, `0x81784460`, `0x81784620` (row kinds of the paths not read), `0x8178d820` / `0x8178d870`, `0x816ef7bc`
+  (the block allocator: an output stream), the profiler set (`0x816e09e0`, `0x800430a0`, `0x800431c8`, `0x816e23f0`,
+  `0x816e2558`, the static-init guards), `0x8017188c` (phive), and 7 indirect calls (the modifiers' callbacks, "fire
+  modifiers": 2.1).
+
+Not yet: the friction and rolling rows' arithmetic, the paths by P's flags, what the output stream receives, the
+records' size rule, the histogram of paths in the game. No native code for it.
