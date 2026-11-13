@@ -308,6 +308,22 @@ void replace_and_forget() {
     std::printf("%s\n", line);
 }
 
+// The import's and the kernel's paths restore the run they ask for, not the whole range; a touch by the game restores
+// the rest of it.
+void partial() {
+    Window w;
+    fresh(w);
+    Drop d(config(), host_of(w));
+    d.decoded(range(58, 4), 0);   // 58..61
+    CHECK(d.pass(30 * S) == 4);
+    CHECK(d.touch(BASE + 59 * G, TouchPath::Import, 31 * S, BASE + 59 * G, BASE + 60 * G));
+    CHECK(w.dropped[58] && !w.dropped[59] && w.dropped[60] && w.dropped[61]);
+    CHECK(d.stats().dropped_now == 3 && d.stats().by_path[int(TouchPath::Import)] == 1);
+    CHECK(w.read(d, BASE + 61 * G + 3) == w.file[61 * G + 3]);
+    CHECK(!w.dropped[58] && !w.dropped[60] && !w.dropped[61] && d.stats().dropped_now == 0);
+    CHECK(w.mem == w.file && d.stats().mismatches == 0);
+}
+
 }   // namespace
 
 int main() {
@@ -317,6 +333,7 @@ int main() {
     writer_during_decision();
     hold_and_give_up();
     replace_and_forget();
+    partial();
     std::printf("drop_test: ok\n");
     return 0;
 }

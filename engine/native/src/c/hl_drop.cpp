@@ -29,6 +29,7 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     config.kernel_ns = c->kernel_ns;
     config.give_up = c->give_up;
     config.pass_bytes = c->pass_bytes;
+    if (c->pass_ns) config.pass_ns = c->pass_ns;
     config.require_cold = c->require_cold != 0;
     config.check = c->check != 0;
     hl::mem::Drop::Host host;
@@ -42,6 +43,7 @@ extern "C" int hl_drop_start(const hl_drop_config* c, const hl_drop_host* h) {
     host.resident = h->resident;
     host.protect = h->protect;
     host.plain = h->plain;
+    host.clock = h->clock;
     g_drop.store(new hl::mem::Drop(config, host));
     return 1;
 }
@@ -63,10 +65,10 @@ extern "C" uint64_t hl_drop_pass(int64_t now_ns) {
     return d ? d->pass(now_ns) : 0;
 }
 
-extern "C" int hl_drop_touch(uint64_t addr, int path, int64_t now_ns) {
+extern "C" int hl_drop_touch(uint64_t addr, int path, int64_t now_ns, uint64_t lo, uint64_t hi) {
     auto* d = g_drop.load();
     if (!d || path < 0 || path >= int(hl::mem::TouchPath::kCount)) return 0;
-    return d->touch(addr, hl::mem::TouchPath(path), now_ns);
+    return d->touch(addr, hl::mem::TouchPath(path), now_ns, lo, hi);
 }
 
 extern "C" int hl_drop_wait_pending(uint64_t addr) {

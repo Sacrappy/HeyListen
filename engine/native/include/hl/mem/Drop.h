@@ -66,6 +66,7 @@ public:
         uint32_t give_up = 4;                  // restores after which a range is never dropped again
         int64_t kernel_ns = 5'000'000'000;     // a granule given to the kernel is not dropped for this long
         uint64_t pass_bytes = 64ull << 20;     // granule bytes looked at a pass at most
+        int64_t pass_ns = 250'000'000;        // no further range looked at once a pass has taken this long (with Host::clock)
         bool require_cold = true;              // only granules with no page in the working set
         bool check = false;                    // a hash of each granule at its drop, compared at its restore
         size_t max_ranges = 65536;             // candidate ranges held at most (the oldest without drops go first)
@@ -89,6 +90,8 @@ public:
         int (*protect)(void* ctx, uint64_t addr, uint64_t size, int read_only) = nullptr;   // 0: done
         // the protection of a granule is plain read-write committed memory (the only kind dropped)
         int (*plain)(void* ctx, uint64_t addr) = nullptr;
+        // the time now, in ns (the pass's time budget; none without it)
+        int64_t (*clock)(void* ctx) = nullptr;
     };
 
     struct Stats {
@@ -116,7 +119,9 @@ public:
 
     /// The substrate's hook: `addr` lies in a dropped granule. Restores its range; true when it was ours (restored now or
     /// by another thread meanwhile), false when no range of ours holds it.
-    bool touch(uint64_t addr, TouchPath path, int64_t now);
+    /// The kernel's and the driver's paths (Kernel, Import) restore only the dropped granules of the range inside [lo, hi)
+    /// when hi > lo: an import of a 16 MB chunk would otherwise bring back every range it cuts, whole.
+    bool touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo = 0, uint64_t hi = 0);
 
     /// A writer's fault on a granule being decided: waits for the decision. True when `addr` was being decided.
     bool wait_pending(uint64_t addr);

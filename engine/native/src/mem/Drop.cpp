@@ -206,6 +206,7 @@ bool Drop::decide(Range& r, int64_t now, uint64_t& looked, uint64_t& dropped) {
 }
 
 uint64_t Drop::pass(int64_t now) {
+    const int64_t t0 = host_.clock ? host_.clock(host_.ctx) : 0;
     stats_.passes.fetch_add(1, std::memory_order_relaxed);
     // the ranges due, from where the last pass stopped
     std::vector<std::pair<uint64_t, uint64_t>> due;   // (id, dest)
@@ -237,6 +238,7 @@ uint64_t Drop::pass(int64_t now) {
     uint64_t looked = 0, dropped = 0;
     for (auto& [id, dest] : due) {
         if (looked >= config_.pass_bytes) break;
+        if (host_.clock && host_.clock(host_.ctx) - t0 > config_.pass_ns) break;
         std::lock_guard<std::mutex> l(range_lock(id));
         Range* r;
         {
@@ -272,7 +274,7 @@ int fill_from_source(void* ctx, uint8_t* buf, uint64_t addr, uint64_t size) {
 }
 }   // namespace
 
-bool Drop::touch(uint64_t addr, TouchPath path, int64_t now) {
+bool Drop::touch(uint64_t addr, TouchPath path, int64_t now, uint64_t lo, uint64_t hi) {
     const uint64_t g = config_.granule;
     const uint64_t granule = addr & ~(g - 1);
     uint64_t id;
@@ -304,10 +306,15 @@ bool Drop::touch(uint64_t addr, TouchPath path, int64_t now) {
     FillCtx f{src, r->src.dest};
     bool ok = true;
     uint32_t n = 0;
+    const bool part = hi > lo && (path == TouchPath::Kernel || path == TouchPath::Import);
+    auto wanted = [&](uint32_t k) {
+        const uint64_t a = r->first + uint64_t(k) * g;
+        return r->state[k] == kDropped && (!part || (a + g > lo && a < hi));
+    };
     for (uint32_t i = 0; i < r->state.size();) {
-        if (r->state[i] != kDropped) { i++; continue; }
+        if (!wanted(i)) { i++; continue; }
         uint32_t e = i;
-        while (e < r->state.size() && r->state[e] == kDropped) e++;
+        while (e < r->state.size() && wanted(e)) e++;
         const uint64_t a = r->first + uint64_t(i) * g, size = uint64_t(e - i) * g;
         if (host_.restore(host_.ctx, a, size, fill_from_source, &f)) {
             stats_.restore_failed.fetch_add(1, std::memory_order_relaxed);

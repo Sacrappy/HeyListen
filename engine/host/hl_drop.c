@@ -89,6 +89,7 @@ static int cb_protect(void *ctx, uint64_t a, uint64_t n, int read_only) {
     DWORD was;
     return VirtualProtect(GP(a), (SIZE_T)n, read_only ? PAGE_READONLY : PAGE_READWRITE, &was) ? 0 : 1;
 }
+static int64_t cb_clock(void *ctx) { (void)ctx; return hos_now_ns(); }
 /* committed read-write memory over the whole granule, one allocation (what a lazy commit or hos_commit made) */
 static int cb_plain(void *ctx, uint64_t a) {
     (void)ctx;
@@ -110,7 +111,7 @@ static int on_touch(void *p, size_t size, int write) {
        restored with its range) */
     int ok = 1;
     for (uint64_t a = guest_of(p), end = a + size; a < end && ok; a += granule)
-        if (hos_gp_is_dropped(GP(a))) ok = hl_drop_touch(a, path, t0);
+        if (hos_gp_is_dropped(GP(a))) ok = hl_drop_touch(a, path, t0, guest_of(p), guest_of(p) + size);
     const int64_t took = hos_now_ns() - t0;
     InterlockedAdd64(&restore_ns_sum, took);
     InterlockedIncrement64(&restore_count);
@@ -217,8 +218,9 @@ void hl_drop_init(void) {
     /* (cold pages off: nothing leaves the working set, so "cold" cannot be told; the age alone then) */
     config.require_cold = !(cold && cold[0] == '0');
     config.check = chk && atoi(chk) == 1;
+    config.pass_ns = 250000000;   /* (a pass once took 19 s on the PC 3050 at a scene's load: pages read back, files decoded) */
     const hl_drop_host host = {NULL, cb_is_dropped, cb_drop, cb_restore, cb_source, cb_release, cb_view, cb_resident,
-                               cb_protect, cb_plain};
+                               cb_protect, cb_plain, cb_clock};
     if (!hl_drop_start(&config, &host)) {
         hos_log("hl drop: off (the policy could not be made)");
         return;

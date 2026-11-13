@@ -28,6 +28,7 @@ typedef struct hl_drop_host {
     uint32_t (*resident)(void *ctx, uint64_t granule);
     int (*protect)(void *ctx, uint64_t addr, uint64_t size, int read_only);
     int (*plain)(void *ctx, uint64_t addr);
+    int64_t (*clock)(void *ctx);
 } hl_drop_host;
 
 typedef struct hl_drop_config {
@@ -35,6 +36,7 @@ typedef struct hl_drop_config {
     int64_t age_ns, retry_ns, hold_ns, kernel_ns;
     uint32_t give_up;
     uint64_t pass_bytes;
+    int64_t pass_ns;
     int require_cold, check;
 } hl_drop_config;
 
@@ -45,8 +47,9 @@ int hl_drop_ready(void);
 void hl_drop_decoded(uint64_t dest, uint64_t size, uint64_t compressed, uint32_t dict_id, const char *name, int64_t now_ns);
 /* The drop thread's pass; returns the granules dropped. */
 uint64_t hl_drop_pass(int64_t now_ns);
-/* The substrate's hook: 1 when `addr` was ours and is restored. */
-int hl_drop_touch(uint64_t addr, int path, int64_t now_ns);
+/* The substrate's hook: 1 when `addr` was ours and is restored ([lo, hi): the run asked for, which the kernel's and the
+   import's paths restore alone). */
+int hl_drop_touch(uint64_t addr, int path, int64_t now_ns, uint64_t lo, uint64_t hi);
 /* A writer's fault on a granule being decided: 1 when it waited. */
 int hl_drop_wait_pending(uint64_t addr);
 void hl_drop_kernel_use(uint64_t lo, uint64_t hi, int64_t now_ns);
