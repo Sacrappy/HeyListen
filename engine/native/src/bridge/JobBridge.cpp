@@ -1,6 +1,8 @@
 // HeyListen native engine: the job system's boundary with the gameplay code (hl/bridge/JobBridge.h).
 #include "hl/bridge/JobBridge.h"
 
+#include "hl/bridge/Dispatcher.h"
+
 namespace hl::bridge {
 
 namespace {
@@ -36,13 +38,19 @@ struct JobBridge::Stage {
     GuestAddr scheduler, context;
 };
 
-JobBridge::JobBridge(GuestRuntime& runtime, jobs::JobSystem& jobs, Mode mode) : runtime_(runtime), jobs_(jobs), mode_(mode) {}
+JobBridge::JobBridge(GuestRuntime& runtime, jobs::JobSystem& jobs, Mode mode, Dispatcher* dispatcher)
+    : runtime_(runtime), jobs_(jobs), mode_(mode), dispatcher_(dispatcher) {}
+
+void JobBridge::dispatch(GuestThread as, GuestAddr scheduler, GuestAddr context) {
+    if (dispatcher_) dispatcher_->dispatch(as, scheduler, context);
+    else runtime_.call(as, kDispatcher, scheduler, context);
+}
 
 void JobBridge::run_stage(void* arg, const jobs::JobContext&) {
     const Stage* s = static_cast<const Stage*>(arg);
     GuestRuntime& rt = s->bridge->runtime_;
     if (rt.current() != s->worker_thread) s->bridge->stats_.moved.fetch_add(1, std::memory_order_relaxed);
-    rt.call(s->worker_thread, kDispatcher, s->scheduler, s->context);
+    s->bridge->dispatch(s->worker_thread, s->scheduler, s->context);
 }
 
 void JobBridge::on_worker_message(GuestAddr worker_at, uint64_t message) {
@@ -55,7 +63,7 @@ void JobBridge::on_worker_message(GuestAddr worker_at, uint64_t message) {
     const GuestAddr context = worker_at + offsetof(guest::Worker, context);
     const uint32_t core = worker->core;
     if (mode_ == Mode::Off || core >= (uint32_t)jobs::kLaneCount) {
-        runtime_.call(self, kDispatcher, scheduler, context);
+        dispatch(self, scheduler, context);
     } else {
         // The stage's work for this worker is one guest job under the worker's lane: its core. The worker's thread stands
         // still inside wait() until the job is done, so whichever host thread runs the job is the only one running as this
@@ -80,7 +88,8 @@ Readiness ready(const JobBridge* bridge) {
     for (const GuestEntry& e : kEntries) native += e.native;
     const bool on = bridge && bridge->mode() != Mode::Off;
     return {on, native, (unsigned)(sizeof kEntries / sizeof kEntries[0]),
-            "the dispatcher still picks the jobs of a stage from the game's queues: jobs are not native jobs one by one yet\n"
+            "the game's jobs are not native jobs one by one: the native dispatcher (HL_DISPATCH=1) runs them from the game's queues\n"
+            "the stage owner's wait and nested waits still run the translated dispatcher\n"
             "the stages' begin, registration and wait, and the worker sets' making, are the game's own functions\n"
             "the module system's job group (the main thread's long wait) does not go through the native job system\n"
             "the identity table and the lane status word are written by the game's functions, not by the native side\n"

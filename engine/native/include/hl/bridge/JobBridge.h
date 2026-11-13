@@ -31,8 +31,14 @@ struct GuestRuntime {
     virtual GuestThread current() const = 0;
     /// Calls the guest function `fn(a0, a1)` on the calling host thread, as guest thread `as`: on that thread's own guest
     /// context (its registers, its stack from where it stands, its thread-local values, its id and core). `as` must not be
-    /// running guest code anywhere else meanwhile: the caller holds its lane.
-    virtual void call(GuestThread as, GuestAddr fn, uint64_t a0, uint64_t a1) = 0;
+    /// running guest code anywhere else meanwhile: the caller holds its lane. Returns the function's x0.
+    virtual uint64_t call(GuestThread as, GuestAddr fn, uint64_t a0, uint64_t a1) = 0;
+    /// The same with up to four arguments; when `frame_size` is not 0, a copy of `frame` is first put on the guest stack
+    /// (16-byte aligned) and its guest address is passed as the argument after `args`.
+    virtual uint64_t call_with(GuestThread as, GuestAddr fn, const uint64_t* args, unsigned nargs, const void* frame,
+                               unsigned frame_size) = 0;
+    /// One line for the game's log.
+    virtual void log(const char* line) = 0;
 };
 
 // ---- the game's structures, in place -------------------------------------------------------------------------------
@@ -43,20 +49,40 @@ namespace guest {
 /// A dispatch context: a worker's own, or a worker set's.
 struct DispatchContext {
     uint8_t _0[8];
-    uint32_t state;   ///< 1: asleep
-    uint8_t _c[4];
+    uint64_t state;   ///< 0: awake, 1: asleep, else a job handed to it
     uint32_t flags;   ///< bit 0: sent its message; bit 1: not to run
-    uint8_t _14[156];
-    uint8_t wake_event[40];
+    uint8_t _14[4];
+    GuestAddr queue;  ///< its own queue of handed jobs (job addresses), a circle of `queue_room`
+    int32_t queue_room;
+    int32_t queue_first;
+    int32_t queue_count;
+    uint8_t _2c[68];
+    uint8_t mutex[64];   ///< guards the queue
+    uint8_t wake_event[16];
+    GuestAddr observer;  ///< 0: none
+    GuestAddr shown_object;   ///< what the observer is shown: the job's object,
+    uint32_t shown_id;        ///< its identifier,
+    uint8_t shown_begin;      ///< 1 before it runs, 0 after
+    uint8_t _d5[3];
     int32_t lane;
     uint8_t _dc[4];
     GuestAddr lane_status;   ///< the lane status word
 };
 static_assert(offsetof(DispatchContext, state) == 8);
 static_assert(offsetof(DispatchContext, flags) == 16);
+static_assert(offsetof(DispatchContext, queue) == 0x18);
+static_assert(offsetof(DispatchContext, queue_room) == 0x20);
+static_assert(offsetof(DispatchContext, queue_first) == 0x24);
+static_assert(offsetof(DispatchContext, queue_count) == 0x28);
+static_assert(offsetof(DispatchContext, mutex) == 0x70);
 static_assert(offsetof(DispatchContext, wake_event) == 176);
+static_assert(offsetof(DispatchContext, observer) == 0xc0);
+static_assert(offsetof(DispatchContext, shown_object) == 0xc8);
+static_assert(offsetof(DispatchContext, shown_id) == 0xd0);
+static_assert(offsetof(DispatchContext, shown_begin) == 0xd4);
 static_assert(offsetof(DispatchContext, lane) == 216);
 static_assert(offsetof(DispatchContext, lane_status) == 224);
+static_assert(sizeof(DispatchContext) == 232);
 
 /// A worker: a thread object of the game's.
 struct Worker {
@@ -103,27 +129,91 @@ static_assert(offsetof(WorkerSet, registered_mask) == 256);
 static_assert(offsetof(WorkerSet, flags) == 260);
 static_assert(offsetof(WorkerSet, scheduler) == 264);
 
-/// One level of a scheduler's job queues: two bounded rings of 16-byte cells.
-struct QueueLevel {
-    uint8_t ring_a[40];
-    uint8_t ring_b[40];
+/// One cell of a ring: the job pushed there and the cell's sequence word.
+struct Cell {
+    GuestAddr job;
+    uint64_t seq;
 };
+static_assert(sizeof(Cell) == 16);
+
+/// A bounded ring of cells (many producers, many consumers). Its counters only grow; counter p is cell p & (size - 1).
+struct Ring {
+    int32_t size;   ///< a power of two
+    uint8_t _4[4];
+    GuestAddr cells;   ///< 0: the ring does not exist
+    uint64_t head;
+    uint64_t tail;
+    uint8_t _20[8];
+};
+static_assert(offsetof(Ring, size) == 0);
+static_assert(offsetof(Ring, cells) == 8);
+static_assert(offsetof(Ring, head) == 16);
+static_assert(offsetof(Ring, tail) == 24);
+static_assert(sizeof(Ring) == 40);
+
+/// One level of a scheduler's job queues: an A ring (parallel jobs put back for their next runners) and a B ring.
+struct QueueLevel {
+    Ring a;
+    Ring b;
+};
+static_assert(offsetof(QueueLevel, b) == 40);
 static_assert(sizeof(QueueLevel) == 80);
+
+/// A job record: what the rings hold.
+struct Job {
+    GuestAddr object;   ///< the job's object; bit 0: tagged (cleared to use it)
+    uint8_t _8[4];
+    int16_t level;      ///< 0: level 2, -2: level 0, else level 1 (when those levels' B rings exist)
+    uint8_t kind;       ///< 0: counted in the low four bits of the lane status, else in the high four
+    uint8_t _f;
+    uint32_t lane;      ///< the lane it must run on; kAnyLane: any
+    uint32_t id;        ///< shown to an observer
+    GuestAddr hook;     ///< called before it is pushed (0: none)
+    GuestAddr dep_node; ///< (the head node of its list of dependents sits here, at +0x20)
+    GuestAddr dep_first;
+    GuestAddr dep_last;
+    uint16_t runners;   ///< bits 0-6 to start, 7-13 running, 14 one finished, 15 complete at the last running one
+    uint8_t _3a[2];
+    int32_t waiting;    ///< jobs it still waits for
+};
+static_assert(offsetof(Job, object) == 0x00);
+static_assert(offsetof(Job, level) == 0x0c);
+static_assert(offsetof(Job, kind) == 0x0e);
+static_assert(offsetof(Job, lane) == 0x10);
+static_assert(offsetof(Job, id) == 0x14);
+static_assert(offsetof(Job, hook) == 0x18);
+static_assert(offsetof(Job, dep_node) == 0x20);
+static_assert(offsetof(Job, dep_first) == 0x28);
+static_assert(offsetof(Job, dep_last) == 0x30);
+static_assert(offsetof(Job, runners) == 0x38);
+static_assert(offsetof(Job, waiting) == 0x3c);
+static_assert(sizeof(Job) == 0x40);
+
+/// A node of a job's list of dependents.
+struct DepNode {
+    GuestAddr job;
+    GuestAddr next;
+};
+static_assert(offsetof(DepNode, next) == 8);
 
 /// A stage's scheduler.
 struct Scheduler {
     uint8_t _0[48];
-    uint32_t context_count;
+    int32_t context_count;
     uint32_t context_room;
-    GuestAddr contexts;
+    GuestAddr contexts;   ///< an array of dispatch contexts' addresses
     QueueLevel levels[3];
-    uint8_t _130[84];
-    uint32_t flags;   ///< bit 1: the stage is over
+    uint8_t _130[16];
+    Job end_job;          ///< its completion ends the stage
+    uint32_t poll_lane;   ///< a context of this lane polls with timed sleeps instead of sleeping on its event
+    uint32_t flags;       ///< bit 1: the stage is over
 };
 static_assert(offsetof(Scheduler, context_count) == 48);
 static_assert(offsetof(Scheduler, context_room) == 52);
 static_assert(offsetof(Scheduler, contexts) == 56);
 static_assert(offsetof(Scheduler, levels) == 64);
+static_assert(offsetof(Scheduler, end_job) == 0x140);
+static_assert(offsetof(Scheduler, poll_lane) == 0x180);
 static_assert(offsetof(Scheduler, flags) == 388);
 
 /// The actor manager's table of who runs what, read in place by gameplay code at hundreds of sites.
@@ -166,6 +256,8 @@ enum class Mode : uint8_t {
     Pool       ///< each stage a job run by a worker of the native pool, under the executor's identity
 };
 
+class Dispatcher;
+
 class JobBridge {
 public:
     struct Stats {
@@ -174,7 +266,8 @@ public:
         std::atomic<uint64_t> moved{0};      ///< of those, run by another host thread than the worker's own
     };
 
-    JobBridge(GuestRuntime& runtime, jobs::JobSystem& jobs, Mode mode);
+    /// `dispatcher`: who runs a stage's work (null: the translated dispatcher, called).
+    JobBridge(GuestRuntime& runtime, jobs::JobSystem& jobs, Mode mode, Dispatcher* dispatcher = nullptr);
 
     /// Answers kWorkerMessage(worker, message) on the worker's own thread: message 1 with a scheduler set runs the
     /// stage's dispatcher on the worker's dispatch context, then signals the worker's end.
@@ -186,10 +279,12 @@ public:
 private:
     struct Stage;
     static void run_stage(void* arg, const jobs::JobContext& ctx);
+    void dispatch(GuestThread as, GuestAddr scheduler, GuestAddr context);
 
     GuestRuntime& runtime_;
     jobs::JobSystem& jobs_;
     Mode mode_;
+    Dispatcher* dispatcher_;
     Stats stats_;
 };
 

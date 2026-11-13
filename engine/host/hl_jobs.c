@@ -9,7 +9,12 @@
      HL_JOBS=2  pool: the job is run by a thread of the native pool, which goes on as the worker's guest thread
                 (hos_thread_act_as) on that thread's own guest context, while the worker's host thread stands still.
                 It ran every stage on the pool in the castle scene, but one run of four stalled: not for use yet
-   HL_JOBS_WORKERS=<n>: the pool's threads (default 6). HL_JOBS_LOG=1: the counters every 10 s. */
+   HL_JOBS_WORKERS=<n>: the pool's threads (default 6). HL_JOBS_LOG=1: the counters every 10 s.
+   HL_DISPATCH=1 (the default, with HL_JOBS on): the stage's work is run by the native dispatcher (hl/bridge/Dispatcher.h)
+   instead of the translated 0x8004ab40, on the same scheduler (docs/native-engine/jobs-boundary.md, "The dispatcher's
+   protocol"). HL_DISPATCH=0: the translated dispatcher, as before.
+   HL_DISPATCH_CHECK=1: its invariants are counted (and, with HL_DISPATCH=0, those that can be read after the translated
+   dispatcher), and the counters are logged every 10 s. */
 #include "hl_host.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +22,7 @@
 #include <windows.h>
 
 #define HL_JOBS_DEFAULT HL_JOBS_THROUGH
+#define HL_DISPATCH_DEFAULT 1   /* (validated 2026-11-13: invariants clean in 18 runs over the three scenes, two PCs) */
 #define HL_WORKER_MESSAGE 0x8004aae0ULL   /* (hl::bridge::kWorkerMessage: hl_jobs_on checks the two agree) */
 
 static int hl_log_on;
@@ -25,7 +31,7 @@ static void hl_report(void) {
     const int64_t now = hos_now_ns();
     const int64_t was = last;
     if (now - was < 10000000000LL || InterlockedCompareExchange64(&last, now, was) != was) return;
-    char line[512];
+    char line[2048];
     if (hl_bridge_report(line, sizeof line)) hos_log("hl jobs: %s", line);
 }
 
@@ -46,9 +52,13 @@ static int hl_jobs_on(void) {
         hos_log("hl jobs: off: the bridge answers %#llx, not the worker message", (unsigned long long)hl_bridge_worker_message_address());
         return 0;
     }
-    const int on = hl_bridge_start(hl_host(), mode, w ? (unsigned)atoi(w) : 0);
-    hl_log_on = getenv("HL_JOBS_LOG") != NULL;
-    char line[512];
+    const char *d = getenv("HL_DISPATCH"), *dc = getenv("HL_DISPATCH_CHECK");
+    const int native = d && d[0] ? atoi(d) == 1 : HL_DISPATCH_DEFAULT;
+    const int check = dc && dc[0] == '1';
+    const int on = hl_bridge_start(hl_host(), mode, w ? (unsigned)atoi(w) : 0,
+                                   (native ? HL_DISPATCH_NATIVE : 0) | (check ? HL_DISPATCH_CHECK : 0));
+    hl_log_on = getenv("HL_JOBS_LOG") != NULL || check;
+    char line[2048];
     hl_bridge_report(line, sizeof line);
     hos_log("hl jobs: %s: %s", on ? "on" : "not started", line);
     return on;

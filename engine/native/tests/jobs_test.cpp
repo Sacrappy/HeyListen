@@ -226,7 +226,12 @@ struct FakeGuest final : bridge::GuestRuntime, jobs::ThreadHost {
 
     void* ptr(bridge::GuestAddr at) const override { return const_cast<uint8_t*>(memory.data()) + (at - kBase); }
     bridge::GuestThread current() const override { return tls_current; }
-    void call(bridge::GuestThread as, bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override {
+    uint64_t call_with(bridge::GuestThread as, bridge::GuestAddr fn, const uint64_t* args, unsigned nargs, const void*,
+                       unsigned) override {
+        return call(as, fn, nargs > 0 ? args[0] : 0, nargs > 1 ? args[1] : 0);
+    }
+    void log(const char*) override {}
+    uint64_t call(bridge::GuestThread as, bridge::GuestAddr fn, uint64_t a0, uint64_t a1) override {
         const bridge::GuestThread before = tls_current;
         if (as != before) {
             std::lock_guard lock(mu);
@@ -240,6 +245,7 @@ struct FakeGuest final : bridge::GuestRuntime, jobs::ThreadHost {
             if (as != before) running.erase(as);
         }
         tls_current = before;
+        return 0;
     }
     void* start(void (*entry)(void*), void* arg, unsigned) override {
         threads.emplace_back(entry, arg);
