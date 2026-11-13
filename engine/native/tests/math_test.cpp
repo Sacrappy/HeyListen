@@ -579,6 +579,48 @@ void segment_box_matches_the_specification() {
     CHECK(taken > 95000);
 }
 
+// Output over the inputs: each C surface reads all it needs before writing its box, so an out that overlaps the
+// inputs gives what a separate one gives (the translated functions read their inputs before their stores too: the
+// check in the game compares every such call).
+void outputs_over_inputs() {
+    alignas(16) uint8_t mem[256] = {};
+    {   // affine: the box written over its centre / extents and the matrix
+        bridge::CentreExtents ce = {{1.5f, -2.0f, 3.25f}, {0.5f, 0.75f, 2.0f}};
+        bridge::AffineColumns m = {};
+        for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++) m.col[c][k] = 0.1f * (float)(c * 4 + k + 1);
+        math::Box want;
+        CHECK(hl_math_affine_box(&ce, &m, &want) == 1);
+        std::memcpy(mem, &ce, sizeof ce);
+        CHECK(hl_math_affine_box(mem, &m, mem) == 1 && std::memcmp(mem, &want, 32) == 0);
+        std::memcpy(mem, &m, sizeof m);
+        CHECK(hl_math_affine_box(&ce, mem, mem) == 1 && std::memcmp(mem, &want, 32) == 0);
+    }
+    {   // the oriented box and the vertex set: the box written over the transform
+        math::PreciseTransform t = {};
+        t.row[0][0] = t.row[1][1] = t.row[2][2] = 1.0f;
+        t.row[0][1] = 0.25f;
+        t.hi[0] = 3.0f, t.hi[1] = -1.0f, t.lo[0] = 1e-5f;
+        alignas(16) bridge::HavokBodyBox body = {};
+        body.convex_radius = 0.05f;
+        for (int k = 0; k < 3; k++) body.frame[k][k] = 1.0f, body.frame[k][3] = 0.5f + (float)k;
+        bridge::HavokBoxBias bias = {};
+        math::Box want;
+        CHECK(hl_math_oriented_box_box(&body, &t, &bias, &want) == 1);
+        std::memcpy(mem, &t, sizeof t);
+        CHECK(hl_math_oriented_box_box(&body, mem, &bias, mem) == 1 && std::memcmp(mem, &want, 32) == 0);
+        const float verts[6] = {1, 2, 3, -1, 0.5f, 2};
+        const float big[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+        alignas(16) uint8_t arr[64] = {};
+        const bridge::HavokRelArray head = {16, 2};
+        std::memcpy(arr, &head, 8);
+        std::memcpy(arr + 16, verts, sizeof verts);
+        CHECK(hl_math_vertex_set_box(arr, &t, big, &want) == 1);
+        std::memcpy(mem, &t, sizeof t);
+        CHECK(hl_math_vertex_set_box(arr, mem, big, mem) == 1 && std::memcmp(mem, &want, 32) == 0);
+    }
+}
+
 // ---- u3, 0x817d9d80: the body box update through its C surface, on a guest memory laid out as the game's ----
 struct BodyWorld {
     Arena a;
@@ -864,6 +906,7 @@ int main() {
     model_sphere_matches_the_specification();
     the_c_surface_reads_the_model_bounds();
     segment_box_matches_the_specification();
+    outputs_over_inputs();
     body_box_still_box_shape();
     body_box_declines();
     body_box_moving();
