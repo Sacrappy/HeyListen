@@ -1,0 +1,469 @@
+# The physics loops: map and specification (castle-move, 2026-11-13)
+
+What one physics step of the game is, as a graph of tasks; what loops each task runs, as code; what bit-exactness asks of
+a native x64 loop and how the translated C answers it today; and the first native units to build, specified. Static
+reading of the user's local translation (`%LOCALAPPDATA%\HookshotBuilder\sa\gen`) and re-aggregation of the three sampled
+runs of `hot-functions.md` / `critical-jobs.md` (`build/hotfn/r1..r3`, pooled as in `critical-jobs.md`). Nothing was run.
+No translated code is quoted (`README.md`, rule 4): addresses, offsets, sizes, call relations and plain-words algorithms
+only.
+
+Status of this document: **sections 1, 2 (solver and narrow phase) and 4 are written; in section 6, U1 and U2 are
+specified completely and U3 by its structure only; the cloth loops, the ranked list of every unit and the scheduling
+study are partly written. What is left is listed in section 7.**
+
+Conventions, as in `critical-jobs.md`: **read** (established from the lifted code or the data), **likely** (shape plus
+strong context), **guess**. "J" is the sampled job-group chain in ms a frame (mean of three runs, 5.80 ms in all),
+"CPU" the same samples on every job thread, "alone" the part of J during which no other executor or module worker ran.
+"insns" are guest instructions (`functions.json`). Function names in quotes are Havok's own signature strings that the
+function forms (assert and profiler strings kept in the binary), so they name the function with high confidence.
+
+Scratch scripts of this study (untracked; session scratchpad `s5/`): `agg.py` (per job root and per function: self and
+inclusive J / CPU / alone, call edges), `roottab.py` (one table a root), `census.py` (per function: insns, loops,
+indirect calls, FP idioms), `sk.py` / `ops.py` (reading views), `dref.py` (where an address is stored in the image),
+`upper.py` (what runs a job).
+
+## 1. The step as a graph
+
+### 1.1 Who runs it
+
+- **Every Havok Physics task runs on the six BaseProcExecutor threads, as a job of the game's own dispatcher**
+  `0x8004ab40` (read: every sample of every hknp task has the dispatcher, then `0x8004aae0 / 0x80df2680 / 0x80df25c0 /
+  0x834a2e50`, above the task's `process`; no Havok thread pool runs in these scenes). Havok's own queue
+  (`hkDefaultTaskQueueEx`, `0x816f8fc0` and its three processing loops) is present in the binary but never sampled.
+  The dispatcher itself contains the call of `hkTask::processTask` (`0x8004fee0`, "void hkTask::processTask(const
+  hkTask::Input &)"; called from `0x8004ab40` and `0x8007fe60`), which calls the task's virtual `process` (vtable slot 3,
+  +24). So an hkTask is one kind of job of the game's scheduler (read), and a native job system that answers the
+  dispatcher answers the Havok tasks too.
+- **phive (Nintendo's layer over hknp) drives the step through a job graph of its own**: 64-byte job nodes allocated
+  from a pool by `0x8349a510` (read: pool +0 capacity, +8 node array, +304 allocation counter (atomic), +32 / +40 the list
+  of created nodes, +312 its counter; node +0 the callable, +8 index, +12 16-bit priority, +14 byte, +16 / +20 two
+  words, +24 zero, +32 a self-linked list head of successors (pushed with a compare-and-swap at +40), +56 16-bit 1, +60
+  the count of predecessors still running, incremented atomically). The graph is built every frame by
+  `0x806a48f0` ("DynamicsFramework::updateWorldSingleThreadExt"; phases "[Phive] updateWorldPreImplExtCallPhase1..3_",
+  "...PostImplExtCallPhase1..3_", "phive::JP::AfterUpdateWorldPostImplExtCallPha..."), which forms the address of the
+  world-step job `0x803749e0` and pushes it (read, `critical-jobs.md`).
+- The Havok tasks are created as hkTask objects in an `hknpTaskGraph` (`hkTaskGraph::addTask` `0x817009dc`, 72 call
+  sites; dependencies through `0x8170160c`, likely `addDependency`), then handed to the scheduler as jobs. Which function
+  turns an `hknpTaskGraph` into the game's jobs is **not established** (candidates: the phive node functions above,
+  `0x80372400`, `0x839febe0` "[Phive] hkTask").
+
+### 1.2 The world step `0x803749e0` (phive, one instance, 0.478 J, 0.795 CPU)
+
+Read (control flow and calls; the field offsets are of the phive world object in x0):
+
+1. Runs the world's pre-step listeners (a list at +496..+504, virtual slot +32 or +16 of each, under the lock at +520,
+   `0x851047f0` / `0x851048a0` are the SDK mutex lock / unlock).
+2. Walks a second listener list under the lock at global `+112` (slot +48 callbacks; filters by a body table at
+   +1120).
+3. `0x80374d80` on the world's +136 object (per-step bookkeeping), then **`0x803799c0`** ("next_center_of_mass_local":
+   the per-body **write-back** of the previous step's results into phive's bodies; it calls `0x8037adc0`, below).
+4. By the step mode in the 64-bit word at +100 / +108 (bit 0: simulate; bit 2: copy a per-substep value from +216
+   +1832; bit 3: run `0x80374ec0` on +232) it calls **`0x803776c0`** (pre-collide jobs: 653 lines, creates phive nodes
+   with `0x8349a510`) and **`0x80372000`** (the collide and solve phase, below) with the time step from +36, the task
+   queue from +1128 and the body manager from +1120 / +1184; or, when not simulating, it bumps the step counter through
+   the 16-byte ring at the queue's +24 (an atomic increment of +308 and a compare-and-swap push at +40).
+
+`0x80372000` ("[Phive] post collide", "post collide 1 / 2 / 3", "post solve"): allocates two phive job nodes (pool in
+x1 +0 / +8, counters +304 / +312), wires them as successors of the current node (compare-and-swap on +40, counter +60),
+then calls **`0x80372ad4`** ("hknpWorld::generateCollideTasks(const hknpStepInput &, hknpTaskGraph &)", phive's
+override of the hknp lambda) which calls **`0x817ee880`** ("hknpWorldEx::preCollide": add bodies, pre-collide
+signal, update caches of mutated shapes, prepare the simulation context) and **`0x819923b8`** (forms every collide task
+name: hknpPrepareNarrowPhaseTask, hknpPrepareNarrowPhasePairsTask, hknpProcessNarrowPhasePairsTask,
+hknpNarrowPhasePairsPrepareGatherTask, hknpNarrowPhasePairsGatherThreadOutputsTask, hknpProcessNarrowPhaseGridTask,
+hknpBroadphaseOptimizeTask, hknpPrepareConstraintsTask, hknpBuildConstraintJacobiansTask; 1,261 insns, 37 indirect
+calls, 88 calls: it builds the collide task graph). Then `0x80372400` (437 insns, 23 atomics, no FP: likely the hand-off
+of the graph to the job nodes). The solve tasks are generated by tasks themselves (below).
+
+`0x803799c0` -> `0x8037adc0` (801 insns) is two loops (read): first over phive's motion records (iterator
+`0x838d8920`), with virtual calls per record (+256, +968 of a body's controller: callbacks into actor code); then over
+phive's rigid bodies (iterator `0x838d8b30`): for each body record whose +240 body has a +120 Havok body, it locks,
+calls **`0x804f5030`** (3,467 insns, 48 indirect calls, 102 calls; "next_position", "next_rot": the per-body
+write-back of hknp's motion into phive's next position / rotation and velocities), stores the result at record +256,
+and unlinks finished records with atomic list operations. **0x804f5030 is the largest single physics leaf on the chain
+(0.341 J inclusive, 0.132 self)**, but it is phive code with 48 virtual calls: class B.
+
+### 1.3 The tasks of one step, in order
+
+Task classes read from their `process` strings and vtables (`dref.py`: the address stored in a vtable whose slot -1 is
+the offset-to-top 0xffffffffffffffe0, so all are `hkTask` overrides):
+
+| order | task (`process`) | vtable slot | what (from its strings and calls) | J | CPU | alone | instances seen |
+|---:|---|---|---|---:|---:|---:|---|
+| 0 | `0x803749e0` phive world step (not a task: a phive job) | data, pushed by `0x806a48f0` | listeners, write-back of the previous step, generation of the collide graph | 0.478 | 0.795 | 0.019 | 1 |
+| 1 | `0x8199f7c0` hknpPrepareNarrowPhaseTask | - | prepares the pair streams | 0.024 | 0.049 | 0 | 1 |
+| 2 | broad phase: `0x81a14200` CopyAabbsAndMarkActiveBodiesRecollide, `0x81a42cd8` -> `0x81a363c0` hkcdBuildRangesTask (SimdTree build), `0x81a191a0` CollideTrees, `0x81a19f80` Finalize, `0x8199d5b8` hknpBroadphaseOptimizeTask | `0x848da9f8` (CollideTrees), `0x848db208` | tree rebuild of moved bodies' AABBs, tree-versus-tree pair collection (`0x81a33440`, integer) | 0.073 + 0.058 + 0.024 + 0.015 | 0.12 + 0.08 + 0.05 + 0.12 | 0.024 + 0.024 + 0.010 + 0 | up to 3 |
+| 3 | `0x8191ee00` hknpProcessNarrowPhasePairsTask | `0x848d7bb8` | the narrow phase over body pairs (section 2.2) | 0.365 (+0.219 deep stacks) | 2.19 (+~1.5 deep) | 0.034 (+0.06) | **6** (72% of rounds with 2+) |
+| 4 | `0x819ab300` PrepareGather, `0x819ad000` GatherThreadOutputs, `0x819affa0` SortThreadOutputs | - | merge the per-thread output streams | < 0.01 each | | | 1 |
+| 5 | `0x819aeae8` hknpNarrowPhasePairsBuildJacobians | `0x848d9d20` | second-round results, deferred manifolds -> contact Jacobians | 0.112 | 0.225 | 0.107 | **1** |
+| 6 | `0x819b25e0` hknpNarrowPhasePairsFinalize; `0x819a9348` PrepareConstraints, `0x819aa220` BuildConstraintJacobians | - | constraint (joint) Jacobians | small | | | |
+| 7 | `0x81997f00` hknpGenSolverTasksTask -> `0x819b657c` "BuildTaskGraphHelper::buildTaskGraphDependencies" ("CreateSolverTask", "BuildGraph") -> `0x819b7700` | - | creates the solver tasks of this step and their dependencies (4 `addTask`, 7 dependency calls, 6 virtual calls) | small | | | 1 |
+| 8 | `0x819b8e20` the solver task ("gatherSolverVelocities", "hknpStepConstraintJacobianProcess", subIntegrate / subIntegrateLastStep) | `0x848d9e80` | section 2.1 | 0.399 | 0.550 | **0.375** | **1** |
+| 9 | phive post-solve in `0x80372000`'s second node, `0x817f4aa0` "hknpWorldEx::postSolve" | | events, deactivation | 0.02 | | 0.02 | 1 |
+| 10 | `0x82bcfae0` point queries (a phive delegate job, record `0x84b37ed0`: hknpWorld::queryPoint / getClosestPoints through `0x803aa320`) | data | gameplay queries against the stepped world | 0.112 | 0.298 | 0.098 | up to 3 |
+
+The order is read from the creation code (1-8: `0x819923b8`, `0x819b7700`) and confirmed by the sample positions in the
+job-group wait (`critical-jobs.md`, tenths 0-1 and 5-8). The step appears **twice in a frame's wait** (tenths 0-1 and
+5-8, each with narrow phase, solver and write-back): whether these are two worlds or two steps of one world is **not
+established** (the step-mode word at +100 / +108 and the per-substep table at +216 +1832 suggest a world stepped in
+two halves; likely, not read).
+
+### 1.4 Why the solver and the Jacobian build run alone
+
+- `0x819b8e20` is a **32-byte task object** (read: `0x819b73a0`, an `hkArray` reserve with 32-byte elements, called by
+  the graph builder; the task's own reads stop at +31): +0 vtable, +8 the solver context, +16 mode byte (0: solve
+  pass; 1: a path guarded by an assert loop; other values trap), +17 / +20 / +21 bytes (passed as solver flags), +18
+  16-bit (substep index into a table of 4-byte entries), +22 flags (bit 0 / bit 1: call subIntegrate for the first /
+  second half, bits 2 / 3: call subIntegrateLastStep for the first / second half), +24 and +28 32-bit counters
+  (iterations done, incremented at the end of a pass).
+- The builder makes **several such tasks, chained**, one per solver pass (likely: each is "one Gauss-Seidel pass of
+  substep s, then optionally integrate"), and each depends on the previous one: the sampled task never had a second
+  instance, and it runs with no other job thread working in 77 of 82 chain samples. **The serialisation is a data
+  dependency, not an artefact of how the list is built**: Gauss-Seidel passes over shared body velocities must run in
+  order within an island. Two islands could run side by side; whether this scene's solver works on one merged island
+  set, or the builder chains independent islands anyway, is **not established** (it decides the scheduling gain in 5.2).
+- `0x819aeae8` (BuildJacobians) has one instance and runs right before the solver: it consumes every narrow-phase
+  thread's output (read: it is after the gather / sort tasks), so it waits for the whole narrow phase.
+
+### 1.5 Havok Cloth (summary; details are a later section)
+
+- A cloth world's step `0x8016b320` -> `0x8016b620` ("hclWorld::stepSingleThreaded") is a job whose address is stored at
+  `0x84c70b28` (a delegate record formed by `0x8016cb20`, which builds the cloth world: hclWorld, hclTransformSet,
+  collidables). It is started and waited for by `0x80168320` from the player's actor stage job `0x800b3ce0`
+  (`jobs-boundary.md`, rule 5): the player's job waits 0.289 ms for it; it runs alone 0.147 of its 0.245 J (tenth 4).
+- The other cloth worlds `0x80166100` (record `0x84b46418`) run in parallel bulk (2.38 ms CPU, 0.08 J).
+- Inside: `0x81b47080` hclSimulateOperator::_execute -> `0x81b56de0` solve (constraint sets' `apply`: standard link
+  `0x81c86720`, local range `0x81c67fa0` -> `0x81c7bd00`, bend stiffness `0x81c7ecc0` -> `0x81c7f880`), collide and solve
+  `0x81b58720` -> `0x81b57a80` "_iterateCollidables" -> `0x81b5a3c0` (4,803 insns) -> `0x81b8c000` (17,427 insns),
+  integrate `0x81c66a60`, skinning `0x81db9a40` -> `0x81cdff40`.
+
+## 2. The loops, as code
+
+Columns: inclusive / self J and CPU, alone (inclusive), insns, indirect calls ("ic"), back edges ("loops"), FP idioms
+from `census.py` (counts of guest operations in the lifted body, fast and fallback paths together, so read them as
+proportions: vmul / vadd = 4-wide float multiply / add-sub, unfused; sfma = scalar fused multiply-add; smul / sadd =
+scalar; d64 = double; minmax = FMIN / FMAX lanes; rsqrte / steps = estimate and Newton step; cvt = integer conversions).
+
+### 2.1 The solver task `0x819b8e20` (0.399 J, 0.550 CPU, 0.375 alone; one instance)
+
+Loop structure (read from its control flow; offsets of the task object in 1.4):
+
+- Entry: x0 = task, x1 = hkTask::Input (+8 a thread context or zero; when zero the thread-local Havok context at
+  tpidr+0x20 is used, created on first use by `0x816e1700`). `0x819212c0(task+8)` returns the simulation thread
+  context; its +1880 holds the solver step info, +1216 the per-thread solver data.
+- Mode 0 (the only one sampled): **for each pass** (counter at task +28 against the count at +24 of the step info):
+  `0x819ba420` "hknpStepConstraintJacobianProcess(threadCtx, int, int, bool, int, ...)" with the task's flags, then by
+  flag bits 2 / 3 `0x8182f860` -> `0x8182dc20` "hknpSolverIntegrator::subIntegrateLastStep", by bits 0 / 1 `0x8182f520`
+  -> `0x8182d2c0` "subIntegrate", then the per-substep counter update. The monitor-stream writes around each part
+  (`0x816e09e0` timer reads, "Tt..." records into the thread's stream when the global flag at a fixed address +944 is
+  set) are Havok's profiler: they cost little but are part of the translated body.
+- Mode 0 tail: `0x817d8300` (542 insns) over the step info's +64 / +80 / +104 / +128 arrays indexed by the substep:
+  the velocity gather ("gatherSolverVelocities" is inlined in the task: its string is formed by `0x819b8e20`).
+
+| function | role | incl J | self J | incl CPU | alone | insns | ic | loops | FP |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `0x819ba420` | hknpStepConstraintJacobianProcess: walks the Jacobian ranges of the pass | 0.180 | 0 | 0.243 | 0.165 | 1,254 | 2 | 62 | none of its own |
+| `0x8177b2a0` | "hknpStreamContactSolver::solveJacobians": the **contact solver kernel**, over contact Jacobian blocks of 4 | 0.175 | 0.097 | 0.238 | 0.165 | 3,969 | 7 | 84 | vmul 689, vadd 675, minmax 82, smul 61, sadd 82, cvt 6, div 2, sqrt 1; **no fused op** |
+| `0x81785c60` | under solveJacobians: a second Jacobian type (likely friction / angular, 23 ic) | 0.044 | 0.010 | 0.068 | 0.039 | 3,522 | 23 | 50 | vmul 320, vadd 330, d64 90, div 10, sqrt 10 |
+| `0x81775a00` -> `0x80171a90` | under it: modifier callbacks (7 ic in 0x8177b2a0 are "FireModifiers") | 0.019 | | | | 602 | 14 | | |
+| `0x8182dc20` | subIntegrateLastStep: **for each active motion**: integrate, then update the body (below) | 0.175 | 0.020 | 0.229 | 0.175 | 1,591 | 7 | 44 | vmul 64, vadd 56, smul 30, sadd 27, minmax 8, div 3, sqrt 3, d64 3 |
+| `0x817d9d80` | per body after the last substep: new world AABB (shape AABB under the new transform, expanded by the motion) | 0.141 | 0.068 | 0.170 | 0.141 | 736 | 1 | 6 | vmul 47, vadd 72, d64 30, minmax 32, sqrt 4, cvt 8 |
+| `0x8173e2ac` -> `0x81746440` | convex shape AABB (unit U1, section 6) | 0.024 | 0.024 | 0.024 | 0.024 | 21 + 124 | 0 | 1 | |
+| `0x81a040bc` -> `0x8170341c` | world AABB of a body's oriented box (unit U2; data-only, reached through `0x84cbfcc8`) | 0.024 | 0.020 | 0.029 | 0.024 | 128 + 44 | 0 | 0 | d64 12 |
+| `0x80168130`, `0x8174bb00`, `0x818556f0` -> `0x80825860` | small vector helpers of the body update | 0.025 | | | | 38, 33, 64, 143 | | | |
+| `0x8182d2c0` | subIntegrate (non-last substeps): per motion, velocity -> transform | 0.029 | 0.024 | 0.059 | 0.029 | 599 | 1 | 26 | vmul 24, vadd 32, smul 21 |
+| `0x817d8300` | velocity gather / scatter | 0.010 | 0.010 | 0.015 | 0 | 542 | 3 | 16 | vmul 62, vadd 54, sqrt 7 |
+
+Shares of the 0.399 J: contact solving 0.18 (of which pure kernel self time 0.10), the last-substep integration and body
+update 0.18 (of which the AABB part 0.14), the other substeps 0.03. All of it runs alone.
+
+**Pure numeric kernels on plain arrays** (no virtual calls, no Havok container calls): `0x81746440`, `0x8170341c`,
+`0x81a040bc`, `0x8174bb00`, `0x80168130`, `0x80825860`. **Kernels with callbacks**: `0x8177b2a0` (7 indirect calls:
+modifier hooks, taken only for Jacobians flagged for them), `0x817d9d80` (1: the shape's virtual AABB for non-convex
+shapes). **Havok structure walkers**: `0x819ba420`, `0x8182dc20`, the task itself.
+
+### 2.2 The narrow-phase task `0x8191ee00` (0.365 J + 0.219 deep, 2.19 CPU + ~1.5 deep; six instances)
+
+Structure (read from the call tree of the samples and the functions' strings; the loop itself not read line by line):
+`0x8191ee00` "hknpProcessNarrowPhasePairsTask::process" takes a range of body-pair work items and calls
+`0x81928de0` "mergeAndCollide2StreamsIntern ... collide_bodyPairs" (3,457 insns, 110 loops): **for each body pair** of
+its range, merging the active and inactive cache streams, it dispatches on the pair's collision-detector type and
+writes manifolds and caches to its thread's output streams ("ThreadOutput::m_activeCacheStreams",
+"m_inactiveCacheStreams", "m_deferredManifoldsOut", "m_perPairOutput"). Each instance owns its output streams: the
+instances are independent (read from the strings: per-thread outputs, merged later by the gather tasks).
+
+Dispatch targets on the chain:
+
+| path | what | incl J | incl CPU | notes |
+|---|---|---:|---:|---|
+| `0x8197a620` -> `0x81855ca0` -> `0x8197af20` -> `0x8197a168` -> `0x81979e40` -> `0x819783e0` -> `0x8176c980` -> `0x81730760` | convex-convex: GSK (`0x8176c980` 3,386 insns, minmax 167, d64 54; `0x81730760` 2,040 insns, vmul 464, vadd 563: the GSK iteration, likely) | 0.132 (+0.22 deep) | 0.88 (+1.5 deep) | the largest CPU of the whole step |
+| -> `0x81738700` -> `0x8173b340` -> `0x81738fa0` / `0x8173a5c0` / `0x8173a830` / `0x8173ae00` -> `0x8173ab70` | penetration depth (expanding polytope: `0x8173a830` one face of the polytope, `0x8173ab70` double geometry) | 0.019 (+0.21 deep) | 0.29 (+1.45 deep) | d64 everywhere |
+| `0x8197a22c` -> `0x81979e40` / `0x81979780` -> `0x8197be18` -> `0x8173e2ac` -> `0x81746440` | convex vs composite (child AABBs of a compound or mesh, then the same convex routines) | 0.112 | 0.43 | `0x81746440` here 0.049 J |
+| `0x81902240` -> `0x81782ca8` -> `0x8177b020` -> `0x81779980` | contact Jacobian setup for new manifolds (`0x81779980` 1,413 insns, vmul 269, d64 59), with phive's modifier `0x80042950` ("LinearCastVsTriggerVolumeModifier::postContactJacobianSetup") | 0.064 | 0.46 | 52 indirect calls in 0x81902240 |
+| `0x817472e0` | support of a 1-4 vertex convex (jump table on the count) | 0.029 | 0.08 (+0.23 deep) | |
+
+The task runs with 3.9 other job threads busy on average: shortening it shortens the chain only where it is the last
+instance to finish (the "strict" columns of `critical-jobs.md`).
+
+### 2.3 The other physics loops (summary)
+
+- `0x819aeae8` BuildJacobians -> `0x819ae440` -> `0x8192f8a0` (1,652 insns, 19 ic) -> `0x81973300` (2,107 insns) ->
+  `0x817738e0`, `0x8176a780` (2,172 insns, minmax 163, div 13): the second narrow-phase round for deferred manifolds,
+  then their contact Jacobians. One instance; 0.107 alone.
+- `0x82bcfae0` point queries -> `0x803aa320` (phive, sfma 102: scalar fused FP is phive's compiler, not Havok's) ->
+  `0x803aaef0` / `0x803a9020` -> hknpWorld::queryPoint `0x818f5998` -> `0x804ed080` / `0x81a44f80` (shape point
+  queries), `0x805621c0` (phive filter, cvt 39).
+- Write-back `0x804f5030` (2.1 above): FP is scalar and **fused** (sfma 140, and fma64 60: double FMAs), unlike Havok's
+  vector code.
+- Broad phase: integer tree code (`0x81a33440`, `0x81a363c0`), no FP of note.
+
+## 3. The data (as far as section 6 needs it)
+
+- **Transforms passed to the AABB kernels** (`0x81746440`'s x1): three float4 rows at +0, +16, +32 (the rotation,
+  applied as row0 * x + row1 * y + row2 * z, so the rows are the rotated basis vectors), then seven floats: a
+  translation high part at +48, +52, +56, +60 (four lanes) and a low part at +64, +68, +72 (three lanes; the w lane
+  reuses +72). Position = high + low computed in double: Havok's "precise transform" (likely; the field use is read).
+- **Convex shape** (x0 of `0x8173e2ac`): +56 a relative array of vertices (32-bit signed offset from +56, then a 32-bit
+  count; offset 0 means "no array"), vertices packed as three floats (12 bytes); +104 a float and +108 a 16-bit value
+  that, placed in the high half of a float, gives a second float: their product is the shape's convex radius.
+- **AABB out**: 32 bytes, min float4 at +0, max float4 at +16; w lanes are computed, not cleared.
+- Alignment: the 4-wide float code assumes nothing beyond 4-byte alignment of the vertex array (loads are 8 + 4 bytes);
+  transforms and outputs are 16-byte aligned (pair loads of 16 bytes).
+- Temporary buffers of the solver (Jacobian and temp streams, "hknpSolverData::ThreadData::m_jac*Stream",
+  "m_solverTempsStream") come from Havok's block stream allocator (strings in `0x817f3ce0` "PdBlock stream allocator"),
+  per thread, per step (likely). Their layouts are **not read** in this session.
+
+## 4. Exactness
+
+### 4.1 How the translated C computes floating point today (read: `a64_suyu.h`, `a64_fpx.h` in the lifted folder)
+
+- **Every guest FP operation keeps its own rounding.** Single-precision add / sub / mul / div / sqrt run natively in SSE
+  when a fast-path test says the native result equals Arm's (finite, normal, and the sticky FPSR flags it could raise
+  already set); otherwise they fall back to exact soft-float bodies (`recomp_fpe_*`) that also keep FPSR. Vector
+  operations do the same per lane (`a64_vfpx_*`), and straight-line runs are grouped into speculative blocks
+  (`A64_BK`: the whole block in SSE, then one test; a failed test re-runs the block's ops one by one).
+- **The fast path is taken only when FPCR is plain** (round to nearest, DN clear, no other control bit but FZ) **and
+  FPSR.IXC is already set** (`RECOMP_FPX_OPEN`); the host runs with MXCSR round-to-nearest, DAZ and FTZ clear.
+  Flush-to-zero (FPCR.FZ, bit 24) is emulated by the tests: a subnormal operand or result sends the op to the exact body.
+- **Fused multiply-add** (FMADD / FMLA): single precision in double then one rounding to single, falling back when the
+  double is a single-precision midpoint; double precision with the hardware FMA (built with `-mfma`, x86-64-v3) or the
+  exact body. A guest FMUL is computed through the same helper with a zero addend (`mul32_fma32`): it is **not** a fusion.
+- **FMIN / FMAX**: inline per lane, Arm's rules (a signalling NaN gives the quieted NaN and IOC; a quiet NaN operand is
+  returned (quiet); min of +0 and -0 is -0, max is +0; under FZ subnormal operands are flushed first, with IDC; under DN
+  a NaN result becomes the default NaN).
+- **FRECPE / FRSQRTE**: `recomp_fp_estimate(c, bits, width, rsqrt)` (runtime, `a64_rtgen.py`: Arm's tables, exact);
+  **FRECPS / FRSQRTS**: fused (2 - a*b) and (3 - a*b) / 2 with one rounding (helpers `recps32` / `rsqrts32`).
+- **Conversions**: FCVT single <-> double inline (exact, with the FZ flag rules), integer conversions through
+  `recomp_fp_to_int` / `recomp_fixed_to_fp` (toward zero for FCVTZS, Arm's saturation on overflow and NaN -> 0).
+- **FPCR at run time.** Havok's per-thread init (`0x816e1700` -> `0x816e1944`) sets or clears FZ by a mode argument
+  (`0x8169d350`: FZ = bit 0 of its argument; `0x816e1944` passes "mode == 2"); `0x80ec0ea0` sets FZ unconditionally on
+  the thread that runs it. Which value the executors carry while they run Havok tasks is **not established** statically
+  (it is one log line: read `c->fpcr` at a task's entry in the bridge). The lift has seven FPCR writes in all (read):
+  the two FZ setters above, three in the SDK's context save / restore (`0x851109b8` and its neighbours), and two in
+  `0x8575d1bc` / `0x8575d228` that replace the rounding-mode and FZ bits with an argument (a C library `fesetround`-like
+  helper, likely; its callers `0x8338d510`, `0x83c62290`, `0x85739e50`, `0x8581d2f0` are not physics). Default NaN
+  (bit 25) is set by none of them except through the saved context: likely never set.
+- FPSR is read back by the game only in the SDK's context save / restore (read: no `mrs fpsr` in the physics
+  functions censused). A native loop need not produce FPSR flags, but **it must leave the guest's FPSR as the translated
+  code would** if the fast path's "IXC already set" test is to stay true afterwards: setting IXC is harmless (it is
+  sticky and set almost always); clearing nothing is required.
+
+### 4.2 What each loop relies on
+
+| loop | fused ops | FMIN / FMAX | estimates | double | conversions | FZ sensitivity |
+|---|---|---|---|---|---|---|
+| contact solver `0x8177b2a0`, `0x81785c60` | **none** (Havok's 4-wide code is FMUL then FADD: the vector multiply-add of hkVector4 is not fused on this build) | yes (82 lanes: impulse clamping, likely) | none | `0x81785c60` yes | 6 (int) | yes if FZ is on (impulses near zero) |
+| integration `0x8182dc20`, `0x8182d2c0` | none | 8 | none | 3 | 2 | idem |
+| body AABB `0x817d9d80`, `0x81746440`, `0x81a040bc`, `0x8170341c` | none | yes | none | yes: positions in double, outward rounding by bit adjustment (6.1) | single <-> double | double -> single of tiny values |
+| narrow phase GSK / EPA (`0x8176c980`, `0x81730760`, `0x8173a830`, `0x8173ab70`) | none | many (167 lanes in `0x8176c980`) | none | yes | 7 | yes |
+| phive write-back `0x804f5030`, `0x8014aad0`, point queries `0x803aa320` | **yes, scalar single and double** | | | yes | | |
+| cloth `0x81b8c000`, `0x81b5a3c0`, `0x81c7bd00`, `0x81c86720`, `0x81c7f880`, `0x81db9a40` | none in vectors | some | **FRSQRTE + FRSQRTS** (36 in `0x81b5a3c0`, 15 + 30 steps in `0x81b8c000`, 4 in `0x81c7bd00`) | little | `0x81db9a40` 308 | yes |
+
+So for **Havok Physics' own loops the x86 rules are simple**: plain AVX (`_mm256_mul_ps`, `_mm256_add_ps`) with **no
+FMA**, in the guest's order; min / max must be Arm's (x86 `minps` returns the second operand when either is NaN and does
+not order -0 / +0: emulate with a compare and blend, or check lanes and fall back); no estimates; doubles where the
+guest uses doubles. Cloth needs Arm's FRSQRTE table (call `recomp_fp_estimate` or a 256-entry table lookup
+reproducing it) and a single-rounded step (with FMA: `fnmadd(a, b, 3) * 0.5` is exact for normal results, the same
+argument as the runtime's helper). Phive's write-back needs FMA exactly where the guest fused.
+
+**FZ.** If the executors run Havok with FZ set, a native loop under MXCSR FTZ+DAZ is not the same as Arm FZ in every
+case: Arm flushes a result to zero when it is tiny *after* rounding, x86 FTZ *before* rounding (results just below the
+smallest normal that round up to it differ), and Arm's FZ also flushes inputs (DAZ does). The safe rule for a native
+unit: run in the host's default MXCSR (no FTZ / DAZ) and detect, per block of lanes, any subnormal input or result (one
+compare on the exponent field); such lanes go to the translated helpers. This is what the runtime's fast path does, and
+it keeps the native loop exact whatever FPCR.FZ is.
+
+## 5. Replaceable units and scheduling (partial: physics, this session)
+
+Chain effect = J x (1 - 1/s), "upper" counting all chain samples, "strict" only the alone ones (as `critical-jobs.md`).
+
+| rank | unit | reached | J (alone) | 2x upper / strict | 4x upper / strict | work (days) |
+|---:|---|---|---:|---|---|---:|
+| 1 | U1 `0x81746440` convex vertex AABB (+ `0x8173e2ac` radius) | direct call (2 sites: `0x8173e24c`, `0x8173e2ac`): HL_GATE | 0.112 (0.029) | 0.056 / 0.015 | 0.084 / 0.022 | 2 |
+| 2 | U2 `0x81a040bc` + `0x8170341c` oriented-box AABB | **pointer** (`0x84cbfcc8`): HL_ANSWER | 0.029 (0.024) | 0.015 / 0.012 | 0.022 / 0.018 | 2 |
+| 3 | U3 `0x817d9d80` body AABB update (U1 and U2 inside) | direct (1 site in `0x8182dc20`): HL_GATE | 0.141 (0.141) | 0.071 / 0.071 | 0.106 / 0.106 | 4-6 |
+| 4 | `0x8177b2a0` contact solveJacobians (+ `0x81785c60`) | virtual (stream contact solver's vtable): HL_ANSWER | 0.175 (0.165) | 0.09 / 0.08 | 0.13 / 0.12 | 10-15 |
+| 5 | `0x8182dc20` subIntegrateLastStep whole (contains U3) | direct from `0x8182f860` | 0.175 (0.175) | 0.09 / 0.09 | 0.13 / 0.13 | +5 after U3 |
+| 6 | the solver task `0x819b8e20` whole (4 + 5 + `0x8182d2c0` + gather) | vtable `0x848d9e80`: HL_ANSWER | 0.399 (0.375) | 0.20 / 0.19 | 0.30 / 0.28 | 20-30 |
+| 7 | narrow-phase convex-convex (GSK `0x8176c980` / `0x81730760`, EPA `0x8173b340` and leaves) | direct | ~0.35 with deep stacks (0.04) | six-wide: ~0.1 upper, ~0.02 strict | | 20+ |
+| 8 | BuildJacobians `0x819aeae8` | vtable `0x848d9d20` | 0.112 (0.107) | 0.056 / 0.054 | 0.084 / 0.080 | 15 |
+| 9 | phive write-back `0x804f5030` | direct | 0.341 (0.019) | 0.17 / 0.01 | 0.26 / 0.014 | 10 (48 virtual calls to keep) |
+| 10 | cloth `0x81b5a3c0` + `0x81b8c000` (collide and solve) | direct | 0.108 (0.108) | 0.054 / 0.054 | 0.081 / 0.081 | 10-15 |
+
+Scheduling (partial):
+
+- **Solver islands across threads.** The solver's 0.375 ms alone is the largest serial stretch of the step. If the
+  builder's chain of passes covers several independent islands, a native solver could run islands on separate threads
+  (native work is not held to six lanes) with each island's Gauss-Seidel order unchanged: bit-exact, since islands
+  share no body. Needed first: read `0x819b7700` (which bodies and Jacobian ranges each pass covers) and count islands
+  in the scene at run time.
+- **Point queries `0x82bcfae0` beside the solver**: they read the world after the step (they run at tenth 8, after the
+  second solve); moving them earlier would change their results. Not available without changing gameplay timing.
+- **Write-back `0x804f5030` per body in parallel**: each body's write-back looks independent (per-record lock), but it
+  calls 48 virtual functions of phive and actor code: not safe to split without reading every callee.
+
+## 6. The first three units
+
+Common to all three:
+
+- **Bridge**: a C function in `engine/host/hl_physics.c` registered with `HL_GATE(addr, hash)` (direct calls) or
+  `HL_ANSWER(addr, fn, on, ...)` (pointer-reached), reading the arguments from the guest context (x0.., v registers)
+  and guest memory in place through `A64_PTR`; the native kernel in `engine/native` (`hl::phys`), plain C++20 with no
+  `-ffp-contract` (the build forbids contraction) and **no FMA** in these three.
+- **Switch** `HL_PHYS_AABB` (0 off; 1 native; 2 differential). In mode 2 the gate runs the translated body first on the
+  real state, then the native kernel on the same inputs into a scratch buffer, and compares the 32 output bytes (and x0,
+  which none of these return); counts mismatches, logs the first ten with their inputs, and logs once the FPCR value seen
+  (`c->fpcr`, which settles section 4.1's FZ question). Zero mismatches in castle-move, kokiri-idle and hyrule-walk before
+  1 becomes the default.
+- **Exact rules**: per lane, in the guest's order; FMUL and FADD separately rounded (single); FMIN / FMAX with Arm's NaN
+  and signed-zero rules; single -> double conversions exact; double -> single in round-to-nearest-even; **fallback**: if
+  any input or intermediate lane is NaN, infinite or subnormal (single or double), or if `c->fpcr` has any bit other
+  than FZ set, call the translated body instead (the gate keeps it). This keeps the native path to the cases where IEEE
+  on x86 and Arm agree bit for bit, and makes FZ irrelevant (no subnormal ever enters or leaves the native path).
+
+### 6.1 U1: `0x81746440`, AABB of a convex vertex set under a precise transform (and `0x8173e2ac`)
+
+- **Reached**: directly, from `0x8173e2ac` (the convex shape's AABB function: also the slot reached from the shape's
+  vtable) and from `0x8173e24c`. Gate `0x81746440` itself (124 insns, leaf, no calls); `0x8173e2ac` (21 insns) can stay
+  translated, or be gated in the same unit (below).
+- **Arguments**: x0 = address of a relative array header: int32 `off` at +0, int32 `n` at +4; the vertices start at
+  x0 + off (when off == 0 the base is 0 and n must be 0). x1 = transform (layout in section 3). x2 = output (32 bytes).
+- **Constants**: one float4 `BIG` loaded from guest address `0x83eb0c20` (read from the image: bits 0x7f7fffee in each
+  lane, Havok's "large float", 17 units of the last place below FLT_MAX). `min = BIG`, `max = -BIG` (sign bit flipped in
+  each lane).
+- **Loop** (i = 0 .. n-1, vertex p = (x, y, z) three floats at base + 12 i):
+  `t = R0 * x` (4 lanes, R0 = transform +0..+15), `u = R1 * y`, `w = R2 * z` (each a separately rounded multiply), then
+  `v = (t + u) + w` (two separately rounded adds, in that order), then `min = FMIN(min, v)`, `max = FMAX(max, v)` per
+  lane (FMIN(a, b) with a = the running min, b = v; FMAX likewise).
+- **After the loop** (all in double, each operation separately rounded):
+  `Hx, Hy, Hz, Hw` = floats at transform +48, +52, +56, +60; `Lx, Ly, Lz` = floats at +64, +68, +72.
+  `Px = Hx + Lx`, `Py = Hy + Ly`, `Pz = Hz + Lz`, `Pw = Hw + Lz` (the w lane adds +72 too: read).
+  For each lane k: `a = P_k + (double)min_k`; then **outward rounding**: take the 64-bit pattern of `a`; if `a > 0`
+  subtract 0x10000000 from it, otherwise (a <= 0, either zero, or NaN) add 0x10000000; convert the adjusted double to
+  float (round to nearest) -> out.min_k. For max: `b = P_k + (double)max_k`; if `b >= 0` add 0x10000000 to its bit
+  pattern, otherwise (b < 0 or NaN) subtract it; convert -> out.max_k. (2^28 units of a double's last place is half a
+  float's last place: the nudge turns round-to-nearest into rounding away from the box's inside. Note the asymmetry at
+  zero: for min, +0 and -0 both get +0x10000000 added; for max, +0 gets +0x10000000, -0 compares >= 0 too and gets it.)
+- **Output**: out +0 = (min_x, min_y, min_z, min_w), +16 = (max_x .. max_w). Nothing else is written; no return value.
+- **`0x8173e2ac`** (if gated with it): x0 = shape, x1 = transform, x2 = out. Calls U1 with x0 + 56. Then `r = f104 *
+  g`, where f104 is the float at shape +104 and g is the float whose bits are (the 16-bit value at shape +108) << 16;
+  one rounded multiply. Then out.max = out.max + r and out.min = out.min - r, each lane (r broadcast to the 4 lanes),
+  separately rounded.
+- **Native form**: each v is computed exactly as above (per vertex, no reordering inside it); the min / max reduction
+  may be reordered, because Arm's FMIN / FMAX are associative and commutative on non-NaN values, signed zeros included
+  (min(+0, -0) = -0 and max(+0, -0) = +0 whatever the order). So two vertices per 256-bit register, reduced at the end,
+  is **bit-exact under the fallback rule** (no NaN input; a NaN vertex sends the call to the translated body).
+- **Check**: mode 2 as above, every call for the first 600 frames then 1 in 64. Expected volume: ~0.38 ms CPU a frame in
+  the translated form; called from the solver (alone) and the narrow phase (six-wide).
+- **Expected chain effect**: J 0.112 (0.029 alone): 2x -0.056 / -0.015, 4x -0.084 / -0.022 (as `critical-jobs.md`).
+
+### 6.2 U2: `0x81a040bc` (with `0x8170341c`), a body's world AABB from its oriented box
+
+Read whole (128 + 44 insns, no indirect call, no loop). `0x81a040bc` is stored in data at `0x84cbfcc8` (the shape-type
+table that `0x817d9d80` calls through, slot +24: see 6.3) and has no direct caller in the samples: answer it with
+HL_ANSWER, no new lift.
+
+- **Arguments**: x0 = body B, x1 = a precise transform A (layout of section 3: rows +0, +16, +32; high translation +48
+  .. +60; low translation +64, +68, +72), x2 = out (32 bytes). Uses 64 bytes of stack for a temporary transform T.
+- **Step 1, `0x8170341c(T, A, B + 128)`: compose A with the body's transform.** Let `Q0, Q1, Q2, Q3` be the four float4
+  at B +128, +144, +160, +176. For each `q` of `Q3, Q2, Q1, Q0` (in that order, results to T +48, +32, +16, +0):
+  `T_q = (A0 * q.x + A1 * q.y) + A2 * q.z`, 4 lanes, each multiply and add separately rounded, single precision
+  (A0, A1, A2 = A +0, +16, +32; q.x etc. = lanes 0, 1, 2 of q broadcast). Then the precise translation: `L = (A64,
+  A68, A72, A72)`, `H = A +48 .. +60`, `s = T48 + L`, `hi = H + s` -> T +48; `lo = s - (hi - H)` (two operations, in
+  that order) -> lanes 0, 1 to T +64, lane 2 to T +72. All single, unfused.
+- **Step 2, half extents.** `r` = float at B +104 (broadcast); `e = (B140 + r, B156 + r, B172 + r, G80 + r)` (B140 =
+  float at B +140, the w lane of Q0; B156, B172 likewise; G80 = float at G +80 where G is the pointer stored at guest address
+  `0x84ca4680` (page `0x84ca4000` +1664); read it at run time; e.w is computed but not
+  used). `C = (G80, G84, G80, G84)` (the 8 bytes at G +80 repeated).
+  `a0 = |T0 * e.x|`, `a1 = |T16 * e.y|`, `a2 = |T32 * e.z|` (multiply rounded, then the sign bit cleared), then
+  `E = (C + a0) + (a1 + a2)`, 4 lanes, single, in that order of operations (the two inner sums first: `C + a0` and
+  `a1 + a2`, then their sum).
+- **Step 3, centre in double**: `P = (d(T48) + d(T64), d(T52) + d(T68), d(T56) + d(T72), d(T60) + d(T72))` (the w lane
+  again adds +72), double adds. For each lane k: `mn = P_k - d(E_k)`, `mx = P_k + d(E_k)` (double), then the outward
+  nudge of U1 (min: bits - 0x10000000 if mn > 0, else bits + 0x10000000; max: bits + 0x10000000 if mx >= 0, else
+  bits - 0x10000000), convert to single (nearest). Out +0 = (mn_x .. mn_w), +16 = (mx_x .. mx_w). Nothing else is
+  written but the 64 bytes of stack (not visible to callers).
+- **Exactness**: no FMA; abs is exact; the only rule beyond plain IEEE is the nudge, done on the integer bits as the
+  guest does. Fallback as in the common rules.
+- **Check**: the 32 output bytes. **Expected chain effect**: J 0.029 (0.024 alone): 2x -0.015 / -0.012, 4x -0.022 /
+  -0.018. Work: 2 days.
+
+### 6.3 U3: `0x817d9d80`, the per-body AABB update of the last substep
+
+**Structure read; operation order of the middle part not yet read: the specification is not complete.** 736 insns,
+called once per body by `0x8182dc20` (subIntegrateLastStep, 1 site: HL_GATE). Arguments x0 = simulation thread context
+(or 0), x1 = motion (+48, +64, +96 read), x2 = a solver per-body record (+76), x3, x4 = **the body** (written), x5 = a
+velocity / motion-state record (+0..+60 read). Global: the pointer at `0x84ca4680` (the same G as in U2: +96, +336,
++512, +640 read).
+
+1. If the body flag word at body +92 has bit 10 clear: zero body +94 and +76 and go to step 3.
+2. Otherwise (a moving body): from the motion's velocities (x5 +40 / +56, x1 +96), squared magnitudes (FMUL, pairwise
+   adds), square roots, an FMIN against G +96, scaled by constants and by the 16-bit value at body +154 placed in a
+   float's high half; converted to integers toward zero (FCVTZS) and clamped to 0xffff: three 16-bit fields at body +76,
+   +78, +94 (the body's quantised speed / look-ahead values, likely). Then the body's new transform is rebuilt from the
+   motion's orientation (x5 +0, +16, +32 through byte-shuffle tables at `0x83c5e000`+1488 / +2512 / +32 and +304: a
+   quaternion-to-matrix with 4-wide multiplies and subtractions, then `0x80168130`), written to body +0..+40 (three
+   rows of 12 bytes), and the precise position written to body +48..+60 (high) and +64..+72 (low) by double
+   subtraction and conversion (same two-part scheme as section 3).
+3. Collision look-ahead: `x = max(f(body +60) - G336 * x1 +48 ..., ...)` (an FMAX pair against x2 +76), then, unless the
+   shape's flag (body +140 bit 3) selects the inline path, **the shape's AABB through the shape-type table**: pointer at
+   `0x83e40000` +2248, entry (shape +24 byte) << 9, slot +24, called with (shape at body +120, body, a stack transform):
+   this is where U1 (`0x8173e2ac`, convex) and U2 (`0x81a040bc`, box-like) are reached. The inline path quantises the
+   body's local AABB (bytes at body +157, widened to 16 then 32 bits, converted to float, times a scale from +154) and
+   transforms it like U2 (absolute rotated extents, double centre, outward nudge).
+4. Expansion by the motion: FMIN / FMAX of the static AABB with the swept one (`0x817d8c90` when the body's +32 flags of
+   x3 bit 17 ask for a linear cast), results kept in v23 / v24, stored as the body's AABB (+112..: 8 bytes stored here;
+   the other half not yet traced) and two 16-bit fields at body +148 / +150.
+5. Bookkeeping: the body's index appended to the thread context's moved-bodies arrays (+1568 with its count, +1888 /
+   +1896; grown by `0x816ef7bc`, Havok's block-stream allocator), flag word +92 updated. **These appends are what make
+   the loop's order visible**: the native unit must append in the same order (it runs per body, called in order, so it
+   does).
+
+To finish before coding: the exact operation order of steps 2-4 (about 400 guest instructions), the second half of the
+AABB store, and `0x817d8c90`. It is the best of the three by chain effect, because it runs entirely in the solver's
+alone stretch: J 0.141 (0.141 alone): 2x -0.071, 4x -0.106 (upper = strict). Work: 4-6 days once read, U1 and U2
+included.
+
+Expected after the three, at 4x: about -0.13 ms of the chain in the strict reading (U1's solver share and U2 counted
+once inside U3), -0.19 in the upper one. Small: their value is that they build the gate, the bridge, the exactness
+rules and the differential check that units 4-6 (the contact solver, the integration, the whole solver task: 0.30 ms
+strict at 4x) need.
+
+## 7. Not established
+
+- The function that turns an `hknpTaskGraph` into the game's jobs, and how task dependencies are expressed to the
+  game's scheduler (the phive node layout is read; the bridge from hkTaskGraph to nodes is not).
+- Why the step appears twice in a frame's wait (two worlds or two half-steps).
+- The number of solver tasks a step creates, what each covers (`0x819b7700` not read), and the number of islands: so
+  the scheduling gain of running islands in parallel is not a number.
+- The FPCR value (FZ) on the executors while they run Havok tasks: two code paths set FZ; which one applies is a run-time
+  fact (one log line in the differential mode of section 6).
+- U3 is not specified completely (6.3): the operation order of its steps 2-4, the second half of the AABB it stores
+  and its callee `0x817d8c90` must be read before coding. U1 and U2 are complete.
+- The meaning of U2's inputs (which transform x1 is, what the w lanes of the body's rows and G +80 hold) is inferred;
+  the specification does not depend on it.
+- The contact solver's Jacobian stream layout (`0x8177b2a0`), the body / motion layouts (offsets beyond those named
+  above), the block-stream allocator's buffers.
+- Section 2 for cloth (only summarised in 1.5 and 4.2), the broad phase and the point queries in loop detail; the full
+  ranking of section 5 beyond physics (cloth units, kernels of the actor jobs).
+- "Calls a frame" for each loop body: the samples give time, not call counts; no counts were taken.
+- One scene, one machine (castle-move, main PC), as in `critical-jobs.md`.
