@@ -111,6 +111,33 @@ table is read against them, not to argue with the goal.
   multiply-adds, NaN rules of min and max, flush-to-zero, ARM's reciprocal square root estimate), or the game's
   simulation diverges from the console's. Each replacement is compared on live inputs before it is switched on.
 
+## State of the hybrid engine (kept current; last update 2026-11-13, midday)
+
+What is native and switched on in the game today (each brick validated in the three scenes by function and picture;
+speed is not being measured for now, by the owner's instruction: it comes back when the physics loops are touched):
+
+| Subsystem | Brick | Switch (default) | What it does today | What is still the game's |
+|---|---|---|---|---|
+| Jobs | `hl::jobs::JobSystem`, `hl::bridge::JobBridge` | `HL_JOBS` (1) | each job thread's stage is a job of the native job system | the dispatcher that picks jobs (a native one is being written: `HL_DISPATCH`), stage begin and wait, the job group, the main loop |
+| Memory | no-access GPU pools out of RAM | `HOS_NOACCESS_RAM` (1) | 0.4 GB of RAM | - |
+| Memory | `hl::mem::ColdPages` | `HL_MEM_COLD` (1) | cold pages of CPU-cached GPU pools leave the working set: 2.1-2.5 GB of RAM (commit unchanged) | the heaps outside pools (3.5 GB, cold at 90%: being added); true decommit with restore from the game's files (specified: `memory-boundary.md` 9) |
+| Memory | heap and regions committed on first touch | `HOS_LAZY_COMMIT` (1) | 2.9 GB of commit | - |
+| Rendering | `hl::gfx::RecordPass` | `HL_GFX` (1) | the recording pass's listener is native and runs the pass's two phases | the phases themselves (translated); the first native producer of NVN calls is being written (`HL_GFX_STATE`); direct emission to Vulkan |
+| OS layer | a mutex finds its host object from itself | `HOS_NO_MUTEX_IX` unset | 0.5 ms a frame of lookups gone from the chain | - |
+| Streaming | - | - | - | everything; the per-file heaps (one heap a loaded resource file, named by its path) are the handle for it |
+| Physics loops | - | - | - | everything; specified in `physics-loops.md` (the step as a task graph, first units) |
+
+Measured with all of the above on (main PC, validation runs, MB): the game's memory in RAM 5,040-5,515 (it was
+8,200), the process's RAM 10,400-11,000 (it was 14,100), commit 19,900-21,600 (it was 24,900), VRAM 6,000-7,100.
+
+Tools that measure it: `HOS_MEM_SPLIT` (RAM by part and by GPU pool flags), `HOS_HEAP_SPLIT[_COLD]` (the heaps as a tree,
+their RAM and coldness), `HOS_POOL_TRAP` (who touches GPU pool pages), `RX_VK_RES_LOG` (the process and VRAM),
+`tools/bench/steptable.py` (the table of a set of runs).
+
+To look at when speed is measured again: in one validation run of the castle walk the cold-pages thread saw 222 MB come
+back within 10 s while the scene streamed, and that run's frame count was low; whether the two are linked is not
+established (other work was running on the PC).
+
 ## Rules
 
 1. **The translator is frozen.** No change to how ARM64 instructions are translated or to how the generated code is
