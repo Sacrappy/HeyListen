@@ -10,7 +10,7 @@
    function) the report says which block the faulting address and each register are in, live or freed, allocated and
    freed by whom and when, then the last 200 events of the crashing thread and the last 50 of every other thread merged
    by time; and hl_trace.bin is written in the game's folder.
-   HL_TRACE_DUMP=<s>: also write hl_trace.bin <s> seconds after the start (runs that end by being stopped). */
+   HL_TRACE_DUMP=<s>: also write hl_trace.bin <s> seconds after the start (runs that end by being stopped), after a report as a crash prints it (with the last 3 events of each thread). */
 #include "hl_host.h"
 #include "hl_trace.h"
 #include <stdio.h>
@@ -135,6 +135,8 @@ void hl_trace_on_crash(Ctx *c, uint64_t fault) {
 
 static DWORD WINAPI dump_after(void *p) {
     Sleep((DWORD)(uintptr_t)p * 1000);
+    /* (the report as a crash prints it, on this thread's state, with every thread's last 3 events: the format seen) */
+    hl_trace_report(0, NULL, NULL, 0, 0, 3);
     uint64_t a, f, u, full, t;
     hl_trace_counts(&a, &f, &u, &full, &t);
     hos_log("hl trace: %llu allocations, %llu frees (%llu of blocks not seen allocated), %llu not listed, %llu threads; %s "
