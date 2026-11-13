@@ -697,6 +697,182 @@ default since these runs.
 - **The rest of the function**: the cluster paths (culling with the frustum and the depth pyramid, merging runs) are a
   numeric kernel; they are 0.01-6% of the calls in these scenes, so they come after the draw function `0x80681320`.
 
+## 10. Brick 2.4: the shared preparation `0x8008fc00`
+
+### Reading: what it is
+
+`0x8008fc00` (7,134 lifted lines, 5,733 guest instructions, a 224-byte frame, one return) **prepares a draw**: it picks the
+drawable's material entry for the block's pass, then applies to the command buffer whatever the block says was not
+applied yet: the render state, the program, the program's buffers and textures, a per-drawable uniform block, and the
+entry's pre-recorded command list (or guest code that binds the vertex streams). It is called directly from 263
+functions (266 sites): the sub-mesh submission `0x80078fc0`, the recording job `0x80084de0` (2 sites), `0x800955a0`
+(3 sites, 4,652 lines) and about 260 small functions (100-200 lines each, `0x8366d820`..., one site each: template
+instances of the per-variant draws, *(inference)*).
+
+| Register | What |
+|---|---|
+| x0 | the render-state block B (section 8: the 352-byte block on the draw function's stack) |
+| x1 | the drawable D (section 9) |
+| w2 | not read (the sub-mesh submission passes 0) |
+| result | w0: 1 when the material entry is not empty (every path that gets past the start), 0 when it is (the function then does nothing at all) |
+
+**Its order** (each step the first branch of the function that can leave the step before):
+
+1. **The material entry M.** The slot is B+0x62, or, when that is 0xff, the drawable's pass slot D+0x2c[B+0x39] (an
+   unsigned byte index; B+0x39 is the byte section 8 calls the depth mode). The slot is a signed byte index into
+   D+0x3b[]: an entry of -1 takes the game's default entry (the GOT slot `0x84cb5d10`), any other e takes
+   M = D+0x60 + e x D+0x5f (the entries' stride). M+0 = 0: return 0.
+2. **The render state.** When D+0x58 (the drawable's state key) differs from B+0x59, or (with B+0x5c bit 0) the material
+   state's id ([D+0x70]+0x154) differs from B+0x98, the function copies the material state into the block (blend color
+   +0xf8, the eight targets' blend factors and equations +0x118..+0x147, the blend targets +0xf4, depth test and writes
+   +0xf0 / +0xf1, depth function +0x154, cull face +0x155, polygon mode +0x15b / +0x15c, polygon offset enables +0x15d,
+   each compared first) and, when anything changed and B's flags bit 17 is clear, **records the whole render state
+   again** (36 NVN sites: blend and color defaults, logic op, the enabled targets' blend, color bind, blend color, eight
+   channel masks, depth-stencil, stencil values when stencil test is on, polygon state, offset clamp, depth clamp): the
+   render-state function's set (section 8) with the logic op and front face fixed.
+3. **The program.** M+8 is the program object P; when it differs from B+0xd8: **BindProgram**(the recording context's
+   +0x188, P+0x20, P+0x28), B+0xd0 = 0, B+0xd8 = P; then the program's interface, each part compared with the block's
+   copy of its id: [P] (four 32-bit words: an id against B+0x90, and three binding words against B+0x78, +0x7c, +0x80),
+   [P+8] (an id against B+0x94, binding words at +0x28 / +0x2c against B+0x84 / +0x88), [P+0x10] (an id against B+0x8c,
+   a 30-bit mask at +4, a binding word per texture slot from +8). A binding word holds a slot per shader stage group
+   in its low three bytes (0xff: none) and a tag in its top byte (0xff, 0xfe, 0xfd, 0xfc, 0xfb: which stages, through
+   the tables at `0x83f0f7c8` and `0x83f49888`). **Uniform blocks and storage buffers** are bound from buffer objects
+   (B+0x30, and the material's +0x538, +0x540, +0x588): the object's alignment and bind are virtual methods (+0x28,
+   +0x50), devirtualized against the game's two known classes (`0x8002a580` / `0x80365940` for the alignment;
+   `0x8353e5d0` binds a uniform buffer, `0x834bc160` a storage buffer), else called; the address is base +0x80 plus an
+   aligned stride (+0x40, +0x48, +0x4a, +0x88) times the index. **Textures and samplers**: per slot of the mask, with B's
+   mode bit 7 from the handle table at B+0xb8 (**BindTexturesDeferred**), else from the texture objects at B+0x20 (an
+   object not ready yet is waited for and registered through guest code: `0x802a6e80`, `0x802a6cc0`, a texture view
+   with swizzle and `0x800634b0`; then **DeviceGetTextureHandle** and **BindTexture** per stage). With the global switch
+   `0x84ca2dd8` set, every bind is written into the command memory directly (method words, no NVN call).
+4. **Pending bits.** When B+0xb0 is not 0: the bits less D+0x14 that B+0xb2 does not have yet are applied (a path at
+   `0x80094654`, not read in detail); else B+0xb2 takes them.
+5. **The per-drawable uniform block.** When the material's +0x518 table exists, D+0x5a differs from B+0x60 and B+0x80
+   is not -1: the entry (0xc8 bytes at the material's +0x598, bounded by +0x590) is made ready once through `0x808a3050`
+   (an atomic flag at its +0xc0) and bound like the program's blocks; B+0x60 = D+0x5a.
+6. **The list or the streams.** k = [D+8]+0x14 & 3. With B+0x5c bit 3 and the entry's list k present (M+0x18+16k bit
+   0): when its bit 1 is set, the command buffer's mark byte is set and **CallCommands**(command buffer, 1, M+0x10+16k)
+   (with the global switch, the call is written into the command memory, as in section 9). Otherwise guest code binds
+   the vertex streams: `0x802a03f0`(the model, the context, the slot) and `0x83604500` (2,315 lines, 57 indirect calls),
+   after a CallCommands of a pre-recorded handle the model keeps per slot, when B+0x5c bit 4 and D+0x59 bit 2 say so.
+7. **Clusters.** With B+0x38 (the cluster index): `0x83606290` when D+0x54 bit 2, and `0x835c2690` (787 lines) when
+   D+0x16 is not 0.
+
+**The structures it reads** (who writes them: the block is the draw function's, section 8, rewritten field by field by
+this function and the render-state function; D, its material entries, the material and the program are the scene's
+and the shader system's, written before the frame's recording: not traced):
+
+| Structure | Fields |
+|---|---|
+| B (written) | +0x59 state key applied, +0x5c mode bits (bits 12, 13, 15 rewritten from the program), +0x60 drawable block applied, +0x78..+0x94 the interface ids and binding words applied, +0x98 material state applied (**the render-state function sets it to all ones at every call**, so a draw that called it re-applies the material state at its next preparation), +0xb2 bits applied, +0xd0 / +0xd8 program applied, +0xf0..+0x15d the render state copied from the material state |
+| B (read) | +0x0 flags (bit 17: record nothing), +0x18 the material (its +0x518, +0x538, +0x540, +0x588, +0x590 / +0x598), +0x20 texture objects, +0x28 the recording context (+0xd8 the command buffer, +0x188 the object BindProgram takes), +0x30 a buffer object, +0x38 cluster, +0x39 pass, +0x62 slot, +0xb0 pending bits, +0xb8 handle table |
+| D | +0x8 (its +0x14: the list selector), +0x14 pending mask, +0x16 cluster count, +0x2c pass slots, +0x3b material slots, +0x54 kinds, +0x58 state key, +0x5a drawable block, +0x5f stride, +0x60 entries, +0x68 model, +0x70 material state (+0xe0..+0x159) |
+| M | +0 (0: no material), +8 program, +0x10 + 16k four lists (+0 handle, +8 flags) |
+| P | +0 interface ids and binding words, +8 more, +0x10 the texture table, +0x20 / +0x28 the NVN program and its stages, +0x30 u16 flags (bits 7, 8: default ids from the globals at `0x84ea2848`..`0x84ea2858`) |
+| Globals | `0x84cb5d10` default entry, `0x84ca2dd8` inline-write switch, `0x84cb56e0` / `0x84cb56e8` / `0x84cb4fa8` / `0x84cb4fb8` the known buffer classes' methods |
+
+**What it caches.** Everything it skips is cached in the block, so for the life of one draw function's block: the
+state key and material state (step 2), the program and each part of its interface (step 3), the pending bits (4), the
+drawable block (5). Nothing is cached across draws, and the list (step 6) is called at every call.
+
+**Callees**, by kind: **guest logic that must be called back**: `0x808a3050` (the drawable block made ready once),
+`0x802a03f0` and `0x83604500` (vertex streams), `0x83606290` and `0x835c2690` (clusters), `0x802a6e80`, `0x802a6cc0`,
+`0x800634b0` (a texture registered and its view made), the buffer objects' virtual methods; **SDK imports** (the
+`0x83c6xxxx` stubs: a timed wait while a texture becomes ready, `0x83c62370` a copy), `0x80e5a620`; **NVN-only**:
+`0x8572f020` (the inline-write copy). Indirect calls: 159, of which **117 are NVN procedures** and 42 the buffer
+objects' methods and their alignment calls. (The brief's "145 NVN sites" counted the virtual binds whose register had
+been loaded from a procedure's GOT entry earlier: a per-site reading of the register's last load gives 117.)
+
+**Its NVN sites by what they bind** (117): render state 36 (setters 25, binds and values 11), program 1, uniform
+blocks 47 (BindUniformBuffer 46, BufferGetAddress 1), storage buffers 12, textures 18 (BindTexture 11,
+BindTexturesDeferred 4, DeviceGetTextureHandle 1, texture view 2), CallCommands 3.
+
+### The cut, and why
+
+The function cannot be cut at a point in its middle and the rest left to the translation: an entry gate answers the
+whole call or none of it. So the native version takes **whole calls on chosen paths**, decided before anything is
+written, and leaves every other call whole to the translated body (as the sub-mesh submission does with its paths).
+`decide()` follows the function's order and stops at the first step that leaves the native paths; that step is the
+call's **route** (`hl::gfx::PrepareRoute`), counted for every call. The paths taken natively:
+
+- **cached** (step 2 and 3 already applied): the material entry not empty, the state key and the material state
+  applied, the program bound, the pending bits applied, the drawable block unchanged (or none), the list present. The
+  call reads about twenty fields, writes at most B+0xb2 and the mark byte, makes at most one NVN call (the list's
+  CallCommands);
+- **program bound** (step 3 without a bind): another program whose interface's three parts have the ids, or the
+  binding words, the block already applied (or whose texture part has no slot): BindProgram, the block's copies of the
+  program and of the ids, mode bits 12 / 13, the per-drawable block's binding word when only it changed (no bind: the
+  entry is then marked to be bound, and the call goes on to step 5, which the translation does when it binds), the
+  applied bits cleared when an id changed; then the rest as on the cached path;
+- **no material**: return 0, nothing else.
+
+None of them reaches a guest callee, so each is exact by construction and checkable call by call. They were chosen from
+the histogram below: the cached path is two thirds of the calls, the program bound alone one tenth. The other routes:
+**state** (the render state recorded again, 28 calls, and in its frequent shapes another program too: 7% of the
+calls, 56% of the function's NVN calls), **program** (another program with buffers or textures to bind: 12%), **drawable block** (1.5%).
+The pending-bits, streams, inline and clusters routes were never taken in the three scenes.
+
+What comes next: the state step (its 28 calls are the render-state function's set, which `RecordSink` already writes
+as records; the step's derivations read the material state at D+0x70 field by field), then the program step's binds
+(uniform blocks and textures: the procedures stream 8 is turning into records, and the buffer objects' virtual methods,
+which need their classes read first).
+
+### What is built
+
+| Piece | Where | What it does |
+|---|---|---|
+| `hl::gfx::Prepare` | `engine/native/{include,src}/hl/gfx/Prepare.*` | `decide()`: the route in the function's order, and on the native paths the result, the program step's writes, the bits written and the list call; `emit()`: BindProgram and CallCommands |
+| The NVN table | `hl/gfx/Nvn.h`, `src/gfx/Nvn.cpp` | one procedure more (35): BindProgram (its global `0x84d67c60`, checked against the game's at start like the others) |
+| The bridge | `hl/bridge/GfxBridge.*` | `guest::MaterialEntry`, `guest::Program`, the drawable's and the block's new fields (each `static_assert(offsetof)`), `PrepareBridge`: the material entry chosen, the reads (the program's parts only where the function dereferences them: a part both the block and the program say is the defaults is not read, the texture part not under mode bit 15), the writes (told to the write tracking), the bytes compared |
+| C surface | `hl/c/hl_gfx.h`, `src/c/hl_gfx.cpp` | `hl_gfx_prep_start / _apply / _check_begin / _check_call / _check_end / _report / _shapes`; the paths' histogram |
+| OS layer | `engine/host/hl_gfx.c` | the gate `HL_GATE(8008fc00, "4df7e218373859d0")` (already in `code_hot_7.c` as section 9's checkpoint: no new gate, no recompile of the lifted file) now also answers the preparation; the checkpoint's call of the translated preparation goes through it, so it is checked too; the tap now tells each procedure's kind |
+| Tests | `engine/native/tests/gfx_test.cpp` | each route in order, the bits, the calls; the program step's parts, defaults, bit 15 and the third word; the bridge's reads (the slot through the pass, a signed slot to the default entry, the list, the program's parts), its stop points, its writes against the expected bytes |
+
+Switches: `HL_GFX_PREP` 0 (the translated function) or 1 (native on the paths above); `HL_GFX_CHECK=1` checks every
+call instead (the route counted; on the native paths the call compared: the NVN calls with their arguments, the block's
+352 bytes, the mark byte and the result) and files every call's translated NVN calls by kind in the histogram;
+`HL_GFX_LOG=1` the lines `hl gfx: preparation: ...` and `hl gfx: preparation shapes ...` every 10 s. `RecordSink` is not
+extended: the native paths' two procedures are not record-only: BindProgram's handler and CallCommands' (which copies
+the called recording into the caller under the copy lock, `inline_recording`) are left to the NVN layer, through
+`NvnSink` as the sub-mesh submission does.
+
+### The paths' histogram and the check (main PC, `HL_GFX_CHECK=1`, 110 s a scene; counts at the last report)
+
+Calls by route (translated NVN calls of those calls in brackets):
+
+| Scene | Calls | cached | program bound | state | program | drawable block | Native share of calls |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | 7,084,588 | 4,811,097 (4.81 M) | 787,010 (1.57 M) | 520,237 (18.0 M) | 860,266 (7.36 M) | 105,978 (0.35 M) | 79.0% |
+| castle-move | 2,720,759 | 1,845,849 (1.85 M) | 287,908 (0.58 M) | 190,999 (6.70 M) | 356,605 (3.03 M) | 39,398 (0.13 M) | 78.4% |
+| hyrule-walk | 6,351,935 | 4,268,874 (4.27 M) | 693,836 (1.39 M) | 474,877 (16.5 M) | 820,113 (6.98 M) | 94,235 (0.31 M) | 78.1% |
+
+No call took the no-material, pending-bits, streams, inline or clusters routes. Every call ends with the list's
+CallCommands in every frequent shape. The most frequent shapes (kokiri-idle; state, program, uniform, storage,
+texture, call NVN calls): cached 0 0 0 0 0 1 (4.81 M); program bound 0 1 0 0 0 1 (787 k); state 28 1 1 0 0 1 (195 k);
+program with 7, 8 or 5 textures 0 1 0 0 n 1 (124 k, 120 k, 107 k); state 28 1 0 0 0 1 (117 k); drawable block 0 1 1 0 0 1
+(72 k); 121 shapes in all, 171-176 in the two other scenes, the same leaders in the same order. None of the sixteen most frequent shapes binds a storage buffer.
+
+**Check**: 0 mismatched calls in the three scenes: 5,598,107 / 2,133,757 / 4,962,710 calls compared (6,385,120 /
+2,421,671 / 5,656,549 NVN calls compared), and the same build's sections 8 and 9 checks at 0 too (render state 65,958 /
+5,605 / 57,603 calls; submission 262,340 / 76,875 / 220,675). The castle-move run reached the scene late (seven reports
+of 10 s), hence its smaller counts. The first build (cached path only) gave the same at its own share: 4,681,192 /
+5,013,227 / 5,533,572 calls compared, 0 mismatched (67-68% of 6.9-8.3 M calls).
+
+### Validation on the main PC (`build/s5/valid.sh`, 110 s a scene, with the other gfx bricks at their defaults)
+
+| Build | Scene | Ran | Game speed ratio | Native calls (cached / program bound; left: state / program / drawable block) | Shots |
+|---|---|---|---|---|---|
+| cached path only (`s2d-prep`) | kokiri-idle | to the end, no crash | 60.33 | 5,924,364 / -; 640,627 / 2,226,150 / 0 | right (the Market square, characters, shadows, HUD, as `refshots-kokiri-idle`) |
+| | castle-move | to the end, no crash | 60.36 | 5,022,907 / -; 544,776 / 1,878,600 / 0 | right (a street of the castle town: the door, the stalls, the tent) |
+| | hyrule-walk | to the end, no crash | 60.11 | 5,150,875 / -; 599,831 / 2,032,596 / 0 | right (the fountain, villagers in close-up, the "Parler" prompt) |
+| both paths (`s2e-prep`) | kokiri-idle | to the end, no crash | 59.86 | 6,218,365 / 1,023,371; 676,265 / 1,123,664 / 137,640 | right (the square with speech text) |
+| | castle-move | to the end, no crash | 59.61 | 4,977,569 / 808,904; 536,099 / 960,090 / 107,131 | right (the square at 16,800; barrels and crates close-up at the end; a loading screen at 13,800 as in the scene's own transition) |
+| | hyrule-walk | to the end, no crash | 59.98 | 5,120,562 / 866,131; 581,282 / 970,557 / 109,534 | right (the fountain square, characters) |
+
+Memory with both paths (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 2,319 / 1,303 / 5,817 /
+17,822 / 5,604; castle-move 2,923 / 1,526 / 6,525 / 18,916 / 6,363; hyrule-walk 2,517 / 1,440 / 6,248 / 18,443 / 5,995
+(the brick allocates nothing: these are the build's figures).
+## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
   (who fills slot +32 / +44 / +48), and when; whether gameplay reads any of them in place.

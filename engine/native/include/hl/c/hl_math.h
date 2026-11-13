@@ -50,6 +50,24 @@ typedef struct {
 } hl_math_body_plan;
 int hl_math_body_box(const hl_guest_host *host, const hl_math_body_args *a, hl_math_body_plan *plan);
 
+/* 0x8182dc20's step of one motion (hl/math/MotionStep.h; physics-loops.md 9.3), on host pointers: motion = its 128 bytes
+   (or a copy), a / b = the two solver velocity entries, data = the solver step data, global = the physics module's
+   global object. Nothing is written but plan: the motion as the step leaves it and what the rest of the function needs.
+   Returns 1, or 0 with the reason in plan->decline (hl::math::MotionDecline: 1 values, 2 the modifier's path). */
+typedef struct {
+    uint8_t motion[128];
+    int clamp_v, clamp_w;   /* the clamp records (kind 0, kind 1) the step appends */
+    int n_path;             /* 0 none, 1 within the threshold, 2 W scaled, 3 W zeroed, 4 W and V zeroed */
+    int moving;
+    int body_flag;          /* 0x1000 or 0 */
+    int still_record;       /* the deactivation's zero case */
+    float cell_pos[4];
+    int32_t acc[4];
+    int decline;
+} hl_math_motion_plan;
+int hl_math_motion_step(const void *motion, const void *a, const void *b, const void *data, const void *global,
+                        hl_math_motion_plan *plan);
+
 /* The calling thread's reason the last declining kernel gave up (hl::math::Why: 0 none; see hl/math/Exact.h), cleared
    by the call; values gets the operation's operands and result (bits). */
 int hl_math_last_why(uint64_t values[3]);

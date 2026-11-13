@@ -18,6 +18,14 @@ The second argument is the hash of the lifted function's text the native code wa
 gate is put in only when the text hashes so. Another game version or another lift leaves the function alone, with a
 warning, and the module's switch then does nothing (hl_gate_on_<address> is never read).
 
+With the gate, one line goes right before the function, which tells the OS layer at start that the gate is in:
+
+    __attribute__((constructor)) static void hl_gate_in_80ba6d80(void) { ... hl_gate_present(0x80ba6d80ULL); }   /* hl gate 80ba6d80 */
+
+so that a module whose gates must be on together (functions sharing state, half native and half translated otherwise)
+switches them on only when every one of them is in the lifted code (host/hl_host.h hl_gates_in). Every function's hash
+leaves out every gate's lines, its own and the next function's presence line.
+
 The gates wanted are read from the host sources, so there is no second list to keep. A gate no source asks for any more is
 taken out. Only the files whose text changes are written (and so recompiled). Applied after a lift by oot_patches.apply,
 and before a build by the development scripts.
@@ -33,12 +41,18 @@ HOST = os.path.join(HERE, "..", "host")
 WANT = re.compile(r'^HL_GATE\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f]*)"\s*\)', re.M)
 MARK = re.compile(r"^.*/\* hl gate ([0-9a-f]{8}) \*/\n", re.M)
 HEAD = "void f_%s(Ctx *__restrict A64_NOESC c) {\n"
+FORM = "form 2: gate line and presence line"
 NEXT = re.compile(r"^void f_[0-9a-f]{8}\(Ctx \*__restrict A64_NOESC c\) \{\n", re.M)
 
 
 def gate_line(addr):
     return ("    { extern volatile int hl_gate_on_%s; extern int hl_gate_%s(Ctx *A64_NOESC); "
             "if (__builtin_expect(hl_gate_on_%s, 0) && hl_gate_%s(c)) return; }   /* hl gate %s */\n" % ((addr,) * 5))
+
+
+def present_line(addr):
+    return ("__attribute__((constructor)) static void hl_gate_in_%s(void) { extern void hl_gate_present(unsigned long long); "
+            "hl_gate_present(0x%sULL); }   /* hl gate %s */\n" % ((addr,) * 3))
 
 
 def wanted(host=HOST):
@@ -64,11 +78,11 @@ def body_of(s, addr):
 
 
 def text_hash(s, addr):
-    """the hash of f_<addr>'s lifted text, without a gate line: the same before and after the gate is put in"""
+    """the hash of f_<addr>'s lifted text, without any gate's lines: the same before and after gates are put in"""
     span = body_of(s, addr)
     if span is None:
         return None
-    body = MARK.sub(lambda m: "" if m.group(1) == addr else m.group(0), s[span[0]:span[1]])
+    body = MARK.sub("", s[span[0]:span[1]])
     return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
 
 
@@ -87,18 +101,24 @@ def apply_text(s, want):
         if span is None:
             continue
         got = text_hash(s, addr)
-        line = gate_line(addr)
+        line, present = gate_line(addr), present_line(addr)
         has = line in s[span[0]:span[1]]
+        has_present = s[:span[0]].endswith(present)
         if got != h:
             if has:
                 s = s[:span[0]] + s[span[0]:span[1]].replace(line, "", 1) + s[span[1]:]
+            if has_present:
+                s = s[:span[0] - len(present)] + s[span[0]:]
             status[addr] = "NOT gated: its lifted text hashes %s, the native code was written against %s" % (got, h or "(none given)")
             continue
-        if has:
+        if has and has_present:
             status[addr] = "gated already"
             continue
-        at = span[0] + len(HEAD % addr)
-        s = s[:at] + line + s[at:]
+        if not has:
+            at = span[0] + len(HEAD % addr)
+            s = s[:at] + line + s[at:]
+        if not has_present:
+            s = s[:span[0]] + present + s[span[0]:]
         status[addr] = "gated"
     return s, status
 
@@ -107,7 +127,8 @@ def apply(gen, host=HOST, quiet=False):
     """Returns the number of gates wanted that are in place."""
     want = wanted(host)
     state_path = os.path.join(gen, "hl_gates.state")
-    state = "\n".join("%s %s" % kv for kv in sorted(want.items()))
+    # (FORM: the gates' lines as this script writes them; a new form makes a gen folder stamped by the old one read again)
+    state = FORM + "\n" + "\n".join("%s %s" % kv for kv in sorted(want.items()))
     files = sorted(glob.glob(os.path.join(gen, "code_*.c")))
     stamp = state + "\n" + "\n".join("%s %d %d" % (os.path.basename(p), os.path.getsize(p), os.stat(p).st_mtime_ns) for p in files)
     if os.path.isfile(state_path):   # (nothing asked for changed and no file was written since: nothing to read)

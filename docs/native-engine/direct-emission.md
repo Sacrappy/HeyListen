@@ -657,3 +657,154 @@ The brick changes no memory: what the segments hold is the same bytes.
   already and would show it.
 - The check's machinery (`mark`, `bytes`, `rewind`) compares any native unit's records with the NVN procedures' in place,
   call by call; brick D's check can reuse it as it is.
+
+## 9. Brick C, step 1: are uniform blocks final at their bind, and what would an inline take out of the capture (measured)
+
+### What was built (`HL_UBO_CHECK=1`, off by default; a measurement, no behaviour change)
+
+| Piece | Where | What it does |
+|---|---|---|
+| The check record | `rx_nvn.h` (`NOP_UBO_CHECK`, `nvn_p_ubo_check`, `nvn_ubo_hash`) | appended after the last op; stage, slot, address, size and three hashes of the block's bytes (at most 64 KB) |
+| The host side | `engine/host/nvn_native.c` (`ubo_check_on/_hash/_end`, `bind_buf`, `resolve_deferred`, `EndRecording`, `inline_recording`) | every `BindUniformBuffer(s)` (whoever calls: translated or native code) is followed by a check record with the block hashed at the bind; `EndRecording` adds the hash at the recording's end (a called recording's records keep their own), `QueueSubmitCommands` the hash at the submit. The record is outside the accounting the game reads: `cmd_used`, `hw_used`, `last_rec` are put back after it, and a new `cmd_rec.extra` / `copy_prefix.extra` keeps it out of what `CallCommands` adds to the caller |
+| The back end | `engine/gpu/vk/vk_ubo_check.cpp` (new), hooks in `vk_replay.cpp` (`replay()`: `NOP_BEGIN`, `NOP_UBO_CHECK`, `NOP_UPDATE_UB`, `ubo_check_refs`; `present()`), `vk_memory.cpp` (`capture_make`, `memory_nvn_pool_of`, `memory_tex_capture_ranges`) | the replay thread's pass over the records (the serial replay or the parallel replay's dry pass, never a segment's worker: each record once) reads the block as submitted (`memory_read_as_submitted`, what the mirror sync and the descriptor's stream copy give the GPU) and compares; counts by stage and slot, size class, pool (flags, size); for the different ones, where the hashes first differ; whether an `UpdateUniformBuffer` of the stream overlaps the range; whether the same range was bound before in the same command buffer. And each capture's pages (`capture_make`) against the ranges the frame's records read, classified at each present |
+
+Lines every 10 s: `hl ubo check: ...` (cumulative), `hl ubo check stage N by slot`, `by size`, `by pool flags:size`, `hl ubo check
+capture the last 10 s ...` and `since the start`, and the pages read by no record by pool and 16 MB region. The renderer interface
+(`vk_api.h`) is unchanged.
+
+### The runs
+
+Main PC, `bash build/s5/valid.sh s8c1 s8-ubo1 HL_UBO_CHECK=1` (the three scenes, 110 s each; logs in `build/s5/s8c1-*`), and one
+castle run of the next build for the pages' pools (`s8c2-castle`). All three ran to the end with no crash line; the game speed
+ratio 59.78 / 60.37 / 59.22 (kokiri / castle / hyrule). **The check is heavy**: it hashes every bound block three times on the
+game's threads and reads it again on the replay's (29-57 GB hashed a run), and the runs' fps were 41-45, the castle's 22 (its
+script marked the run "stopped early" for its few frames measured; the log shows it running to the end). It is a measuring
+mode only. Shots looked at (the last of each scene): the castle town market, complete and right, as the reference.
+
+Binds counted over the whole run (the load included):
+
+| Scene | Binds | Equal | Different | of them changed bind -> end of recording | end of recording -> submit | after the submit | Updated in the stream | Re-binds of a range bound before in the command buffer (equal / different) |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| kokiri-idle | 21,350,119 | 58.0% | 41.3% | 48,579 | **8,770,198** | 2,696 | 139,355 | 8,337,037 / 4,627,692 |
+| castle-move | 10,948,561 | 62.7% | 36.5% | 24,443 | **3,964,604** | 4,980 | 90,248 | 4,864,727 / 2,112,801 |
+| hyrule-walk | 20,051,677 | 61.0% | 38.3% | 43,621 | **7,633,912** | 2,119 | 146,613 | 8,381,874 / 4,032,304 |
+
+No block was unreadable. `UpdateUniformBuffer`s into a range bound already: 233,979 / 160,972 / 243,535.
+
+By pool (flags : pool size), the same in the three scenes:
+
+| Pool | Binds (castle) | Equal (kokiri / castle / hyrule) |
+|---|---:|---|
+| `0x22`, pools of 1 MB or less | 7,146,037 | 43.2% / 44.1% / 45.2% (every different bind is here, but ~2,000 a run) |
+| `0x22`, pools of 1-16 MB | 1,452,865 | 99.9% / 99.8% / 100.0% |
+| `0xa2`, 1-16 MB | 603,803 | 100% |
+| in no pool the back end has flags for | 1,745,856 | 93.8% / 94.8% / 93.2% (the rest: updated in the stream) |
+
+By size: 256 bytes or less 55-63% equal; up to 1 KB 72-74%; up to 4 KB 78-86%; **up to 16 KB 11-13%**; up to 64 KB 84-88% (the
+rest updated in the stream, none different).
+
+By stage and slot (vertex stage 0, fragment 1, the others 2-5): slots 5-8 and 10-13 of stages 0 and 1, slots 3-8 and 10-13 of
+stage 1 (slot 3: 99.9%, a few hundred different a run), every slot of stage 2 but 9, and compute's slots 1-3 are **100% equal in
+the three scenes**; they are bound about once or a few times a frame. The slots that carry the per-draw data are not: stage 0
+slot 1 38-43% (the most bound: ~2.5-5.4 M a run), slot 2 74-76%, slot 3 18-22%, slot 0 33-37%, slot 4 73-84%; stage 1 slot 1
+37-46%, slot 2 71-75%, slot 0 35-41%; slot 9 of stages 0-2 33-49%; compute slot 0 63-73%.
+
+**What the different blocks are.** 99.3-99.4% of them changed between the end of their recording and the submit: the game
+records a command buffer (binding ranges of its ring pools, `0x22` of 1 MB or less) and then writes the per-draw blocks it
+bound, before it submits. A copy at the bind is the previous use's bytes for them. 0.6% of the different blocks (0.2% of all
+binds) changed between the bind and the recording's end, and 0.01-0.05% of all binds after the submit call (the held submits:
+bytes written between `QueueSubmitCommands` and the flush that captures). Re-binds of a range bound earlier in the same command
+buffer are 52-53% of the different binds: the rings are reused within a command buffer, and the console's GPU too sees such a
+range with its submit-time bytes at every draw.
+
+The capture, pages a frame (the last 10 s of each run):
+
+| Scene | Captured | Read only by equal uniform binds | by uniform binds, one at least different | by uniform binds and other records (all storage) | only by other records | texture storage read by no record | **read by no record** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | 9,414 (36.8 MB) | 168 | 238 | 87 | 111 | 35 | **8,774** |
+| castle-move | 11,078 (43.3 MB) | 137 | 205 | 109 | 106 | 49 | **10,473** |
+| hyrule-walk | 9,864 (38.5 MB) | 101 | 169 | 100 | 109 | 26 | **9,359** |
+
+"Read by" means a record of the same frame names a range over the page: uniform and storage binds (immediate and deferred),
+vertex buffers, index buffers (count x size; an indexed indirect draw's first 64 KB), indirect arguments and counts, buffer
+copies' sources, render conditions. The pages read by no record (castle run `s8c2-castle`, a frame): ~9,500 in no pool the back
+end has flags for, the twelve busiest 16 MB regions all in the 256 MB region `0x1050000000`-`0x1060000000` that SPRINT-5 found
+holding most of the capture (1,280-1,360 a frame in `0x1059000000`), ~560-600 in `0x22` pools of 1 MB or less, ~340-500 in
+`0x24` pools. No
+record names those pages: they are read, if at all, through addresses the GPU finds in other data (storage buffers and uniform
+blocks holding pointers: the global memory Eden's recompiler tracks, the culling lists), or by later frames, or not at all;
+this measurement cannot tell which.
+
+### Step 2: built for the one class equal everywhere, not for the per-draw blocks, and why
+
+**Why not for the per-draw blocks (the numbers).** The slots that carry per-draw data (vertex stage slots 0-4 and 9, fragment
+slots 0-2 and 9, geometry slot 9, compute slot 0: with the few mixed slots, about 90% of all binds) are equal at the bind for 18-84% of their binds, slot by
+slot, and their different binds (36-41% of all binds, 4-9 million a run) changed between the end of the recording and the submit
+in 99.3-99.4% of cases: the game records the command buffer, binding ranges of its small ring pools (`0x22`, 1 MB or less, where
+every different bind lies), and only then writes the blocks it bound, before the submit. A copy at the bind would draw them with
+the ring slot's previous bytes, and whether a bind is one of those cannot be known at the bind (the same slot is equal or not draw
+by draw). **What would make the inline possible for them** is the writer: the code that fills those ring blocks after
+`EndRecording` (not identified by this measurement; a `HOS_POOL_TRAP` / write watch on one `0x22` ring pool between a
+recording's end and its submit names it) writing them before it records the bind, which only a native draw loop (brick D) that
+computes the block and binds it in one step can do. Even then the gain in the capture is small: the pages read only by equal
+uniform binds are 101-168 a frame (0.4-0.7 MB of 37-43 MB), every page any uniform bind reads 4-5% (~450-500 pages).
+
+**The class equal everywhere, inlined (`HL_UBO_INLINE=1`).** Every bind of these slots was equal to what the replay read as
+submitted in the three scenes (0 different, 0 updated in the stream, 15,796-451,954 binds a slot a run): vertex stage slots 5-8,
+10, 11 and 13; fragment slots 4-8 and 10-13; geometry slots 0-8 and 10-13; compute slots 1 and 2. (Vertex slot 12 had one
+different bind in hyrule, fragment slot 3 44-186 a run: left out. Compute slots 3 and up were not in the log, whose slot line was
+cut by the log's line limit in those runs: left out.) They are ~10.5% of the binds (castle: 1.15 M of 10.9 M), bound once or a
+few times a frame: per-frame
+and per-pass constants. Built:
+
+| Piece | Where | What it does |
+|---|---|---|
+| The record | `rx_nvn.h` (`NOP_UBO_INLINE`, `nvn_p_ubo_inline`: stage, slot, address, size, n, then the bytes) | appended after `NOP_UBO_CHECK` |
+| The host | `nvn_native.c` (`ubo_inline_slots`, `ubo_inline_on`, `ubo_inline`, `bind_buf`) | a `BindUniformBuffer(s)` of those slots, at most 64 KB and contiguous in host memory, is recorded as the inline record instead of the address record; `cmd_used` and `hw_used` move as the 40-byte address record hw_fix'd to 20 would make them, the rest of the record is in `cmd_rec.extra`, which `CallCommands` leaves out of the caller's accounting (so `GetCommandMemoryUsed` reads the same numbers as without the switch) |
+| The replay | `vk_replay.cpp` (`NOP_UBO_INLINE`, `NOP_BEGIN`, `NOP_BIND_UBO`, `NOP_BIND_BUFS`), `vk_state.h` (`ubo_bytes`, `ubo_bytes_n`) | in every mode (serial, dry, worker) the slot gets the bind's address as before and a pointer to the bytes; `bind_gen` moves when the address, size or bytes change; a bind by address drops the bytes; every recording's `NOP_BEGIN` drops them too (the bytes live in the recording that bound them, which may be freed after its submission: a later recording drawing without a rebind reads the slot by address, as before). The parallel replay's saved states carry the pointer with the rest of `NvnState` |
+| The descriptor | `vk_draw.cpp` `uniform_range`, `vk_replay.cpp` `ub_overlay_onto` | an inline slot is copied from the bytes into the recording's upload stream, the stream's `UpdateUniformBuffer`s over the range applied as `ub_overlay` does, zeros past the bytes carried; no mirror, no read as submitted |
+| The other readers of a slot's address (DLSS and FSR 3 scene notes, the bank and handle reads, the program pick's constant reads, dumps) | unchanged | they read the slot's address in guest memory as before: the measurement says the same bytes |
+| The WebGPU replay | `rx_nvn.cpp` | the inline record as a bind by address |
+
+The capture is not changed: 93-95% of the captured pages are read by no record at all and are still needed (they are read, if at
+all, through pointers in other data), so "needed by no record" is not a safe test, and the pages only these slots' blocks hold
+are a few at most.
+
+**Validation (main PC, function and picture).** `valid.sh s8i1 s8-ubo3 HL_UBO_INLINE=1`: castle-move and hyrule-walk ran to the
+end, no crash line, game speed ratio 60.18 / 59.75; kokiri-idle's first run spent its 110 s compiling the predicted pipelines
+again (0 frames: the new `NvnState` fields change the replay's state stamp, which keys the pipeline cache, so the first start
+after this build re-predicts ~25,500 pipelines) and was run again (`s8i2-kokiri-idle`): to the end, ratio 59.87. Shots looked
+at (the last three to four of each scene): complete and right, the same market scenes as the reference, no flicker between
+shots. Inlined in a run: 2.4-2.8 million binds, 9.6-11.3 GB of block bytes (~4 KB a block) copied into the records.
+`HL_UBO_INLINE=1 HL_UBO_CHECK=1` in the castle (`s8i3-castle`, the check compares the inline bytes, hashed at the bind, with what
+the replay reads as submitted): **every inlined slot 0 different** (e.g. fragment slot 4: 482,653 equal of 482,653; vertex slot 11
+181,484 of 181,484); compute slots 3-8 and 10-13 were also all equal in that run (a fourth scene run, not inlined). Memory with
+the switch (game RAM / GPU pools / process RAM / commit / VRAM, MB): castle 3,279 / 1,535 / 7,791 / 20,414 / 6,905; hyrule 2,454
+/ 1,499 / 6,775 / 18,349 / 5,281; kokiri (game RAM / pools) 2,283 / 1,299.
+
+**Default: off** (`HL_UBO_INLINE=0`). It is clean in the three scenes on the main PC, but it buys nothing yet: the capture is
+unchanged and these blocks' pages are not what it copies; it adds ~100 MB a second of block bytes copied into the recordings
+(not timed, rule 6); the PC 3050 was not run with it (nor with the check: its build of this branch stopped at the link on
+`hl_gate_present`, a gate another stream's tree left in that machine's lifted code, which this tree does not define); and the slot list is a measurement of three scenes, not a property of the
+game. It stays as the record kind and descriptor path brick D will use for blocks a native draw loop computes.
+
+### What this says for the rest of the plan
+
+- **A copy at the submit instead of the bind would match what the replay reads for all binds but 0.01-0.05%** (and the ~0.7%
+  updated in the stream, which neither copy serves): `resolve_deferred` already walks every submitted record at the submit. It
+  is not a gain either while the capture's bulk is the region above, and it puts every bound block's bytes (1.8 MB a frame on
+  average over the castle run) onto the submitting thread; it is noted, not proposed.
+- **The capture's 37-43 MB a frame are not uniform data.** ~85% of them (castle) are one 256 MB region that no record reads directly. What
+  writes it and what reads it (a pointer table walk, `RX_VK_PROTECT_BARE`, `HOS_POOL_TRAP` on that range) is the next question for
+  the capture, before any brick of this plan can reduce it; brick D's premise ("the capture's pages in the draw loop's pools
+  fall") holds only for the ~1,000 pages a frame in the `0x22` and `0x24` pools.
+- Section 7's line "whether the uniform blocks the translated draw loop binds are complete at bind time" is answered: no, for
+  the per-draw slots; they are complete at the submit.
+- **The next brick proposed instead of more inlining: the capture's attribution.** Name the writer and the readers of the 256 MB
+  region `0x1050000000`-`0x1060000000` (85-95% of the capture): which pool it is (it is in no pool the back end has flags for),
+  which guest functions write it between submits (`HOS_POOL_TRAP` over the region, as `memory-boundary.md` 6 did for the
+  no-access pools), and whether the GPU reads it through pointers (the programs' global-memory descriptors that point into it,
+  logged at the descriptor build). That decides whether the capture can be cut by range (a region the GPU never reads, or reads
+  only through a known table) rather than by record. Second, for the per-draw uniform blocks: find the ring writer that fills
+  them after `EndRecording` (a write watch on one `0x22` ring pool between a recording's end and its submit), which brick D must
+  replace for an inline of those blocks to be right.

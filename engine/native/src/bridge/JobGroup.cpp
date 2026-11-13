@@ -280,6 +280,48 @@ void JobGroup::push(GuestThread as, GuestAddr g_at, GuestAddr job) {
     __atomic_fetch_add(&g->take_count, 1, __ATOMIC_SEQ_CST);
 }
 
+// (0x800711f0 to 0x80071334) The roots, in the graph list's order, under the mutex. A hook's first virtual function is
+// called with the hook and the job's object word; its answer's low 16 bits are the runners to start (stored as the whole
+// 32-bit runner word) and its bit 16 the cancel flag, then one runner and no cancel when that gave none. Then the push's
+// heap step: at the end and up, or (full) not put in; the take count up by one either way.
+uint32_t JobGroup::seed(GuestThread as, GuestAddr g_at, uint32_t& hooks) {
+    guest::Group* g = at<guest::Group>(g_at);
+    uint32_t seeded = 0;
+    hooks = 0;
+    lock(as, g_at);
+    const int32_t n = ld(&g->jobs);
+    const GuestAddr list = ld(&g->job_list);
+    for (int32_t i = 0; i < n; i++) {
+        const GuestAddr job = ld(at<GuestAddr>(list + (GuestAddr)(int64_t)i * 8));
+        guest::GroupJob* j = at<guest::GroupJob>(job);
+        if (ld(&j->waiting)) continue;
+        if (const GuestAddr hook = ld(&j->hook)) {
+            const uint64_t r = call(as, ld(at<GuestAddr>(ld(at<GuestAddr>(hook)))), hook, ld(&j->object));
+            st(&j->runners, (uint32_t)(r & 0xffff));
+            st(&j->cancel, (uint8_t)(r >> 16 & 1));
+            if (!(r & 0xffff)) {
+                st(&j->runners, 1u);
+                st(&j->cancel, (uint8_t)0);
+            }
+            hooks++;
+        }
+        const int32_t room = ld(&g->heap.room), size = ld(&g->heap.size);
+        if (size != room) {
+            GuestAddr* items = at<GuestAddr>(ld(&g->heap.items));
+            st(&items[size], job);
+            st(&g->heap.size, size + 1);
+            sift_up(g, size, job);
+            if (options_.check) check_heap(g);
+        } else {
+            stats_.full.fetch_add(1, std::memory_order_relaxed);
+        }
+        __atomic_fetch_add(&g->take_count, 1, __ATOMIC_SEQ_CST);
+        seeded++;
+    }
+    unlock(as, g_at);
+    return seeded;
+}
+
 // ---- jobs --------------------------------------------------------------------------------------------------------------
 
 // A job tied to another lane, handed to the context of that lane, under the group's mutex (0x800806d0, 0x80080fd0).
