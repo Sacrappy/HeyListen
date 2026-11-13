@@ -488,3 +488,172 @@ Of the trapped `0x024` pages, 750-756 MB lie in chunks the back end imported (bo
 - What this does not show: a page first touched by the back end is given back then, so a game touch after it is not seen
   (18-170 MB of the 3.35 GB); only the pages resident at the arming, in pools older than 2 s, in one 35 s window each; no
   scene change was in the window. `HOS_POOL_TRAP_EVERY=<s>` re-arms, for longer runs.
+
+## 8. Cold pages of CPU-cached pools leave the working set (`HL_MEM_COLD`, 2026-11-13)
+
+### What it is, and what it is not
+
+The pages of the CPU-cached pools (flags `0x024`: textures, vertex and index data; `0x064`: shader code) hold the CPU side
+of data the back end already has in VRAM, and section 7 showed game code touching under 1 MB of their 3.6 GB in 35 s. A
+thread of the OS layer now **takes those pages out of the process's working set**: `VirtualUnlock` on a range that is not
+locked removes its pages from the working set (Windows' documented behaviour; the call fails with `ERROR_NOT_LOCKED` and
+trims all the same, and every take-out is checked right after with `QueryWorkingSetEx`). Nothing is decommitted:
+
+- the pages keep their contents. They go to the standby list (through the modified list and a write to the page file, as
+  they are dirty: the game wrote them); a later touch by anyone (the game, the back end, the kernel or the driver) is a
+  soft fault that maps the same page back, or a hard fault that reads it back from the page file if Windows gave its RAM
+  away meanwhile. No handler of ours is involved: **no one can read a wrong byte**, whatever the policy does;
+- **RAM is freed, the commit charge is not**: the pages stay committed, backed by the page file (the commit column below
+  does not move). On a PC with no page file the dirty pages cannot leave the modified list: the working set falls, the RAM
+  in use does not;
+- the cost of a wrong guess is a fault per page (a soft one, microseconds; a hard one if RAM was short), and the page file
+  writes of the pages taken out (~3.5 GB in a 110 s run, by Windows' modified page writer, not on a game thread).
+
+### How (`host/hl_mem.c`, `native/src/mem/ColdPages.cpp`)
+
+- `host/hl_mem.c`: one thread, a pass every 500 ms. A pass takes the pools with the chosen flags made 10 s ago or more
+  (`hos_pools_with_flags`, `host/hos_memsplit.c`: the pool list copied under its lock, nothing else done under it), merged
+  into ranges, and goes on from where the last pass stopped: at most 256 MB looked at a pass (the 3.6 GB in ~7 s), in
+  slices of 1 MB. It asks `QueryWorkingSetEx` which pages of each 64 KB unit are resident, asks the policy, takes out the
+  resident runs of the units it says (at most 64 MB a pass) and tells the policy how many pages left. It holds no lock that
+  a game thread or the back end waits for (the only one is the kernel's working-set lock, for each call over at most 64 KB).
+- `hl::mem::ColdPages` (native, no guest knowledge; `native/tests/mem_test.cpp`): a 32-bit word a 64 KB unit (pages out,
+  times it came back, the pass it may be taken out again). A unit taken out and seen resident again **came back**: it is
+  counted and left in for 30 s, 60 s, 120 s after its first, second, third come-back, and for good after the fourth, so
+  that pages someone reads all the time are left alone. Units the back end imported are never taken out (the driver pins
+  them: `hos_noaccess_import`, which `import_pool` calls before each import, marks them); a pool made over units forgets
+  their history.
+- Not with large pages (they cannot leave the working set), never while `HOS_POOL_TRAP` measures (it has pages
+  `NOACCESS`): the thread is then not started. Windows only; stubs elsewhere.
+- Switches: `HL_MEM_COLD=1` (**the default**), `=0`: off, nothing above runs (the two hooks are a load and a branch);
+  `HL_MEM_COLD_FLAGS` (hex, default `24,64`; `0x022`, the per-frame pools the game writes ~25 MB of a scene, is left out
+  for want of evidence it pays), `HL_MEM_COLD_AGE` (seconds, default 10). Every 10 s a line `hl mem: cold pages: ...`
+  gives the counters.
+
+### Validation (main PC, `valid.sh s1v1 s1-cold` against `refv`, the reference build of main, 2026-11-13)
+
+All three scenes ran to the end (110 s), no crash line, game speed ratio 58.5 / 60.4 / 60.0 (kokiri, castle, hyrule; ref
+59.1 / 60.0 / 59.3); the last shots of each scene looked at beside the reference shots: the same scenes, complete and right
+(the camera and the characters are elsewhere at a given frame, as between any two runs). No visible stutter in the logs'
+speed lines.
+
+| Scene | Build | Game RAM | of it GPU pools | `0x024` in RAM | `0x064` in RAM | Process RAM (working set) | Process commit | VRAM | Vulkan in system memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | ref | 7512 | 3920 | 3129 | 315 | 13102 | 19700 | 5981 | 1391 |
+| | `HL_MEM_COLD` | **5435** | 1817 | 1323 | 9 | **10575** | 19965 | 6059 | 1431 |
+| castle-move | ref | 7830 | 4163 | 3353 | 315 | 13718 | 21425 | 7137 | 1614 |
+| | `HL_MEM_COLD` | **5704** | 2037 | 1535 | 23 | **11342** | 21435 | 6810 | 1668 |
+| hyrule-walk | ref | 7801 | 4146 | 3352 | 315 | 13512 | 20687 | 6376 | 1456 |
+| | `HL_MEM_COLD` | **5299** | 1772 | 1277 | 18 | **11032** | 20596 | 6491 | 1518 |
+
+MB; game RAM and pools from `HOS_MEM_SPLIT=95`, the rest from `RX_VK_RES_LOG=1`'s last lines (`tools/bench/steptable.py`);
+one run each.
+
+- **The game's RAM: -2.1 to -2.5 GB in every scene; the process's working set: -2.4 to -2.5 GB. The commit charge does not
+  move** (+265 / +10 / -91 MB: run-to-run noise), as it should not.
+- What stays of `0x024` (1.3-1.5 GB) is mostly in the 16 MB chunks the back end imported around buffer bindings (26,000 to
+  28,000 units of 64 KB, ~1.7 GB of address space, marked imported by the end of the runs): the driver has them locked.
+  Imports cut to the bound ranges would let more go (a back-end change, for brick 1.2).
+- The counters (`hl mem: cold pages:`, end of each run): taken out 3.4-3.8 GB in all; out of the working set at the end
+  2.1-2.5 GB; came back 1.06-1.37 GB in 18,000-23,000 units. The come-backs are not spread over the run: **~1 GB of them
+  in one 10-20 s window at the scene's load** (memory of long-lived pools reused for the new scene's resources: the
+  decompression writes the new data over pages taken out, which brings them back and overwrites their old bytes, a soft
+  fault each), then 0-15 MB per 10 s while the scene plays, with bursts of 100-175 MB per 10 s in the moving scenes
+  (castle, hyrule: new textures made from storage taken out, read by the back end's uploads). No unit came back four times
+  (none left in for good); no take-out failed (0 MB stayed in). A pass took at most 15-22 ms of its own thread.
+- Not measured, by the rule of the night (no speed study): the time of the faults on the threads that take them, and what
+  a scene change costs when the pages taken out were written to the page file and their RAM reused (hard faults on the
+  loading threads). On a PC short of RAM that is the case to watch.
+
+### Not verified
+
+- The PC 3050 (8 GB of VRAM, evicts textures: more re-uploads read pages taken out) was not run.
+- Long sessions (more than 110 s), several scene changes in a row, a PC with a small page file or none.
+- `HOS_LARGE_PAGES=1` and `HOS_POOL_TRAP` with the switch on: by reading only (the thread is not started then).
+
+## 9. Specification: true decommit with an exact restore (the next brick; read, not built)
+
+Section 8 frees RAM but keeps the commit charge and writes the pages to the page file. Giving the pages back for good
+(`MEM_DECOMMIT`) needs a way to make the same bytes again when someone touches a page, from a copy this engine controls.
+Two exist, for two kinds of data.
+
+### (i) Buffer storage mirrored in VRAM: restore by reading the mirror back
+
+- What is there: on a discrete GPU the back end gives every pool bound as a buffer a device-local mirror of the **whole
+  pool** (`gpu/vk/vk_memory.cpp`, `mirror_make`; budget `RX_VK_MIRROR_MB`). CPU-written pages reach the mirror at a
+  submission's first use (from the capture of the submit that wrote them); GPU writes come back to guest memory through
+  the write-back shadow. So for a page with no CPU write since its last mirror sync (`PageX::syn` against the page's
+  generation, `vk_memory.cpp`) and no GPU write pending, the mirror holds its bytes exactly.
+- What a restore needs: (1) the pages made `PAGE_NOACCESS` before the decommit, and a handler for the touch that commits
+  the page and copies it from the mirror (a GPU copy to a host-visible buffer and a wait); the handler can run on the
+  replay's own thread (texture uploads read pool memory, section 7) and must then not wait for work that thread would
+  submit; (2) **the imports dropped first**: every mirrored pool lies in 16 MB chunks the driver locked (`import_pool`), and
+  a locked page cannot be decommitted. The mirror syncs copy from the captures since TICK-019, but guest memory through the
+  import is still the source for pages not in a kept capture (`cap_entry`: "else from guest memory") and for the
+  write-backs: both would have to go through staging; (3) a page the CPU writes after the decommit is committed again and
+  written (its write-track mark makes the next sync copy it).
+- What it is worth: the `0x024` pages that stay resident under section 8 are mostly these (1.3-1.5 GB, in imported chunks),
+  plus the commit of every mirrored pool.
+
+### (ii) Data the game decompresses from its files into pool memory: restore by decoding again
+
+What was established by reading the lifted code (no run):
+
+- **The zstd frame decoder `0x8010b380`** (dictionary support, 5,646 lines) has three callers:
+  - `0x80108da0`, the resource loader's decode of a file (reached only through a vtable: slot 2 of `0x84c377e8`, made by
+    `0x836dea10`, in the `ares` decompression system). Its second argument is a request whose fields give: `+16` a heap,
+    `+28` an alignment, `+32` a destination already given (or 0), `+40` a size limit, `+56` the file object, `+64` a value
+    passed on to the read. It reads the frame header (`0x80109790`), takes the **decompressed size from the frame header**,
+    rounded up to 32, and gets the destination: the given buffer (`+32`), else an allocation from the request's heap (its
+    virtual slot 6, the heap's alloc, with the alignment), else `aligned_alloc`. The **source is the decompressor's own
+    work buffer** (in the object at its first argument's `+1432`, 32-byte aligned past a 290,816-byte workspace), filled by
+    the file object's virtual read (`+144`): never pool memory. Two cases:
+    - the compressed file fits in one chunk (the object's `+1424`): one read, then one call
+      `0x8010b380(workspace, destination, size, source, compressed size, 0, 0, ...)`: **the whole file decoded into the
+      destination at once**;
+    - it does not: the loading thread fills a descriptor in the object (`+1456`..`+1640`: destination `+1464`, its size
+      `+1472`, the workspace `+1480`, the source buffers from `+1608`, a step of 128 KB at `+1496`), hands it to another
+      thread through a callback (`+1640`) and light events (`+1544`, `+1592`: `nn::os::WaitLightEvent` and
+      `ClearLightEvent`, answered by the OS layer), and reads the file chunk after chunk into two buffers in turn while that
+      thread decodes them (by their creator, the `ParallelDecompThread`s of `0x8069a5e0`; the decoding side's body was not
+      read). The output is still one destination for the whole file, written in order.
+  - `0x80c17040` (through a vtable made by `0x80d331e0`): decodes a block embedded in data already in memory (its fourth
+    argument, checked for the magic `TARB`; compressed size at `+16`, data at the offset at `+10`) into a buffer of a ring
+    in the caller's object (`+31216`/`+31224`): a work buffer, not resource storage.
+  - `0x80f700d0`: the ROM cache and the heap size table (`HeapSizeDB`), at start.
+- **So a resource file's decoded bytes land in one buffer, from the request's heap or given by the caller, written by one
+  decoder call or one ordered chunked decode, from one file read in order.** Whether that buffer is pool memory is not read
+  on this path: the GPU resource heap `ForResourceG` is a heap over an NVN pool (section 3: `0x83bada70`, `0x809df570`), and
+  section 6 found the `0x021` pools filled before `nvnMemoryPoolInitialize` was called on them, which is what a pool made
+  over a file already decoded into a heap looks like *(inference: a resource file's GPU section made a pool in place, so the
+  pool's bytes are the file's decoded bytes at an offset)*. Section 8's come-backs at a scene load (the decode writing into
+  long-lived pools' pages) agree.
+- **The other two writers the trap named are not the decoder**: `0x8575cdc0` is the SDK's `memcpy` (its callers into
+  pools were not identified); `0x80105170` is reached through a function table at `0x84b400e8`, makes virtual calls on its
+  objects and writes 64-bit words in unrolled loops: an update of data in place, not a decompressor (it is only near the
+  zstd code by address). Together 0.3 MB in 35 s (section 7): pages they write after a decode can no longer be made again
+  by decoding.
+
+What the next brick (native streaming) needs, in order:
+
+1. **Provenance**, measured before anything is decommitted: an entry gate (`HL_GATE`) on `0x8010b380` answered by a native
+   zstd decoder giving the same bytes (compared byte for byte with the translated decoder on live inputs, rule 7), which
+   records for each output range: the file (from the request's file object, `+56`: how it names its file and archive member
+   is still to be read), the offset and length of the compressed frame, the dictionary (`zsdic`, by the dictionary id in
+   the frame header), the destination and the decompressed size. A table of ranges by guest address. The chunked path
+   decodes on the other thread: to be confirmed that it goes through the same decoder.
+2. **Which ranges are pool storage and still the decoder's bytes**: a range is a candidate when it lies in a CPU-cached
+   pool and no page of it was written since its decode (the write-track marks, `A64_WRITE_TRACK`, per 4 KB page: the
+   writers above and any relocation of the CPU part of a file show there).
+3. **Decommit and restore**: candidate pages decommitted once the back end has consumed them (section 8's policy says which
+   stay cold). A touch reaches `commit_on_touch` (`host/mkw_glue.c`), which today commits a zero page; it would look the
+   page up in the provenance table, read the frame from the file, decode it into a scratch buffer and copy the page (or the
+   whole range) in. That handler can run on any thread, the back end's included, and does file I/O; a frame is the unit of
+   a zstd decode, so a page costs reading and decoding up to its whole frame. A wrong decommit costs milliseconds on the
+   thread that touched.
+4. **Not covered**: data copied into pools with `memcpy` (no decode on the way), pools the GPU fills, and files read
+   uncompressed straight into their destination (the same provenance without the decode, cheaper).
+
+Not read, and needed before building: the decoding thread's body on the chunked path; the file object's read (`+144`) and
+how a request names its file; which requests allocate from `ForResourceG` (the request's heap at `+16`, by resource kind);
+where `0x80c17040`'s input comes from.
