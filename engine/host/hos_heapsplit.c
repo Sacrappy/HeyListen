@@ -29,8 +29,8 @@
    list walk is capped, and a walk that leaves the range, meets a bad size or reaches its cap stops and is marked "torn".
    What a walk can miscount: blocks taken or given back while it ran (missed or counted twice; the free total and the free
    block count then differ from the heap's own count, which is logged beside them), never memory outside the heap. Heaps
-   made or ended during the enumeration may be missed; a heap object is taken only with a vtable in the image and an arena in
-   the window. Residency is counted by page: a page goes to the smallest heap whose range holds its start. GPU pools are the
+   made or ended during the enumeration may be missed; a heap object is taken only with a heap vtable (in the image, with the
+   heap base's function 0x809dfe30 in slot 29) and an arena in the window. Residency is counted by page: a page goes to the smallest heap whose range holds its start. GPU pools are the
    ranges the host's GPU mapping list keeps (nvdrv.c hos_gpu_pools: the NVN pools with storage), merged. */
 #include "hos.h"
 #include <stdio.h>
@@ -216,10 +216,12 @@ static void own_free(Heap *h, int idx) {
 }
 
 static int add_heap(uint64_t obj, int parent, int depth) {
-    uint64_t vt, start, size, namep;
+    uint64_t vt, start, size, namep, slot29;
     ok_hi = 0;   /* (the readable region is looked up again for each heap: memory may have been given back meanwhile) */
+    /* (a heap's vtable has the heap base's own function in slot 29, 0x809dfe30, in all thirteen classes: a list node that
+       moved under the walk leads to some other object, whose vtable does not) */
     if (nheaps >= MAX_HEAPS || depth >= MAX_DEPTH || (obj & 7) || !rd64(obj, &vt) || vt < hos_image_base ||
-        vt >= hos_image_end || !rd64(obj + 40, &start) || !rd64(obj + 48, &size) || !size || start < HOS_SYSTEM_BASE ||
+        vt >= hos_image_end || !rd64(vt + 232, &slot29) || slot29 != 0x809dfe30 || !rd64(obj + 40, &start) || !rd64(obj + 48, &size) || !size || start < HOS_SYSTEM_BASE ||
         start >= HOS_GUEST_SPACE || size > HOS_GUEST_SPACE - start || !seen_add(obj))
         return -1;
     const int idx = nheaps++;
