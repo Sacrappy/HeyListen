@@ -42,12 +42,17 @@ constexpr ProcInfo kProcs[kProcCount] = {
     {"nvnCommandBufferBindPolygonState", {2, 0}},
     {"nvnCommandBufferSetPolygonOffsetClamp", {1, 3}},
     {"nvnCommandBufferSetDepthClamp", {2, 0}},
+    {"nvnCommandBufferSetGeometryProcessingMode", {2, 0}},
+    {"nvnCommandBufferCallCommands", {3, 0}},
+    {"nvnCommandBufferDrawMeshTasks", {3, 0}},
+    {"nvnBufferGetAddress", {1, 0, true}},
+    {"nvnCommandBufferDrawElementsInstanced", {8, 0}},
 };
 }   // namespace
 
 const char* proc_name(uint32_t proc) { return proc < kProcCount ? kProcs[proc].name : nullptr; }
 
-ProcArgs proc_args(uint32_t proc) { return proc < kProcCount ? kProcs[proc].args : ProcArgs{6, 4}; }
+ProcArgs proc_args(uint32_t proc) { return proc < kProcCount ? kProcs[proc].args : ProcArgs{8, 4}; }
 
 bool same_call(const Command& a, const Command& b) {
     if (a.op != b.op) return false;

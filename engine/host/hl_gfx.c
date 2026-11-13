@@ -23,7 +23,18 @@
                      once against them); a call that reaches the material's state callback is left to the translation
    With HL_GFX_CHECK=1 (or 2) the gate checks instead, call by call (hl/gfx/StateCheck.h): the native version runs into a
    recording, the translated body runs for real under the tap, and the two lists of NVN calls and the block's bytes are
-   compared; the first mismatches are logged in full. */
+   compared; the first mismatches are logged in full.
+
+   The draw path's sub-mesh submission (guest 0x80078fc0, a virtual method its callers call directly) is answered through
+   an entry gate too (gfx-record-job.md section 9):
+     HL_GFX_DRAW=0  off: the translated function, as before
+     HL_GFX_DRAW=1  (the default) the native function on its direct paths (hl::gfx::SubmeshDraw): the prologue native,
+                    the shared preparation 0x8008fc00 called back on the same context, the submission native
+                    (pre-recorded list, indexed instanced draw or mesh tasks, and the block's triangle counter); a call
+                    on any other path (the cluster, indirect, query and inline-write paths) is left whole to the
+                    translation
+   With HL_GFX_CHECK=1 (or 2) it checks instead, in two segments around the preparation: a second gate at 0x8008fc00 is
+   the checkpoint, for the call the checked body makes (gfx-record-job.md section 9 says how). */
 #include "hl_host.h"
 #include "hl/c/hl_gfx.h"
 #include <stdio.h>
@@ -55,19 +66,21 @@ static int check_wanted(void) {
 typedef struct { HostFn fn; void *user; uint32_t op; uint32_t proc; } Tap;   /* proc: the native numbering */
 static _Thread_local int recording;         /* a pass runs on this thread and is being recorded */
 static _Thread_local int state_recording;   /* the render-state function's translated body runs here, compared */
+static _Thread_local int draw_recording;    /* the sub-mesh submission's translated body runs here, compared (by segment) */
 static volatile LONG taps;
 enum { TAP_NAMES = 2048 };
 static const char *tap_names[TAP_NAMES];
 
 static void tap(Ctx *c, void *user) {
     const Tap *t = (const Tap *)user;
-    if (recording | state_recording) {
-        uint64_t x[6];
+    if (recording | state_recording | draw_recording) {
+        uint64_t x[8];
         uint32_t f[4];
         memcpy(x, c->x, sizeof x);
         for (int i = 0; i < 4; i++) memcpy(&f[i], &c->vreg[i][0], 4);
         if (recording) hl_gfx_check_call(t->op, x, f);
         if (state_recording) hl_gfx_state_check_call(t->proc, x, f);
+        if (draw_recording) hl_gfx_draw_check_call(t->proc, x, f);
     }
     t->fn(c, t->user);
 }
@@ -99,6 +112,7 @@ static void hl_report(void) {
     if (hl_gfx_report(line, sizeof line, tap_names, TAP_NAMES))
         hos_log("hl gfx: %s; passes on another context %lld", line, (long long)other_ctx);
     if (hl_gfx_state_report(line, sizeof line)) hos_log("hl gfx: %s", line);
+    if (hl_gfx_draw_report(line, sizeof line)) hos_log("hl gfx: %s", line);
 }
 
 /* ---- the pass ---- */
@@ -161,7 +175,7 @@ static HostFn nvn_fn[STATE_PROCS];
 static void *nvn_user[STATE_PROCS];
 static _Thread_local Ctx *t_ctx;   /* the guest context of the call the gate is answering on this thread */
 
-static void nvn_call(void *user, uint32_t proc, const uint64_t *x, uint32_t nx, const uint32_t *f, uint32_t nf) {
+static uint64_t nvn_call(void *user, uint32_t proc, const uint64_t *x, uint32_t nx, const uint32_t *f, uint32_t nf) {
     (void)user;
     Ctx *c = t_ctx;
     for (uint32_t i = 0; i < nx; i++) c->x[i] = x[i];
@@ -170,6 +184,7 @@ static void nvn_call(void *user, uint32_t proc, const uint64_t *x, uint32_t nx, 
         c->vreg[i][1] = 0;
     }
     nvn_fn[proc](c, nvn_user[proc]);
+    return c->x[0];
 }
 static void gfx_written(void *user, uint64_t guest, uint64_t n) {
     (void)user, (void)guest, (void)n;   /* (unused when the build tracks no writes) */
@@ -177,15 +192,22 @@ static void gfx_written(void *user, uint64_t guest, uint64_t n) {
 }
 static void gfx_log(void *user, const char *line) {
     (void)user;
-    hos_log("hl gfx: render state %s", line);
+    hos_log("hl gfx: %s", line);
 }
 static const hl_gfx_host gfx_host = {NULL, nvn_call, gfx_written, gfx_log};
 
-/* 1 when every procedure resolves to a host call and the game's global holds that same host call */
+/* 1 when every procedure resolves to a host call and the game's global holds that same host call (asked once: the
+   render state and the submission share the table) */
+static int nvn_resolve_all(void);
 static int nvn_resolve(void) {
+    static volatile LONG done;   /* 0: not asked, 1: no, 2: yes */
+    if (!done) InterlockedCompareExchange(&done, nvn_resolve_all() ? 2 : 1, 0);
+    return done == 2;
+}
+static int nvn_resolve_all(void) {
     const uint32_t n = hl_gfx_nvn_count();
     if (n > STATE_PROCS) {
-        hos_log("hl gfx: render state off: %u NVN procedures, room for %d", n, STATE_PROCS);
+        hos_log("hl gfx: native producers off: %u NVN procedures, room for %d", n, STATE_PROCS);
         return 0;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -194,7 +216,7 @@ static int nvn_resolve(void) {
         uint64_t game;
         memcpy(&game, GP(hl_gfx_nvn_global(i)), 8);
         if (!hos_hostcall_target(a, &nvn_fn[i], &nvn_user[i]) || game != a) {
-            hos_log("hl gfx: render state off: %s is %#llx for the game (its global %#llx), %#llx in the NVN layer", name,
+            hos_log("hl gfx: native producers off: %s is %#llx for the game (its global %#llx), %#llx in the NVN layer", name,
                     (unsigned long long)game, (unsigned long long)hl_gfx_nvn_global(i), (unsigned long long)a);
             return 0;
         }
@@ -264,3 +286,113 @@ HL_GATE(80077d60, "31664901fd8bc782") {
     return answered;
 }
 __attribute__((constructor)) static void hl_gfx_state_gate(void) { hl_gate_on_80077d60 = 1; }
+
+/* ---- the sub-mesh submission ---- */
+
+#define HL_GFX_DRAW_DEFAULT 1   /* (the check and the validation clean in the three scenes on both PCs: gfx-record-job.md section 9) */
+#define HL_DRAW_FN 0x80078fc0ULL      /* (hl_gfx_draw_address: draw_init checks the two agree) */
+#define HL_DRAW_PREPARE 0x8008fc00ULL
+
+static int draw_check;
+static A64Fn draw_translated, prepare_translated;
+static volatile LONG draw_ready;   /* as state_ready */
+static _Thread_local int t_draw_inside;   /* the gate's own call of the translated body runs on this thread */
+static _Thread_local int t_draw_armed;    /* that body's call of the preparation is the check's checkpoint */
+extern volatile int hl_gate_on_8008fc00;  /* (the checkpoint's gate, below) */
+
+static int draw_init(void) {
+    for (;;) {
+        const LONG s = draw_ready;
+        if (s == 1 || s == 2) return s == 2;
+        if (s == 0 && InterlockedCompareExchange(&draw_ready, 3, 0) == 0) break;
+        Sleep(0);
+    }
+    const char *e = getenv("HL_GFX_DRAW");
+    const int mode = e && e[0] ? atoi(e) : HL_GFX_DRAW_DEFAULT;
+    draw_check = check_wanted() != 0;
+    int on = 0;
+    if (mode != 1 && !draw_check) {
+        hos_log("hl gfx: draw: the translated sub-mesh submission (HL_GFX_DRAW=%d)", mode);
+    } else if (!hl_supported_build()) {
+        hos_log("hl gfx: draw off: not the supported build");
+    } else if (hl_gfx_draw_address() != HL_DRAW_FN || hl_gfx_draw_prepare_address() != HL_DRAW_PREPARE ||
+               !(draw_translated = hl_translated(HL_DRAW_FN)) || !(prepare_translated = hl_translated(HL_DRAW_PREPARE))) {
+        hos_log("hl gfx: draw off: the bridge answers %#llx", (unsigned long long)hl_gfx_draw_address());
+    } else if (nvn_resolve() && hl_gfx_draw_start(hl_host(), &gfx_host, draw_check)) {
+        on = 1;
+        log_on |= draw_check || getenv("HL_GFX_LOG") != NULL;
+        hl_gate_on_8008fc00 = draw_check;
+        hos_log("hl gfx: draw: %s",
+                draw_check ? "the check: each direct call compared in two segments around its preparation, the "
+                             "translated function answering"
+                           : "the native sub-mesh submission on its direct paths (HL_GFX_DRAW=1)");
+    }
+    draw_ready = on ? 2 : 1;
+    return on;
+}
+
+/* The function itself (x0 drawable, x1 block, w2 sub-mesh, w3 mask; returns nothing). Native: the prologue, the
+   preparation called on this context below the function's own frame (where the translation calls it, with the link
+   register its call leaves), then the submission. */
+HL_GATE(80078fc0, "329b54a385248a34") {
+    if (t_draw_inside) return 0;
+    if (draw_ready != 2 && !draw_init()) {
+        hl_gate_on_80078fc0 = 0;
+        return 0;
+    }
+    Ctx *before = t_ctx;
+    t_ctx = c;
+    const uint64_t drawable = c->x[0], block = c->x[1];
+    const uint32_t sub_mesh = (uint32_t)c->x[2], mask = (uint32_t)c->x[3];
+    int answered;
+    if (draw_check) {
+        answered = hl_gfx_draw_check_begin(drawable, block, sub_mesh, mask);
+        if (answered) {
+            t_draw_inside = 1;
+            t_draw_armed = 1;
+            draw_recording = 1;
+            draw_translated(c);
+            draw_recording = 0;
+            t_draw_armed = 0;
+            t_draw_inside = 0;
+            hl_gfx_draw_check_end();
+        }
+    } else {
+        answered = hl_gfx_draw_begin(drawable, block, sub_mesh, mask);
+        if (answered == 2) {
+            const uint64_t sp = c->x[31], fp = c->x[29], lr = c->x[30];
+            c->x[31] = sp - hl_gfx_draw_frame();
+            c->x[0] = block;
+            c->x[1] = drawable;
+            c->x[2] = 0;
+            c->x[30] = hl_gfx_draw_prepare_return();
+            a64_icall(c, HL_DRAW_PREPARE);
+            const uint64_t prepared = c->x[0];
+            c->x[31] = sp;
+            hl_gfx_draw_end(prepared);
+            c->x[29] = fp;   /* (as the function's epilogue leaves them) */
+            c->x[30] = lr;
+        }
+    }
+    t_ctx = before;
+    if (log_on) hl_report();
+    return answered != 0;
+}
+__attribute__((constructor)) static void hl_gfx_draw_gate(void) { hl_gate_on_80078fc0 = 1; }
+
+/* The preparation (x0 block, x1 drawable, w2 0): only the check's checkpoint, for the call the checked body makes on this
+   thread; every other call runs the translation (on only while checking). */
+HL_GATE(8008fc00, "4df7e218373859d0") {
+    if (!t_draw_armed) return 0;
+    t_draw_armed = 0;
+    draw_recording = 0;
+    hl_gfx_draw_check_segment();
+    prepare_translated(c);
+    /* (the native submission asks NVN queries on this context: the translated body goes on with these registers) */
+    uint64_t keep[32];
+    memcpy(keep, c->x, sizeof keep);
+    hl_gfx_draw_check_prepared(c->x[0]);
+    memcpy(c->x, keep, sizeof keep);
+    draw_recording = 1;
+    return 1;
+}
