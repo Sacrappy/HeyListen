@@ -436,7 +436,12 @@ void model_sphere_matches_the_specification() {
 struct Arena {
     alignas(16) uint8_t mem[4096] = {};
     static void* ptr(void* user, uint64_t guest) { return static_cast<Arena*>(user)->mem + (guest - 0x10000); }
-    hl_guest_host host() { return hl_guest_host{this, ptr, nullptr, nullptr, nullptr, nullptr}; }
+    hl_guest_host host() {
+        hl_guest_host h = {};   // (only the memory callback is used by the surface under test)
+        h.user = this;
+        h.ptr = ptr;
+        return h;
+    }
     template <class T> void put(uint64_t at, const T& v) { std::memcpy(mem + (at - 0x10000), &v, sizeof v); }
 };
 
