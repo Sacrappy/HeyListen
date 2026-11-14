@@ -94,6 +94,9 @@ struct Pool {
     uint64_t fill_value = 0;         // the recording whose uploads filled its mirror
     uint64_t again_epoch = 0;        // the submission that last imported it again
     uint32_t again = 0;              // times imported again after its import was given back
+    // (HeyListen, RX_VK_POOL_MIRROR: made with no import: its mirror filled and synced from guest memory through staging; false
+    // once anything imported it after all (import_again, counted by why))
+    bool never_imported = false;
 };
 void diff_gpu_wrote(uint64_t guest, uint64_t size);   // (TICK-048, below: the GPU may have written there)
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
@@ -112,6 +115,10 @@ Pool* pool_lookup(uint64_t guest, uint64_t size);
 // (RX_VK_NO_HOST_IMPORT: a pool whose import was given back, imported again where guest memory is needed through it; below)
 enum { kAgainBind, kAgainWrite, kAgainSync, kAgainMake, kAgainRb, kAgainTexture, kAgainFree, kAgainWb, kAgainKinds };
 bool import_again(Pool& p, int why);
+// (RX_VK_POOL_MIRROR: pools made with no import; see "a mirror per pool, never imported" below)
+bool pool_mirror_on();
+int64_t st_pm_made = 0, st_pm_fills = 0, st_pm_fill_bytes = 0, st_pm_live_bytes = 0, st_pm_again[kAgainKinds] = {};
+bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
     SRWLOCK l = SRWLOCK_INIT;
     void lock() { AcquireSRWLockExclusive(&l); }
@@ -3798,6 +3805,9 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
             lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
             if (spanned && chunk) span_game_pools(lo, hi, chunk);
             if (chunk) clip_noaccess(lo, hi, range.lo, range.hi);   // (HOS_NOACCESS_RAM)
+            // (RX_VK_POOL_MIRROR: no import, so no reason for the chunk's reach: the game's pool's part of it, no memory outside it.
+            // A pool larger than a chunk keeps its chunks, cut to the pool)
+            if (chunk && pool_mirror_on()) lo = std::max(lo, it->lo), hi = std::min(hi, it->hi);
             for (bool grew = true; grew;) {
                 grew = false;
                 overlapped.clear();
@@ -3833,6 +3843,13 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
                 if (lo == spanned_lo && hi == spanned_hi) break;
             }
             const auto t0 = std::chrono::steady_clock::now();
+            if (pool_mirror_on()) {   // (a table entry with no import: its mirror is made at the binding, filled through staging)
+                p = Pool{};
+                p.lo = lo, p.hi = hi, p.never_imported = true;
+                ok = true;
+                st_pm_made++;
+                break;
+            }
             ok = import_pool(lo, hi, p);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             static double total_ms;
@@ -3915,7 +3932,7 @@ bool mirror_on() {
 /// pools, or next to an import that would have to grow). RX_VK_ASYNC_IMPORT=1 (opt-in: background imports slowed AMD before) (pools_mu held)
 int64_t st_async_sent, st_async_copies;
 bool import_in_background(uint64_t guest, uint64_t size) {
-    if (guest_pools.empty() || !size || !dev.external_memory_host) return false;
+    if (guest_pools.empty() || !size || !dev.external_memory_host || pool_mirror_on()) return false;   // (RX_VK_POOL_MIRROR: no imports)
     bg_drain();
     auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), guest, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
     if (it == guest_pools.begin()) return false;
@@ -5001,6 +5018,7 @@ int64_t mirror_sync(Pool& p) {
         for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
         st_sync_copies += (int64_t)rs.size();
     }
+    if (!runs.empty() && !p.memory && p.never_imported && staging_into_mirror(p, runs)) runs.clear();   // (RX_VK_POOL_MIRROR)
     if (!runs.empty() && !p.memory && !import_again(p, kAgainSync)) {   // (RX_VK_NO_HOST_IMPORT: not imported again: left out)
         runs.clear();
         st_sync_live_lost++;
@@ -5539,6 +5557,85 @@ void reap_mirrors() {   // (pools_mu held)
         dead_imports.pop_front();
     }
 }
+// ---- (HeyListen, 2026-11-14) RX_VK_POOL_MIRROR=1 (default 0): a mirror per pool, the pool never imported ----
+// The import (VK_EXT_external_memory_host) pins the game's pages: in the owner's play10 session 3.85 GB of imports held the live
+// pools in RAM (2.62 GB) and 1.13 GB of memory no pool covers (the 16 MB chunks' reach), which neither cold pages nor the drop can
+// take (the substrate refuses a granule ever imported). Here a pool the GPU reads as a buffer gets a table entry with no import, cut
+// to the game's pool; its mirror is made at its first binding and filled from guest memory through a host-visible staging buffer
+// (a CPU copy on the replay's thread, then a GPU copy into the mirror, in the uploads of the recording); the pages the CPU writes
+// later come from the captures as before, and the "live" ones (no kept capture holds them) through staging too. What still
+// imports (counted by why, the pool then marked imported for good): a binding while the pool has no mirror and none can be made
+// now (the mirrors' budget, a parallel segment, RX_VK_MIRROR_DEFER), a binding for writing (its write-backs go through the import;
+// the staged write-back is the next step), readback refreshes and texel views over the pool. Never-imported mirrors are not given
+// back as idle (the GPU would have nothing to read there). RX_VK_POOL_MIRROR_CHECK=1 compares mirrors with guest memory (below).
+void pool_mirror_check_start();   // (RX_VK_POOL_MIRROR_CHECK: at the end of this file)
+namespace {   // (with their declarations at the top)
+bool pool_mirror_on() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_POOL_MIRROR");
+        const bool on = e && atoi(e) != 0 && mirror_on();
+        if (on) logf("vk: a mirror per pool, the pool never imported (RX_VK_POOL_MIRROR=1)");
+        return on;
+    }();
+    return v;
+}
+/// The runs [srcOffset, +size) of p's guest memory copied into its mirror at dstOffset, through a staging buffer freed once the
+/// GPU is past this recording (pools_mu held). False when no staging buffer could be made
+bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs) {
+    uint64_t total = 0;
+    for (const VkBufferCopy& r : runs) total += r.size;
+    if (!total || !p.mirror) return false;
+    VkBuffer sb = VK_NULL_HANDLE;
+    VmaAllocation sa = nullptr;
+    void* map = nullptr;
+    {
+        MemKindScope mem_kind_(MemKind::Staging);
+        if (!create_buffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, sb, sa, &map) || !map) {
+            if (sb) destroy_buffer(sb, sa);
+            return false;
+        }
+    }
+    std::vector<VkBufferCopy> out;
+    out.reserve(runs.size());
+    uint64_t at = 0;
+    for (const VkBufferCopy& r : runs) {
+        if (!host->gpu_read(p.lo + r.srcOffset, static_cast<uint8_t*>(map) + at, r.size))
+            std::memset(static_cast<uint8_t*>(map) + at, 0, r.size);
+        out.push_back({at, r.dstOffset, r.size});
+        at += r.size;
+    }
+    flush_mapped(sa, total);
+    {
+        GprofSpan gp(upload_command_buffer(), "pool mirror copies (guest memory through staging -> mirror)");
+        gp.items = (int)out.size(), gp.bytes = total;
+        vkCmdCopyBuffer(upload_command_buffer(), sb, p.mirror, (uint32_t)out.size(), out.data());
+    }
+    dead_mirrors.push_back({sb, sa, mem_rec_value});   // (freed with the retired mirrors, once the GPU is past this recording)
+    st_pm_live_bytes += (int64_t)total;
+    return true;
+}
+void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
+    static uint64_t at;
+    if (!pool_mirror_on()) return;
+    pool_mirror_check_start();
+    if (mirror_epoch - at < 1200) return;
+    at = mirror_epoch;
+    size_t never = 0, imported_n = 0;
+    uint64_t never_b = 0, imp_b = 0;
+    for (const auto& [lo, p] : imported) {
+        if (p.never_imported) never++, never_b += p.hi - p.lo;
+        if (p.memory) imported_n++, imp_b += p.hi - p.lo;
+    }
+    logf("vk: pools mirrored, never imported (RX_VK_POOL_MIRROR): %zu now (%llu MB), %lld made; fills %lld (%lld MB), live pages %lld MB, "
+         "through staging; imported after all, by why: bind %lld, written %lld, sync %lld, mirror made %lld, readback %lld, texture %lld, "
+         "mirror freed %lld, write-back %lld; imports live %zu (%llu MB)", never, (unsigned long long)(never_b >> 20), (long long)st_pm_made,
+         (long long)st_pm_fills, (long long)(st_pm_fill_bytes >> 20), (long long)(st_pm_live_bytes >> 20), (long long)st_pm_again[kAgainBind],
+         (long long)st_pm_again[kAgainWrite], (long long)st_pm_again[kAgainSync], (long long)st_pm_again[kAgainMake], (long long)st_pm_again[kAgainRb],
+         (long long)st_pm_again[kAgainTexture], (long long)st_pm_again[kAgainFree], (long long)st_pm_again[kAgainWb], imported_n,
+         (unsigned long long)(imp_b >> 20));
+}
+}  // namespace
+
 void retired_imports_give_back() {   // (pools_mu held)
     // (hookshot) Kept by default on Windows: giving them back is for the Linux amdgpu submit above, and on Windows an Intel Arc
     // B390 lost the device entering Kokiri every time with it and 1 run in 5 without (issue 17, fuxau); the AMD device losses
@@ -5603,6 +5700,7 @@ double st_again_ms = 0, st_again_max_ms = 0;
 
 bool import_again(Pool& p, int why) {   // (pools_mu held)
     if (p.memory) return true;
+    if (p.never_imported) st_pm_again[why]++, p.never_imported = false;   // (RX_VK_POOL_MIRROR: imported after all, by why)
     const auto t0 = std::chrono::steady_clock::now();
     Pool q;
     if (!import_pool(p.lo, p.hi, q)) {
@@ -5719,7 +5817,8 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     if (vram_tight) want_bytes = std::max(want_bytes, mirror_budget());
     std::vector<Pool*> idle;
     for (auto& [lo, p] : imported)
-        if (p.mstate == Pool::MIRROR_ON && !p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
+        if (p.mstate == Pool::MIRROR_ON && !p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed &&
+            !(p.never_imported && !p.memory))   // (RX_VK_POOL_MIRROR: its mirror is all the GPU has of it)
             idle.push_back(&p);
     std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
     for (Pool* p : idle) {
@@ -5962,6 +6061,7 @@ void memory_begin_submission() {
     std::lock_guard lk(pools_mu);
     reap_mirrors();
     if (pool_finalize_on()) finalize_retire();
+    pool_mirror_log();
     retired_imports_give_back();
     imports_release();   // (RX_VK_NO_HOST_IMPORT)
     mirror_epoch++;
@@ -6063,7 +6163,7 @@ bool mirror_make(Pool& pool) {
                      (unsigned long long)(mirror_budget() >> 20));
             return false;
         }
-        if (!p->memory && !import_again(*p, kAgainMake)) {   // (RX_VK_NO_HOST_IMPORT: the fill reads the import)
+        if (!p->memory && !p->never_imported && !import_again(*p, kAgainMake)) {   // (RX_VK_NO_HOST_IMPORT: the fill reads the import)
             p->mstate = Pool::MIRROR_NONE;
             return false;
         }
@@ -6087,7 +6187,18 @@ bool mirror_make(Pool& pool) {
                      (unsigned long long)ma, (unsigned long long)(ma + n));
         }
         const VkBufferCopy all{0, 0, n};
-        {
+        if (!p->memory) {   // (RX_VK_POOL_MIRROR: guest memory through staging; failing that, imported after all)
+            std::vector<VkBufferCopy> whole{all};
+            if (staging_into_mirror(*p, whole)) st_pm_fills++, st_pm_fill_bytes += (int64_t)n, st_pm_live_bytes -= (int64_t)n;
+            else if (!import_again(*p, kAgainMake)) {
+                dead_mirrors.push_back({p->mirror, p->mirror_alloc, mem_rec_value});
+                p->mirror = VK_NULL_HANDLE, p->mirror_alloc = nullptr;
+                p->mstate = Pool::MIRROR_NONE;
+                guest_pages_set(p->lo, p->hi, 0);
+                return false;
+            }
+        }
+        if (p->memory) {
             GprofSpan gp(upload_command_buffer(), "mmake copy (a whole pool -> its new mirror)");
             gp.bytes = n;
             vkCmdCopyBuffer(upload_command_buffer(), p->buffer, p->mirror, 1, &all);   // (all of it, at this generation)
@@ -7097,6 +7208,76 @@ int memory_mirror_read(uint64_t guest, uint64_t size, void* out) {
     invalidate_mapped(stage_alloc, size);
     std::memcpy(out, stage_map, size);
     return 1;
+}
+// ---- (RX_VK_POOL_MIRROR_CHECK=1) the never-imported mirrors compared with guest memory ----
+// Every 2 s a thread of its own takes the next never-imported pool with its mirror on, never written by the GPU, synced in a
+// submission before the one being recorded, reads its mirror back (memory_mirror_read: after everything submitted) and compares it
+// with guest memory page by page. A page the CPU wrote after the mirror's last sync (its generation newer than synced_gen, checked
+// after the comparison) may differ and is not counted; any other difference is a mismatch: the mirror does not hold the pool's bytes.
+// Counted, the first 20 logged with the pool, the page and its flags. Zero is the bar.
+namespace {
+std::atomic<int64_t> st_pmc_pools{0}, st_pmc_pages{0}, st_pmc_skipped{0}, st_pmc_bad{0};
+void pool_mirror_check_main() {
+    std::vector<uint8_t> mir(4ull << 20), mem(4ull << 20);
+    uint64_t next = 0;
+    for (;;) {
+        Sleep(2000);
+        uint64_t lo = 0, hi = 0;
+        uint32_t synced = 0;
+        {
+            std::lock_guard lk(pools_mu);
+            auto it = imported.upper_bound(next);
+            for (int tries = 0; tries < 2 && !hi; tries++, it = imported.begin())
+                for (; it != imported.end(); ++it) {
+                    const Pool& p = it->second;
+                    if (p.never_imported && !p.memory && p.mstate == Pool::MIRROR_ON && p.mirror && !p.gpu_written && !p.lazy_held &&
+                        p.synced_epoch < mirror_epoch) {
+                        lo = p.lo, hi = p.hi, synced = p.synced_gen;
+                        break;
+                    }
+                }
+        }
+        if (!hi) continue;
+        next = lo;
+        st_pmc_pools++;
+        for (uint64_t a = lo; a < hi; a += mir.size()) {
+            const uint64_t n = std::min<uint64_t>(mir.size(), hi - a);
+            if (!memory_mirror_read(a, n, mir.data())) break;
+            if (!host->gpu_read(a, mem.data(), n)) break;
+            for (uint64_t o = 0; o < n; o += 4096) {
+                const uint64_t k = std::min<uint64_t>(4096, n - o);
+                st_pmc_pages++;
+                if (!std::memcmp(mir.data() + o, mem.data() + o, k)) continue;
+                if (memory_written_since(a + o, k, synced)) { st_pmc_skipped++; continue; }   // (the CPU wrote it since the sync)
+                const int64_t bad = ++st_pmc_bad;
+                if (bad <= 20) {
+                    uint64_t plo = 0;
+                    uint32_t flags = 0;
+                    {
+                        std::lock_guard lk(nvn_pools_mu);
+                        if (const NvnPool* np = nvn_pool_at(a + o, &plo)) flags = np->flags;
+                    }
+                    logf("vk: pool mirror check: MISMATCH at %#llx (mirror %#llx..%#llx, game pool at %#llx flags %#x, synced gen %u)",
+                         (unsigned long long)(a + o), (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)plo, flags, synced);
+                }
+            }
+        }
+        static int64_t logged_at = -1;
+        if (st_pmc_pools / 16 != logged_at) {
+            logged_at = st_pmc_pools / 16;
+            logf("vk: pool mirror check (RX_VK_POOL_MIRROR_CHECK): %lld pools, %lld pages compared, %lld written since their sync, "
+                 "MISMATCHES %lld", (long long)st_pmc_pools.load(), (long long)st_pmc_pages.load(), (long long)st_pmc_skipped.load(),
+                 (long long)st_pmc_bad.load());
+        }
+    }
+}
+}  // namespace
+void pool_mirror_check_start() {
+    static bool started = false;
+    if (started || !getenv("RX_VK_POOL_MIRROR_CHECK") || !atoi(getenv("RX_VK_POOL_MIRROR_CHECK"))) return;
+    started = true;
+    logf("vk: the never-imported mirrors compared with guest memory every 2 s (RX_VK_POOL_MIRROR_CHECK=1)");
+    std::thread(pool_mirror_check_main).detach();
 }
 }   // namespace mkwvk
 
