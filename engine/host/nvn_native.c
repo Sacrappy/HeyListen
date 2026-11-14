@@ -1069,7 +1069,18 @@ static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: f
    MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then.
    HOS_NVN_HOLD=1: every submit held. HOS_NVN_HOLD=2 (below; the default since TICK-054, =0: none held): only those of threads
    other than the presenting one, replayed ~20 us later by a host thread. */
-typedef struct { int n; uint64_t h[64]; uint64_t queue; uint32_t *pages; int64_t npages; uint8_t *copy; int64_t t; } held_submit;
+typedef struct { int n; uint64_t h[64]; uint64_t queue; uint32_t *pages; int64_t npages; uint8_t *copy; int64_t t; int64_t f; } held_submit;
+/* (HeyListen, RX_VK_LAG_LOG: the back end's measurement of the replay's lag, gpu/vk/vk_lag.cpp) when the game made the submit now being
+   handed over, and the game's presents then; read by the back end through hos_lag_sub. And the counts of the game's sync calls
+   by kind and of the held submits' flushes by cause (hos_lag_counts). */
+static __thread int64_t lag_t_sub, lag_f_sub;
+static volatile LONG64 lag_c[24];
+enum { LC_SYNC, LC_NEVER, LC_FENCED, LC_OTHER, LC_SAT, LC_ALREADY, LC_TIMEOUT, LC_POLL, LC_EVENT, LC_FINISH, LC_FENCE };
+extern volatile LONG64 hos_present_count;   /* display.c */
+__declspec(dllexport) void hos_lag_sub(int64_t *t, int64_t *f) { *t = lag_t_sub, *f = lag_f_sub; }
+__declspec(dllexport) int64_t hos_lag_frames(void) { return hos_present_count; }
+__declspec(dllexport) void hos_lag_counts(int64_t *out);
+#define LAG_COUNT(k) InterlockedIncrement64(&lag_c[k])
 static held_submit held[256];
 static volatile LONG nheld;
 static CRITICAL_SECTION held_cs, flush_cs;   /* (held_cs: the list; flush_cs: a flush and the presenting thread's submit, in order) */
@@ -1086,6 +1097,10 @@ static int hold_check = -1;
 static HANDLE hold_event;   /* (mode 2: a host thread replays a held submit as soon as it is held, ~10 us after the game's submit) */
 static int64_t st_hold_flushes, st_hold_submits, st_hold_pages, st_hold_again, st_hold_differ, st_hold_max_differ, st_hold_wait_ns,
     st_hold_replay_ns, st_hold_by[8];
+__declspec(dllexport) void hos_lag_counts(int64_t *out) {   /* (see lag_c) */
+    for (int i = 0; i < 11; i++) out[i] = lag_c[i];
+    for (int i = 0; i < 8; i++) out[11 + i] = st_hold_by[i];
+}
 int64_t hos_hold_snapshot(uint32_t **pages, uint8_t **copy);   /* (rx_backend.c, HOS_NVN_HOLD_CHECK) */
 void hos_hold_check(uint32_t *pages, int64_t n, uint8_t *copy, int64_t *again, int64_t *differ);
 enum { HF_FLUSH, HF_FINISH, HF_PRESENT, HF_SYNC, HF_EVENT, HF_SUBMIT, HF_THREAD, HF_OTHER, HF_N };
@@ -1163,6 +1178,7 @@ static void held_flush_why(int why) {
                 local[i].pages = NULL, local[i].copy = NULL;
             }
             HOS_JT(JT_MARK, 1, (uint64_t)i);   /* (TICK-054: the held submit's capture and replay, on this thread) */
+            lag_t_sub = local[i].t, lag_f_sub = local[i].f;
             if (hold_on == 2) rx_nvn_submit_q(local[i].h, local[i].n, local[i].queue);
             else rx_nvn_submit(local[i].h, local[i].n);
             HOS_JT(JT_MARK, 2, (uint64_t)i);
@@ -1193,7 +1209,7 @@ static uint64_t held_count(void) { return (uint64_t)nheld; }
 
 NV(nvnQueueFenceSync) {
     held_init();
-    nvn_sync *s = (nvn_sync *)P(1); s->fenced = 1;
+    nvn_sync *s = (nvn_sync *)P(1); s->fenced = 1; LAG_COUNT(LC_FENCE);
     /* (hookshot) the queue's own work: with nothing held, its last submission (a wait for it no longer waits for another
        queue's work stopped at an event wait) */
     s->fence = held_count() ? rx_nvn_fence() + held_count() : rx_nvn_fence_q((uint64_t)(uintptr_t)P(0));
@@ -1218,10 +1234,12 @@ static void wait_note(int kind, int64_t t0) {
 /* never fenced: times out, as on the console; fenced: released once the GPU reached the fence */
 NV(nvnSyncWait) {
     const nvn_sync *s = (const nvn_sync *)P(0);
+    LAG_COUNT(LC_SYNC), LAG_COUNT(!s->fenced ? LC_NEVER : s->fenced == 1 ? LC_FENCED : LC_OTHER);
+    if (U64(1) == 0) LAG_COUNT(LC_POLL);
     if (sync_log()) hos_log("nvn: SyncWait %p fence %llu timeout %llu (lr %#llx); latest %llu, done %llu", (void *)s,
                             (unsigned long long)s->fence, (unsigned long long)U64(1), (unsigned long long)c->x[30],
                             (unsigned long long)rx_nvn_fence(), (unsigned long long)rx_nvn_replayed());
-    if (!s->fenced) { RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
+    if (!s->fenced) { LAG_COUNT(LC_TIMEOUT); RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush_why(HF_SYNC);   /* (a wait flushes what it waits for) */
     /* (TICK-058) trace marks 30/31: the wait's first look (b: the caller; then 1 signalled, 0 not) */
     HOS_JT(JT_MARK, 30, c->x[30]);
@@ -1250,7 +1268,7 @@ NV(nvnSyncWait) {
     const int away0 = poll_away ? hos_vcore_away() : 0;
     const int first = rx_nvn_wait(s->fence, 0);
     if (away0) hos_vcore_back();
-    if (first) { HOS_JT(JT_MARK, 31, 1); RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    if (first) { HOS_JT(JT_MARK, 31, 1); LAG_COUNT(LC_ALREADY); RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     HOS_JT(JT_MARK, 31, 0);
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */
     if (block < 0) block = getenv("HOS_NVN_SYNC_BLOCK") != NULL;
@@ -1259,6 +1277,7 @@ NV(nvnSyncWait) {
     const int ok = rx_nvn_wait(s->fence, block ? ~0ull >> 1 : U64(1));
     wait_note(ok ? 0 : 1, t0);
     if (away) hos_vcore_back();
+    LAG_COUNT(ok ? LC_SAT : LC_TIMEOUT);
     RET(ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
 NV(nvnEventBuilderSetDefaults) { memset(P(0), 0, sizeof(nvn_event_builder)); }
@@ -1288,6 +1307,7 @@ NV(nvnEventGetValue) {
         if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
         if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
     }
+    LAG_COUNT(LC_EVENT);
     if (hold_on == 2 && nheld && !hold_lingering()) held_flush_why(HF_EVENT);   /* (TICK-054: a held submit may be what signals it) */
     uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);
@@ -1331,6 +1351,7 @@ NV(nvnQueueFinalize) { ((nvn_queue *)P(0))->magic = 0; }
 NV(nvnQueueGetError) { if (P(1)) memset(P(1), 0, sizeof(NVNqueueErrorInfo)); RET(NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR); }
 NV(nvnQueueFlush) { if (hold_on != 2) held_flush_why(HF_FLUSH); }   /* (mode 2: the held submits' thread is on it) */
 NV(nvnQueueFinish) {
+    LAG_COUNT(LC_FINISH);
     held_flush_why(HF_FINISH);
     const int away = hos_vcore_away();
     const int64_t t0 = hos_now_ns();
@@ -2685,6 +2706,7 @@ NV(nvnQueueSubmitCommands) {
     uint64_t h[64];
     if (n < 0 || n > 64) die("submit of %d handles", n);
     memcpy(h, PN(2, 8 * (size_t)n), 8 * (size_t)n);
+    lag_t_sub = hos_now_ns(), lag_f_sub = hos_present_count;   /* (RX_VK_LAG_LOG: when the game made this submit) */
     q->submits++;
     {   /* (which queues submit, 60 lines then every 20000: the game's queues are replayed on one, in arrival order) */
         static volatile LONG k;
@@ -2720,7 +2742,7 @@ NV(nvnQueueSubmitCommands) {
     memcpy(hs->h, h, 8 * (size_t)n);
     hs->queue = (uint64_t)(uintptr_t)q;
     hs->pages = NULL, hs->copy = NULL, hs->npages = 0;
-    hs->t = hos_now_ns();
+    hs->t = lag_t_sub, hs->f = lag_f_sub;
     if (hold_check) hs->npages = hos_hold_snapshot(&hs->pages, &hs->copy);
     nheld++;
     if (hold_linger_ns > 0) hold_linger_thread = (void *)hos_self(), InterlockedExchange64(&hold_linger_until, hs->t + hold_linger_ns);

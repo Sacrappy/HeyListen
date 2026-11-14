@@ -32,6 +32,7 @@
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_ledger.h"    // (RX_VK_LEDGER)
+#include "vk_lag.h"       // (RX_VK_LAG_LOG)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
 #include "capture_merge.h"    // (TICK-043: the capture copied ahead)
@@ -3439,6 +3440,13 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         late_mark.assign(c->pages.size(), 0);
         if (late_merge)
             for (uint32_t i : c->late) late_mark[i] = 1;
+        if (lag_on()) {   // (RX_VK_LAG_LOG: this capture's pages, to compare when the recording is whole and when the GPU is done)
+            static thread_local std::vector<uint8_t> lm;
+            lm.assign(c->pages.size(), 0);
+            if (late_merge || late_defer)
+                for (uint32_t i : c->late) lm[i] = 1;
+            lag_cap_taken(value, g, c->copied.data(), c->slots.data(), c->copied.size(), lm.data());
+        }
         const auto te0 = std::chrono::steady_clock::now();
         if (split) {
             stamp_split_run(c->pages.data(), c->pages.size(), c->copied.data(), c->slots.data(), c->copied.size(), g, late_mark.data());
@@ -3557,6 +3565,32 @@ bool memory_capture_now(uint64_t value, uint64_t completed) {
     if (completed > mem_completed) mem_completed = completed;
     std::unique_ptr<Capture> c = capture_make();
     return c && take_capture(std::move(c), value, completed);
+}
+
+/// (RX_VK_LAG_LOG, vk_lag.cpp) The sampled pages of one capture against guest memory now: the pages the game has written other
+/// bytes into since the capture copied them, by what the GPU has bound the page for. Kinds: 0 uniform, 1 vertex or index, 2
+/// storage, indirect, GPU-written or another binding, 3 never bound by a record. A buffer already retired: all skipped.
+void memory_lag_compare(uint32_t gen, const uint32_t* pages, const uint32_t* slots, size_t n, LagCmp& out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    static thread_local uint8_t cur[4096];
+    std::lock_guard lk(pools_mu);
+    auto it = cap_bufs.find(gen);
+    if (it == cap_bufs.end() || !it->second.map) {
+        out.skipped += (int64_t)n;
+        return;
+    }
+    const uint8_t* const map = static_cast<const uint8_t*>(it->second.map);
+    const uint64_t used = it->second.used;
+    const uint8_t* const base = host->guest_base();
+    for (size_t i = 0; i < n; i++) {
+        if ((uint64_t)slots[i] * 4096 + 4096 > used) { out.skipped++; continue; }
+        if (!guarded_copy(cur, base + ((uint64_t)pages[i] << kPageShift), 4096)) { out.skipped++; continue; }
+        out.sampled++;
+        if (!std::memcmp(cur, map + (uint64_t)slots[i] * 4096, 4096)) continue;
+        const uint16_t u = ledger_use_of(pages[i]);
+        out.differ[u & kUseUniform ? 0 : u & (kUseVertex | kUseIndex) ? 1 : u ? 2 : 3]++;
+    }
+    out.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 namespace {
