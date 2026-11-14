@@ -123,6 +123,8 @@ static int fps_limit(void) {
 }
 static int64_t next_frame_at, window_start, frames_in_window;
 static volatile LONG64 presents;
+/* (HL_STEP_SCAN, hl_trace.c: the frames presented so far) */
+int64_t hos_vi_presents(void) { return presents; }
 int hos_vi_native_interval(Ctx *c, int requested) {
     (void)c;
     /* (hookshot) OoT's frame-rate controller asks for 2, 3 or 4 vsyncs a frame whenever one runs long (480 changes a minute

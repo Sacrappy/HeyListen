@@ -76,6 +76,8 @@ int hl_trace_write(const char *path);
 /* The back end's writes into guest memory and its mirrors' and imports' lives (gpu/vk/vk_api.h MKWVK_TRACE_*): kept in
    a ring of their own, told beside a block at a crash. done: the GPU's completed timeline value when it was recorded. */
 void hl_trace_gpu_record(uint32_t what, uint64_t guest, uint64_t size, uint64_t pool, uint64_t value, uint64_t done);
+/* Each live block (under its stripe's lock: fn must not allocate through the recorder). */
+void hl_trace_live_each(void (*fn)(const HlTraceRecord *, void *), void *user);
 /* (counters for the log) */
 void hl_trace_counts(uint64_t *allocs, uint64_t *frees, uint64_t *unknown_frees, uint64_t *live_full, uint64_t *threads);
 

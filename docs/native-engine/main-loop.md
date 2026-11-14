@@ -101,3 +101,61 @@ between them. The smallest honest cut in which the native loop owns the order an
 
 What this gives later: a native subsystem can be given its place in the frame as a phase of the native loop, between two
 of the game's steps, without a translated caller.
+
+## Frame rates above 60: the time step and what does not follow it
+
+**How the game keeps time.** The game is written for 30 or 60 frames a second with a time step, not for a fixed frame.
+The module system's frame (`0x80706be0`) computes each frame a ratio r = 60 (30 when the framework's `+0x24f` bit 0 is
+set) over the nominal frame rate (the framework's `+0x2c8`) and hands it to `0x83b6e300`, which fills the **frame-time
+object** (`*0x84c9e890`):
+
+| Offset | What (r: 1.0 at 60 fps, 0.5 at 120, 2.0 at 30) |
+|---|---|
+| `+0x10`, `+0x14` | r and 1/r |
+| `+0x18` | r times a constant (`0x83e6066c`): the step in seconds |
+| `+0x1c` | the frame rate as an integer: 60 / r rounded to nearest |
+| `+0x00`..`+0x0c` | the step after the game's time scales (16 scales at `+0x140`..`+0x1bc`, a global one at `+0x1c0`): step in frames, its inverse, in seconds, frames a second |
+| `+0x20`..`+0x11c` | six more such groups, one a category (each of the 4-bit fields of `+0x1c4` picks its scale) |
+
+133 functions read it; by the fields they load, 63 read the step `+0x00` and 61 the category selector `+0x1c4` (they
+take their category's step); one reads `+0x0c`, two `+0x10`, none the integer rate `+0x1c` directly.
+
+**How the port runs above 60.** The game sets its nominal rate back to 60 whenever it is above 60. The OS layer's
+real-time step (TICK-014, `nn_os_sync.c`, the Insert menu's Game speed "Real time", `game_speed=1`) writes the rate
+actually reached into `+0x2c8` just before the step is computed, so at 120 fps r is 0.5. The game therefore runs its
+whole simulation once per presented frame with a smaller step: delta time, no interpolation, no frame generation. Every
+system that advances by the frame-time object's step keeps real time (the log's "game 1/60 s a second: ratio 60"
+line sums r: 60 at any rate). **A system that advances by one per frame (a frame counter, a fixed per-frame constant)
+runs at the frame rate instead**: twice as fast at 120.
+
+**The honest fix: a 60 Hz tick for the systems that count frames.** Running the whole simulation at 60 and presenting
+each picture twice would keep every system right but show 60 different pictures a second: nothing gained over the cap.
+The engine has no interpolation of its own. The fix that keeps 120 pictures a second is per system: each system found
+to advance by one per frame gets its per-frame update called by an accumulator of the frame's step r instead of once a
+frame: r is added each frame, and the update runs (and 1 is taken off) while the sum is 1 or more. At 120 fps (r = 0.5)
+such a system runs every other frame, at 90 two frames in three, at 60 every frame as now, and below 60 (r > 1) twice in
+some frames, which also mends their slowness at low frame rates. One accumulator, kept by the native main loop (it owns
+the iteration and sees the step each frame), gives every such system the same ticks so that they stay in step with each
+other (a cutscene's sequencer and its voice lines). Each system is answered by an entry gate on its update function
+that lets the translated update run, or not, by that tick: the game's code is unchanged, its order too.
+
+**Finding the systems that count frames: `HL_STEP_SCAN`.** With `HL_TRACE=2` (the heaps' allocations recorded) and
+`HL_STEP_SCAN=<s>`, the recorder copies every live block of 16 KB or less at <s> seconds and compares it
+`HL_STEP_SCAN_SECS` (5) seconds later: a 32-bit word that went up by the number of frames presented counts frames, one
+that went up by 60 a second counts the game's time; the words are summed by the allocation site of their block (the
+log's `hl step scan` lines, and `hl_step_scan.txt`). It needs a frame rate at least 10% away from 60 during the window
+(`HL_FPS_LIMIT=120` on a quiet machine, or `HOS_FRAME_SLEEP_MS` to go below). First run, main PC, the market save
+(castle-move walk, 26 fps during the window with two other games running, 559,000 blocks): 78 frame-counting words
+against 146 time-counting ones. 72 of the 78 are in blocks made at `0x80ad3278` (in `0x80ad3230`, reached through a
+pointer) called from `0x8080b9bc` (`0x8080b990`, whose largest caller `0x80803ef0` is the chemistry system's object
+set-up: its strings are the `Chm_Object*` parameters): **the chemistry objects count frames**, so anything they time
+(burning, spreading, reactions) runs at the frame rate. The rest are single words in rendering objects (models,
+procedural eyes). The time-counting words are mostly floats in seconds. That walk had no cutscene, movie, voice line or
+boss: the three systems the owner reported are not in this sample, and finding them takes the same scan in those
+situations (below).
+
+**What to measure next, and what to play.** The scan in a cutscene with voice, in the Deku Tree boss fight and during
+the opening movie (a new game: a copy of the saves in a slot), each with the frame rate away from 60, names their
+frame-counting objects by maker; each maker's update function then gets the 60 Hz tick above. Owner's checks once a
+system has its tick, at 120 fps against 60: the opening movie (voice lines one after the other, picture to its end), a
+cutscene with voice-over (no overlap), the Deku Tree boss (the same pace as at 60).

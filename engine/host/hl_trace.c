@@ -19,6 +19,7 @@
 #include "hl_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -172,8 +173,121 @@ static DWORD WINAPI dump_after(void *p) {
     return 0;
 }
 
-/* (a constructor: the heaps' first allocations come before the game's code runs anything else) */
-__attribute__((constructor)) static void hl_trace_switch(void) {
+/* ---- HL_STEP_SCAN=<s> (with HL_TRACE=1): which of the game's objects count frames and which count time ----
+   At <s> seconds every live block of 16 KB or less (512 MB at most) is copied; W seconds later (HL_STEP_SCAN_SECS, 5) each 32-bit word is
+   compared with its copy. Over those W seconds P frames were presented: a word that went up by P (+-1) is a frame counter,
+   one that went up by 60 W (+-3%) counts the game's time in 1/60 s; a float that went up by P, by 60 W or by W (+-3%) the
+   same in floats. Words are summed by the allocation site of their block (its caller chain's first two return
+   addresses): at a frame rate 10% or more away from 60 (HL_FPS_LIMIT=120, or HOS_FRAME_SLEEP_MS for a slower one) the
+   frame-counted objects and their makers stand
+   apart from the time-counted ones. The table goes to the log and to hl_step_scan.txt. */
+typedef struct {
+    uint64_t addr, size, off;
+    uint32_t site0, site1;
+} ScanBlock;
+typedef struct {
+    ScanBlock *blocks;
+    size_t n, cap;
+    uint8_t *bytes;
+    uint64_t used, budget;
+} Scan;
+static void scan_take(const HlTraceRecord *r, void *u) {
+    Scan *s = u;
+    if (r->size == 0 || r->size > 16384 || s->used + r->size > s->budget || s->n == s->cap) return;
+    s->blocks[s->n++] = (ScanBlock){r->addr, r->size, s->used, r->chain[0], r->chain[1]};
+    s->used += r->size;
+}
+typedef struct {
+    uint32_t site0, site1;
+    uint32_t frames, time, fframes, ftime, fsec, words;
+} Site;
+static int by_frames(const void *a, const void *b) {
+    const Site *x = a, *y = b;
+    const uint32_t fx = x->frames + x->fframes, fy = y->frames + y->fframes;
+    return fx < fy ? 1 : fx > fy ? -1 : 0;
+}
+static int by_time(const void *a, const void *b) {
+    const Site *x = a, *y = b;
+    const uint32_t fx = x->time + x->ftime + x->fsec, fy = y->time + y->ftime + y->fsec;
+    return fx < fy ? 1 : fx > fy ? -1 : 0;
+}
+static DWORD WINAPI step_scan(void *p) {
+    Sleep((DWORD)(uintptr_t)p * 1000);
+    int64_t hos_vi_presents(void);
+    Scan s = {0};
+    s.cap = 4u << 20;
+    s.budget = 512ull << 20;
+    s.blocks = malloc(s.cap * sizeof *s.blocks);
+    s.bytes = malloc(s.budget);
+    if (!s.blocks || !s.bytes) return 0;
+    hl_trace_live_each(scan_take, &s);
+    const int64_t p0 = hos_vi_presents();
+    for (size_t k = 0; k < s.n; k++) memcpy(s.bytes + s.blocks[k].off, GP(s.blocks[k].addr), s.blocks[k].size);
+    const char *ws = getenv("HL_STEP_SCAN_SECS");
+    const int W = ws && atoi(ws) > 0 ? atoi(ws) : 5;
+    Sleep((DWORD)W * 1000);
+    const int64_t P = hos_vi_presents() - p0, T = 60 * W;   /* (frames presented; the game's time in 1/60 s) */
+    enum { SITES = 1 << 16 };
+    Site *sites = calloc(SITES, sizeof *sites);
+    if (!sites) return 0;
+    uint64_t frames = 0, time = 0;
+    for (size_t k = 0; k < s.n; k++) {
+        const ScanBlock *b = &s.blocks[k];
+        Site *st = NULL;
+        for (uint32_t h = (b->site0 * 2654435761u ^ b->site1) & (SITES - 1);; h = (h + 1) & (SITES - 1)) {
+            if (!sites[h].site0 || (sites[h].site0 == b->site0 && sites[h].site1 == b->site1)) {
+                st = &sites[h];
+                break;
+            }
+        }
+        st->site0 = b->site0, st->site1 = b->site1;
+        const uint8_t *was = s.bytes + b->off, *now = GP(b->addr);
+        for (uint64_t o = 0; o + 4 <= b->size; o += 4) {
+            uint32_t a, c;
+            memcpy(&a, was + o, 4);
+            memcpy(&c, now + o, 4);
+            if (a == c) continue;
+            st->words++;
+            const int64_t d = (int64_t)(int32_t)(c - a);
+            const int apart = P < T * 9 / 10 || P > T * 11 / 10;   /* (frames and time told apart) */
+            if (apart && d >= P - 1 && d <= P + 1) st->frames++, frames++;
+            else if (apart && d >= T * 97 / 100 && d <= T * 103 / 100) st->time++, time++;
+            float fa, fc;
+            memcpy(&fa, &a, 4);
+            memcpy(&fc, &c, 4);
+            const float df = fc - fa;
+            if (fa == fa && fc == fc && fa > -1e7f && fa < 1e7f && fc > -1e7f && fc < 1e7f) {
+                const int apart = P < T * 9 / 10 || P > T * 11 / 10;
+                if (apart && df > 0.98f * P && df < 1.02f * P) st->fframes++, frames++;
+                else if (apart && df > 0.97f * T && df < 1.03f * T) st->ftime++, time++;
+                else if (apart && df > 0.97f * W && df < 1.03f * W) st->fsec++, time++;
+            }
+        }
+    }
+    FILE *f = fopen("hl_step_scan.txt", "w");
+    char line[256];
+#define SCAN_OUT(...) do { snprintf(line, sizeof line, __VA_ARGS__); hos_log("%s", line); if (f) fprintf(f, "%s\n", line); } while (0)
+    SCAN_OUT("hl step scan: %llu blocks (%llu MB) compared over %d s with %lld frames presented: %llu words counting frames, "
+             "%llu counting time", (unsigned long long)s.n, (unsigned long long)(s.used >> 20), W, (long long)P,
+             (unsigned long long)frames, (unsigned long long)time);
+    qsort(sites, SITES, sizeof *sites, by_frames);
+    for (int k = 0; k < 40 && sites[k].frames + sites[k].fframes; k++)
+        SCAN_OUT("hl step scan: frames: site %#x %#x: %u ints, %u floats counting frames (time: %u ints, %u floats, %u seconds; "
+                 "%u words changed)", sites[k].site0, sites[k].site1, sites[k].frames, sites[k].fframes, sites[k].time,
+                 sites[k].ftime, sites[k].fsec, sites[k].words);
+    qsort(sites, SITES, sizeof *sites, by_time);
+    for (int k = 0; k < 20 && sites[k].time + sites[k].ftime + sites[k].fsec; k++)
+        SCAN_OUT("hl step scan: time: site %#x %#x: %u ints, %u floats in 1/60 s, %u in seconds (frames: %u ints, %u floats)",
+                 sites[k].site0, sites[k].site1, sites[k].time, sites[k].ftime, sites[k].fsec, sites[k].frames, sites[k].fframes);
+#undef SCAN_OUT
+    if (f) fclose(f);
+    free(sites);
+    free(s.blocks);
+    free(s.bytes);
+    return 0;
+}
+
+/* (a constructor: the heaps' first allocations come before the game's code runs anything else) */__attribute__((constructor)) static void hl_trace_switch(void) {
     const char *e = getenv("HL_TRACE");
     uint32_t mask = e && e[0] ? (uint32_t)strtoul(e, NULL, 0) : 0;
     if (!mask) return;
@@ -182,6 +296,8 @@ __attribute__((constructor)) static void hl_trace_switch(void) {
     if (!hl_trace_start(mask, &config)) return;
     const char *d = getenv("HL_TRACE_DUMP");
     if (d && atoi(d) > 0) CreateThread(NULL, 0, dump_after, (void *)(uintptr_t)atoi(d), 0, NULL);
+    const char *sc = getenv("HL_STEP_SCAN");
+    if (sc && atoi(sc) > 0) CreateThread(NULL, 0, step_scan, (void *)(uintptr_t)atoi(sc), 0, NULL);
 }
 
 /* The gates go on once the lift's gates are known (hl_gates_in reads the presence lines' constructors: asked at the
