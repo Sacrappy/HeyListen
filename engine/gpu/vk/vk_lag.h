@@ -30,7 +30,8 @@ void lag_poll_late();
 void lag_wait(uint64_t fence, uint64_t timeout_ns, int result, int64_t t0, int64_t t1, uint64_t rec_seq, int path, uint64_t done_at_exit);
 void lag_finish(int64_t t0, int64_t t1, uint64_t q_values, uint64_t completed, uint64_t pushed, int blocked);
 /// The GPU's counters, and the recording a submission value ended in (0: not known yet)
-void lag_set_timelines(uint64_t (*completed)(), uint64_t (*rec_completed)(), uint64_t (*rec_of)(uint64_t));
+void lag_set_timelines(uint64_t (*completed)(), uint64_t (*rec_completed)(), uint64_t (*rec_of)(uint64_t),
+                       void (*wait_any)(uint64_t timeline_next, uint64_t rec_next, uint64_t timeout_ns));
 /// The submission stopped at a wait for an event (the work waits for the game's own signal)
 void lag_note_stop(uint64_t value, int bit);   // (bit 1: stopped itself, 2: queued behind a stopped one)
 /// A recording went to the queue with this number on the recordings' timeline: the submissions whose recording was whole in a burst end in it

@@ -87,21 +87,24 @@ void flush_row(Rec& r) {   // (mu held)
 std::vector<uint64_t> pend;   // (the values whose recording the GPU has not finished yet; mu)
 std::vector<uint64_t> waiting_end;   // (whole in a burst: the recording that ends it is the next one submitted; mu)
 uint64_t (*rec_of_fn)(uint64_t) = nullptr;
+void (*wait_fn)(uint64_t, uint64_t, uint64_t) = nullptr;
 
-// (the thread that stamps the GPU's completions: it spins on the timeline, so a value is stamped within microseconds of its
-// signal; on a core of its own, as a measuring tool)
+// (the thread that stamps the GPU's completions: it sleeps on the two timelines, so a value is stamped within microseconds of its
+// signal)
 void poller_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk lag poller");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     uint64_t last = 0, last_rec = 0;
     int64_t last_flush = 0;
     for (;;) {
+        if (wait_fn) wait_fn(last + 1, last_rec + 1, 2000000);   // (until either timeline moves, 2 ms at most)
+        else Sleep(1);
         const uint64_t c = completed_fn ? completed_fn() : 0;
         const uint64_t rc = rec_completed_fn ? rec_completed_fn() : 0;
-        if (c > last || rc > last_rec) {
+        {
             const int64_t t = now(), f = frames();
             std::lock_guard lk(mu);
-            if (rc > last_rec && rec_of_fn)
+            if (rec_of_fn)
                 for (size_t i = 0; i < pend.size();) {
                     Rec& r = ring[pend[i] % kRing];
                     if (r.value != pend[i]) { pend[i] = pend.back(), pend.pop_back(); continue; }
@@ -119,9 +122,6 @@ void poller_main() {
                 if (r.value == v) r.t_gpu = t, r.f_gpu = f, flush_row(r);
             }
             last = std::max(last, c), last_rec = std::max(last_rec, rc);
-        } else {
-            for (int i = 0; i < 16; i++) _mm_pause();
-            SwitchToThread();
         }
         const int64_t t = now();
         if (t - last_flush > 2000000000LL) {
@@ -163,9 +163,10 @@ bool gpu_done(uint64_t value) {   // (mu held)
 }
 }  // namespace
 
-void lag_set_timelines(uint64_t (*completed)(), uint64_t (*rec_completed)(), uint64_t (*rec_of)(uint64_t)) {
+void lag_set_timelines(uint64_t (*completed)(), uint64_t (*rec_completed)(), uint64_t (*rec_of)(uint64_t),
+                       void (*wait_any)(uint64_t, uint64_t, uint64_t)) {
     if (!lag_on()) return;
-    completed_fn = completed, rec_completed_fn = rec_completed, rec_of_fn = rec_of;
+    completed_fn = completed, rec_completed_fn = rec_completed, rec_of_fn = rec_of, wait_fn = wait_any;
     start();
 }
 

@@ -5765,6 +5765,16 @@ bool replay_start() {
                           std::lock_guard mk(rec_map_mu);
                           const auto it = value_rec.find(value);
                           return it != value_rec.end() ? it->second : 0;
+                      },
+                      [](uint64_t tl_next, uint64_t rec_next, uint64_t timeout_ns) {
+                          VkSemaphore s[2] = {timeline, rec_timeline};
+                          uint64_t v[2] = {tl_next, rec_next};
+                          VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+                          wi.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
+                          wi.semaphoreCount = rec_timeline ? 2 : 1;
+                          wi.pSemaphores = s;
+                          wi.pValues = v;
+                          vkWaitSemaphores(dev.device, &wi, timeout_ns);
                       });
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.queueFamilyIndex = dev.queue_family;
