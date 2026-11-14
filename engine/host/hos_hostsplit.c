@@ -37,7 +37,7 @@ static int hs_enabled(void) {
     if (hs_first < 0) {
         const char *e = getenv("HOS_HOST_SPLIT");
         hs_first = e && atoi(e) > 0 ? atoi(e) : 0;
-        const char *c = e ? strchr(e, ',') : NULL;
+        const char *c = e ? strpbrk(e, ",:") : NULL;   /* (a batch file splits at a comma: HOS_HOST_SPLIT=60:60 there) */
         hs_every = c ? atoi(c + 1) : 0;
         const char *l = getenv("RX_VK_LEDGER");
         hs_ledger = l && atoi(l) > 0;
