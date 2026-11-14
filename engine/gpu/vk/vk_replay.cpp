@@ -52,6 +52,7 @@
 #include "vk_present_trace.h"
 
 #include "vk_internal.h"
+#include "vk_lag.h"   // (RX_VK_LAG_LOG)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -132,6 +133,19 @@ bool fence_poll_fast_on() {
     return v;
 }
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
+// (HeyListen, RX_VK_SYNC_HONEST=1, default off) value_rec keeps the FIRST recording a value was put in (emplace): a submission stopped at an
+// event wait is mapped to the recording of its piece before the wait, and a game fence for it was answered as soon as that one was
+// done, while the rest of its work (after the wait) was still on the GPU (RX_VK_LAG_LOG: 96% of the answers the game gets, 8 ms early).
+// With the switch a fence waits for the recording its last piece went into (value_end), or for the timeline while none is known.
+std::map<uint64_t, uint64_t> value_end;
+bool sync_honest_on() {
+    static const bool v = [] {
+        const bool on = getenv("RX_VK_SYNC_HONEST") && atoi(getenv("RX_VK_SYNC_HONEST")) != 0;
+        if (on) logf("vk: fence waits honest (RX_VK_SYNC_HONEST): a fence waits for the recording its work ended in");
+        return on;
+    }();
+    return v;
+}
 std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (sync_order_mu)
 std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (sync_order_mu)
 std::atomic<uint64_t> pushed{0};
@@ -637,15 +651,19 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     uint64_t seq = 0;
     if (rec_timeline) {   // (and its number on the recordings' timeline; every caller holds replay_mu: in order)
         seq = ++rec_seq;
+        lag_recording_submitted(seq);   // (RX_VK_LAG_LOG)
         signals[nsig].semaphore = rec_timeline;
         signals[nsig].value = seq;
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         nsig++;
         std::lock_guard mk(rec_map_mu);
         for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
+        if (sync_honest_on())   // (RX_VK_SYNC_HONEST: the recording the last piece of each went into)
+            for (uint64_t v : rec_open_values) value_end[v] = seq;
         if (r.value) value_rec.emplace(r.value, seq);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
+        while (value_end.size() > 8192) value_end.erase(value_end.begin());
         // (TICK-058: after value_rec has them, so a poll that sees the mark finds the recording; see wait_inner)
         for (uint64_t v : rec_open_qvalues) whole_val[v & (kWholeSlots - 1)].store(v, std::memory_order_release);
         rec_open_qvalues.clear();
@@ -3152,6 +3170,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     ReplayPin pin;
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
+    if (lag_on()) lag_poll_late(), lag_run_start(value);   // (RX_VK_LAG_LOG)
     if (memory_work) {
         if (frame_submits.empty()) frame_first_value = value;
         frame_submits.emplace_back(handles, handles + std::max(n, 0));
@@ -3184,6 +3203,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         q.waiting = true;
         q.handles.assign(handles, handles + n);
         q.cb = cb, q.p = stop, q.value = value;
+        lag_note_stop(value, 1);   // (RX_VK_LAG_LOG)
         if (st_stops++ < 12) {
             const nvn_p_wait_event w = wait_at(stop);
             logf("vk: submission %llu (queue %#llx) stopped at command buffer %d's wait for event %#llx %s %u (has %u)",
@@ -3201,6 +3221,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     if (pushed.load() < value) pushed = value;
     st_submits++;
     if (!burst_open && dump_pending()) wait_value(value), dump_write();
+    lag_run_end(value, rec_seq, burst_open);   // (RX_VK_LAG_LOG: the recording is whole)
     return true;
 }
 void do_submit(const uint64_t* handles, int n) {   // (RX_VK_ASYNC=0: on the submitting thread, in its order)
@@ -3388,6 +3409,7 @@ void submit_job(std::vector<uint64_t>& handles, uint64_t value, uint64_t queue) 
         if (frame_submits.empty()) frame_first_value = value;
         frame_submits.emplace_back(handles);
         submit_memory_work(value);
+        lag_note_stop(value, 2);   // (RX_VK_LAG_LOG: behind a stopped submission of its queue)
         it->second.later.push_back({std::move(handles), value});
         return;
     }
@@ -3408,8 +3430,9 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     uint64_t seq = 0;
     {
         std::lock_guard mk(rec_map_mu);
-        auto it = value_rec.find(f);
-        if (it == value_rec.end()) return false;
+        const bool honest = sync_honest_on();
+        auto it = honest ? value_end.find(f) : value_rec.find(f);
+        if (honest ? it == value_end.end() : it == value_rec.end()) return false;
         seq = it->second;
     }
     // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
@@ -3436,7 +3459,7 @@ int wait_inner(uint64_t f, uint64_t timeout_ns);
 uint64_t fence();
 /// (TICK-017) the game's fence waits that block (nvnSyncWait, nvnQueueFinish): how long, how far ahead of the GPU, by path.
 /// RX_VK_FENCE_WAIT_LOG=1: also the first 60 over 5 ms, one by one
-int wait(uint64_t f, uint64_t timeout_ns) {
+int wait_core(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
     const uint64_t done0 = completed(), latest = fence();
     bool recorded;
@@ -3467,6 +3490,22 @@ int wait(uint64_t f, uint64_t timeout_ns) {
              (long long)unrec, (long long)by_path[1], (long long)by_path[2], (long long)by_path[3]);
         sum_ms = max_ms = ahead = 0, n_long = unrec = 0, by_path[0] = by_path[1] = by_path[2] = by_path[3] = 0;
     }
+    return r;
+}
+/// (RX_VK_LAG_LOG: each answer the game gets to a fence wait or poll, with the clock and the GPU's state at the answer)
+int wait(uint64_t f, uint64_t timeout_ns) {
+    if (!lag_on()) return wait_core(f, timeout_ns);
+    const int64_t t0 = host->now_ns();
+    wait_path = 0;
+    const int r = wait_core(f, timeout_ns);
+    const int64_t t1 = host->now_ns();
+    uint64_t seq = 0;
+    {
+        std::lock_guard mk(rec_map_mu);
+        const auto it = value_rec.find(f);
+        if (it != value_rec.end()) seq = it->second;
+    }
+    lag_wait(f, timeout_ns, r, t0, t1, seq, wait_path, completed());
     return r;
 }
 int wait_inner(uint64_t f, uint64_t timeout_ns) {
@@ -3558,6 +3597,12 @@ bool replay_behind();
 void finish() {
     wait_queue_empty();
     wait_value(pushed.load());
+}
+/// (the game's nvnQueueFinish; RX_VK_LAG_LOG: what the GPU and the order's stopped queues have left when it returns)
+void finish_game() {
+    const int64_t t0 = lag_on() ? host->now_ns() : 0;
+    finish();
+    if (lag_on()) lag_finish(t0, host->now_ns(), q_values.load(), completed(), pushed.load(), blocked_n.load());
 }
 void wait_writebacks_reading(const void*, uint64_t) {}   // (nothing to write back: the GPU writes guest memory)
 /// (host: the CPU is about to read [gpu, gpu + size), nvnMemoryPoolInvalidateMappedRange / nvnBufferInvalidateMappedRange)
@@ -5527,6 +5572,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         // With it the syncs take the submits' captures, as the console's GPU sees its memory. RX_VK_SYNC_CAPTURE=0: off.
         static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
         jt_mark(11, 0);
+        lag_bq_enter();   // (RX_VK_LAG_LOG)
         if (capture) memory_capture_submit();
         jt_mark(12, 0);
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
@@ -5541,6 +5587,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
             std::call_once(watch, [] { std::thread(sync_watch).detach(); });
             std::vector<uint64_t> h(handles, handles + std::max(n, 0));
             const uint64_t value = ++q_values;
+            lag_submit(value);
             if (queue) {
                 q_last[queue] = value;
                 value_queue[value] = queue;
@@ -5563,6 +5610,8 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    lag_present();   // (RX_VK_LAG_LOG)
+    if (lag_on() && presents % 600 == 0) log_order_stats();
     memory_precopy_present();
     memory_cap_present();
     if (!async_on()) {
@@ -5711,6 +5760,27 @@ bool replay_start() {
     if (vkCreateSemaphore(dev.device, &tsi, nullptr, &timeline) != VK_SUCCESS) return false;
     if (vkCreateSemaphore(dev.device, &tsi, nullptr, &batch_tl) != VK_SUCCESS) batch_tl = VK_NULL_HANDLE;
     if (vkCreateSemaphore(dev.device, &tsi, nullptr, &rec_timeline) != VK_SUCCESS) rec_timeline = VK_NULL_HANDLE;
+    lag_set_timelines([]() -> uint64_t { return completed(); },   // (RX_VK_LAG_LOG: the thread that stamps the GPU's completions)
+                      []() -> uint64_t {
+                          uint64_t v = 0;
+                          if (rec_timeline) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &v);
+                          return v;
+                      },
+                      [](uint64_t value) -> uint64_t {
+                          std::lock_guard mk(rec_map_mu);
+                          const auto it = value_rec.find(value);
+                          return it != value_rec.end() ? it->second : 0;
+                      },
+                      [](uint64_t tl_next, uint64_t rec_next, uint64_t timeout_ns) {
+                          VkSemaphore s[2] = {timeline, rec_timeline};
+                          uint64_t v[2] = {tl_next, rec_next};
+                          VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+                          wi.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
+                          wi.semaphoreCount = rec_timeline ? 2 : 1;
+                          wi.pSemaphores = s;
+                          wi.pValues = v;
+                          vkWaitSemaphores(dev.device, &wi, timeout_ns);
+                      });
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.queueFamilyIndex = dev.queue_family;
     pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -5768,7 +5838,7 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_replayed = get_replayed;
     t.nvn_wait = wait;
     t.wait_writebacks_reading = wait_writebacks_reading;
-    t.nvn_finish = finish;
+    t.nvn_finish = finish_game;
     t.nvn_present = present;
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;

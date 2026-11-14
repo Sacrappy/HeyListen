@@ -32,6 +32,8 @@ inline void ledger_mark(uint64_t gpu, uint64_t size, uint16_t use) {
 }
 /// A pool was made at [lo, lo + size): what its memory was used for before is forgotten
 void ledger_pool_made(uint64_t lo, uint64_t size);
+/// (RX_VK_LAG_LOG) what the GPU used a guest page for (the marks above; 0 when the ledger is off or the page was never bound)
+uint16_t ledger_use_of(uint64_t page);
 
 // ---- snapshots, taken on the replay's thread (texture_frame) and handed to the ledger's own thread ----
 struct LedgerTex {

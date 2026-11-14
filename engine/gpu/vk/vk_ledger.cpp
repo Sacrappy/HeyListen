@@ -94,6 +94,8 @@ void ledger_mark_slow(uint64_t gpu, uint64_t size, uint16_t use) {
     }
 }
 
+uint16_t ledger_use_of(uint64_t page) { return ledger_on() ? mark_at(page) : 0; }
+
 void ledger_pool_made(uint64_t lo, uint64_t size) {
     if (lo >= (1ull << 40)) return;
     for (uint64_t p = lo >> 12, e = std::min<uint64_t>((lo + size + 4095) >> 12, (1ull << 28)); p < e; p++)

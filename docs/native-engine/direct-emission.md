@@ -925,3 +925,28 @@ change: `vk: VRAM breakdown` (heaps %, free in VMA blocks: it should fall back a
 `vk: image generations` (given back should grow at zone changes), `vk: image blocks` (render targets as before), and the
 release lines (`not as the pool is gone` growing at zone changes, `at the copy into guest memory` counts). To compare,
 `RX_VK_IMAGE_GENERATIONS=0` (the default) in another session over the same route.
+
+## 12. Replay lag, the truth of the game's waits, and what the capture protects (`RX_VK_LAG_LOG`, 2026-11-14, measured)
+
+Question: does the back end replay late, answer the game's waits early, and is that what the capture is for? Built `RX_VK_LAG_LOG=1`
+(`gpu/vk/vk_lag.cpp`, logging only, default off: `lag_log.csv` in the working directory; `RX_VK_LEDGER=3600` adds the page kinds,
+`RX_VK_LAG_STRIDE` the sample of pages compared, default 4). Main PC, `hyrule-field` (70 fps, machine free), `market` (21 fps) and
+`death-mountain-trail` (44 fps) from the save library, 32 s windows after the load, 25,727 submits.
+
+- **A. Replay lag.** The back end takes a submit 0.4-0.5 ms after the game made it (held submits included), the recording is whole
+  after a median 1-2 ms for the 33% of submits that never stop at an event wait (p95 2.4-5 ms), and after 8-13 ms for the 67% that
+  stop at one (the presentation queue waits for the game's own CPU signal; hyrule 7.9, market 11.1, death-mountain 12.8 ms). **0 of
+  25,727 submits were recorded more than 0 game frames after the game's submit.** The GPU finishes the last piece of a submit after a
+  median 3-6 ms (never stopped) or 12-21 ms (stopped); 33-52% finish one present later, **none two**.
+- **B. Waits.** Per frame the game polls one fence of the stopped queue (and one window-texture acquire sync, always answered done at
+  once by rule). **65-99% of those fence answers are early**: `value_rec` keeps the first recording a value was put in (`emplace`),
+  a submission stopped at an event wait is mapped to its piece before the wait, and `wait_inner`'s per-queue path
+  (`RX_VK_PER_QUEUE_FENCES`, on) answers when that recording is done. Early by a median 2.6 / 8.7 / 4.3 ms (p95 3.5 / 68 / 8).
+  No answer was early for a submit that never stopped; no wait was forced past a stopped wait (`RX_VK_WAIT_HOLD_US` path: 0).
+- **C. What the capture protects** (pages of the capture whose bytes differ in guest memory when the recording is whole, per game
+  frame, of ~2,500-4,900 captured): 84-155 (2.6-3.3%): uniform-bound 0.7-2.1, vertex or index 0, storage 0, **never bound by a record
+  83-155**. Without the stopped submits 4-5 (0.1-0.2%), uniform 0.2-1.0. Not one of the ~64,000 sampled pages was written after the
+  game had been told the submit was done.
+- **D. `RX_VK_SYNC_HONEST=1`** (default off, 20 lines, `vk_replay.cpp` `value_end`): a fence waits for the recording the last
+  piece went into. Early answers 99% -> 0.1%; the main thread blocks in sync waits 3.2 ms a frame (0.98 waits a frame, median 2.9 ms),
+  none before; 71 fps against 70 (one run each, noise); the capture's count does not move (73 pages a frame against 87).
