@@ -430,7 +430,7 @@ def run(args: argparse.Namespace) -> dict:
         raise SystemExit(f"{image} is already running: refusing to start a second instance")
     # (2026-11-09: a scripted walk left the area, the game autosaved and the user's own save was overwritten) the run must leave
     # the saves exactly as they were: copied before, put back after
-    save_dir = next((d / "user" / "save" for d in (exe.parent, exe.parent.parent) if (d / "user" / "save").is_dir()), None)
+    save_dir = next((d for d in save_dirs(exe) if d.is_dir()), None)
     save_copy = out / "save-guard"
     if save_dir is not None and not os.environ.get("BENCH_KEEP_GAME_SAVES"):
         shutil.rmtree(save_copy, ignore_errors=True)
@@ -464,7 +464,8 @@ def run(args: argparse.Namespace) -> dict:
         for _ in range(10):
             if not instances(image):
                 break
-            subprocess.run(["taskkill", "/F", "/IM", image], capture_output=True)
+            subprocess.run(["taskkill", "/F", "/IM", image] if os.name == "nt" else ["pkill", "-KILL", "-x", image[:15]],
+                           capture_output=True)
             time.sleep(1)
         if instances(image):
             warnings.append(f"{image} still running after the run")
@@ -571,10 +572,21 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def instances(image: str) -> int:
-    """Number of running processes with this image name (Windows tasklist; 0 elsewhere)."""
+def save_dirs(exe: Path) -> list[Path]:
+    """Where the game keeps its saves: user/save beside the exe (Windows), else the Linux data folder
+    ($XDG_DATA_HOME/hookshot/save, by default ~/.local/share/hookshot/save)."""
+    dirs = [exe.parent / "user" / "save", exe.parent.parent / "user" / "save"]
     if os.name != "nt":
-        return 0
+        data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        dirs.append(Path(data) / "hookshot" / "save")
+    return dirs
+
+
+def instances(image: str) -> int:
+    """Number of running processes with this image name (Windows tasklist, pgrep -x elsewhere)."""
+    if os.name != "nt":
+        r = subprocess.run(["pgrep", "-x", image[:15]], capture_output=True, text=True)
+        return len(r.stdout.split())
     out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
                          capture_output=True, text=True, errors="replace").stdout
     return sum(1 for line in out.splitlines() if line.lower().startswith(f'"{image.lower()}"'))

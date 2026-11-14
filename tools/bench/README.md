@@ -11,6 +11,9 @@ Runs one build, collects per-frame present intervals, writes `<dir>/bench.json`
 (plus the raw `present_trace.csv` / `presentmon.csv` and `game_log.txt`).
 Exit code 0 when frames were recorded, 2 when none were.
 
+On Linux, `--exe` is the game folder's `hookshot`; the saves the run guards (copied before, put back after) are
+`$XDG_DATA_HOME/hookshot/save` (`~/.local/share/hookshot/save`), and the running check uses `pgrep -x`.
+
 `--repeat N` (TICK-009) runs N launches back to back into `<dir>/run1` .. `run<N>`
 (each with its own watchdog, the game killed before the next one starts) and writes
 `<dir>/repeat.json`: fps min/max/mean and `spread_pct` = (max - min) / mean. The
