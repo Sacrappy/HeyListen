@@ -315,6 +315,10 @@ static_assert(offsetof(TextureObject, sampler) == 0xf2);
 /// The NVN device the texture handles are asked of: a GOT slot holding the address of a global that points at an object
 /// whose +0x170 is the device.
 inline constexpr uint64_t kDeviceHolderSlot = 0x84cacc98, kDeviceOffset = 0x170;
+/// The material's per-drawable uniform blocks: their count and table (0xc8-byte entries, each a buffer object with a
+/// made-ready word).
+inline constexpr uint64_t kDrawableBlockCount = 0x590, kDrawableBlockTable = 0x598, kDrawableBlockSize = 0xc8,
+                          kDrawableBlockReady = 0xc0;
 /// The material's per-texture-slot index into the block's handle table (a signed byte at +0x189 + 16 x slot).
 inline constexpr uint64_t kMaterialHandleIndex = 0x189;
 

@@ -827,6 +827,26 @@ void the_preparation_binds_new_textures() {
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
 }
 
+void the_preparation_binds_the_drawable_block_after_the_textures() {
+    gfx::PrepareInputs in = cached_inputs();
+    in.known = {0xa0, 0xa1, 0xb0, 0xb1};
+    in.view_blocks = true, in.drawable_block = 3, in.applied_drawable_block = 1, in.block_binding = 0xffff02ff;
+    in.drawable_buffer.align_method = 0xa0, in.drawable_buffer.bind_method = 0xb0, in.drawable_buffer.base = 0x5000;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::DrawableBlock);   // (never made ready: guest code)
+    in.drawable_ready = 1;
+    in.applied_program = 0x5678;
+    in.interface_id[2] = 4, in.texture_mask = 1;
+    in.textures[0].word = 0xffffff00, in.textures[0].texture = 7;
+    gfx::PrepareOutputs out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.drawable_bound && out.drawable_block == 3 && out.bind_marked);
+    CHECK(out.tail_binds == 0 && out.bind_count == 1 && out.binds[0].stage == 2 && out.binds[0].slot == 2);   // (byte 1: stage 2)
+    Recorder r;
+    gfx::PrepareHandles h;
+    gfx::Prepare::emit(out, h, r);
+    // (program, texture handle and bind, then the drawable block, then the list)
+    CHECK(r.calls.size() == 5 && r.calls[3].op == (uint32_t)gfx::Proc::CommandBufferBindUniformBuffer && r.calls[3].x[3] == 0x5000);
+}
+
 void the_prepare_bridge_reads_in_the_functions_order() {
     SparseRuntime rt;
     const uint64_t drawable = 0x100000, block = 0x200000, context = 0x300000, cb = 0x310000, materials = 0x400000,
@@ -969,6 +989,7 @@ int main() {
     the_preparation_state_step_derives_and_records();
     the_preparation_binds_changed_uniform_words();
     the_preparation_binds_new_textures();
+    the_preparation_binds_the_drawable_block_after_the_textures();
     the_prepare_bridge_reads_in_the_functions_order();
     std::printf("gfx: ok\n");
     return 0;

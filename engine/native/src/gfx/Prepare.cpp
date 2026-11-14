@@ -296,8 +296,14 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
         out.mask_written = true;
         out.applied_mask = (uint16_t)bits;
     }
-    if (in.view_blocks && in.drawable_block != applied_drawable_block && block_binding != 0xffffffffu)
-        return left(PrepareRoute::DrawableBlock);
+    out.tail_binds = out.bind_count;
+    if (in.view_blocks && in.drawable_block != applied_drawable_block && block_binding != 0xffffffffu) {
+        // (the drawable's entry of the per-drawable blocks, bound by the block's binding word; its first use makes it ready
+        // through guest code)
+        if (!in.drawable_ready || !bind_word(in, in.drawable_buffer, block_binding, out)) return left(PrepareRoute::DrawableBlock);
+        out.drawable_bound = true, out.drawable_block = in.drawable_block;
+        if (route == PrepareRoute::Cached || route == PrepareRoute::ProgramBound) route = PrepareRoute::ProgramBuffers;
+    }
     if (!(mode & 8) || !(in.list_flags & 1)) return left(PrepareRoute::Streams);
     if (in.list_flags & 2) {
         if (in.inline_switch) return left(PrepareRoute::Inline);
@@ -313,7 +319,7 @@ void Prepare::emit(const PrepareOutputs& out, const PrepareHandles& at, CommandS
     if (out.state_recorded && with_state) emit_state(out.state, at, sink);
     if (out.program_bound)
         sink.emit(command(Proc::CommandBufferBindProgram, out.binder, out.program_object, out.program_stages));
-    for (uint32_t i = 0; i < out.bind_count; i++) {
+    for (uint32_t i = 0; i < out.tail_binds; i++) {
         const PrepareOutputs::Bind& b = out.binds[i];
         sink.emit(command(Proc::CommandBufferBindUniformBuffer, at.bind_buffer, b.stage, b.slot, b.address, b.size));
     }
@@ -327,6 +333,10 @@ void Prepare::emit(const PrepareOutputs& out, const PrepareHandles& at, CommandS
         sink.emit(command(Proc::DeviceGetTextureHandle, at.device, x.texture, x.sampler));
         for (uint32_t k = 0; k < x.stages; k++)
             sink.emit(command(Proc::CommandBufferBindTexture, at.bind_buffer, x.stage[k], x.slot[k], at.handles[i]));
+    }
+    for (uint32_t i = out.tail_binds; i < out.bind_count; i++) {
+        const PrepareOutputs::Bind& b = out.binds[i];
+        sink.emit(command(Proc::CommandBufferBindUniformBuffer, at.bind_buffer, b.stage, b.slot, b.address, b.size));
     }
     if (out.call_list) sink.emit(command(Proc::CommandBufferCallCommands, at.command_buffer, 1, at.command_list));
 }

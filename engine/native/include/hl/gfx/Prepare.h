@@ -140,6 +140,8 @@ struct PrepareInputs {
     uint8_t drawable_block = 0;         ///< the drawable's entry in it
     uint8_t applied_drawable_block = 0;
     uint32_t block_binding = 0;         ///< the block's binding word for it
+    BufferObject drawable_buffer;       ///< the drawable's entry in the table (read when the entry may be bound)
+    uint32_t drawable_ready = 0;        ///< its made-ready word (0: never used: guest code makes it ready)
     uint8_t list_flags = 0;             ///< the material entry's list flags (bit 0: present; bit 1: call it); mode bit 3
     bool inline_switch = false;         ///< read when the list is called
     uint8_t cluster = 0;                ///< the block's cluster index
@@ -173,7 +175,7 @@ struct PrepareOutputs {
         uint32_t stage = 0;
         uint64_t slot = 0, address = 0, size = 0;
     };
-    Bind binds[9];
+    Bind binds[12];
     /// The texture binds, in order: a handle asked for each texture (texture id, sampler id as the registers hold them),
     /// then its stages and slots.
     struct Texture {
@@ -187,6 +189,9 @@ struct PrepareOutputs {
     Texture textures[30];
     uint32_t texture_count = 0;
     uint32_t bind_count = 0;
+    uint32_t tail_binds = 0;            ///< binds[tail_binds..] are the per-drawable block's, after the textures
+    bool drawable_bound = false;        ///< the per-drawable block bound: the block's entry written, its ready bit set
+    uint8_t drawable_block = 0;
     bool bind_marked = false;           ///< a uniform bind sets the command buffer's mark byte
     bool mask_cleared = false;          ///< the block's applied bits cleared (before the pending step)
     bool mask_written = false;          ///< the block's applied bits are rewritten
@@ -201,6 +206,7 @@ struct PrepareHandles {
     // The state record's: the command buffer, the five state objects in the function's frame, the block's blend color.
     uint64_t state_buffer = 0;
     uint64_t bind_buffer = 0;           ///< the uniform and texture binds' command buffer
+    uint64_t drawable_entry = 0;        ///< the per-drawable block's entry (its made-ready word is set at its bind)
     uint64_t device = 0;
     uint64_t handles[30] = {};          ///< the texture handles asked (PrepareOutputs::textures' order)
     uint64_t blend = 0, color = 0, channel_mask = 0, depth_stencil = 0, polygon = 0, blend_color = 0;

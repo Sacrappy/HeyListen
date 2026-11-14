@@ -376,6 +376,21 @@ void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs
     in.drawable_block = d.block_entry;
     in.applied_drawable_block = b.drawable_block;
     in.block_binding = b.block_binding;
+    if (in.view_blocks && (in.drawable_block != in.applied_drawable_block || in.program != in.applied_program)) {
+        // (the drawable's entry: its signed index, -1 or past the count taking entry 0; each entry is a buffer object
+        // with a made-ready word)
+        const uint32_t count = u32(runtime_, b.material + guest::kDrawableBlockCount);
+        const int32_t s = (int8_t)d.block_entry;
+        const int32_t index = s == -1 || (uint32_t)s >= count ? 0 : s;
+        const GuestAddr e = u64(runtime_, b.material + guest::kDrawableBlockTable) + (uint64_t)((int64_t)index * guest::kDrawableBlockSize);
+        const guest::BufferObjectG& g = at<guest::BufferObjectG>(runtime_, e);
+        gfx::BufferObject& o = in.drawable_buffer;
+        o.align_method = u64(runtime_, g.vtable + guest::kBufferAlignMethod);
+        o.bind_method = u64(runtime_, g.vtable + guest::kBufferBindMethod);
+        o.size = g.size, o.slot = g.slot, o.stride = g.stride, o.base = g.base, o.alignment = g.alignment;
+        in.drawable_ready = __atomic_load_n(static_cast<const uint32_t*>(runtime_.ptr(e + guest::kDrawableBlockReady)), __ATOMIC_ACQUIRE);
+        h.drawable_entry = e;
+    }
     // (the function reads the list selector before it tests the mode bit)
     const uint32_t list = u16(runtime_, d.lists + guest::kListsSelector) & 3;
     if (!(in.mode_bits & 8)) return;
@@ -490,6 +505,13 @@ void PrepareBridge::write(GuestAddr block, const gfx::PrepareHandles& h, const g
         runtime_.written(block + offsetof(guest::RenderStateBlock, mode_bits),
                          offsetof(guest::RenderStateBlock, program) + 8 - offsetof(guest::RenderStateBlock, mode_bits));
     }
+    if (out.drawable_bound) {
+        guest::RenderStateBlock& b = *static_cast<guest::RenderStateBlock*>(runtime_.ptr(block));
+        b.drawable_block = out.drawable_block;
+        runtime_.written(block + offsetof(guest::RenderStateBlock, drawable_block), 1);
+        // (the entry's made-ready word: the function sets its bit 0 atomically at every bind)
+        __atomic_fetch_or(static_cast<uint32_t*>(runtime_.ptr(h.drawable_entry + guest::kDrawableBlockReady)), 1u, __ATOMIC_ACQ_REL);
+    }
     if (out.mask_written) {
         static_cast<guest::RenderStateBlock*>(runtime_.ptr(block))->applied_bits = out.applied_mask;
         runtime_.written(block + offsetof(guest::RenderStateBlock, applied_bits), 2);
@@ -506,11 +528,12 @@ void PrepareBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t*
 }
 
 void PrepareBridge::expect(uint8_t* bytes, const gfx::PrepareOutputs& out) {
-    if (out.state_step || out.program_bound) {
+    if (out.state_step || out.program_bound || out.drawable_bound) {
         guest::RenderStateBlock b;
         std::memcpy(&b, bytes, sizeof b);
         if (out.state_step) put_state(b, out.state);
         put_program(b, out);
+        if (out.drawable_bound) b.drawable_block = out.drawable_block;
         std::memcpy(bytes, &b, sizeof b);
     }
     if (out.mask_written) std::memcpy(bytes + offsetof(guest::RenderStateBlock, applied_bits), &out.applied_mask, 2);
