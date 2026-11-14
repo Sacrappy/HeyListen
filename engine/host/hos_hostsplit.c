@@ -177,6 +177,20 @@ static int paint_stacks(void) {
 /* heaps: each one's regions, and its large busy blocks apart. Reported against HeapSummary (the engine's own "C heaps" line) */
 typedef struct { uint64_t allocated, committed, region_committed, large_bytes; int large_n; } HeapNote;
 static HeapNote heap_notes[64];
+/* (the heaps' blocks over 256 KB: by size, and the biggest few: what the engine's own big malloc and calloc buffers are) */
+enum { BIG_BINS = 5, BIG_TOP = 8 };
+static uint64_t big_bytes[BIG_BINS], big_count[BIG_BINS], big_top[BIG_TOP];
+static const char *const big_bin_name[BIG_BINS] = {"256 KB to 1 MB", "1 to 4 MB", "4 to 16 MB", "16 to 64 MB", "64 MB and up"};
+static void big_note(uint64_t size) {
+    const int k = size >= (64u << 20) ? 4 : size >= (16u << 20) ? 3 : size >= (4u << 20) ? 2 : size >= (1u << 20) ? 1 : 0;
+    big_bytes[k] += size, big_count[k]++;
+    int at = BIG_TOP;
+    while (at > 0 && size > big_top[at - 1]) at--;
+    if (at < BIG_TOP) {
+        memmove(&big_top[at + 1], &big_top[at], (BIG_TOP - 1 - at) * sizeof big_top[0]);
+        big_top[at] = size;
+    }
+}
 static int nheaps;
 static int64_t heap_ms;
 static void paint_heaps(void) {
@@ -187,6 +201,7 @@ static void paint_heaps(void) {
     nheaps = (int)GetProcessHeaps(64, hs);
     if (nheaps > 64) nheaps = 64;
     const int64_t t0 = hos_now_ns();
+    memset(big_bytes, 0, sizeof big_bytes), memset(big_count, 0, sizeof big_count), memset(big_top, 0, sizeof big_top);
     for (int i = 0; i < nheaps; i++) {
         char label[72];
         snprintf(label, sizeof label, "C/Win heap %d (%s)", i, hs[i] == GetProcessHeap() ? "process heap" : "other");
@@ -208,6 +223,7 @@ static void paint_heaps(void) {
                 const uint64_t lo = (uint64_t)(uintptr_t)e.lpData;
                 paint(lo, lo + e.cbData, large_owner);
                 heap_notes[i].large_bytes += e.cbData, heap_notes[i].large_n++;
+                big_note(e.cbData);
             }
         }
         HeapUnlock(hs[i]);
