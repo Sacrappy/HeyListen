@@ -233,6 +233,26 @@ bool batch_on() {
     }();
     return on && batch_tl != VK_NULL_HANDLE;
 }
+// RX_VK_READBACK_STRICT: a readback of results with write-backs waits for the write-back's own value, not only the
+// recordings' timeline. On RADV that timeline is signalled before the write-back at the end of the submission has landed,
+// and a read in the gap took the light meter's sums from an earlier submission: OoT's auto-exposure jumped, the whole picture
+// 8-15% brighter for ~16 frames (an RX 9070 XT in Kokiri: up to 99 pulses in 2 minutes with the CPU busy, 0 with the wait,
+// at no measurable cost). On NVIDIA's driver the pulses were not seen and the wait cost ~18% (an RTX 5070 in Kokiri, pull
+// request 6). So on by default with RADV only; RX_VK_READBACK_STRICT=0 / 1: off / on on any driver
+bool readback_strict_on() {
+    static const bool on = [] {
+        bool radv = false;
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        if (dev.physical) vkGetPhysicalDeviceProperties2(dev.physical, &p2), radv = dp.driverID == VK_DRIVER_ID_MESA_RADV;
+        const char* e = getenv("RX_VK_READBACK_STRICT");
+        const bool v = e ? atoi(e) != 0 : radv;
+        logf("vk: readback waits for the write-back %s (RX_VK_READBACK_STRICT%s)", v ? "on" : "off", !e && radv ? ", on with RADV" : "");
+        return v;
+    }();
+    return on;
+}
 // (TICK-060, RX_VK_LATE_DEFER) the highest timeline value a submit sent to the queue signals: a capture's late value at or below it
 // is reached with nothing more submitted, so its wait can move to the queue (vk_memory.cpp take_capture)
 std::atomic<uint64_t> tl_signal_sent{0};
@@ -3759,8 +3779,8 @@ void invalidate(uint64_t gpu, uint64_t size) {
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
                     wait_value(v);
                 }
-                // (sprint 5, RX_VK_READBACK_STRICT=1, a test: the value itself reached on the GPU's timeline before the CPU reads)
-                static const bool strict = getenv("RX_VK_READBACK_STRICT") && atoi(getenv("RX_VK_READBACK_STRICT")) != 0;
+                // (sprint 5, RX_VK_READBACK_STRICT: the value itself reached on the GPU's timeline before the CPU reads)
+                static const bool strict = readback_strict_on();
                 static std::atomic<int64_t> st_strict{0};
                 if (strict && v > completed()) {
                     wait_value(v);

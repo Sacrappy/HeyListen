@@ -49,7 +49,8 @@ its next readback; the Presentation Thread's event poll does not flush meanwhile
 submits are of the light meter's buffers (0x113c88b000 / 88e000 / 891000 +0x1040, 0x11371e7f00 +0xc0). Read while the GPU is
 still inside the frame before, they hold what an earlier submission of that frame left (raw sums: 2.1e7 where the measure is
 78; `RX_VK_LOG_READBACK2`). The wait the linger removed was not for the flush but for **the GPU done with everything
-submitted**. Waiting for exactly that (`RX_VK_READBACK_STRICT=1`) gives the right picture at 67 fps; answering the polls "not
+submitted**. Waiting for exactly that (`RX_VK_READBACK_STRICT=1`, on by default with RADV since 2026-11-15: there the stale reads
+pulsed the exposure in Kokiri on an RX 9070 XT, at no cost; on NVIDIA the wait cost ~18%) gives the right picture at 67 fps; answering the polls "not
 yet" while the GPU is busy (`HOS_NVN_POLL_HONEST=1`) changes nothing (the module workers read too). The linger stays in the
 source as a documented experiment, off.
 

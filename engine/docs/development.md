@@ -115,6 +115,7 @@ case-sensitive, and an unknown one is ignored.
 | `RX_VK_FLASH=1` | The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the frames around a flash and dumps the next one |
 | `RX_VK_FRAMELOG=<file>` | Every frame shown, at 320x180, while `<file>.go` exists; `python -I scripts/framelog.py <file>` finds the flashes |
 | `RX_VK_DUMP=<present>[+<count>][,...]` | Every step of the frame after that present as PNGs, in `dump_<present>` under `RX_VK_DUMP_DIR` (or `RX_VK_SHOTS`, or the current folder); `RX_VK_DUMP_STEPS=<lo>-<hi>` and `RX_VK_DUMP_PROGS=<key>,...` narrow it |
+| `RX_VK_READBACK_STRICT=0` or `1` | Whether reads of GPU results (the light meter) wait for their write-back to land, not only for the recordings' timeline. On by default with RADV, where without it the auto-exposure pulses (the whole picture brighter for ~16 frames) when the CPU is busy; off elsewhere (on NVIDIA it cost ~18% and no pulses were seen). Set `=1` in `hookshot_env.txt` if the picture pulses on another driver. `RX_VK_FRAMELOG` shows the pulses; `RX_VK_EXPOSURE_LOG`'s factor does not |
 | `RX_VK_PASS_TRACE=1` | The passes of the last frames, logged at a flash or a dark frame (`RX_VK_PASS_TRACE_AT=<n>`: every n-th present) |
 | `RX_VK_PROBE=1` or `2` | The centre texel after every pass: `probe_<frame>.txt` at a flash (1), or `probe_all_<n>.txt` at speed (2); `python -I scripts/probe.py` reads them |
 | `RX_VK_DUMP_FAILED=<dir>` | The native code of every program that does not translate, for `nx2/lower_test.py` (game data: keep it local) |
