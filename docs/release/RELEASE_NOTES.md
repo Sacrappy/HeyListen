@@ -25,9 +25,12 @@ update reads. It builds the game from your own copy on your PC, like the Windows
 buildable again on this release by a contributor's pull request (#4) and given HeyListen's names, folders
 (`~/.local/share/heylisten`, `~/.config/heylisten`) and update links. What was and was not tested:
 - Tested: the game-free test suite on Ubuntu 26.04 (WSL2); the AppImage built there with the repository's scripts; a
-  player's build started from it up to the compile; the builder window starting and showing HeyListen's name; an update
-  installed from a test list.
-- WSL has no hardware Vulkan on the test PC (only the CPU renderer), so the game was not played there: {WSLRESULT}
+  complete player's build from it with a real game copy (32 minutes on 8 cores); the builder window starting and showing
+  HeyListen's name; an update installed from a test list (parts unchanged, so nothing was downloaded).
+- WSL has no hardware Vulkan on the test PC (only Mesa's CPU renderer), so the game was not played there. The built game
+  starts, opens a window named HeyListen, creates the Vulkan device and begins the first start's shader preparation (2,300 of
+  38,809 shaders in the 100 seconds it was left running, then stopped); the CPU renderer is far too slow to go further, and
+  it reports some programs as not translated for that renderer, which says nothing about a real GPU.
 - A contributor reported the Linux build of the `main` branch working on CachyOS with a Radeon RX 9070 XT. That is not this
   release's code, and no one has run this AppImage on a PC with a Linux GPU: we have no native Linux machine.
 - The Linux update (a new AppImage's parts downloaded from the `linux-parts` release) has never run against a real release.
