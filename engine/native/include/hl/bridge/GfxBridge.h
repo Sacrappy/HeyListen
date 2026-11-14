@@ -65,7 +65,9 @@ struct RenderStateBlock {
     uint64_t blend_color_in[2];
     uint16_t pending;            ///< bits the preparation still has to apply
     uint16_t applied_bits;
-    uint8_t _b4[28];
+    uint8_t _b4[4];
+    GuestAddr handle_table;      ///< texture handles, by the material's per-slot index (the preparation, mode bit 7)
+    uint8_t _c0[16];
     uint64_t program_aux;        ///< cleared when the preparation binds a program (not read by it)
     GuestAddr program;           ///< the program the preparation bound last
     uint8_t _e0[16];
@@ -112,6 +114,7 @@ static_assert(offsetof(RenderStateBlock, interface_id_b) == 0x94);
 static_assert(offsetof(RenderStateBlock, done) == 0x98);
 static_assert(offsetof(RenderStateBlock, pending) == 0xb0);
 static_assert(offsetof(RenderStateBlock, applied_bits) == 0xb2);
+static_assert(offsetof(RenderStateBlock, handle_table) == 0xb8);
 static_assert(offsetof(RenderStateBlock, program) == 0xd8);
 static_assert(offsetof(RenderStateBlock, geometry_mode) == 59);
 static_assert(offsetof(RenderStateBlock, triangles) == 80);
@@ -312,6 +315,8 @@ static_assert(offsetof(TextureObject, sampler) == 0xf2);
 /// The NVN device the texture handles are asked of: a GOT slot holding the address of a global that points at an object
 /// whose +0x170 is the device.
 inline constexpr uint64_t kDeviceHolderSlot = 0x84cacc98, kDeviceOffset = 0x170;
+/// The material's per-texture-slot index into the block's handle table (a signed byte at +0x189 + 16 x slot).
+inline constexpr uint64_t kMaterialHandleIndex = 0x189;
 
 /// The game's default binding words (globals): the first part's three, then the second part's two.
 inline constexpr uint64_t kDefaultWordsA = 0x84ea2848, kDefaultWordsB = 0x84ea2854;

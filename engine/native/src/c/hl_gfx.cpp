@@ -450,7 +450,8 @@ void ask_handles(const hl::gfx::PrepareInputs& in, const hl::gfx::PrepareOutputs
     if (!out.texture_count || !hl::gfx::Prepare::native(out.route)) return;
     at.device = in.device;
     for (uint32_t i = 0; i < out.texture_count; i++)
-        at.handles[i] = g_nvn.ask(hl::gfx::command(hl::gfx::Proc::DeviceGetTextureHandle, in.device,
+        if (!out.textures[i].deferred)
+            at.handles[i] = g_nvn.ask(hl::gfx::command(hl::gfx::Proc::DeviceGetTextureHandle, in.device,
                                                    out.textures[i].texture, out.textures[i].sampler));
 }
 }   // namespace

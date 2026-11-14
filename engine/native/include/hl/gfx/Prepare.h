@@ -125,6 +125,7 @@ struct PrepareInputs {
     /// object of the block's table at that slot (its ready word, texture id and sampler id).
     struct TextureSlot {
         uint32_t word = 0;
+        uint64_t entry = 0;             ///< mode bit 7: the address of its handle in the block's handle table
         uint32_t ready = 0, texture = 0;
         int16_t sampler = 0;
     };
@@ -176,6 +177,8 @@ struct PrepareOutputs {
     /// The texture binds, in order: a handle asked for each texture (texture id, sampler id as the registers hold them),
     /// then its stages and slots.
     struct Texture {
+        bool deferred = false;          ///< mode bit 7: BindTexturesDeferred of the handle at entry, no handle asked
+        uint64_t entry = 0;
         uint64_t texture = 0, sampler = 0;
         uint32_t stages = 0;
         uint32_t stage[3] = {};

@@ -58,6 +58,7 @@ enum class Proc : uint32_t {
     CommandBufferBindUniformBuffer,
     DeviceGetTextureHandle,
     CommandBufferBindTexture,
+    CommandBufferBindTexturesDeferred,
     Count
 };
 inline constexpr uint32_t kProcCount = (uint32_t)Proc::Count;

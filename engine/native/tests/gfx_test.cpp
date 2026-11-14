@@ -787,8 +787,8 @@ void the_preparation_binds_new_textures() {
     in.applied_program = 0x5678;
     in.interface_id[2] = 4;
     in.texture_mask = 0x40000005;   // (slots 0 and 2; bit 30 is past the slots)
-    in.textures[0] = {0xff02ff01, 0, 7, 3};    // (tag 0xff: stage 0 slot 1, stage 1 slot 2)
-    in.textures[2] = {0xfeffff05, 0, 9, -2};   // (tag 0xfe: stage 6 slot 5)
+    in.textures[0].word = 0xff02ff01, in.textures[0].texture = 7, in.textures[0].sampler = 3;   // (tag 0xff: stage 0 slot 1, stage 1 slot 2)
+    in.textures[2].word = 0xfeffff05, in.textures[2].texture = 9, in.textures[2].sampler = -2;  // (tag 0xfe: stage 6 slot 5)
     gfx::PrepareOutputs out = gfx::Prepare::decide(in);
     CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.texture_count == 2 && out.id_written[2]);
     CHECK(out.textures[0].texture == 7 && out.textures[0].sampler == 3 && out.textures[0].stages == 2);
@@ -810,8 +810,18 @@ void the_preparation_binds_new_textures() {
     in.textures[0].ready = 1;
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
     in.textures[0].ready = 0;
+    // (mode bit 7: the handle table's entries bound deferred, the command buffer marked; the texture objects not looked at)
     in.mode_bits |= 0x80;
+    in.textures[0].entry = 0x9008;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.texture_count == 1 && out.textures[0].deferred && out.bind_marked);
+    Recorder rd;
+    gfx::Prepare::emit(out, h, rd);
+    CHECK(rd.calls.size() == 1 + 2 + 1 && rd.calls[1].op == (uint32_t)gfx::Proc::CommandBufferBindTexturesDeferred);
+    CHECK(rd.calls[1].x[1] == 0 && rd.calls[1].x[2] == 1 && rd.calls[1].x[3] == 1 && rd.calls[1].x[4] == 0x9008);
+    in.inline_switch = true, in.list_flags = 1;
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in.inline_switch = false, in.list_flags = 3;
     in.mode_bits &= ~0x80u;
     in.textures[0].word = 0xfd02ff01;
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
