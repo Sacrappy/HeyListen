@@ -101,3 +101,40 @@ between them. The smallest honest cut in which the native loop owns the order an
 
 What this gives later: a native subsystem can be given its place in the frame as a phase of the native loop, between two
 of the game's steps, without a translated caller.
+
+## Frame rates above 60: the time step and what does not follow it
+
+**How the game keeps time.** The game is written for 30 or 60 frames a second with a time step, not for a fixed frame.
+The module system's frame (`0x80706be0`) computes each frame a ratio r = 60 (30 when the framework's `+0x24f` bit 0 is
+set) over the nominal frame rate (the framework's `+0x2c8`) and hands it to `0x83b6e300`, which fills the **frame-time
+object** (`*0x84c9e890`):
+
+| Offset | What (r: 1.0 at 60 fps, 0.5 at 120, 2.0 at 30) |
+|---|---|
+| `+0x10`, `+0x14` | r and 1/r |
+| `+0x18` | r times a constant (`0x83e6066c`): the step in seconds |
+| `+0x1c` | the frame rate as an integer: 60 / r rounded to nearest |
+| `+0x00`..`+0x0c` | the step after the game's time scales (16 scales at `+0x140`..`+0x1bc`, a global one at `+0x1c0`): step in frames, its inverse, in seconds, frames a second |
+| `+0x20`..`+0x11c` | six more such groups, one a category (each of the 4-bit fields of `+0x1c4` picks its scale) |
+
+133 functions read it; by the fields they load, 63 read the step `+0x00` and 61 the category selector `+0x1c4` (they
+take their category's step); one reads `+0x0c`, two `+0x10`, none the integer rate `+0x1c` directly.
+
+**How the port runs above 60.** The game sets its nominal rate back to 60 whenever it is above 60. The OS layer's
+real-time step (TICK-014, `nn_os_sync.c`, the Insert menu's Game speed "Real time", `game_speed=1`) writes the rate
+actually reached into `+0x2c8` just before the step is computed, so at 120 fps r is 0.5. The game therefore runs its
+whole simulation once per presented frame with a smaller step: delta time, no interpolation, no frame generation. Every
+system that advances by the frame-time object's step keeps real time (the log's "game 1/60 s a second: ratio 60"
+line sums r: 60 at any rate). **A system that advances by one per frame (a frame counter, a fixed per-frame constant)
+runs at the frame rate instead**: twice as fast at 120.
+
+**The honest fix: a 60 Hz tick for the systems that count frames.** Running the whole simulation at 60 and presenting
+each picture twice would keep every system right but show 60 different pictures a second: nothing gained over the cap.
+The engine has no interpolation of its own. The fix that keeps 120 pictures a second is per system: each system found
+to advance by one per frame gets its per-frame update called by an accumulator of the frame's step r instead of once a
+frame: r is added each frame, and the update runs (and 1 is taken off) while the sum is 1 or more. At 120 fps (r = 0.5)
+such a system runs every other frame, at 90 two frames in three, at 60 every frame as now, and below 60 (r > 1) twice in
+some frames, which also mends their slowness at low frame rates. One accumulator, kept by the native main loop (it owns
+the iteration and sees the step each frame), gives every such system the same ticks so that they stay in step with each
+other (a cutscene's sequencer and its voice lines). Each system is answered by an entry gate on its update function
+that lets the translated update run, or not, by that tick: the game's code is unchanged, its order too.
