@@ -18,12 +18,19 @@ repository (the engine under `engine/`).
 
 ## New in this release
 
-**v0.3.1 repairs the installation.** The setup downloaded four of the builder's tools (Python, emsdk, the CPM packages and
-wgpu-native) from the Hookshot repository, which is no longer online, so a new install of v0.3.0 stopped with a download
-error. Those parts are now served from this repository, byte for byte the same files (same SHA-256), and the release tool
-refuses a list that names any other host than this repository and llvm-mingw's official release. The game and the builder
-are those of v0.3.0: if v0.3.0 is installed and working, the update downloads only the builder's own few MB and you need
-not build again for anything new.
+**v0.3.2 fixes crashes when moving between areas**, which have been there since v0.3.0. When graphics memory got tight
+(more likely at high resolutions and after several areas), a memory-saving step could copy stale GPU data over memory the
+game had just reused for its own objects, and the game crashed shortly after, usually while an area loaded. The data is now
+written back only into memory the game still uses for graphics, and only if the game has not written it since. Played by
+hand for 35 and 20 minutes through every area reachable from our save without a crash, where every earlier session crashed
+within 3 to 21 minutes. The update downloads only the builder's own few MB; the game is built again once.
+
+Known and not fixed in this release: on a first play, each area's graphics pipelines are compiled as they are first seen,
+which shows as missing buildings over a white background, low frame rates and stalls for the first seconds or minutes in
+a new area (worse on some drivers). It gets better as the game learns them; a proper fix is being worked on.
+
+v0.3.1 repaired the installation: the setup downloaded four of the builder's tools from the Hookshot repository, which is
+no longer online; they are now served from this repository, byte for byte the same files.
 
 The rest of these notes is v0.3.0's. Everything below is new since v0.2.0. It is a speed release: nothing changes in how the game looks or plays.
 
