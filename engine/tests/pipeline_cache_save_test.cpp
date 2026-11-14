@@ -99,6 +99,9 @@ int save_replace(const char* from, const char* to, unsigned flags) {
 #endif
 }
 
+// (the production mapped writer is not under test here: the vector path below it is the one these cases break)
+bool pcache_save_mapped(const std::string&, std::size_t) { return false; }
+
 #define fwrite save_fwrite
 #define MoveFileExA save_replace
 #include "pipeline_cache_save.inc"
