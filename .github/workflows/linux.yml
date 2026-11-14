@@ -206,7 +206,7 @@ jobs:
           name: HeyListen-linux-parts
           path: dist/parts
       - name: Check the files
-        run: tools/release/make_release_linux.sh "$RELEASE_TAG" dist
+        run: bash tools/release/make_release_linux.sh "$RELEASE_TAG" dist
       - name: Parts to the linux-parts release
         run: engine/scripts/linux/publish_parts.sh dist/parts
       - name: AppImage and list to the tag's release
