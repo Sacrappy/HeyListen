@@ -97,7 +97,11 @@ git subtree pull --prefix=engine upstream-hookshot main
 
 ## Credits
 
-HeyListen is **made by Sacrappy**, on top of the work of many people. Everything below is credit due to Hookshot's own contributors, whose recompiler, builder and renderer do the work:
+HeyListen is **made by Sacrappy**, with contributions from:
+
+- **[Mooseca](https://github.com/Mooseca)**: Linux (the engine builds again, the CI job, the game tested on a Radeon RX 9070 XT, what the players' guide says about it), the shaders prepared again when the program cache lost them, and the checks that build and run again.
+
+It stands on the work of many people. Everything below is credit due to Hookshot's own contributors, whose recompiler, builder and renderer do the work:
 
 - **NotRexed**: [Hookshot](https://github.com/NotRexed/Hookshot), BlueShell (Mario Kart World), Skybound (Tears of the Kingdom) and the a64-kit tools.
 - **[Eden](https://git.eden-emu.dev/eden-emu/eden)** and **Eglantine**: the shader recompiler and Switch 2 shader work.
