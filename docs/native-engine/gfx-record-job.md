@@ -1017,6 +1017,36 @@ recording); `DeviceGetTextureHandle`: none (it combines the two ids). No texture
 could write these records (`bind_handles` is one of `RecordWriter`'s kinds); not done in this brick: they go through the
 procedures (`NvnSink`), and moving them is the next step of the record path with the uniform binds stream 8 owns.
 
+**The check** (PC 3050, `HL_GFX_CHECK=1`, 170 s runs; "program buffers" now counts the calls with uniform, texture or
+per-drawable binds):
+
+| Zone | Calls | cached | program bound | program buffers | state applied | left: program | left: drawable block | Native share |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| hyrule-field | 3,925,736 | 2,602,440 | 395,829 | 564,697 | 221,239 | 132,425 | 9,106 | 96.4% |
+| kokiri-forest | 3,392,719 | 2,087,351 | 332,465 | 593,004 | 248,218 | 124,347 | 7,334 | 96.1% |
+| lake-hylia | 6,450,481 | 4,929,879 | 415,104 | 683,431 | 275,597 | 138,466 | 8,004 | 97.7% |
+| death-mountain-trail | 1,420,306 | 451,101 | 342,960 | 297,522 | 201,145 | 123,110 | 4,468 | 91.0% |
+| zora-river | 2,189,875 | 1,063,651 | 318,917 | 391,933 | 291,677 | 116,266 | 7,431 | 94.4% |
+| inside-deku-tree | 1,753,776 | 870,260 | 269,459 | 293,770 | 168,245 | 143,955 | 8,087 | 91.3% |
+| lost-woods | 1,170,234 | 361,742 | 250,365 | 289,800 | 165,204 | 99,532 | 3,591 | 91.2% |
+
+0 mismatched calls over 19.38 M calls compared (seven zones; Lake Hylia stands in for Kakariko, whose save does not
+load in scripted runs). What is left: 3-9% of the calls, nearly all on the "program" route (99-144 k a run, about 40
+NVN calls each: word 1's BufferGetAddress path, the other tags and the textures being made ready, not told apart by
+the histogram), and the per-drawable block's first uses (4-9 k a run). The pending-bits, streams, inline-write and
+clusters routes, and the empty material entry, were never taken in any zone in any run: they need no code; they stay
+the translation's, which the gate falls back to. **So the function is answered natively now with the translation as
+the fallback for a listed set of cases only** (the routes above and the cases each native step lists); what remains
+to make the last 3-9% native is word 1's table path and the 0xfd / 0xfc / 0xfb stage sets, then the textures' and the
+drawable block's first-use paths, which are guest code (waiting for a texture, registering it, making a block ready)
+and should stay called back.
+
+**Native, by picture** (defaults, `HL_GFX_REC_CHECK=1`, 170 s runs, shots every 600 frames): Hyrule Field, Kokiri Forest,
+Lake Hylia, Death Mountain Trail and the Lost Woods ran to the end with no crash line and the scene right in the last
+shots (the textures in place everywhere: grass, rock, water, foliage, the HUD); 0.31-0.68 M calls with binds a run
+native; the record check (render-state and preparation state records) 188,119-280,577 calls compared a run, 0
+mismatched.
+
 ## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
