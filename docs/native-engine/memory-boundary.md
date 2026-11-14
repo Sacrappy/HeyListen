@@ -1699,3 +1699,70 @@ submissions ago.
 | 6 | Output resolution: the game's frame at 2048x1152, not 2560x1440 | ~-36% of full-frame targets (~170-300 MB) | | | an A/B run (`HOS_OUTPUT_RES`), and the shadow map's size against it | picture size, the owner's choice |
 | 7 | The texture-storage commit dropped once uploaded (the drop, section 14, on by default) | | 0 (already cold) | ~1.0-1.5 GB | the main PC's validation of `HL_MEM_DROP` | restore hitches |
 | 8 | Write-back shadows (261 MB) and BC scratch (160 MB) made only while used | ~0.4 GB | | | shadows' 85/95% rule; scratch freed after a load | a stall at the next transcode |
+
+## 19. The commit budget of the 30-minute reference session (`play10.orch.log`, 2026-11-14)
+
+Sources: the census (`HOS_HOST_SPLIT=60,60`, 19 tables, a column below is one of them) and R1's ledger (`RX_VK_LEDGER=60`, 18 tables;
+its first table is at the census' 181 s: the ledger's clock starts 121 s later). Process commit 4.7 GB on the title, 19.1 GB with
+the first zone loaded, 28.0 GB at 547 s, **29.5 GB at 1158 s**. MB, private commit by owner (images are not private commit):
+
+| Owner | 60 s (title) | 181 s (zone loaded) | 547 s (mid) | 1158 s (end) | 181 s to end | Bound? |
+|---|---:|---:|---:|---:|---:|---|
+| The game's window | 1028 | 7370 | 11398 | 11527 | +4157 | the game's heaps; flat after 609 s |
+| **Driver regions of 32-64 MB (beside VRAM)** | 128 | 5491 | 8420 | 9201 | **+3710** | follows the VMA blocks (below) |
+| Driver arenas (private 512 MB and up; 128-512 MB before it merged at 486 s) | 2760 | 4550 | 4600 | 4630 | +80 | flat after the start (below) |
+| Tagged by us: captures, BC cache | 0 | 153 | 1326 | 1536 | +1383 | BC cache at its 1024 MB cap from 303 s; captures 0.4 GB |
+| C and Windows heaps | 468 | 604 | 1027 | 1091 | +487 | flat from 547 s (below) |
+| Driver regions 64-128 MB | 0 | 44 | 149 | 293 | +249 | creeps; VMA's larger blocks |
+| Other private (8-32, 1-8 MB, stacks, BAR charge) | 331 | 648 | 815 | 868 | +220 | |
+| **Not seen by the walk** (a constant charge, see section 16) | 237 | 266 | 268 | 414 | +148 | |
+| **Process private commit** | 4738 | 19119 | 27998 | 29523 | **+10404** | |
+
+The columns add up to the process figure within 6 MB. From the title to the end: +24.8 GB, of which the window 10.5, the 32-64 MB
+regions 9.1, the arenas 1.9, tagged 1.5, heaps 0.6. There is no unexplained remainder beyond the constant 0.24-0.41 GB.
+
+### (a) Do our Vulkan textures pile up when the game reuses storage? No
+
+The back end's textures (ledger header) go 1292, 3666, 3109, 3992, 4375, 3050, 2369 ... 1679 ... 2807 over the session; the
+texture images' VRAM 2311, 3659, 3820, 4197, 3515, 2695 ... 2117 ... 3124 MB; mirrors 1100-2524 MB; render-target images 112-240.
+None is monotone: the figures fall when the zone changes, and the live pools they sit in grow only from 3778 (5694 MB) to 5231
+(6626 MB). The ledger's "both (a range reused, or a buffer over a texture)" is 0 MB in every table: no range is both texture
+storage and a bound buffer. Not measured: whether one range holds two textures of ours at once (the ledger counts images, not
+overlaps): what the counts say is that the images alive follow the game's, and do not accumulate.
+
+### (b) The driver: arenas, and the regions beside VRAM
+
+- **Arenas**: 2.76 GB committed at the title (before any scene), 4.07 GB when the first zone has loaded, 4.6 GB from 486 s: a 0.5 GB
+  region that was "128-512 MB" until 425 s grew into the 512 MB class (the sum does not change). Pipelines made: 6645 to 6720 over
+  the session (+75) while the arenas moved by 0.08 GB after the first zone: the arenas are the start-up's (the 6600 pipelines made
+  before the first table, about 0.7 MB each with their shader modules), not the zones'. Their RAM: 2.6, 3.9, 3.9 GB ... then 1.7 GB
+  from 853 s with the commit unchanged: Windows took the pages out of the working set (`private by size 512+` RAM 3934 at 792 s,
+  1731 at 853 s); the peak is not a leak.
+- **The 32-64 MB regions are the driver's system-memory commit for VRAM, and it follows the VMA blocks, not what is allocated in
+  them**: over the 16 tables of the zone, commit of the 32-128 MB regions against the heap-0 blocks of `vk: memory heaps` correlates
+  0.875 (ratio 1.09-1.11 from 486 s on: 9.2 GB against 8.6 GB of blocks at the end), against allocations in them 0.12 (blocks 7.2-8.6 GB
+  while allocations moved 4.3-7.0 GB). **Empty space inside blocks costs commit one for one: 3.4 GB at the end (8572 MB of
+  blocks, 5217 MB allocated; the ledger's "free in VMA blocks" 0.67 to 2.7-3.7 GB).** Freeing blocks that hold nothing frees
+  that commit (not tried: a measurement of the correlation, not of the effect). Over-budget: VRAM used was 9.1-9.8 GB of 10.7-10.9
+  allowed (84-91%) in the second half; the working set did not collapse, and nothing in the log shows demotion beyond the arenas'
+  trimming above.
+- **The 15.1 GB working-set peak** (reached between 792 s and 853 s; census at 792 s: 13.7 GB): the game's window 6.7 GB (it swings
+  3.7-6.8 GB as zones load and cold pages come back), **the driver's arenas 3.9 GB resident**, ours 1.4 GB (BC cache 1.0 GB at its cap,
+  captures 0.4 GB), heaps 0.9, regions and images 0.5. Ours and the game's are 56% of it, the driver's 28%.
+
+### (c) The C heaps, 519 to 861 MB in use (ledger) over the session
+
+By size: blocks over 256 KB went from 194 to 277 MB (blocks of 256 KB to 1 MB 25 to 94 MB; 1-4 MB 18 to 45; 4-16 MB 33 to 56;
+16-64 MB 64 to 80) and then stopped; blocks under 256 KB, about 320 to 610 MB, make the rest (+290 MB). Named: the capture table 8
+to 25 MB (51 chunks, bounded by the pages seen), the texture shadow 0-24 MB (bounded by `kShadowMax`), capture spares in the
+back end's own buffers are not in the C heap. **The remaining 250 MB or so of small blocks is not attributed** (no allocation
+hook): the candidates are the per-pool, per-texture and per-import records (live pools +1450, imports 43 to 108) and the
+descriptor and pipeline tables. It is bounded in practice: the heap rose in the first 7 minutes (zone loads) and stayed at 860-940
+MB in use from 423 s to the end.
+
+### Levers this gives, by size
+
+1. Give back empty VMA blocks (up to 3.4 GB of commit; free space in blocks fell between 0.67 and 3.7 GB with the zone).
+2. The window's growth (+4.2 GB) is the game's heaps: the memory manager's job (section 4).
+3. The arenas (4.6 GB commit, 3.9 GB RAM at the peak): start-up work (section 16 item 1).
+4. The BC cache's 1 GB of RAM when VRAM is above 3/4 of its budget (section 11.1): it earns its memory only if textures are made again.
