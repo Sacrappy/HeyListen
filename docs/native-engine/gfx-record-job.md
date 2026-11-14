@@ -978,6 +978,45 @@ records, RecordSink against the NVN procedures, call by call): 134,083 / 174,102
 compared, 0 mismatched, accounting included. Kakariko Village's save does not load in scripted runs (for any stream):
 Lake Hylia stands in for it. The Kokiri Forest shot shows the minimap's dark rectangle, as before these bricks.
 
+### The texture binds and the per-drawable block (2026-11-14)
+
+**Map.** A new program whose texture part (P+0x10) has a new id (against B+0x8c; not under mode bit 15) binds, for each
+of the 30 slots its mask at +4 names, the texture of the slot's binding word (+8 + 4 x slot; -1: none). The words are
+read as the uniform blocks' (tag 0xff: stages 0, 1, 2 from bytes 0, 2, 1; 0xfe: stages 1, 6, 7 from bytes 2, 0, 1;
+0xfd, 0xfc, 0xfb: other stages, among them 5 and 8, through the table at `0x83f0f7c8` = 0, 1, 2, 5, 6, 7, 8). Two
+sources, by the block's mode bit 7:
+
+- **bit 7 set** (the common case in every zone): the handle the block's table at B+0xb8 holds for the slot, at the index
+  the material gives it (a signed byte at the material's +0x189 + 16 x slot): **BindTexturesDeferred**(command buffer,
+  stage, slot, 1, the entry's address), the command buffer marked first; with the inline-write switch set the bind is
+  written into the command memory (left to the translation natively);
+- **bit 7 clear**: the texture object at B+0x20 + 8 x slot: when its word at +0xec is not 0 it is being made ready (the
+  function waits, registers it, `0x802a6e80` / `0x802a6cc0`, makes its view, `0x800634b0`: guest code, left to the
+  translation); a texture id (+0x68) or sampler id (+0xf2) of -1 binds nothing; else **DeviceGetTextureHandle**(the
+  device at [[`0x84e9f6c8`]+0x170], texture, sampler) and **BindTexture**(command buffer, stage, slot, handle) per stage,
+  with no mark.
+
+What is cached: the texture part's id per block; nothing per slot. **The per-drawable block** (the material's table
+at +0x598, 0xc8-byte entries, count at +0x590; the drawable's signed index at D+0x5a, -1 or past the count taking entry
+0): bound by B+0x80 when D+0x5a differs from B+0x60, each entry a buffer object bound like the program's words; its
+word at +0xc0 is set atomically at every bind, and its first use (the word 0) makes it ready through `0x808a3050`
+(left to the translation); then B+0x60 takes D+0x5a.
+
+**Native**: both texture sources (tags 0xff and 0xfe; the handle asked through the NVN table, a query the check
+compares too, the check keeping the context's registers around it), and the per-drawable block once made ready (its
+bind after the textures, as the function's order; the made-ready word's bit set by an atomic OR, as the function's
+`ldset`). Left whole: a texture being made ready, tags 0xfd / 0xfc / 0xfb, the inline-write switch, the per-drawable
+block's first use, word 1 of the program's first part (the BufferGetAddress table path), storage or unknown buffer
+objects.
+
+**The handlers and RecordSink.** `BindTexture`: `watch_tex` (a debugging trace under `HOS_NVN_WATCH_TEX` that walks the
+guest frame pointers of the caller: a native caller's chain is the gate's) and `bind_handles` (a `NOP_BIND_TEX` record of
+one handle, `hw` 20); `BindTexturesDeferred`: the same trace over the guest handle array, and a `NOP_BIND_TEX` record
+naming the array's guest address (the back end reads the handles at the submit: the game fills its tables after the
+recording); `DeviceGetTextureHandle`: none (it combines the two ids). No texture pin, no control-memory mark. RecordSink
+could write these records (`bind_handles` is one of `RecordWriter`'s kinds); not done in this brick: they go through the
+procedures (`NvnSink`), and moving them is the next step of the record path with the uniform binds stream 8 owns.
+
 ## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
