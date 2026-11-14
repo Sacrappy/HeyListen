@@ -18,24 +18,6 @@ repository (the engine under `engine/`).
 
 ## New in this release
 
-**Linux (new, little tested).** This release also carries a Linux AppImage, `HeyListen-<version>-x86_64.AppImage`
-(built by this repository's CI in an Ubuntu 22.04 container, glibc 2.35 and newer), with `heylisten-linux.txt`, the list its
-update reads. It builds the game from your own copy on your PC, like the Windows builder; see the Linux section of the
-[user guide](https://github.com/Sacrappy/HeyListen/blob/main/docs/USER_GUIDE.md). It is Hookshot's Linux port, made
-buildable again on this release by a contributor's pull request (#4) and given HeyListen's names, folders
-(`~/.local/share/heylisten`, `~/.config/heylisten`) and update links. What was and was not tested:
-- Tested: the game-free test suite on Ubuntu 26.04 (WSL2); the AppImage built there with the repository's scripts; a
-  complete player's build from it with a real game copy (32 minutes on 8 cores); the builder window starting and showing
-  HeyListen's name; an update installed from a test list (parts unchanged, so nothing was downloaded).
-- WSL has no hardware Vulkan on the test PC (only Mesa's CPU renderer), so the game was not played there. The built game
-  starts, opens a window named HeyListen, creates the Vulkan device and begins the first start's shader preparation (2,300 of
-  38,809 shaders in the 100 seconds it was left running, then stopped); the CPU renderer is far too slow to go further, and
-  it reports some programs as not translated for that renderer, which says nothing about a real GPU.
-- A contributor reported the Linux build of the `main` branch working on CachyOS with a Radeon RX 9070 XT. That is not this
-  release's code, and no one has run this AppImage on a PC with a Linux GPU: we have no native Linux machine.
-- The Linux update (a new AppImage's parts downloaded from the `linux-parts` release) has never run against a real release.
-
-
 **v0.3.2 fixes crashes when moving between areas**, which have been there since v0.3.0. When graphics memory got tight
 (more likely at high resolutions and after several areas), a memory-saving step could copy stale GPU data over memory the
 game had just reused for its own objects, and the game crashed shortly after, usually while an area loaded or when an
@@ -62,7 +44,41 @@ cache is rebuilt once after the update.
 Also fixed: a graphics memory pool destroyed twice by the game could make the engine forget a newer pool made at the same
 address.
 
+**An interrupted shader preparation no longer leaves the game stuttering** (a contributor's pull request, #5). The record
+that said "the shaders are prepared" did not know whether the shader cache still held them: a start under other shader
+settings, or one closed before its preparation ended, could leave an empty cache that the next start trusted, and every
+shader was then translated during play. The next start now sees that the cache lost what was prepared and prepares again.
+
+**Linux (new, little tested).** This release also carries a Linux AppImage, `HeyListen-<version>-x86_64.AppImage`
+(built by this repository's CI in an Ubuntu 22.04 container, glibc 2.35 and newer), with `heylisten-linux.txt`, the list its
+update reads. It builds the game from your own copy on your PC, like the Windows builder; see the Linux section of the
+[user guide](https://github.com/Sacrappy/HeyListen/blob/main/docs/USER_GUIDE.md). It is Hookshot's Linux port, made
+buildable again on this release by a contributor's pull request (#4) and given HeyListen's names, folders
+(`~/.local/share/heylisten`, `~/.config/heylisten`) and update links. What was and was not tested:
+- Tested: the game-free test suite on Ubuntu 26.04 (WSL2); the AppImage built there with the repository's scripts; a
+  complete player's build from it with a real game copy (32 minutes on 8 cores); the builder window starting and showing
+  HeyListen's name; an update installed from a test list (parts unchanged, so nothing was downloaded).
+- WSL has no hardware Vulkan on the test PC (only Mesa's CPU renderer), so the game was not played there. The built game
+  starts, opens a window named HeyListen, creates the Vulkan device and begins the first start's shader preparation (2,300 of
+  38,809 shaders in the 100 seconds it was left running, then stopped); the CPU renderer is far too slow to go further, and
+  it reports some programs as not translated for that renderer, which says nothing about a real GPU.
+- A contributor reported the Linux build of the `main` branch working on CachyOS with a Radeon RX 9070 XT. That is not this
+  release's code, and no one has run this AppImage on a PC with a Linux GPU: we have no native Linux machine.
+- The Linux update (a new AppImage's parts downloaded from the `linux-parts` release) has never run against a real release.
+
 The update downloads only the builder's own few MB; the game is built again once.
+
+## Known issues
+
+- **Above 60 fps, cutscenes and some enemies run too fast**: the voice lines of the opening movie start almost together
+  and the picture goes black for the rest of its time, and a boss's behaviour speeds up. Limiting the frame rate to 60
+  (the builder's and the in-game settings) avoids it. This is not new in this release.
+- **Memory grows with each area visited** (several GB over a long session at 2560x1440) and is only given back when
+  graphics memory runs short. No crash is known from it since this release's fix; it is being worked on.
+- The first entry into an area can still stall for a few seconds (see above), and entering the Deku Tree was seen to run
+  at about 30 fps for a minute on a first visit.
+- On an older integrated Radeon (Ryzen 5700U) the picture is covered by a regular grid of dark lines. Not fixed.
+- A builder that is newer than the latest published release offers to "update" to the older one. Ignore it.
 
 v0.3.1 repaired the installation: the setup downloaded four of the builder's tools from the Hookshot repository, which is
 no longer online; they are now served from this repository, byte for byte the same files.
