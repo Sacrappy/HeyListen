@@ -335,6 +335,15 @@ Recording& begin_segment_recording(uint64_t) {
     r.value = 100 + k, r.slot = k;
     return r;
 }
+// (TICK-060 and TICK-061's chain B switches, all off as they ship: RX_VK_SEG_SETUP_PAR (D7) has the replay thread begin each
+// segment's command buffers, as above; RX_VK_WORK_LOCAL (D6) and the late fix's wait do nothing here)
+bool seg_setup_par_on() { return false; }
+void* ts_pool = nullptr;   // (no GPU timestamps)
+Recording& begin_segment_slot(uint64_t value) { return begin_segment_recording(value); }
+void segment_begin_here(Recording&) {}
+void work_seg_begin() {}
+void work_seg_end() {}
+bool late_fix_wait_unlocked() { return true; }
 // (replay_handle's part after the segments: the replay thread's next recording, submitted later as [its uploads, it])
 Recording post;
 Recording* rec_cur = nullptr;

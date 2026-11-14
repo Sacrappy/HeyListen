@@ -13,10 +13,11 @@ namespace hl::bridge {
 
 namespace {
 
+// (the generic forms: GCC's _n forms take integers and pointers only, and these load and store floats too; clang takes both)
 template <class T>
-T ld(const T* p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
+T ld(const T* p) { T v; __atomic_load(p, &v, __ATOMIC_RELAXED); return v; }
 template <class T>
-void st(T* p, T v) { __atomic_store_n(p, v, __ATOMIC_RELAXED); }
+void st(T* p, T v) { __atomic_store(p, &v, __ATOMIC_RELAXED); }
 
 // The guest's float-to-int conversion toward zero (fcvtzs): saturating, NaN to 0 (x86's own gives INT32_MIN there).
 int32_t to_int(float f) {

@@ -39,6 +39,7 @@
 #include "gone_ring.h"        // (TICK-052: the recording threads' pool table)
 #include "shaders/msync_scatter_comp_spv.h"   // (TICK-021: the mirror syncs' scatter copy)
 #ifdef __linux__
+#include "pcie_link.h"        // (TICK-048: the link speed from sysfs)
 #include <cerrno>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -4593,7 +4594,8 @@ uint64_t diff_table_bytes = 0;
 // ~3.9 GB/s) and lost ~10% on a full Gen4/5 x16 link (RTX 5070: the bytes cost 1 ms of GPU, the hashing ~3 ms of replay thread).
 // NVML (nvml.dll of the NVIDIA driver) gives the link's maximum generation and width; the link is throttled at idle, so the
 // maximum is read, not the current state. On when the maximum is <= 8 GB/s (Gen3 x8, Gen4 x4 and narrower); off when it is
-// wider, or when NVML is missing (other vendors, integrated GPUs: no known slow link).
+// wider, or when NVML is missing (other vendors, integrated GPUs: no known slow link). On Linux NVML never loads (nvml.dll), and
+// the link is read from sysfs instead, for every vendor: pcie_link_gbps_sysfs.
 double pcie_link_gbps() {
     HMODULE h = LoadLibraryA("nvml.dll");
     if (!h) return -1;
@@ -4622,13 +4624,33 @@ double pcie_link_gbps() {
     FreeLibrary(h);
     return gbps;
 }
+#ifdef __linux__
+// (Linux, any vendor) The card's PCI address from VK_EXT_pci_bus_info, its link and every bridge's above it from sysfs: the
+// narrowest one (pcie_link.h). The same maximum-speed, current-width reading as NVML's.
+double pcie_link_gbps_sysfs() {
+    if (!dev.pci_bus_info || dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return -1;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &pci;
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    const auto l = mkwvk::pcie_link::sysfs_link("/sys", pci.pciDomain, pci.pciBus, pci.pciDevice, pci.pciFunction);
+    if (l.gbps > 0)
+        logf("vk: mirror syncs: PCIe link Gen%d x%u (%.1f GB/s; sysfs, the narrowest of %d links, at %s)", l.gen, l.width, l.gbps,
+             l.hops, l.limited_by.c_str());
+    else logf("vk: mirror syncs: no PCIe link in sysfs for %04x:%02x:%02x.%x", pci.pciDomain, pci.pciBus, pci.pciDevice, pci.pciFunction);
+    return l.gbps;
+}
+#endif
 int diff_mode() {
     static const int v = [] {
         const char* e = getenv("RX_VK_MSYNC_DIFF");
         int m;
         if (e) m = std::clamp(atoi(e), 0, 2);
         else {
-            const double g = pcie_link_gbps();
+            double g = pcie_link_gbps();
+#ifdef __linux__
+            if (g <= 0) g = pcie_link_gbps_sysfs();
+#endif
             m = (g > 0 && g <= 8.0) ? 2 : 0;   // (on by default only on a slow link: PC 3050, Gen3 x4, +10..16%; off on x16 Gen4/5: -10%)
             logf("vk: mirror syncs: chunk diff %s by default (RX_VK_MSYNC_DIFF unset)", m ? "on" : "off");
         }

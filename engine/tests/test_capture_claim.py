@@ -49,6 +49,13 @@ def main():
 #include <thread>
 #include <vector>
 #include <windows.h>
+#ifndef _WIN32   // (Linux: host/posix's windows.h declares these; the copy helpers only name and lift their threads)
+extern "C" {
+HANDLE GetCurrentThread(void) { return nullptr; }
+BOOL SetThreadPriority(HANDLE, int) { return 1; }
+HRESULT SetThreadDescription(HANDLE, PCWSTR) { return 0; }
+}
+#endif
 constexpr uint64_t kPageShift = 12;
 constexpr uint32_t kGuestPages = 4096;
 static uint8_t* guest;
@@ -112,6 +119,12 @@ int main() {
         for (uint8_t b : ok) h = (h ^ b) * 1099511628211ull;
     }
     std::printf("%016llx\n", (unsigned long long)h);
+#ifndef _WIN32
+    // (as the game ends, host/posix ExitProcess: glibc's exit() destroys copy_helpers' condition variables under the detached
+    // helpers still waiting on them, and pthread_cond_destroy waits for those waiters for ever; Windows ends the threads first)
+    std::fflush(stdout);
+    std::_Exit(0);
+#endif
     return 0;
 }
 '''
@@ -119,7 +132,7 @@ int main() {
         cpp = os.path.join(tmp, "t.cpp")
         exe = os.path.join(tmp, "t.exe")
         Path(cpp).write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++20", "-O2", "-o", exe, cpp], check=True)
+        subprocess.run([args.cxx, "-std=c++20", "-O2"] + ([] if os.name == "nt" else ["-I", str(ROOT / "host/posix"), "-pthread"]) + ["-o", exe, cpp], check=True)
         hashes = {}
         for name, extra in (("parts", {}), ("claimed", {"RX_VK_CAPTURE_CLAIM": "1"}), ("claimed 8", {"RX_VK_CAPTURE_CLAIM": "8"}),
                             ("claimed, streaming", {"RX_VK_CAPTURE_CLAIM": "1", "STREAM": "1"}), ("2 helpers", {"RX_VK_CAPTURE_CLAIM": "1", "RX_VK_CAPTURE_THREADS": "2"})):

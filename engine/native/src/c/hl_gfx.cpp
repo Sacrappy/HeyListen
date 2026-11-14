@@ -491,7 +491,7 @@ extern "C" void hl_gfx_prep_check_call(uint32_t proc, uint32_t group, const uint
     std::memcpy(c.x, x, sizeof c.x);
     std::memcpy(c.f, f, sizeof c.f);
     t.translated.emit(c);
-    t.groups[group < HL_GFX_PREP_GROUPS ? group : HL_GFX_PREP_GROUP_OTHER]++;
+    t.groups[group < HL_GFX_PREP_GROUPS ? group : (uint32_t)HL_GFX_PREP_GROUP_OTHER]++;   // (one type: GCC -Wextra)
 }
 
 extern "C" void hl_gfx_prep_check_end(uint64_t result) {

@@ -57,7 +57,8 @@ struct Device {
          sparse_buffers = false, // (sparse-bound buffers on the queue: a pool imported as several dma-bufs)
          view_2d_of_3d = false, // (VK_EXT_image_2d_view_of_3d: a 3D texture a 2D sample instruction reads)
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
-         native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         native_mma = false,    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         pci_bus_info = false;  // (VK_EXT_pci_bus_info supported, not enabled: its properties name the card's sysfs node, vk_memory.cpp pcie_link_gbps)
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool swapchain_colorspace = false;   // (hookshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
     bool hdr = false;                    // (hookshot) the swapchain is HDR10 (ST 2084, Rec. 2020): framegen_hdr writes it

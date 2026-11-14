@@ -118,6 +118,7 @@ class NupCacheTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(make_game, "stop_stray_compilers"))   # (Windows: powershell, taskkill)
             stack.enter_context(mock.patch.object(make_game, "drop_stale_objects"))
             stack.enter_context(mock.patch.object(make_game, "no_throttle"))
+            stack.enter_context(mock.patch.object(make_game, "profile_readable", return_value=True))   # (Linux: runs clang on a kept profile)
             stack.enter_context(mock.patch("ctypes.WinDLL", create=True))
             stack.enter_context(mock.patch.object(make_game, "run", side_effect=run))
             output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))

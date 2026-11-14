@@ -430,7 +430,7 @@ def run(args: argparse.Namespace) -> dict:
         raise SystemExit(f"{exe} is already running: refusing to start a second instance of this game folder")
     # (2026-11-09: a scripted walk left the area, the game autosaved and the user's own save was overwritten) the run must leave
     # the saves exactly as they were: copied before, put back after
-    save_dir = next((d / "user" / "save" for d in (exe.parent, exe.parent.parent) if (d / "user" / "save").is_dir()), None)
+    save_dir = next((d for d in save_dirs(exe) if d.is_dir()), None)
     save_copy = out / "save-guard"
     if save_dir is not None and not os.environ.get("BENCH_KEEP_GAME_SAVES"):
         shutil.rmtree(save_copy, ignore_errors=True)
@@ -467,7 +467,10 @@ def run(args: argparse.Namespace) -> dict:
             if not left:
                 break
             for pid in left:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+                else:
+                    subprocess.run(["kill", "-KILL", str(pid)], capture_output=True)
             time.sleep(1)
         if instances(exe):
             warnings.append(f"{image} still running after the run")
@@ -574,14 +577,34 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def save_dirs(exe: Path) -> list[Path]:
+    """Where the game keeps its saves: user/save beside the exe (Windows), else the Linux data folder
+    ($XDG_DATA_HOME/hookshot/save, by default ~/.local/share/hookshot/save)."""
+    dirs = [exe.parent / "user" / "save", exe.parent.parent / "user" / "save"]
+    if os.name != "nt":
+        data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        dirs.append(Path(data) / "hookshot" / "save")
+    return dirs
+
+
 def instance_pids(exe: Path) -> list[int]:
-    """Process ids of the running processes whose executable is exactly this file (Windows; [] elsewhere).
+    """Process ids of the running processes whose executable is exactly this file.
 
     By full path, not by image name: several game folders (instance slots, build/s5/slot.sh) run the same HeyListen.exe
     at once, and this run must see, refuse on and kill only its own folder's.
     """
     if os.name != "nt":
-        return []
+        # (Linux: pgrep by name (the kernel keeps 15 characters), then /proc/<pid>/exe for the path)
+        want = os.path.realpath(str(exe))
+        r = subprocess.run(["pgrep", "-x", exe.name[:15]], capture_output=True, text=True)
+        pids = []
+        for w in r.stdout.split():
+            try:
+                if os.path.realpath(f"/proc/{w}/exe") == want:
+                    pids.append(int(w))
+            except (OSError, ValueError):
+                pass
+        return pids
     import ctypes
     from ctypes import wintypes
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)

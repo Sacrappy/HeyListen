@@ -217,10 +217,27 @@ static void thread_finish(DWORD code) {
     self_thread = NULL;
     thread_unref(t);
 }
+/* (thread priorities: only lowered, with nice values: an unprivileged process cannot raise them, nor take back a lowering.
+   A thread's id is only known once it runs, and CreateThread's caller often sets the priority before that (hos_thread_pin
+   lowering OptimizeChangeBank): the priority is kept and whichever of the two comes second applies it) */
+static void thread_nice(HThread *t) {
+    const int p = __atomic_load_n(&t->priority, __ATOMIC_SEQ_CST);
+    const pid_t tid = __atomic_load_n(&t->tid, __ATOMIC_SEQ_CST);
+    const int nice = p <= THREAD_PRIORITY_IDLE ? 19 : p <= THREAD_PRIORITY_LOWEST ? 10 : p == THREAD_PRIORITY_BELOW_NORMAL ? 5 : 0;
+    if (nice && tid) setpriority(PRIO_PROCESS, (id_t)tid, nice);
+}
+BOOL SetThreadPriority(HANDLE h, int p) {
+    HThread *t = thread_of(h);
+    if (!t) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
+    __atomic_store_n(&t->priority, p, __ATOMIC_SEQ_CST);
+    thread_nice(t);
+    return TRUE;
+}
 static void *thread_entry(void *p) {
     HThread *t = (HThread *)p;
     self_thread = t;
-    t->tid = (pid_t)syscall(SYS_gettid);
+    __atomic_store_n(&t->tid, (pid_t)syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    thread_nice(t);   /* (a SetThreadPriority from the creator before this thread had its id: applied here) */
     thread_finish(t->fn(t->arg));
     return NULL;
 }
@@ -281,15 +298,7 @@ BOOL DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, HANDLE *out, DWORD access
     *out = t;
     return TRUE;
 }
-/* (thread priorities: only lowered, with nice values: an unprivileged process cannot raise them, nor take back a lowering) */
-BOOL SetThreadPriority(HANDLE h, int p) {
-    HThread *t = thread_of(h);
-    if (!t) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
-    t->priority = p;
-    const int nice = p <= THREAD_PRIORITY_IDLE ? 19 : p <= THREAD_PRIORITY_LOWEST ? 10 : p == THREAD_PRIORITY_BELOW_NORMAL ? 5 : 0;
-    if (nice && t->tid) setpriority(PRIO_PROCESS, (id_t)t->tid, nice);
-    return TRUE;
-}
+
 int GetThreadPriority(HANDLE h) {
     HThread *t = thread_of(h);
     return t ? t->priority : 0;
@@ -1323,3 +1332,96 @@ MMRESULT waveOutReset(HWAVEOUT hw) {
     return 0;
 }
 MMRESULT waveOutClose(HWAVEOUT hw) { waveOutReset(hw); return 0; }
+
+/* ---- (HeyListen) the performance overlay's, the capture pre-copy's and the replay trace's calls ---- */
+BOOL SetWaitableTimer(HANDLE t, const LARGE_INTEGER *due, LONG period, void *fn, void *arg, BOOL resume) {
+    (void)resume;
+    return SetWaitableTimerEx(t, due, period, fn, arg, NULL, 0);
+}
+HANDLE CreateEventW(void *attr, BOOL manual, BOOL initial, LPCWSTR name) { (void)name; return CreateEventA(attr, manual, initial, NULL); }
+static void filetime_100ns(FILETIME *ft, uint64_t t) { ft->dwLowDateTime = (DWORD)t, ft->dwHighDateTime = (DWORD)(t >> 32); }
+BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user) {
+    FILE *f = fopen("/proc/stat", "r");
+    unsigned long long us = 0, ni = 0, sy = 0, id = 0, io = 0, irq = 0, sirq = 0, st = 0;
+    const int n = f ? fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &us, &ni, &sy, &id, &io, &irq, &sirq, &st) : 0;
+    if (f) fclose(f);
+    if (n < 4) { last_error = ERROR_NOT_SUPPORTED; return FALSE; }
+    const uint64_t tick = 10000000ULL / (uint64_t)sysconf(_SC_CLK_TCK);   /* (100 ns units a clock tick) */
+    if (idle) filetime_100ns(idle, (id + io) * tick);
+    if (kernel) filetime_100ns(kernel, (sy + irq + sirq + id + io) * tick);
+    if (user) filetime_100ns(user, (us + ni) * tick);
+    return TRUE;
+}
+BOOL GetProcessTimes(HANDLE p, FILETIME *create, FILETIME *exit_, FILETIME *kernel, FILETIME *user) {
+    if (p != GetCurrentProcess()) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru)) { last_error = ERROR_NOT_SUPPORTED; return FALSE; }
+    if (kernel) filetime_100ns(kernel, (uint64_t)ru.ru_stime.tv_sec * 10000000ULL + (uint64_t)ru.ru_stime.tv_usec * 10);
+    if (user) filetime_100ns(user, (uint64_t)ru.ru_utime.tv_sec * 10000000ULL + (uint64_t)ru.ru_utime.tv_usec * 10);
+    if (exit_) filetime_100ns(exit_, 0);
+    if (create) {
+        /* (the start time, field 22 of /proc/self/stat, is in clock ticks since boot: now minus the process's age) */
+        char buf[1024];
+        unsigned long long start = 0;
+        FILE *f = fopen("/proc/self/stat", "r");
+        const size_t got = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+        if (f) fclose(f);
+        buf[got] = 0;
+        const char *q = strrchr(buf, ')');   /* (the name may hold spaces: the fields after it) */
+        for (int field = 2; q && *q && field < 22; q++)
+            if (*q == ' ') field++;
+        if (q) start = strtoull(q, NULL, 10);
+        struct timespec up;
+        clock_gettime(CLOCK_BOOTTIME, &up);
+        const int64_t age_ns = (int64_t)up.tv_sec * 1000000000LL + up.tv_nsec - (int64_t)(start * (1000000000ULL / (uint64_t)sysconf(_SC_CLK_TCK)));
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        const uint64_t t = ((uint64_t)now.dwHighDateTime << 32 | now.dwLowDateTime) - (uint64_t)(age_ns > 0 ? age_ns / 100 : 0);
+        filetime_100ns(create, t);
+    }
+    return TRUE;
+}
+BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *ms) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) { last_error = ERROR_NOT_SUPPORTED; return FALSE; }
+    unsigned long long total = 0, avail = 0, swap_total = 0, swap_free = 0, v;
+    char key[64];
+    while (fscanf(f, "%63s %llu kB\n", key, &v) == 2) {
+        if (!strcmp(key, "MemTotal:")) total = v;
+        else if (!strcmp(key, "MemAvailable:")) avail = v;
+        else if (!strcmp(key, "SwapTotal:")) swap_total = v;
+        else if (!strcmp(key, "SwapFree:")) swap_free = v;
+    }
+    fclose(f);
+    if (!total) { last_error = ERROR_NOT_SUPPORTED; return FALSE; }
+    const DWORD len = ms->dwLength;
+    memset(ms, 0, sizeof *ms);
+    ms->dwLength = len;
+    ms->ullTotalPhys = total << 10, ms->ullAvailPhys = avail << 10;
+    ms->ullTotalPageFile = (total + swap_total) << 10, ms->ullAvailPageFile = (avail + swap_free) << 10;
+    ms->dwMemoryLoad = (DWORD)(100 - avail * 100 / total);
+    ms->ullTotalVirtual = ms->ullAvailVirtual = 1ULL << 47;
+    return TRUE;
+}
+LSTATUS RegGetValueA(HKEY key, LPCSTR sub, LPCSTR value, DWORD flags, DWORD *type, void *data, DWORD *size) {
+    (void)sub, (void)flags;
+    if (key != HKEY_LOCAL_MACHINE || !value || strcmp(value, "ProcessorNameString") || !size) return ERROR_FILE_NOT_FOUND;
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    char line[512];
+    const char *name = NULL;
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "model name", 10) && (name = strchr(line, ':'))) {
+            name++;
+            while (*name == ' ' || *name == '\t') name++;
+            line[strcspn(line, "\n")] = 0;
+            break;
+        }
+    if (f) fclose(f);
+    if (!name) return ERROR_FILE_NOT_FOUND;
+    const DWORD need = (DWORD)strlen(name) + 1;
+    if (type) *type = 1;   /* (REG_SZ) */
+    if (!data || *size < need) { *size = need; return data ? 234L : ERROR_SUCCESS; }   /* (ERROR_MORE_DATA) */
+    memcpy(data, name, need);
+    *size = need;
+    return ERROR_SUCCESS;
+}

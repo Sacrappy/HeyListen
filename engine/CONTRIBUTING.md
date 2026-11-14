@@ -90,7 +90,9 @@ scripts/linux/deps.sh       # LLVM, Python packages, FFmpeg with dav1d, SDL2, Vu
 scripts/linux/appimage.sh   # the AppImage, in build-linux/
 ```
 
-The AppImage needs glibc 2.35 or newer and a Vulkan 1.3 driver with mesh shaders. `HOOKSHOT_JOBS` sets how many files
+`deps.sh` wants a C/C++ compiler, make, cmake, meson, ninja, nasm, pkg-config, curl and the Xft development files on
+the system (its header lists the Ubuntu and Arch packages; Fedora works too) and says which tool is missing. The
+AppImage needs glibc 2.35 or newer and a Vulkan 1.3 driver with mesh shaders. `HOOKSHOT_JOBS` sets how many files
 compile at once. The README's [Linux section](readme.md#on-linux) has the details and the runtime paths.
 
 ### NVIDIA DLSS (optional)
@@ -169,9 +171,14 @@ failure's output. Name a check to run only the ones whose path contains it (`pyt
 Some checks compile a small C or C++ fixture and need a compiler (`g++`, `gcc` or `clang++` on PATH), the SPIR-V
 validator (`spirv-val`), the SPIR-V or Vulkan headers (`HOOKSHOT_SPIRV_HEADERS` / `HOOKSHOT_VULKAN_HEADERS`, or the CPM
 cache in `RX_CPM` or `build-linux/deps/cpm`), or the `zstandard` package. A check whose tool is missing is skipped and
-says so; CI passes `--strict`, which fails it instead. The skip list at the top of `tests/run_all.py` names the checks
+says so; CI passes `--strict`, which fails it instead. The checked-in shader headers are compared with glslang
+16.6.0's output, so an older `glslangValidator` on PATH (Ubuntu 22.04's is 11) fails those comparisons. The skip list at the top of `tests/run_all.py` names the checks
 that cannot run in CI (a GPU, the game, a Visual Studio prompt) and the few that run on Linux only; `--no-skip` runs
 them anyway.
+
+In HeyListen, GitHub runs only the root `.github/workflows`: `linux.yml` runs these checks with `--strict` on Ubuntu 24.04
+(clang, spirv-tools, glslang 16.6.0 and the pinned SPIR-V and Vulkan headers, as `engine/.github/workflows/source-regressions.yml`
+does) and builds the AppImage in an Ubuntu 22.04 container.
 
 ### Checks that need your dump or a run
 

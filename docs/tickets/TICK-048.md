@@ -38,3 +38,6 @@ Docs: engine/docs/perf-audit.md "TICK-048", docs/benchmarks/2026-11-10-tick048-u
 
 ## Main PC check (2026-11-11): the diff loses on a full link; the default follows the PCIe link
 castle-move, 3 interleaved runs, one dll: diff off 70.5 fps, diff on 62.9 (-7.6, frame prep +3.2 ms; every on run below every off run). msync GPU 0.5 ms / 22 MB off, 0.14 ms / 3.7 MB on: the hashing costs more than the bytes. Default now: on only when NVML reports a maximum PCIe link <= 8 GB/s (PC 3050: Gen3 x4), else off; `RX_VK_MSYNC_DIFF` still overrides. Details: docs/benchmarks/2026-11-11-tick048-mainpc.md.
+
+## Linux, any card (2026-11-14): the link from sysfs when NVML gives nothing
+NVML is NVIDIA's, so on AMD and Intel cards the chunk diff stayed off whatever the link. On Linux `pcie_link_gbps_sysfs` (`gpu/vk/pcie_link.h`) now finds the card by its `VK_EXT_pci_bus_info` address, walks `/sys/bus/pci/devices` up to the root port and takes the narrowest `max_link_speed` x `current_link_width` (capped at `max_link_width`) on the way; integrated GPUs and cards without the extension stay -1 (off). An RX 9070 XT behind a Gen4 x16 root port reads 31.5 GB/s, so the diff stays off; a card in a Gen3 x4 slot reads 3.9 GB/s and turns it on. Test: `tests/test_pcie_link.py` (fake sysfs trees, no GPU).
