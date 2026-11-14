@@ -349,9 +349,18 @@ NV(nvnMemoryPoolFinalize) {
         }
         InterlockedIncrement(&vmap_gen);
         ReleaseSRWLockExclusive(&vmap_lock);
-    } else if (o->mem) {
+    } else if (o->mem && o->magic == NVN_MAGIC('P', 'O', 'O', 'L')) {
         hos_gpu_track(o->gpu, o->size, 0);
         { void hos_memsplit_pool(uint64_t, uint64_t, uint32_t, int); hos_memsplit_pool(o->gpu, o->size, o->flags, 0); }
+    } else if (o->mem) {
+        /* (HeyListen, 2026-11-14) a pool object finalized again (its magic gone with the first Finalize): its range was untracked
+           then, and untracking it again took the counted entry of a newer live pool made over the same memory since (the
+           actor heap's small pools are made again at the same addresses): the back end's capture then took that live pool
+           for heap memory (RX_VK_CAP_ONLY_GPU's reads into left-out ranges, play9). Nothing to do now but say so */
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 8)
+            hos_log("nvn: memory pool %#llx+%#llx finalized again (lr %#llx): left alone", (unsigned long long)o->gpu,
+                    (unsigned long long)o->size, (unsigned long long)c->x[30]);
     }
     o->magic = 0;
 }

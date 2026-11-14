@@ -668,6 +668,8 @@ namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in th
 namespace { int cap_only_gpu(); bool cap_excl_hit(uint64_t lo, uint64_t hi); void cap_born_take(std::vector<std::pair<uint64_t, uint64_t>>& out); }   // (RX_VK_CAP_ONLY_GPU: below)
 // (RX_VK_CAP_ONLY_GPU's report of a read into a left-out range: the back end's record of the game's pool at g, below)
 bool nvn_pool_record_at(uint64_t g, uint64_t* lo, uint64_t* hi, uint32_t* flags, uint64_t* made_ns);
+// (RX_VK_CAP_ONLY_GPU: every pool the back end has a record of, page-aligned, appended to out; below)
+void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out);
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
 void memory_collect_written() {
     if (cap_only_gpu() == 1) {   // (pools made since: their pages' earlier writes were dropped as heap memory's, see below)
@@ -1387,7 +1389,14 @@ std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked() {
     std::vector<std::pair<uint64_t, uint64_t>> imp = cap_ranges;
     if (cap_only_gpu()) {
         imp = ranges_merged(imp);
-        std::vector<std::pair<uint64_t, uint64_t>> keep = all_pool_ranges;
+        // (2026-11-14, play9) the GPU-visible memory: the host's pools and every pool the back end has a record of since the game
+        // made it (until another pool is made over it). The host's counted list lost live pools: one bound for 46 s was in no
+        // pool of it (a pool object finalized twice untracked a newer pool's entry: nvn_native.c), and a pool finalized after a
+        // submission's capture may still be bound by its replay. A record stays: never left out while it can be bound
+        std::vector<std::pair<uint64_t, uint64_t>> gpu = all_pool_ranges;
+        nvn_pool_record_ranges(gpu);
+        gpu = ranges_merged(std::move(gpu));
+        std::vector<std::pair<uint64_t, uint64_t>> keep = gpu;
         keep.insert(keep.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
         keep = ranges_merged(keep);
         std::vector<std::pair<uint64_t, uint64_t>> excl = ranges_clip(imp, keep, false);
@@ -1395,7 +1404,7 @@ std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked() {
             std::lock_guard lk(cap_excl_mu);
             cap_excl.swap(excl);
         }
-        if (cap_only_gpu() == 1) imp = ranges_clip(imp, all_pool_ranges, true);
+        if (cap_only_gpu() == 1) imp = ranges_clip(imp, gpu, true);
     }
     imp.insert(imp.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
     imp.insert(imp.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
@@ -4270,6 +4279,10 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
 // NVN's CPU_NO_ACCESS flag keep no zero pages in RAM. The back end's part: no import of such a pool's pages for another pool's
 // binding (clip_noaccess below), and no upload of a texture whose storage lies in such a pool and is all reserved
 // (texture_touch: the image is made cleared to zero, which is what the storage reads as)
+void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out) {
+    std::lock_guard lk(nvn_pools_mu);
+    for (const auto& [lo, np] : nvn_pools) out.push_back({lo & ~4095ull, (np.hi + 4095) & ~4095ull});
+}
 bool nvn_pool_record_at(uint64_t g, uint64_t* lo, uint64_t* hi, uint32_t* flags, uint64_t* made_ns) {
     std::lock_guard lk(nvn_pools_mu);
     const NvnPool* np = nvn_pool_at(g, lo);

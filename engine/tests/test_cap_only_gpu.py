@@ -41,6 +41,12 @@ def main():
             raise SystemExit(f"cap_pool_born_now does not use {want!r}")
     if "hos_gpu_live_pools" not in block(source, "void refresh_pool_ranges_locked("):
         raise SystemExit("the pool list's refresh does not read the host's live pools")
+    union = block(source, "std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked(")
+    if "nvn_pool_record_ranges(gpu);" not in union or "ranges_clip(imp, gpu, true)" not in union:
+        raise SystemExit("the clip does not keep every pool the back end has a record of")
+    if "o->magic == NVN_MAGIC('P', 'O', 'O', 'L')" not in block((ROOT / "host" / "nvn_native.c").read_text(encoding="utf-8"),
+                                                                "NV(nvnMemoryPoolFinalize)"):
+        raise SystemExit("a pool finalized twice untracks its range twice")
     if "cap_born_take(born);" not in block(source, "void memory_collect_written("):
         raise SystemExit("the replay's collection does not stamp the pools made")
     host = (ROOT / "host" / "nvdrv.c").read_text(encoding="utf-8")
