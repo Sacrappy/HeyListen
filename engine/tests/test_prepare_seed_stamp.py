@@ -10,6 +10,9 @@ translator; a seed rewritten as it was (a new time) is hashed once and not prepa
 prepares once; a seed whose time is as new as the record's is hashed (its time cannot show a second write in the same tick:
 whole seconds from libstdc++'s std::filesystem on Windows); and that prepare_run uses all of this. Every write time is set
 by the test, so that it does not depend on how fast it runs or the file system's resolution.
+The record also holds how many program keys the cache had when the prepare ended: a cache that has lost more than half of
+them (made again under other shader settings and closed before it prepared), or an empty one under a record from before
+the count, is prepared again (PrepareWhy::Cache); no program cache (SIZE_MAX) is never a reason.
 python -I -B tests/test_prepare_seed_stamp.py [--cxx g++]
 """
 import argparse
@@ -53,6 +56,9 @@ def main():
 #include <filesystem>
 #include <string>
 #include <vector>
+// (vk_shader.cpp's program_cache_kept, set by the test: SIZE_MAX, no cache, for every check before the cache's own)
+size_t g_kept = SIZE_MAX;
+size_t program_cache_kept() { return g_kept; }
 """ + helpers + r"""
 int fails = 0;
 std::string dir, rec, seed;
@@ -77,7 +83,10 @@ PrepareWhy start(uint64_t stamp, double* hash_ms = nullptr) {
     PreparedFor now;
     double ms = 0;
     const PrepareWhy why = prepare_check(rec, seed, stamp, &now, &ms);
-    if (why != PrepareWhy::None) prepared_write(rec, now);
+    if (why != PrepareWhy::None) {
+        if (g_kept != SIZE_MAX) now.kept = g_kept;   // (as prepare_run records the cache's count once it is done)
+        prepared_write(rec, now);
+    }
     if (hash_ms) *hash_ms = ms;
     return why;
 }
@@ -207,6 +216,25 @@ int main(int argc, char** argv) {
     want("legacy Windows record, the next start", start(3, &ms), PrepareWhy::None);
     if (ms != 0) std::puts("legacy Windows record: hashed twice"), fails++;
 #endif
+    // the program cache: what the last prepare left is counted, a cache that lost it prepares again
+    g_kept = 40000;
+    want("the cache's count not recorded yet, cache full", start(3), PrepareWhy::None);
+    {   // (an empty cache under a record from before the count: prepared, after which the cache holds the programs again)
+        g_kept = 0;
+        PreparedFor now;
+        want("a record from before the count, the cache empty", prepare_check(rec, seed, 3, &now, &ms), PrepareWhy::Cache);
+        now.kept = 40000;
+        prepared_write(rec, now);
+    }
+    g_kept = 40000;
+    want("prepared again: the count recorded", start(3), PrepareWhy::None);
+    g_kept = 25000;
+    want("some keys gone, more than half left", start(3), PrepareWhy::None);
+    g_kept = 16;
+    want("most keys gone (a cache made again)", start(3), PrepareWhy::Cache);
+    want("then the count is the new one's", start(3), PrepareWhy::None);
+    g_kept = SIZE_MAX;
+    want("no program cache", start(3), PrepareWhy::None);
     // no seed: the translator alone, as before
     std::filesystem::remove(seed);
     want("no seed, same translator", start(3), PrepareWhy::None);
@@ -227,7 +255,9 @@ int main(int argc, char** argv) {
     run = block(src, "bool prepare_run(")
     for need, why in (("prepare_check(path, seed_path(), program_cache_stamp()", "asks prepare_check"),
                       ("prepared_write(path, prepared_for)", "records what it prepared for"),
-                      ("why == PrepareWhy::Seed", "says when the seed made it prepare again")):
+                      ("why == PrepareWhy::Seed", "says when the seed made it prepare again"),
+                      ("why == PrepareWhy::Cache", "says when the cache made it prepare again"),
+                      ("prepared_for.kept = kept", "records the cache's count")):
         if need not in run:
             raise SystemExit("prepare_run no longer " + why)
     if "fwrite(&stamp, 8, 1" in run:
