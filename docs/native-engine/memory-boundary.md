@@ -1700,7 +1700,7 @@ submissions ago.
 | 7 | The texture-storage commit dropped once uploaded (the drop, section 14, on by default) | | 0 (already cold) | ~1.0-1.5 GB | the main PC's validation of `HL_MEM_DROP` | restore hitches |
 | 8 | Write-back shadows (261 MB) and BC scratch (160 MB) made only while used | ~0.4 GB | | | shadows' 85/95% rule; scratch freed after a load | a stall at the next transcode |
 
-## 19. The commit budget of the 30-minute reference session (`play10.orch.log`, 2026-11-14)
+## 20. The commit budget of the 30-minute reference session (`play10.orch.log`, 2026-11-14)
 
 Sources: the census (`HOS_HOST_SPLIT=60,60`, 19 tables, a column below is one of them) and R1's ledger (`RX_VK_LEDGER=60`, 18 tables;
 its first table is at the census' 181 s: the ledger's clock starts 121 s later). Process commit 4.7 GB on the title, 19.1 GB with
