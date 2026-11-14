@@ -52,6 +52,8 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+// (RX_VK_POOL_FINALIZE: the captures of the game's submits queued, and those the replay took: a finalize waits for the ones before it)
+std::atomic<uint64_t> submits_queued{0}, submits_taken{0};
 namespace {
 
 struct Pool {
@@ -2138,6 +2140,7 @@ void memory_capture_submit() {
     if (!c) return;
     std::lock_guard lk(cap_mu);
     captures.push_back(std::move(c));
+    submits_queued.fetch_add(1, std::memory_order_release);
 }
 // ---- (TICK-043) the submit's scan of the write marks on the copy helpers: RX_VK_CAPTURE_SCAN_SPLIT=1 ----
 // The scan (collect_in over ~1,500 ranges, ~3.4 GB of guest memory: ~830 KB of marks) is ~0.07 ms a submit on the submitting
@@ -3536,6 +3539,7 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
         if (captures.empty()) return false;
         c = std::move(captures.front());
         captures.pop_front();
+        submits_taken.fetch_add(1, std::memory_order_release);
     }
     return take_capture(std::move(c), value, completed);
 }
@@ -4389,6 +4393,7 @@ void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
 // a parallel replay thread's pool cache still point at a live one.)
 std::deque<std::map<uint64_t, Pool>::node_type> retired_pools;
 
+bool retiring_finalized = false;   // (RX_VK_POOL_FINALIZE: the retirement is finalize_retire's, for the log)
 void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     Pool* old = &it->second;
     if (inherit_watch_page() != ~0ull && (inherit_watch_page() << kPageShift) >= old->lo && (inherit_watch_page() << kPageShift) < old->hi)
@@ -4411,7 +4416,8 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
     static int logged;
     if (logged++ < 8 || retired_pools.size() % 64 == 0)
-        logf("vk: pool %#llx remade larger (%zu retired)", (unsigned long long)old->lo, retired_pools.size());
+        logf("vk: pool %#llx %s (%zu retired)", (unsigned long long)old->lo, retiring_finalized ? "retired: its game pools ended" : "remade larger",
+             retired_pools.size());
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_inherit_kept, st_inherit_newer, st_inherit_unfilled;   // (TICK-036: bytes a new mirror took from retired mirrors / from guest memory instead)
@@ -5849,9 +5855,113 @@ void imports_give_back() {   // (pools_mu held)
              (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
 }
 
+// ---- (HeyListen, 2026-11-14) RX_VK_POOL_FINALIZE=1 (default 0): a chunk of the pool table retires once no live game pool is left in it ----
+// The back end heard of a pool's birth (memory_pool_flags) but never of its end: a chunk (an import of 16 MB around a binding, with
+// its VRAM mirror) left the table only when a larger import took it in (retire_pool), under the import-pressure rule (off on
+// Windows), or gave back its mirror under the idle and VRAM rules; its table entry, its import (unless RX_VK_NO_HOST_IMPORT gave it
+// back) and the pinning stayed. Over a 45-minute session of 17 zones the live imports grew 0.16 -> 6.6 GB with the zones and never came
+// back (play8). Now the host tells the back end at a live pool's nvnMemoryPoolFinalize (host/nvn_native.c: only an object that is
+// still a live pool), and once every submission the game made before that finalize has been taken by the replay, each chunk over
+// its range in which no live pool is left (the host's counted list, hos_gpu_live_pools: a newer pool made at the same address since
+// keeps the chunk) is retired as a pool taken in by a larger one is: its table entries gone, its mirror freed once the GPU is past
+// its last use (mirrors_give_back's retired pools), its import given back the same way (retired_imports_give_back: on NVIDIA by
+// default), its pages unpinned. Its mirror is not inherited (the pool ended: a pool made there later is filled from guest memory),
+// and write-backs its mirror left out (lazy_held) are dropped: their pool is gone, as the staged lazy release decides. A chunk the
+// recording under way has bound waits for the next submission (counted: it should stay 0).
+bool pool_finalize_on() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_POOL_FINALIZE");
+        const bool on = e && atoi(e) != 0;
+        if (on) logf("vk: chunks whose game pools all ended retired at their finalize (RX_VK_POOL_FINALIZE=1)");
+        return on;
+    }();
+    return v;
+}
+struct FinNote { uint64_t lo, hi, after; };
+std::mutex fin_mu;
+std::vector<FinNote> fin_notes;   // (fin_mu)
+int64_t st_fin_notes = 0, st_fin_retired = 0, st_fin_kept_live = 0, st_fin_waited_bound = 0;
+uint64_t st_fin_bytes = 0, st_fin_mirror_bytes = 0, st_fin_import_bytes = 0;
+void finalize_retire() {   // (pools_mu held, at a submission's start)
+    std::vector<FinNote> ready;
+    {
+        std::lock_guard lk(fin_mu);
+        if (fin_notes.empty()) return;
+        const uint64_t taken = submits_taken.load(std::memory_order_acquire);
+        for (size_t i = 0; i < fin_notes.size();)
+            if (taken >= fin_notes[i].after + 1) ready.push_back(fin_notes[i]), fin_notes[i] = fin_notes.back(), fin_notes.pop_back();
+            else i++;
+    }
+    if (ready.empty()) return;
+    using LivePools = int (*)(uint64_t (*)[2], int);
+    static const LivePools live_fn = (LivePools)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_live_pools");
+    if (!live_fn) return;
+    static std::vector<std::array<uint64_t, 2>> lp(16384);
+    const int n = live_fn(reinterpret_cast<uint64_t(*)[2]>(lp.data()), (int)lp.size());
+    std::vector<std::pair<uint64_t, uint64_t>> live;
+    for (int i = 0; i < n; i++)
+        if (lp[i][1] > lp[i][0]) live.push_back({lp[i][0], lp[i][1]});
+    std::sort(live.begin(), live.end());
+    auto has_live = [&](uint64_t lo, uint64_t hi) {
+        for (auto it = live.begin(); it != live.end() && it->first < hi; ++it)   // (sorted by start: any reaching into [lo, hi))
+            if (it->second > lo) return true;
+        return false;
+    };
+    std::vector<FinNote> again;
+    for (const FinNote& f : ready) {
+        auto it = imported.upper_bound(f.lo);
+        if (it != imported.begin() && std::prev(it)->second.hi > f.lo) --it;
+        while (it != imported.end() && it->second.lo < f.hi) {
+            Pool& p = it->second;
+            if (has_live(p.lo, p.hi)) {
+                st_fin_kept_live++;
+                ++it;
+                continue;
+            }
+            if (p.last_value >= mem_rec_value && mem_rec_value) {   // (bound by the recording under way: next submission)
+                st_fin_waited_bound++;
+                again.push_back(f);
+                ++it;
+                continue;
+            }
+            const auto next = std::next(it);
+            st_fin_retired++, st_fin_bytes += p.hi - p.lo;
+            if (p.mstate == Pool::MIRROR_ON && p.mirror) st_fin_mirror_bytes += p.hi - p.lo;
+            if (p.memory) st_fin_import_bytes += p.hi - p.lo;
+            std::erase(lazy_release, &p);
+            p.lazy_held = false;
+            retiring_finalized = true;
+            retire_pool(it);
+            retiring_finalized = false;
+            p.inherit_pending = false;   // (the node lives on in retired_pools: p is still it)
+            it = next;
+        }
+    }
+    if (!again.empty()) {
+        std::lock_guard lk(fin_mu);
+        fin_notes.insert(fin_notes.end(), again.begin(), again.end());
+    }
+    static int64_t logged_at = -1;
+    if (st_fin_retired / 16 != logged_at) {
+        logged_at = st_fin_retired / 16;
+        logf("vk: chunks retired as their game pools all ended (RX_VK_POOL_FINALIZE): %lld (%llu MB; mirrors %llu MB, imports held %llu MB) "
+             "of %lld finalizes; chunks kept for a live pool in them %lld; waited a submission as the recording bound them %lld",
+             (long long)st_fin_retired, (unsigned long long)(st_fin_bytes >> 20), (unsigned long long)(st_fin_mirror_bytes >> 20),
+             (unsigned long long)(st_fin_import_bytes >> 20), (long long)st_fin_notes, (long long)st_fin_kept_live,
+             (long long)st_fin_waited_bound);
+    }
+}
+void memory_pool_finalized(uint64_t gpu, uint64_t size) {   // (the game's thread, at nvnMemoryPoolFinalize of a live pool)
+    if (!pool_finalize_on() || !size || gpu >= (1ull << 40) || !capture_on()) return;
+    std::lock_guard lk(fin_mu);
+    fin_notes.push_back({gpu, gpu + size, submits_queued.load(std::memory_order_acquire)});
+    st_fin_notes++;
+}
+
 void memory_begin_submission() {
     std::lock_guard lk(pools_mu);
     reap_mirrors();
+    if (pool_finalize_on()) finalize_retire();
     retired_imports_give_back();
     imports_release();   // (RX_VK_NO_HOST_IMPORT)
     mirror_epoch++;
@@ -6889,6 +6999,14 @@ extern "C" __declspec(dllexport) void mkwvk_pool_flags(uint64_t gpu, uint64_t si
 extern "C" __attribute__((visibility("default"))) void mkwvk_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
 #endif
     mkwvk::memory_pool_flags(gpu, size, flags);
+}
+// (RX_VK_POOL_FINALIZE) a third, resolved the same way: a live game pool finalized
+#ifdef _WIN32
+extern "C" __declspec(dllexport) void mkwvk_pool_finalized(uint64_t gpu, uint64_t size) {
+#else
+extern "C" __attribute__((visibility("default"))) void mkwvk_pool_finalized(uint64_t gpu, uint64_t size) {
+#endif
+    mkwvk::memory_pool_finalized(gpu, size);
 }
 
 namespace mkwvk {

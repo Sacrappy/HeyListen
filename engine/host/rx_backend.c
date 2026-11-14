@@ -351,6 +351,12 @@ static void (*vk_pool_flags)(uint64_t gpu, uint64_t size, uint32_t flags);
 void rx_nvn_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {
     if (vk && vk_pool_flags) vk_pool_flags(gpu, size, flags);
 }
+/* (HeyListen, RX_VK_POOL_FINALIZE) and a live pool's finalize (only a pool object still live: nvn_native.c checks its magic), so the
+   back end can retire the import chunks no live pool is left in */
+static void (*vk_pool_finalized)(uint64_t gpu, uint64_t size);
+void rx_nvn_pool_finalized(uint64_t gpu, uint64_t size) {
+    if (vk && vk_pool_finalized) vk_pool_finalized(gpu, size);
+}
 
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
@@ -375,6 +381,7 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
     vk_module = m;
     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
     vk_pool_flags = (void (*)(uint64_t, uint64_t, uint32_t))(void *)GetProcAddress(m, "mkwvk_pool_flags");   /* (TICK-015; optional) */
+    vk_pool_finalized = (void (*)(uint64_t, uint64_t))(void *)GetProcAddress(m, "mkwvk_pool_finalized");   /* (RX_VK_POOL_FINALIZE; optional) */
     vk_precopy_kick = (void (*)(void))(void *)GetProcAddress(m, "mkwvk_precopy_kick");   /* (TICK-054; optional) */
     {   /* (HL_TRACE: the back end's writes into guest memory, for the crash report; host/hl_trace.c) */
         extern volatile uint32_t hl_trace_mask;

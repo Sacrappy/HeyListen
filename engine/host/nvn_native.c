@@ -352,6 +352,7 @@ NV(nvnMemoryPoolFinalize) {
     } else if (o->mem && o->magic == NVN_MAGIC('P', 'O', 'O', 'L')) {
         hos_gpu_track(o->gpu, o->size, 0);
         { void hos_memsplit_pool(uint64_t, uint64_t, uint32_t, int); hos_memsplit_pool(o->gpu, o->size, o->flags, 0); }
+        { void rx_nvn_pool_finalized(uint64_t, uint64_t); rx_nvn_pool_finalized(o->gpu, o->size); }   /* (RX_VK_POOL_FINALIZE) */
     } else if (o->mem) {
         /* (HeyListen, 2026-11-14) a pool object finalized again (its magic gone with the first Finalize): its range was untracked
            then, and untracking it again took the counted entry of a newer live pool made over the same memory since (the

@@ -197,6 +197,8 @@ struct ParLock {
 void memory_pool_created(uint64_t gpu, uint64_t size);
 /// (TICK-015) a game pool made, with its NVNmemoryPoolFlags (the export mkwvk_pool_flags)
 void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags);
+/// (RX_VK_POOL_FINALIZE) a live game pool finalized (the export mkwvk_pool_finalized): its chunks retire once no live pool is left in them
+void memory_pool_finalized(uint64_t gpu, uint64_t size);
 /// (TICK-015) the CPU is about to read [guest, guest + size) (invalidate): its game pool's write-backs are made from now on
 void memory_cpu_reads(uint64_t guest, uint64_t size);
 /// (HOS_NOACCESS_RAM, on unless =0) the pools the game made without CPU access keep no zero pages in RAM (vk_memory.cpp)

@@ -4654,8 +4654,39 @@ void texture_frame(uint64_t completed) {
     // batches (flush_textures), not one submission and one wait each: a sweep of 500 at a scene load stalled for seconds
     struct Evict { Texture* tex; bool flush, shifted; };
     std::vector<Evict> evict;
+    // (HeyListen, 2026-11-14, RX_VK_FREE_FINALIZED=1, default 0) a render target the game finalized goes 3 presents after its last
+    // use, once the GPU is past it, whatever the budget: under the budget nothing above took it (a finalized target is no longer kept
+    // as "rendered", but the usual pass runs only past 7/8 of the budget and the transient sweep only for targets drawn over), and
+    // the ledger saw 65 of them, 212 MB, in the market (2560x1440 R11G11B10 and D32 among them). Not one keep_finalized keeps (drawn
+    // in one frame, 4 MB or less, not drawn over: made again over its storage and sampled undrawn, the terrain's normal maps).
+    // Nothing samples it after: the game cannot sample a texture it finalized (a texture made again over the storage is a new one,
+    // uploaded from guest memory, which is the risk this switch takes for targets over 4 MB); the BC cache holds ASTC transcodes only;
+    // the write-back before eviction is for targets not finalized; the upscaler and the present read images of their own and the
+    // frame's live target
+    static const bool free_finalized = [] {
+        const char* e = getenv("RX_VK_FREE_FINALIZED");
+        const bool on = e && atoi(e) != 0;
+        if (on) logf("vk: render targets the game finalized freed 3 presents after their last use (RX_VK_FREE_FINALIZED=1)");
+        return on;
+    }();
+    static uint64_t st_fin_freed = 0, st_fin_freed_bytes = 0, fin_logged_at = 0;
+    std::unordered_set<const Texture*> freed_fin;
+    if (free_finalized) {
+        for (auto& [last, tex] : order)
+            if (tex->gpu_written && tex->released && frame_no - last >= 3 && tex->last_value <= completed && !keep_finalized(tex)) {
+                evict.push_back({tex, false, false});
+                freed_fin.insert(tex);
+                st_fin_freed++, st_fin_freed_bytes += tex->bytes;
+            }
+        if (st_fin_freed && frame_no >= fin_logged_at + 600) {
+            fin_logged_at = frame_no;
+            logf("vk: finalized render targets freed (RX_VK_FREE_FINALIZED): %llu so far (%llu MB)", (unsigned long long)st_fin_freed,
+                 (unsigned long long)(st_fin_freed_bytes >> 20));
+        }
+    }
     for (auto& [last, tex] : order) {
         if ((!usual_on && !overwritten_unused) || frame_no - last < need_first) break;
+        if (!freed_fin.empty() && freed_fin.count(tex)) continue;
         // (TICK-027: a target drawn over, unused for overwritten_unused frames, goes in any pass)
         const bool ours_over = overwritten_unused && frame_no - last >= overwritten_unused && !keep_finalized(tex) &&
                                (drawn_over(tex) || overlapped_later(tex));
