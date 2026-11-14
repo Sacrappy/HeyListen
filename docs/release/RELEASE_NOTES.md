@@ -18,6 +18,21 @@ repository (the engine under `engine/`).
 
 ## New in this release
 
+**Linux (new, little tested).** This release also carries a Linux AppImage, `HeyListen-<version>-x86_64.AppImage`
+(built by this repository's CI in an Ubuntu 22.04 container, glibc 2.35 and newer), with `heylisten-linux.txt`, the list its
+update reads. It builds the game from your own copy on your PC, like the Windows builder; see the Linux section of the
+[user guide](https://github.com/Sacrappy/HeyListen/blob/main/docs/USER_GUIDE.md). It is Hookshot's Linux port, made
+buildable again on this release by a contributor's pull request (#4) and given HeyListen's names, folders
+(`~/.local/share/heylisten`, `~/.config/heylisten`) and update links. What was and was not tested:
+- Tested: the game-free test suite on Ubuntu 26.04 (WSL2); the AppImage built there with the repository's scripts; a
+  player's build started from it up to the compile; the builder window starting and showing HeyListen's name; an update
+  installed from a test list.
+- WSL has no hardware Vulkan on the test PC (only the CPU renderer), so the game was not played there: {WSLRESULT}
+- A contributor reported the Linux build of the `main` branch working on CachyOS with a Radeon RX 9070 XT. That is not this
+  release's code, and no one has run this AppImage on a PC with a Linux GPU: we have no native Linux machine.
+- The Linux update (a new AppImage's parts downloaded from the `linux-parts` release) has never run against a real release.
+
+
 **v0.3.2 fixes crashes when moving between areas**, which have been there since v0.3.0. When graphics memory got tight
 (more likely at high resolutions and after several areas), a memory-saving step could copy stale GPU data over memory the
 game had just reused for its own objects, and the game crashed shortly after, usually while an area loaded or when an

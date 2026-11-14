@@ -26,7 +26,7 @@ Only the folder they are in differs.
 
 | Program | Linux | Windows | How sure |
 |---|---|---|---|
-| Hookshot | `~/.local/share/hookshot/save/<user id>/` | `<game folder>\user\save\<user id>\` | Hookshot's source; Linux tested |
+| HeyListen | `~/.local/share/heylisten/save/<user id>/` | `<game folder>\user\save\<user id>\` | its source; Linux: tested by a contributor on `main`. Upstream Hookshot on Linux keeps its saves in `~/.local/share/hookshot/save/<user id>/`: `import --from ~/.local/share/hookshot` brings them over |
 | [Lichii](https://github.com/zortos293/Lichii) | `~/.local/share/eden/` + Eden's save path below | `%APPDATA%\eden\` + Eden's save path | Lichii's source; Linux tested, Windows not |
 | [Frizti (Fritchii)](https://github.com/Frizti/Lichii), a Lichii fork | (Windows only) | `%APPDATA%\eden\` + Eden's save path | its source (`fritchii-v5.5`); not tried |
 | [Orchid](https://github.com/MythosOfs/Orchid) | `~/.local/share/eden/` + Eden's save path | `%APPDATA%\eden\` + Eden's save path | its source; not tried |
