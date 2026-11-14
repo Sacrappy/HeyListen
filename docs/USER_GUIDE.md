@@ -102,8 +102,9 @@ on CachyOS with a Radeon RX 9070 XT (Mesa's RADV driver). Expect problems and re
   stutter much more than on a quiet PC.
 - **Building it yourself** instead of using the AppImage: `engine/CONTRIBUTING.md` (Linux) has the tools to install
   (`scripts/linux/deps.sh` fetches the rest, about 30 minutes the first time) and `engine/readme.md` the `make_game.py`
-  command, which takes your `.nup` and makes the game folder as the builder does. A game built this way from the `main`
-  branch is started with `./hookshot` in its folder and keeps its saves in `~/.local/share/hookshot/save`.
+  command, which takes your `.nup` and makes the game folder as the builder does. A game built this way is
+  started with `./HeyListen` in its folder (the launcher; the game itself is `bin/hookshot`) and keeps its saves where the
+  AppImage's game does, `~/.local/share/heylisten/save`.
 - **Updates**: the builder asks GitHub for `Sacrappy/HeyListen`'s latest release (nothing is sent about you) and downloads
   only the parts of the AppImage that changed from this repository's `linux-parts` release, checked by SHA-256, into
   `~/.local/share/heylisten/builder`; then it builds your game folder again from the game files the folder keeps. A
