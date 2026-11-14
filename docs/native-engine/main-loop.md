@@ -170,3 +170,23 @@ handed out: the buffer gets the last picture again (`HOS_VIDEO_NO_HOLD=1`: as be
 pictures on the clock to the end (within 0.02 s), the movie the same length as its sound. The new-game opening movie
 itself was not reached by the scripted input (the title's background and a save loaded instead); the fix is the same
 for any movie.
+
+**What actually ran fast, and the fix (2026-11-14, after upstream Hookshot a2a89ae11).** The engine makes its time step
+in two places, each a float divide "base / nominal rate": the module system's frame `0x80706be0` (the frame's step, the
+game clock at `+0xd58`, the frame-time object above) and the game framework's prepare `0x83b6ea90` (the **global step**,
+60 / nominal, the float at `0x84d61fc8`). The engine's controller puts its nominal rate back to 60 before the steps are
+made; TICK-014's real-time step wrote the reached rate in again just before the first divide only, so the frame's step
+and the game clock kept real time while the global step stayed a whole 1/60 s a frame: **everything that reads the
+global step ran at fps / 60** (the cutscenes' timing, the voice lines, the Deku Tree boss). Upstream's fix, ported:
+the host's measured frame time goes in at both divides (base x the frame's seconds), both or neither, published by
+`nn_vi.c` while the cap is above 60 (`hos_frame_seconds_bits`; the nominal rate kept at 60 at most then; `HOS_FPS_STEP=0`:
+as before; `HOS_FPS_LOG=1`: the game clock's and the global step's speeds).
+
+**The mechanism in this tree.** Upstream writes the hook into the lifted text with its post-lift patch script; here the
+lifted work folder is shared by every worktree and never lifted again, and a tree without the two host symbols must still
+link. So the two hooks are lines `nx2/hl_gates.py` puts in per tree, as it puts entry gates: `host/hl_step.c` asks for
+them (`HL_STEP_HOOK`, with each function's text hash), they go in after the one divide of each function only when both
+can, and they carry the marker of the address plus one (`hl gate 80706be1`), so that any tree that does not ask for
+them, an older `hl_gates.py` included, takes them out as stale gates before it builds. The native main loop's prepare
+(`HL_MAINLOOP=1`) makes the global step the same way. The 60 Hz tick designed above is not needed for the systems the
+owner reported; it stays the answer for anything found counting frames with the fix on.
