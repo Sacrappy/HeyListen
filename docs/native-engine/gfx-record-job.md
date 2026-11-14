@@ -917,6 +917,59 @@ translucent rectangle: the owner's second defect of 2026-11-13, seen here at 128
 Defaults since these runs: `HL_GFX_PREP=1` and `HL_GFX_PREP_STATE=1`. Not run on the main PC: the state step, and any
 zone outside Castle Town.
 
+### The program step's uniform-block binds (2026-11-14)
+
+**Map.** When a new program's interface part has a new id, its binding words are compared with the block's copies
+and each changed word is recorded and bound:
+
+| Word (block copy) | Buffer object | Path |
+|---|---|---|
+| part 1, word 0 (B+0x78) | B+0x30 | `0x8008fecc` |
+| part 1, word 1 (B+0x7c) | the material's +0x588, through a 0x48-byte table and BufferGetAddress | `0x800909b4` (the stage of each slot from the table at `0x83f0f7c8`) |
+| part 1, word 2 (B+0x80) | none: recorded, the per-drawable block's entry made 0xff | `0x8008fe10` |
+| part 2, word 3 (B+0x84) | the material's +0x538 | `0x80090bc0` |
+| part 2, word 4 (B+0x88) | the material's +0x540 | `0x800907ec` |
+
+A buffer object (0x90 bytes) is one uniform block kept as a ring of copies: +0x40 the block's size, +0x48 the copy in
+use, +0x4a (its high four bits) the copies' count multiplier, +0x80 the base address, +0x88 its alignment; its vtable's
++0x28 gives the alignment (the game's two known implementations: 0x100, or the object's +0x88) and +0x50 binds (known:
+a uniform bind, or a storage bind). The function asks the alignment first (even for a word of -1), and calls the
+methods when they are not the known ones. The address is the base plus (copy x multiplier) x (size rounded up to the
+alignment), in 32 bits, and the size bound is the unrounded one. A word's top byte is a tag: 0xff binds stage 0, 1, 2
+with the slots in bytes 0, 2, 1; 0xfe stages 1, 6, 7 with bytes 2, 0, 1; 0xfd, 0xfc, 0xfb other stage sets (not read in detail); a slot byte 0xff binds nothing for that stage. A uniform bind sets the command buffer's
+mark byte first, and with the inline-write switch set (and room in the command memory) writes the bind's method words
+itself instead of calling BindUniformBuffer. What it caches: the words, per block (one draw's life).
+
+**Native** (route "program buffers"): words 0, 3 and 4 changed, with known methods, tags 0xff and 0xfe, uniform binds,
+the switch off; the binds emitted after BindProgram (through the NVN procedures: the bind handler is stream 8's). Left
+whole to the translation: word 1, other tags, storage or unknown objects, the switch on, and any texture part with
+slots.
+
+**The state step's record** now goes through the render state's record path (`gfx_rec_emit_commands`, beside
+`gfx_rec_emit`): with `HL_GFX_REC=1` (the default) RecordSink writes its records directly. RecordSink seeds the five
+state objects from the guest bytes at the function's frame addresses at first use within the call, as the procedures
+read them, and writes nothing to the guest stack, where the procedures wrote the objects. That frame is dead after the call;
+what a later call's state objects hold in bits no setter covers is the stack's either way, as for the render-state
+function (section 8 of `direct-emission.md`). `HL_GFX_REC_CHECK=1` compares
+the two on every such call.
+
+**The check** (PC 3050, `HL_GFX_CHECK=1`, 170 s runs, the save library; Lake Hylia in place of Kakariko, whose save
+does not load in scripted runs):
+
+| Zone | Calls | cached | program bound | program buffers | state applied | left: program | left: drawable block | Native share | Compared, mismatched |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| hyrule-field | 3,870,283 | 2,565,482 | 390,415 | 70,120 | 124,049 | 673,043 | 47,174 | 81.4% | 3,150,066, 0 |
+| kokiri-forest | 3,355,981 | 2,017,935 | 340,706 | 69,537 | 161,771 | 710,175 | 55,857 | 77.2% | 2,589,953, 0 |
+| lake-hylia | 6,450,541 | 4,929,703 | 415,160 | 93,528 | 174,727 | 752,618 | 84,805 | 87.0% | 5,613,118, 0 |
+| death-mountain-trail | 1,417,677 | 447,072 | 347,146 | 49,519 | 111,753 | 449,860 | 12,327 | 67.4% | 955,490, 0 |
+| zora-river | 1,996,588 | 968,874 | 290,878 | 37,462 | 141,953 | 543,893 | 13,528 | 72.1% | 1,439,168, 0 |
+| inside-deku-tree | 1,588,645 | 788,397 | 244,047 | 35,905 | 74,639 | 428,022 | 17,635 | 71.9% | 1,142,988, 0 |
+| lost-woods | 1,170,618 | 365,487 | 249,015 | 54,636 | 107,494 | 379,399 | 14,587 | 66.3% | 776,632, 0 |
+
+0 mismatched calls over 15.67 M calls compared (410,707 of them with buffer binds). The binds take 2-5% of the calls
+from the "program" route; what is left there is mostly the texture part (shapes with 5-8 textures bound lead it in every
+zone) and word 1. The state step now also covers calls whose program then binds buffers, hence its larger counts.
+
 ## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
