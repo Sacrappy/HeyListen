@@ -556,6 +556,30 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type);
 #define MB_ICONWARNING 0x00000030L
 #endif
 
+/* ---- (HeyListen) calls the performance overlay, the capture pre-copy and the replay workers make: /proc and clock_gettime ---- */
+static inline void GetSystemTimePreciseAsFileTime(FILETIME *ft) { GetSystemTimeAsFileTime(ft); }   /* (already clock_gettime) */
+BOOL SetWaitableTimer(HANDLE t, const LARGE_INTEGER *due, LONG period, void *fn, void *arg, BOOL resume);
+HANDLE CreateEventW(void *attr, BOOL manual, BOOL initial, LPCWSTR name);
+/* (kernel includes idle, as on Windows; from /proc/stat) */
+BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user);
+/* (this process only: getrusage, the start time from /proc/self/stat) */
+BOOL GetProcessTimes(HANDLE p, FILETIME *create, FILETIME *exit, FILETIME *kernel, FILETIME *user);
+/* (a hint on Windows; none here: -1, as when it fails) */
+static inline DWORD SetThreadIdealProcessor(HANDLE t, DWORD cpu) { (void)t, (void)cpu; return (DWORD)-1; }
+/* (no Windows heaps: none listed, nothing summed) */
+static inline DWORD GetProcessHeaps(DWORD n, HANDLE *heaps) { (void)n, (void)heaps; return 0; }
+typedef struct {
+    DWORD dwLength, dwMemoryLoad;
+    DWORDLONG ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
+} MEMORYSTATUSEX;
+/* (/proc/meminfo: MemTotal, MemAvailable, swap) */
+BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *ms);
+typedef LONG LSTATUS;
+#define HKEY_LOCAL_MACHINE ((HKEY)(ULONG_PTR)0x80000002)
+#define RRF_RT_REG_SZ 0x00000002
+/* (one value only: the CPU's name, ProcessorNameString, from /proc/cpuinfo's model name; any other is not found) */
+LSTATUS RegGetValueA(HKEY key, LPCSTR sub, LPCSTR value, DWORD flags, DWORD *type, void *data, DWORD *size);
+
 #ifdef __cplusplus
 }
 #endif
