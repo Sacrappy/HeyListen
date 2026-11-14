@@ -6848,9 +6848,17 @@ void memory_ledger_snapshot(LedgerSnap& s) {
     }
     std::lock_guard lk(pools_mu);
     for (const auto& [lo, p] : imported) {
-        if (p.memory != VK_NULL_HANDLE) s.imports.push_back({p.lo, p.hi});
-        if (p.mstate == Pool::MIRROR_ON && p.mirror != VK_NULL_HANDLE) s.mirrors.push_back({p.lo, p.hi});
+        const bool imp = p.memory != VK_NULL_HANDLE, mir = p.mstate == Pool::MIRROR_ON && p.mirror != VK_NULL_HANDLE;
+        if (imp) s.imports.push_back({p.lo, p.hi});
+        if (mir) s.mirrors.push_back({p.lo, p.hi});
+        LedgerChunk c;
+        c.lo = p.lo, c.hi = p.hi, c.import = imp, c.mirror = mir, c.gpu_written = p.gpu_written;
+        c.bound_ago = mem_rec_value > p.last_value ? mem_rec_value - p.last_value : 0;
+        c.synced_ago = mirror_epoch > p.synced_epoch ? mirror_epoch - p.synced_epoch : 0;
+        s.chunks.push_back(c);
     }
+    for (const auto& nh : retired_pools) s.retired_chunks++, s.retired_chunk_bytes += nh.mapped().hi - nh.mapped().lo;
+    s.evicted_chunks = evicted_pools.size();
     for (const DeadMirror& d : dead_mirrors) s.retired_mirror_bytes += allocation_size(d.alloc);
 }
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {

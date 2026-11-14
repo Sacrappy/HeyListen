@@ -42,7 +42,15 @@ struct LedgerTex {
 };
 struct LedgerRange { uint64_t lo, hi; };
 struct LedgerPoolFlags { uint64_t lo, hi; uint32_t flags; };
+struct LedgerChunk {   // (an entry of the back end's pool table: an import chunk, its import and its mirror)
+    uint64_t lo = 0, hi = 0;
+    bool import = false, mirror = false, gpu_written = false;
+    uint64_t bound_ago = 0;    // (submissions since one last bound it)
+    uint64_t synced_ago = 0;   // (mirror submissions since its mirror was last brought up to date)
+};
 struct LedgerSnap {
+    std::vector<LedgerChunk> chunks;
+    uint64_t retired_chunks = 0, retired_chunk_bytes = 0, evicted_chunks = 0;
     std::vector<LedgerTex> textures;
     uint64_t spare_bytes = 0, rt_pool_bytes = 0, bcc_bytes = 0, bcc_entries = 0;
     std::vector<LedgerPoolFlags> pool_flags;   // (the flags the game made its pools with, by guest range)

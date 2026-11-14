@@ -118,7 +118,7 @@ template <class F> F host_fn(const char* name) {
 // (hos_hostsplit_totals' values, in its order)
 enum { T_WS, T_PRIVATE, T_RAM_COUNTED, T_WIN_RES, T_WIN_COM, T_BAR, T_GROUP_COM, T_GROUP_RES = T_GROUP_COM + 9, T_BIG_RES = T_GROUP_RES + 9,
        T_BIG_COM, T_WALK_MS, T_N };
-enum { G_GUEST, G_TAG, G_BAR, G_HEAP, G_STACK, G_IMAGE, G_DRIVER_IMAGE, G_MAPPED, G_OTHER };
+constexpr int G_TAG = 1, G_BAR = 2, G_HEAP = 3, G_STACK = 4, G_IMAGE = 5, G_DRIVER_IMAGE = 6, G_MAPPED = 7, G_OTHER = 8;   // (its groups)
 
 constexpr uint64_t MB(uint64_t b) { return b >> 20; }
 
@@ -447,6 +447,63 @@ void count(const LedgerSnap& s, const char* why, double secs) {
                  "runs over %llu granules", (unsigned long long)tops[i].lo, (unsigned long long)MB(tops[i].size), tops[i].flags,
                  (unsigned long long)MB(tops[i].m.tex), (unsigned long long)MB(tops[i].m.buf), (unsigned long long)MB(tops[i].m.both),
                  (unsigned long long)MB(tops[i].m.none), (unsigned long long)tops[i].m.runs, (unsigned long long)tops[i].m.grans);
+    }
+    // the pool table's chunks: the live pools in each against those the game finalized (pools it made there that are no longer
+    // live), what no live pool covers, its import and mirror, how long since it was bound
+    {
+        std::vector<LedgerRange> made;   // (every pool the game made, live or finalized, as the back end heard of them; clipped)
+        for (const LedgerPoolFlags& f : s.pool_flags) made.push_back({f.lo, f.hi});
+        std::sort(made.begin(), made.end(), [](const LedgerRange& a, const LedgerRange& b) { return a.lo < b.lo; });
+        auto covered = [](const auto& v, uint64_t lo, uint64_t hi) {   // (bytes of [lo, hi) inside the sorted ranges, overlaps once)
+            uint64_t n = 0, cur = lo;
+            auto it = std::upper_bound(v.begin(), v.end(), lo, [](uint64_t a, const auto& p) { return a < p.lo; });
+            if (it != v.begin()) --it;
+            for (; it != v.end() && it->lo < hi; ++it) {
+                const uint64_t a = std::max(cur, it->lo), b = std::min(hi, it->hi);
+                if (b > a) n += b - a, cur = b;
+            }
+            return n;
+        };
+        struct Agg { uint64_t n = 0, bytes = 0, imp = 0, mir = 0, live = 0, fin = 0; };
+        Agg all, orphan, part;
+        uint64_t orphan_ago[4]{}, orphan_ago_b[4]{};   // (orphans by submissions since bound: <600, <6000, <60000, more)
+        std::vector<std::pair<uint64_t, const LedgerChunk*>> orphans;
+        for (const LedgerChunk& c : s.chunks) {
+            const uint64_t size = c.hi - c.lo, live = covered(pools, c.lo, c.hi), any = covered(made, c.lo, c.hi);
+            const uint64_t fin = any > live ? any - live : 0;
+            auto add = [&](Agg& a) {
+                a.n++, a.bytes += size, a.imp += c.import ? size : 0, a.mir += c.mirror ? size : 0, a.live += live, a.fin += fin;
+            };
+            add(all);
+            if (!live) {
+                add(orphan), orphans.push_back({size, &c});
+                const int k = c.bound_ago < 600 ? 0 : c.bound_ago < 6000 ? 1 : c.bound_ago < 60000 ? 2 : 3;
+                orphan_ago[k]++, orphan_ago_b[k] += size;
+            } else if (fin) add(part);
+        }
+        auto aggline = [](const char* what, const Agg& a) {
+            logf("vk: ledger: chunks %s: %llu, %llu MB (import held %llu MB, mirror %llu MB); live pools in them %llu MB, finalized pools "
+                 "%llu MB, no pool at all %llu MB", what, (unsigned long long)a.n, (unsigned long long)MB(a.bytes), (unsigned long long)MB(a.imp),
+                 (unsigned long long)MB(a.mir), (unsigned long long)MB(a.live), (unsigned long long)MB(a.fin),
+                 (unsigned long long)MB(a.bytes > a.live + a.fin ? a.bytes - a.live - a.fin : 0));
+        };
+        aggline("in the pool table", all);
+        aggline("whose pools are all finalized (no live pool left)", orphan);
+        aggline("with live and finalized pools", part);
+        logf("vk: ledger: chunks with no live pool, by submissions since last bound: <600 %llu (%llu MB), <6000 %llu (%llu MB), <60000 %llu "
+             "(%llu MB), more %llu (%llu MB); retired chunks waiting for the GPU %llu (%llu MB); imports given back under pressure, "
+             "waiting %llu", (unsigned long long)orphan_ago[0], (unsigned long long)MB(orphan_ago_b[0]), (unsigned long long)orphan_ago[1],
+             (unsigned long long)MB(orphan_ago_b[1]), (unsigned long long)orphan_ago[2], (unsigned long long)MB(orphan_ago_b[2]),
+             (unsigned long long)orphan_ago[3], (unsigned long long)MB(orphan_ago_b[3]), (unsigned long long)s.retired_chunks,
+             (unsigned long long)MB(s.retired_chunk_bytes), (unsigned long long)s.evicted_chunks);
+        std::sort(orphans.rbegin(), orphans.rend());
+        for (size_t i = 0; i < orphans.size() && i < 8; i++) {
+            const LedgerChunk& c = *orphans[i].second;
+            logf("vk: ledger: chunk with no live pool %#llx %llu MB: import %s, mirror %s%s, bound %llu submissions ago, mirror synced %llu "
+                 "mirror epochs ago", (unsigned long long)c.lo, (unsigned long long)MB(c.hi - c.lo), c.import ? "held" : "given back",
+                 c.mirror ? "on" : "off", c.gpu_written ? ", written by the GPU" : "", (unsigned long long)c.bound_ago,
+                 (unsigned long long)c.synced_ago);
+        }
     }
     // render targets by shape
     {
