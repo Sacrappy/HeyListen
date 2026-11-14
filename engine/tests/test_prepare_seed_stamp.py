@@ -257,7 +257,8 @@ int main(int argc, char** argv) {
                       ("prepared_write(path, prepared_for)", "records what it prepared for"),
                       ("why == PrepareWhy::Seed", "says when the seed made it prepare again"),
                       ("why == PrepareWhy::Cache", "says when the cache made it prepare again"),
-                      ("prepared_for.kept = kept", "records the cache's count")):
+                      ("prepared_for.kept = kept", "records the cache's count"),
+                      ("remove(path.c_str());", "forgets the record while it prepares, so a preparation cut short runs again")):
         if need not in run:
             raise SystemExit("prepare_run no longer " + why)
     if "fwrite(&stamp, 8, 1" in run:
