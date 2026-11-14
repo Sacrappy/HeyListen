@@ -1517,8 +1517,8 @@ Changes (both default on; `=0` is the old behaviour):
 
 PC 3050, market, scripted, 235 s, one run each (`h1-3050-pcA2` old, `pcB` new): old, two saves, at the title and at the scene
 load: private commit 5383 to 5674 MB and 16124 to 16419 MB (+291 and +295 MB for a 287 MB cache), 151 ms each; new: **no save,
-no spike** (the run had no misses: 105 compute pipelines from the cache, 0 compiled; the old run's 86 compiled were caused by
-it saving nothing new). The mapped writer's own line was not seen in a run (no save was needed with the warm cache); it is
+no spike** (the run had no misses: 105 compute pipelines from the cache, 0 compiled; the old run had 86 compiled, so it was not a comparable warm start: its saves are real but its cache state differed)
+(run-to-run state differs). The mapped writer's own line was not seen in a run (no save was needed with the warm cache); it is
 built and tested only by the suite (the vector path's cases, with a stub for the mapped one).
 
 Not verified: that a killed run keeps what it compiled. A cold-cache run (`pcC`, cache file removed, 290 s) was killed
