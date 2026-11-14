@@ -459,13 +459,19 @@ extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t sp,
     hl::gfx::PrepareHandles at;
     g_prep->read(block, drawable, in, at);
     const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in, g_prep_state);
-    if (out.state_recorded) g_prep->state_handles(block, sp, at);
+    if (out.state_recorded || out.bind_count) g_prep->state_handles(block, sp, at);
     g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
     if (!hl::gfx::Prepare::native(out.route)) return 0;
     // (the block and the mark first: the function writes them before its call)
     g_prep->write(block, at, out);
+    // (the state record through the record path the render state takes: the NVN procedures or the records written
+    // directly, by HL_GFX_REC; then the rest, which RecordSink does not cover, through the procedures)
+    if (out.state_recorded)
+        hl::c::gfx_rec_emit_commands(at.state_buffer, g_nvn, [&](hl::gfx::CommandSink& s) {
+            hl::gfx::Prepare::emit_state(out.state, at, s);
+        });
     hl::gfx::NvnSink sink(g_nvn);
-    hl::gfx::Prepare::emit(out, at, sink);
+    hl::gfx::Prepare::emit(out, at, sink, false);
     *result = out.result;
     return 1;
 }
@@ -476,7 +482,7 @@ extern "C" void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable, uint6
     hl::gfx::PrepareInputs in;
     g_prep->read(block, drawable, in, t.at);
     const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in, g_prep_state);
-    if (out.state_recorded) g_prep->state_handles(block, sp, t.at);
+    if (out.state_recorded || out.bind_count) g_prep->state_handles(block, sp, t.at);
     g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
     t.route = out.route;
     t.result = out.result;
@@ -484,7 +490,7 @@ extern "C" void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable, uint6
     t.native.clear();
     t.translated.clear();
     hl::gfx::Prepare::emit(out, t.at, t.native);
-    g_prep->snapshot(block, t.at.command_buffer, t.expected);
+    g_prep->snapshot(block, t.at.command_buffer ? t.at.command_buffer : t.at.bind_buffer, t.expected);
     PrepareBridge::expect(t.expected, out);
 }
 
@@ -504,7 +510,7 @@ extern "C" void hl_gfx_prep_check_end(uint64_t result) {
     file_shape(shape_of(t, result));
     if (!hl::gfx::Prepare::native(t.route)) return;
     uint8_t actual[PrepareBridge::kSnapshotSize];
-    g_prep->snapshot(t.block, t.at.command_buffer, actual);
+    g_prep->snapshot(t.block, t.at.command_buffer ? t.at.command_buffer : t.at.bind_buffer, actual);
     // (the result is the function's w0: a different one is a mismatch whatever the calls and bytes)
     g_prep_check->compare(t.block, (uint32_t)t.drawable, t.native.calls(), t.translated.calls(), t.expected, actual,
                           sizeof actual, result != t.result);

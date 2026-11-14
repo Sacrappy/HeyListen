@@ -26,6 +26,7 @@ enum class PrepareRoute : uint8_t {
     NoMaterial,       ///< the drawable's material entry is empty: the function returns 0 at once (native)
     Cached,           ///< state and program already applied (native)
     ProgramBound,     ///< another program whose interface's buffers and textures are the ones applied: bound alone (native)
+    ProgramBuffers,   ///< another program, its changed uniform-block words bound from the known buffer objects (native)
     StateApplied,     ///< the state step taken (the render state copied, recorded again when it changed), the rest as on
                       ///< the two paths above (native)
     StateChanged,     ///< the state step (left: only with HL_GFX_PREP's state step off)
@@ -70,9 +71,32 @@ struct MaterialState {
     uint8_t depth_test = 0, depth_write = 0, depth_func = 0;
 };
 
+/// A buffer object the program step binds uniform blocks from (read when its binding word differs): its two methods
+/// (compared with the game's known implementations, PrepareInputs::known), its size, the slot it is at in a ring of
+/// copies and the ring's stride, its base address and its own alignment.
+struct BufferObject {
+    uint64_t align_method = 0, bind_method = 0;
+    uint32_t size = 0;
+    uint16_t slot = 0;
+    uint8_t stride = 0;       ///< (its high four bits count)
+    uint64_t base = 0;
+    uint32_t alignment = 0;
+};
+
+/// The game's implementations the function devirtualizes against (read from its GOT at run time).
+struct KnownMethods {
+    uint64_t align_fixed = 0;    ///< alignment 0x100
+    uint64_t align_field = 0;    ///< the object's own alignment
+    uint64_t bind_uniform = 0;   ///< binds a uniform buffer
+    uint64_t bind_storage = 0;   ///< binds a storage buffer
+};
+
 /// What the cached path reads, in the function's order (a field past the point where the call leaves that path is not
 /// read and keeps its default).
 struct PrepareInputs {
+    // The program step's buffer binds: the objects behind binding words 0, 3 and 4 (read when that word differs).
+    BufferObject buffers[3];
+    KnownMethods known;
     // The state step's.
     uint64_t flags = 0;                 ///< the block's (bit 6: reversed depth; bit 16: no blend copy; bit 17: no record)
     uint8_t state_bits = 0;             ///< the block's byte the state key is combined with
@@ -132,6 +156,16 @@ struct PrepareOutputs {
     uint32_t ids[3] = {};
     bool binding_written = false;       ///< the per-drawable block's binding word, and its entry made "none" (0xff)
     uint32_t block_binding = 0;
+    bool word_written[5] = {};          ///< binding words 0, 3 and 4 recorded when they changed (their buffers bound)
+    uint32_t words[5] = {};
+    /// The uniform buffer binds, in order: stage, slot (as the register holds it), address, size.
+    struct Bind {
+        uint32_t stage = 0;
+        uint64_t slot = 0, address = 0, size = 0;
+    };
+    Bind binds[9];
+    uint32_t bind_count = 0;
+    bool bind_marked = false;           ///< a uniform bind sets the command buffer's mark byte
     bool mask_cleared = false;          ///< the block's applied bits cleared (before the pending step)
     bool mask_written = false;          ///< the block's applied bits are rewritten
     uint16_t applied_mask = 0;
@@ -144,6 +178,7 @@ inline constexpr uint64_t kProgramBinder = 0x188;
 struct PrepareHandles {
     // The state record's: the command buffer, the five state objects in the function's frame, the block's blend color.
     uint64_t state_buffer = 0;
+    uint64_t bind_buffer = 0;           ///< the uniform binds' command buffer
     uint64_t blend = 0, color = 0, channel_mask = 0, depth_stencil = 0, polygon = 0, blend_color = 0;
     uint64_t command_buffer = 0;
     uint64_t command_list = 0;          ///< the list's handle in the material entry (its address: a list of one)
@@ -153,7 +188,7 @@ class Prepare {
 public:
     static bool native(PrepareRoute r) {
         return r == PrepareRoute::NoMaterial || r == PrepareRoute::Cached || r == PrepareRoute::ProgramBound ||
-               r == PrepareRoute::StateApplied;
+               r == PrepareRoute::ProgramBuffers || r == PrepareRoute::StateApplied;
     }
     /// `state_step`: take the state step natively (else a call that needs it is left, route StateChanged).
     static PrepareOutputs decide(const PrepareInputs& in, bool state_step = true);
@@ -161,7 +196,8 @@ public:
     static bool apply_state(PrepareState& s, uint8_t key, uint8_t state_bits, uint32_t mode, uint64_t flags,
                             uint8_t blend_target_mask, const MaterialState& m);
     static void emit_state(const PrepareState& s, const PrepareHandles& at, CommandSink& sink);
-    static void emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink);
+    /// `with_state` false: all but the state record (which the caller sends through the record path itself).
+    static void emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink, bool with_state = true);
 };
 
 }   // namespace hl::gfx

@@ -33,7 +33,7 @@ struct RenderStateBlock {
     GuestAddr material;
     uint8_t _20[8];
     GuestAddr renderer;
-    uint8_t _30[8];
+    GuestAddr buffer;        ///< the buffer object the preparation binds binding word 0's uniform blocks from
     uint8_t cluster;         ///< the cluster entry's index (the sub-mesh submission; the preparation's cluster calls)
     uint8_t depth_mode;      ///< (also the pass: the preparation's index into the drawable's pass slots)
     uint8_t state_bits;      ///< combined with the drawable's state key by the preparation's state step
@@ -94,6 +94,7 @@ struct RenderStateBlock {
 };
 static_assert(offsetof(RenderStateBlock, material) == 24);
 static_assert(offsetof(RenderStateBlock, renderer) == 40);
+static_assert(offsetof(RenderStateBlock, buffer) == 0x30);
 static_assert(offsetof(RenderStateBlock, cluster) == 0x38);
 static_assert(offsetof(RenderStateBlock, depth_mode) == 57);
 static_assert(offsetof(RenderStateBlock, state_bits) == 0x3a);
@@ -155,12 +156,15 @@ struct Material {
     uint32_t offset_factor;   ///< slot 0
     uint8_t _4d0[0x48];
     GuestAddr drawable_blocks;   ///< the per-drawable uniform blocks' table (the preparation binds an entry: 0 none)
-    uint8_t _520[0x48];
+    uint8_t _520[0x18];
+    GuestAddr buffers[2];        ///< the buffer objects of the program's binding words 3 and 4 (the preparation)
+    uint8_t _548[0x20];
     GuestAddr state_callback;
 };
 static_assert(offsetof(Material, offset_units) == 1224);
 static_assert(offsetof(Material, offset_factor) == 1228);
 static_assert(offsetof(Material, drawable_blocks) == 0x518);
+static_assert(offsetof(Material, buffers) == 0x538);
 static_assert(offsetof(Material, state_callback) == 1384);
 
 /// The state callback object (a function object: its invoker at +16 is the game's empty function when none is set).
@@ -266,6 +270,30 @@ static_assert(offsetof(MaterialStateObject, kind) == 0x159);
 /// them.
 inline constexpr uint64_t kPrepBlend = 0x70, kPrepColor = 0x78, kPrepChannelMask = 0x74, kPrepDepthStencil = 0x80,
                           kPrepPolygon = 0x84;
+
+/// A buffer object the preparation binds uniform blocks from: a ring of copies of one block (its methods at the vtable's
+/// +0x28 (alignment) and +0x50 (bind)).
+struct BufferObjectG {
+    GuestAddr vtable;
+    uint8_t _8[0x38];
+    uint32_t size;
+    uint8_t _44[4];
+    uint16_t slot;
+    uint8_t stride;
+    uint8_t _4b[0x35];
+    GuestAddr base;
+    uint32_t alignment;
+};
+static_assert(offsetof(BufferObjectG, size) == 0x40);
+static_assert(offsetof(BufferObjectG, slot) == 0x48);
+static_assert(offsetof(BufferObjectG, stride) == 0x4a);
+static_assert(offsetof(BufferObjectG, base) == 0x80);
+static_assert(offsetof(BufferObjectG, alignment) == 0x88);
+inline constexpr uint64_t kBufferAlignMethod = 0x28, kBufferBindMethod = 0x50;
+/// The GOT slots of the game's known implementations: alignment 0x100, the object's alignment, a uniform bind, a storage
+/// bind.
+inline constexpr uint64_t kAlignFixedSlot = 0x84cb56e0, kAlignFieldSlot = 0x84cb4fa8, kBindUniformSlot = 0x84cb56e8,
+                          kBindStorageSlot = 0x84cb4fb8;
 
 /// The game's default binding words (globals): the first part's three, then the second part's two.
 inline constexpr uint64_t kDefaultWordsA = 0x84ea2848, kDefaultWordsB = 0x84ea2854;

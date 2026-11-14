@@ -727,6 +727,61 @@ void the_preparation_state_step_derives_and_records() {
     CHECK(all.calls.size() == 28 + 1 && all.calls.back().op == (uint32_t)gfx::Proc::CommandBufferCallCommands);
 }
 
+void the_preparation_binds_changed_uniform_words() {
+    gfx::PrepareInputs in = cached_inputs();
+    in.applied_program = 0x5678;
+    in.known = {0xa0, 0xa1, 0xb0, 0xb1};
+    in.interface_id[0] = 5;   // (a new first part: its words compared)
+    in.words[0] = 0xff01ff03;   // (tag 0xff: stage 0 slot 3 (byte 0), stage 1 slot 1 (byte 2), stage 2 none (byte 1))
+    gfx::BufferObject& b = in.buffers[0];
+    b.align_method = 0xa0, b.bind_method = 0xb0;
+    b.size = 0x130, b.slot = 3, b.stride = 0x20, b.base = 0x10000;
+    gfx::PrepareOutputs out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.word_written[0] && out.words[0] == 0xff01ff03);
+    CHECK(out.bind_count == 2 && out.bind_marked && out.mask_cleared);
+    // (address: base + slot * (stride >> 4) * size rounded up to 0x100)
+    CHECK(out.binds[0].stage == 0 && out.binds[0].slot == 3 && out.binds[0].address == 0x10000 + 3 * 2 * 0x200);
+    CHECK(out.binds[1].stage == 1 && out.binds[1].slot == 1 && out.binds[1].size == 0x130);
+    // (tag 0xfe: stages 1, 6, 7 from bytes 2, 0, 1; a negative slot as the register holds it; the object's alignment)
+    in.words[0] = 0xfe80ff02;
+    b.align_method = 0xa1, b.alignment = 0x40;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.bind_count == 2 && out.binds[0].stage == 1 && out.binds[0].slot == 0xffffff80u && out.binds[1].stage == 6);
+    CHECK(out.binds[1].slot == 2 && out.binds[0].address == 0x10000 + 3 * 2 * 0x140);
+    Recorder r;
+    gfx::PrepareHandles h;
+    h.bind_buffer = 0xcb;
+    gfx::Prepare::emit(out, h, r);
+    CHECK(r.calls.size() == 4 && r.calls[1].op == (uint32_t)gfx::Proc::CommandBufferBindUniformBuffer);
+    CHECK(r.calls[1].x[0] == 0xcb && r.calls[1].x[1] == 1 && r.calls[2].x[1] == 6 && r.calls[1].x[4] == 0x130);
+    // (the word -1: recorded, nothing bound; an unknown method, another tag, a storage object, the switch: left)
+    in.words[0] = 0xffffffffu;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBound && out.word_written[0] && out.bind_count == 0);
+    in.words[0] = 0xff01ff03;
+    b.align_method = 0x99;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    b.align_method = 0xa0;
+    in.words[0] = 0xfd01ff03;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in.words[0] = 0xff01ff03;
+    b.bind_method = 0xb1;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    b.bind_method = 0xb0;
+    in.inline_switch = true, in.list_flags = 1;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in.inline_switch = false;
+    // (words 3 and 4: the second part's)
+    in = cached_inputs();
+    in.applied_program = 0x5678;
+    in.known = {0xa0, 0xa1, 0xb0, 0xb1};
+    in.interface_id[1] = 9;
+    in.words[4] = 0xffffff00;
+    in.buffers[2].align_method = 0xa0, in.buffers[2].bind_method = 0xb0;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.word_written[4] && out.bind_count == 1 && out.binds[0].stage == 0);
+}
+
 void the_prepare_bridge_reads_in_the_functions_order() {
     SparseRuntime rt;
     const uint64_t drawable = 0x100000, block = 0x200000, context = 0x300000, cb = 0x310000, materials = 0x400000,
@@ -867,6 +922,7 @@ int main() {
     the_draw_bridge_reads_and_writes_in_place();
     the_preparation_decides_its_route_in_order();
     the_preparation_state_step_derives_and_records();
+    the_preparation_binds_changed_uniform_words();
     the_prepare_bridge_reads_in_the_functions_order();
     std::printf("gfx: ok\n");
     return 0;

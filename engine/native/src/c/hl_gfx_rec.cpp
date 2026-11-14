@@ -146,17 +146,23 @@ namespace hl::c {
 
 void gfx_rec_emit(const gfx::StateInputs& in, const gfx::StateOutputs& out, const gfx::StateHandles& at,
                   const gfx::NvnEntryPoints& nvn) {
+    // (nothing recorded: the flags' bit 17)
+    gfx_rec_emit_commands(((in.flags >> 17) & 1) ? 0 : at.command_buffer, nvn,
+                          [&](gfx::CommandSink& sink) { gfx::RenderState::emit(in, out, at, sink); });
+}
+
+void gfx_rec_emit_commands(uint64_t command_buffer, const gfx::NvnEntryPoints& nvn,
+                           const std::function<void(gfx::CommandSink&)>& emit) {
     gfx::NvnSink nvn_sink(nvn);
     const int m = mode();
-    // (nothing recorded: the flags' bit 17)
-    if (!m || !at.command_buffer || ((in.flags >> 17) & 1)) {
-        gfx::RenderState::emit(in, out, at, nvn_sink);
+    if (!m || !command_buffer) {
+        emit(nvn_sink);
         return;
     }
-    void* cmd = g_host->open(g_host->user, at.command_buffer);
+    void* cmd = g_host->open(g_host->user, command_buffer);
     if (!cmd) {
         g_n.fell_back.fetch_add(1, std::memory_order_relaxed);
-        gfx::RenderState::emit(in, out, at, nvn_sink);
+        emit(nvn_sink);
         report();
         return;
     }
@@ -165,20 +171,20 @@ void gfx_rec_emit(const gfx::StateInputs& in, const gfx::StateOutputs& out, cons
     g_host->mark(g_host->user, cmd, &before);
     if (m & HL_REC_WRITE) {
         LiveSegment live(cmd);
-        gfx::RecordSink sink(live, guest, at.command_buffer);
-        gfx::RenderState::emit(in, out, at, sink);
+        gfx::RecordSink sink(live, guest, command_buffer);
+        emit(sink);
         g_n.written.fetch_add(1, std::memory_order_relaxed);
         g_n.written_records.fetch_add(sink.records(), std::memory_order_relaxed);
         if (m & HL_REC_CHECK) {
             g_host->mark(g_host->user, cmd, &mid);
-            gfx::RenderState::emit(in, out, at, nvn_sink);
+            emit(nvn_sink);
             g_host->mark(g_host->user, cmd, &after);
             // (the two runs' accounting as deltas from where each started)
             hl_rec_mark native_acc = mid, nvn_acc = after;
             nvn_acc.cmd_used = before.cmd_used + (after.cmd_used - mid.cmd_used);
             nvn_acc.hw_used = before.hw_used + (after.hw_used - mid.hw_used);
             const uint8_t* bytes = g_host->bytes(g_host->user, cmd, before.offset);
-            compare(at.command_buffer, bytes, mid.offset - before.offset, native_acc, bytes + (mid.offset - before.offset),
+            compare(command_buffer, bytes, mid.offset - before.offset, native_acc, bytes + (mid.offset - before.offset),
                     after.offset - mid.offset, nvn_acc, sink.stray());
             g_host->rewind(g_host->user, cmd, &mid);
         } else if (sink.stray()) {
@@ -187,11 +193,11 @@ void gfx_rec_emit(const gfx::StateInputs& in, const gfx::StateOutputs& out, cons
     } else {
         gfx::ScratchSegment& scratch = t_scratch;
         scratch.reset(before);
-        gfx::RecordSink sink(scratch, guest, at.command_buffer);
-        gfx::RenderState::emit(in, out, at, sink);
-        gfx::RenderState::emit(in, out, at, nvn_sink);
+        gfx::RecordSink sink(scratch, guest, command_buffer);
+        emit(sink);
+        emit(nvn_sink);
         g_host->mark(g_host->user, cmd, &after);
-        compare(at.command_buffer, scratch.bytes().data(), scratch.bytes().size(), scratch.mark(),
+        compare(command_buffer, scratch.bytes().data(), scratch.bytes().size(), scratch.mark(),
                 g_host->bytes(g_host->user, cmd, before.offset), after.offset - before.offset, after, sink.stray());
     }
     report();
