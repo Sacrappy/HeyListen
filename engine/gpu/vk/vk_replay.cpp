@@ -3759,8 +3759,13 @@ void invalidate(uint64_t gpu, uint64_t size) {
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
                     wait_value(v);
                 }
-                // (sprint 5, RX_VK_READBACK_STRICT=1, a test: the value itself reached on the GPU's timeline before the CPU reads)
-                static const bool strict = getenv("RX_VK_READBACK_STRICT") && atoi(getenv("RX_VK_READBACK_STRICT")) != 0;
+                // (sprint 5, RX_VK_READBACK_STRICT: the value itself reached on the GPU's timeline before the CPU reads.) On by
+                // default (=0: off): the recordings' timeline is signalled before the write-back that ends the submission has
+                // landed, and a read in between got the light meter's sums of an earlier submission. The auto-exposure then
+                // jumped for ~16 frames (the whole picture +8-15% brighter, then easing back): 37 and 99 such pulses in two
+                // minutes in Kokiri with the CPU busy (RX 9070 XT, RADV, Ryzen 5 5500X3D), 2 with it quiet; with this wait, 0 in
+                // all three rounds, the same fps when quiet (41.5 against 41.6)
+                static const bool strict = !getenv("RX_VK_READBACK_STRICT") || atoi(getenv("RX_VK_READBACK_STRICT")) != 0;
                 static std::atomic<int64_t> st_strict{0};
                 if (strict && v > completed()) {
                     wait_value(v);
