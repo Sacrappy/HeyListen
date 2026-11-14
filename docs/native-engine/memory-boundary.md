@@ -1443,3 +1443,85 @@ session's 8 GB, items 1 and 2 (about 2.5-3.5 GB) are what was found and are pres
   window and `HOS_OUTPUT_RES` (`output_res=` in `hookshot_options.ini`, 1 = 2560x1440) for the game's frame, which the slots already have at 2560x1440.
 - The census of a long session; which call made which driver allocation; `RX_VK_PRECOMPILE=0` against these numbers.
 - The `at exit` census (the harness kills the game).
+
+## 17. What grows (2026-11-14): the owner's 45-minute session, and eight minutes standing still on the PC 3050
+
+### The play session (`build/s5/play8.orch.log`, 17 zones, `HL_TRACE` on; one `vk: process memory` line per 600 presents)
+
+| Counter | line 16 | 168 | 281 | 394 | 562 (end) | Bound? |
+|---|---:|---:|---:|---:|---:|---|
+| private commit, MB | 10539 | 23067 | 24406 | 24525 | 27866 | none seen: only rises |
+| working set, MB | 6105 | 11525 | 10978 | 11248 | 10309 | follows the zone |
+| C heaps in use, MB | 1088 | 1198 | 1323 | 1467 | 1504 | none seen (see below) |
+| **imports live** (pinned guest ranges with a VRAM mirror each) | 4 (160 MB) | 66 (2102) | 95 (3167) | 148 (4565) | **229 (6615 MB)** | none seen; 46 retired in all |
+| capture buffers made | 49 | 550 | 1108 | 1955 | 3955 | churn: kept 70-120 MB, spares 50-240 MB stay flat |
+| capture table, MB | 11 | 25 | 27 | 27 | 27 | grows with the pages seen, flat after the third zone |
+| BC cache, MB | 0 | 656 | 1023 | 1022 | 1022 | its 1024 MB cap (that build stored everything) |
+| graphics pipelines made / bound | 6396 / 25 | 6405 / 2167 | 6432 / 3263 | 6491 / 4713 | 6675 / 6058 | the game's set |
+| cold-page units left in for good (`HL_MEM_COLD_HEAPS`) | 0 | 1259 | 5054 | 7703 | **19508** | only rises: a unit that comes back twice is never taken out again |
+| drop spill held, MB | 860 | 2665 | 2115 | 1250 | 964 | 4 GB cap |
+| VMA device blocks, MB | 992 | 7448 | 7637 | 6707 | 9163 | follows VRAM |
+
+HL_TRACE's own tables are fixed in size, not growing without end: the freed ring (1 M entries of 136 bytes, 136 MB), the live
+table (2 M of 64 bytes, 128 MB), 2 MB a thread that has events, 12 MB for the back end's writes: **up to 0.4-0.6 GB of the C
+heaps, reached in the first minutes**. The recorder explains why this session started at 1.09 GB of C heaps where an untraced
+run has 0.55 GB (PC 3050 below), but not the further +0.4 GB over the session: that is the game side and the host's own
+tables, and the two lines that name them are the imports and the cold-page records.
+
+### Standing still, eight minutes (PC 3050, market, `HOS_HOST_SPLIT=60:60`, `h1-3050-long2`; RAM in MB)
+
+| | 61 s | 121 | 182 | 243 | 304 | 365 | 426 | 486 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| guest window | 1181 | 3205 | 2116 | 2130 | 2114 | 2125 | 2110 | 2128 |
+| driver arenas (private 512 MB and up) | 1622 | 1774 | 1780 | 1809 | 1823 | 1827 | 1815 | 1815 |
+| tagged (captures, BC cache, BAR left out) | 199 | 829 | 887 | 891 | 955 | 943 | 1010 | 964 |
+| of it the BC cache | 0 | 640 | 670 | 698 | 704 | 711 | 711 | 719 |
+| C heaps | 269 | 481 | 484 | 507 | 511 | 512 | 512 | 513 |
+| images | 166 | 233 | 236 | 249 | 250 | 250 | 250 | 250 |
+| private 32-64 MB (driver, usually commit only) | 2 | 34 | 34 | 34 | 1398 | 1081 | 1336 | 1080 |
+| commit charge | 8836 | 15866 | 16669 | 16396 | 16389 | 16275 | 16412 | - |
+
+Nothing leaks while the player stands: after the load the window, the arenas, the heaps (+30 MB in six minutes), the images, the
+imports (48 to 50) and the capture table are flat, and the commit charge is flat at 16.3-16.7 GB. What moves: the BC cache
+fills toward its cap (640 to 719 MB; on this 8 GB card it stores everything, bounded at 1024 MB), and from 5 minutes **1.1-1.4
+GB of the driver's 32-64 MB regions become resident**, with VRAM at 80% of the card: the driver keeps system-memory backing for
+what it holds in VRAM, and it fills in once VRAM is nearly full (not seen on the 12 GB main PC at 40% VRAM: the lever is VRAM
+use). The cold-page units left in for good rose by 4246 in the last three lines without the player moving.
+
+### Who grows, and whether it has a bound
+
+1. **Imports and the commit charge they bring** (6.6 GB of live imports at the end of the session, 229 of them): grows with every zone;
+   no limit other than the game's pools ending. The commit charge (10 to 28 GB) follows imports plus VMA blocks. Next: read what
+   retires an import (46 given back of 275 made) and give back those of pools the game no longer binds.
+2. **The cold-page policy's "left in for good" units** (19508): a rule that cannot be undone, so the working set it was written to
+   lower rises over a session. Bound: the heap's size, reached after hours.
+3. **C heaps** (+0.4 GB over the session beyond the recorder): not attributed; the heap walk names big blocks only. The
+   host's tables for pools, drops and imports are the candidates.
+4. Bounded: the BC cache (cap), capture buffers and table, the drop's spill (cap), pipelines (the game's set).
+
+## 18. The pipeline cache's save (`RX_VK_PCACHE_MISSES`, `RX_VK_PCACHE_MAP`, 2026-11-14)
+
+What it does: `pipeline_cache_save` (`vk_draw.cpp`) runs every 300 presents on a detached thread when 32 pipelines have been
+counted as built since the last save, fetches the whole `VkPipelineCache` with `vkGetPipelineCacheData` into one `std::vector`
+and writes it to `mkw_vk_pipelines.bin` through a temporary file (the file is the driver's pipeline data: 0.3 GB on the PC
+3050, 1.2 GB on the main PC). The counter counted **every graphics pipeline made, including those the cache already had**, so the
+load of any scene counted 32 at once and the 1.2 GB was fetched and written again, with nothing new in it. The replay does not
+wait for it (a thread of its own), the cache is internally locked.
+
+Changes (both default on; `=0` is the old behaviour):
+- `RX_VK_PCACHE_MISSES`: a graphics pipeline counts only when `VkPipelineCreationFeedback` says the cache did not have it (compute
+  already did this).
+- `RX_VK_PCACHE_MAP`: the data is fetched into a mapped view of the temporary file: no private commit, no working set that stays.
+  Vulkan cannot hand the data over in pieces, so a true stream is not possible; the file's own pages are what is written.
+- A log line `vk: pipeline cache saved (...)` gives the process's private commit before the fetch and with the data in hand.
+
+PC 3050, market, scripted, 235 s, one run each (`h1-3050-pcA2` old, `pcB` new): old, two saves, at the title and at the scene
+load: private commit 5383 to 5674 MB and 16124 to 16419 MB (+291 and +295 MB for a 287 MB cache), 151 ms each; new: **no save,
+no spike** (the run had no misses: 105 compute pipelines from the cache, 0 compiled; the old run's 86 compiled were caused by
+it saving nothing new). The mapped writer's own line was not seen in a run (no save was needed with the warm cache); it is
+built and tested only by the suite (the vector path's cases, with a stub for the mapped one).
+
+Not verified: that a killed run keeps what it compiled. A cold-cache run (`pcC`, cache file removed, 290 s) was killed
+inside the start-up precompile (1242 of 3675 pipelines) before any save, which is also what the old code does there (the
+precompile builds into the driver's cache and counts nothing, and the save at its end never came). With misses in play the
+rule is the old one (32 built, checked every 300 presents).
