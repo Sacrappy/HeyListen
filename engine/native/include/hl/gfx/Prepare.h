@@ -196,7 +196,8 @@ public:
     static bool apply_state(PrepareState& s, uint8_t key, uint8_t state_bits, uint32_t mode, uint64_t flags,
                             uint8_t blend_target_mask, const MaterialState& m);
     static void emit_state(const PrepareState& s, const PrepareHandles& at, CommandSink& sink);
-    static void emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink);
+    /// `with_state` false: all but the state record (which the caller sends through the record path itself).
+    static void emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink, bool with_state = true);
 };
 
 }   // namespace hl::gfx

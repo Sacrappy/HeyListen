@@ -464,8 +464,14 @@ extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t sp,
     if (!hl::gfx::Prepare::native(out.route)) return 0;
     // (the block and the mark first: the function writes them before its call)
     g_prep->write(block, at, out);
+    // (the state record through the record path the render state takes: the NVN procedures or the records written
+    // directly, by HL_GFX_REC; then the rest, which RecordSink does not cover, through the procedures)
+    if (out.state_recorded)
+        hl::c::gfx_rec_emit_commands(at.state_buffer, g_nvn, [&](hl::gfx::CommandSink& s) {
+            hl::gfx::Prepare::emit_state(out.state, at, s);
+        });
     hl::gfx::NvnSink sink(g_nvn);
-    hl::gfx::Prepare::emit(out, at, sink);
+    hl::gfx::Prepare::emit(out, at, sink, false);
     *result = out.result;
     return 1;
 }

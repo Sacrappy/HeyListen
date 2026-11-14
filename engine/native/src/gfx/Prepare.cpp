@@ -272,8 +272,8 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
     return out;
 }
 
-void Prepare::emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink) {
-    if (out.state_recorded) emit_state(out.state, at, sink);
+void Prepare::emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink, bool with_state) {
+    if (out.state_recorded && with_state) emit_state(out.state, at, sink);
     if (out.program_bound)
         sink.emit(command(Proc::CommandBufferBindProgram, out.binder, out.program_object, out.program_stages));
     for (uint32_t i = 0; i < out.bind_count; i++) {
