@@ -111,7 +111,7 @@ table is read against them, not to argue with the goal.
   multiply-adds, NaN rules of min and max, flush-to-zero, ARM's reciprocal square root estimate), or the game's
   simulation diverges from the console's. Each replacement is compared on live inputs before it is switched on.
 
-## State of the hybrid engine (kept current; last update 2026-11-13, evening)
+## State of the hybrid engine (kept current; last update 2026-11-14, evening)
 
 Every one of the five subsystems of the hybrid scope has native code switched on in the game. Each brick is validated in
 the three scenes by function and picture, and by its own check (invariants or bit-for-bit comparison with the
@@ -133,6 +133,9 @@ translated code); speed is not being measured for now, by the owner's instructio
 | Rendering | `hl::gfx::RenderState` | `HL_GFX_STATE` (1) | the state of every draw (about 33 NVN calls) is derived and emitted by native code through the `CommandSink` seam; exact check: 0 mismatches over 4.2 million NVN calls | the shared draw preparation `0x8008fc00` (mapped, being written: `HL_GFX_PREP`), the draw function and its variants, the draw loop |
 | Rendering | `hl::gfx::SubmeshDraw` | `HL_GFX_DRAW` (1) | the sub-mesh submission `0x80078fc0` is native on its direct paths, exact check at 0 mismatches | its cluster paths |
 | Rendering | `hl::gfx::Records` | `HL_GFX_REC` (1) | the native render state writes the back end's records itself, with no NVN procedure call in between (`HL_GFX_REC_CHECK`: byte-identical records) | uniform data in the records (measured: `direct-emission.md` 9), the flatten copy |
+| Rendering | `hl::gfx` preparation | `HL_GFX_PREP` (1), `HL_GFX_PREP_STATE` (1) | the shared draw preparation `0x8008fc00` is answered natively with the translation as the fallback for a listed set of cases: the cached route, the program and state steps, the uniform-block binds, the texture binds and the per-drawable block; 91-98% of its calls native by zone, 0 mismatches over 19.4 M compared calls in seven zones (`gfx-record-job.md` 10) | word 1's table path, the 0xfd / 0xfc / 0xfb stage sets, first uses (textures and blocks being made ready), the cluster and inline-write routes |
+| Game speed | step hooks | `HOS_FPS_STEP` (1) | above a 60 fps cap the engine's two step divides take the frame's measured time (hooks put in per tree by `nx2/hl_gates.py`, asked for by `host/hl_step.c`): speed 1.000 within 0.6% at 60 and about 87 fps, against 1.37-1.50 before (`main-loop.md`) | systems that count frames (the chemistry objects) |
+| Memory | a mirror per pool, no host import | `RX_VK_POOL_MIRROR` (0) | pools are never imported and cold pages inside live pools can be dropped (`memory-boundary.md` 19): imports 0, mirrors halved, the game's commit 2 to 4 GB lower with the drop | default on after the owner's zone-change session |
 | Streaming | `hl::stream` | `HL_STREAM` (1) | every resource file's decompression is native, the chunked case included: zstd's own decoder with the game's dictionaries, byte-identical over 27,000 files; provenance of each decoded range recorded | the file reads' scheduling, the resource manager around it |
 | Physics loops | `hl::math` | `HL_MATH` (1) | five units native and bit-exact (0 mismatches over tens of millions of compared calls on two machines): four box and sphere kernels and the per-body box update of the solver's last step | the solver's integration and contact loops (being written), the narrow phase, cloth |
 | OS layer | a mutex finds its host object from itself | `HOS_NO_MUTEX_IX` unset | 0.5 ms a frame of lookups gone from the chain | - |
@@ -160,8 +163,12 @@ any brick, and it is not ruled out either.
 Reviewed whole on 2026-11-13 (`review-2026-11-13.md`): the defects that a player could meet are fixed and merged; left
 open are the first-touch commit's protection of already committed pages (B7), the Linux build of the C++ tree (the
 AppImage's toolchain has no C++20: the tree is to be prebuilt as a static library, as the Vulkan back end is) and
-hygiene items. Player releases are cut from the branch `release/0.3.x` (v0.3.0's engine) until this engine is declared
-stable.
+hygiene items. Since 2026-11-14 (the owner's decision) the next player release is cut from `main`, which now holds everything
+v0.3.2 shipped (the pipeline state list, the fixes for GPUs without mesh shaders, the Linux release files); `release/0.3.x`
+stays as v0.3.2's line. Before that release: the candidate measured 2-4% slower than v0.3.2's engine on the PC 3050 (30.2
+against 31.6 fps in the castle scene, 32.4 against 33.0 in Kokiri; the cause is not located: neither the cold pages nor the
+native preparation), a whole build through the builder from `main` and a hand-played zone-change session are still to do,
+and players prepare their shaders again once (the shader stamp differs from v0.3.2's).
 
 ## Rules
 
