@@ -82,7 +82,7 @@ about 10 GB of RAM.
 
 ### Linux
 
-Either use the `Hookshot-<version>-x86_64.AppImage` from the Releases page, or build the environment and the AppImage
+Either use the `HeyListen-<version>-x86_64.AppImage` from the Releases page, or build the environment and the AppImage
 yourself:
 
 ```sh
