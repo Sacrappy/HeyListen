@@ -1,8 +1,8 @@
 """Linux builder updates, the same way Windows installs (builder/setup/setup.c, scripts/make_setup_parts.py).
 
-A release publishes hookshot-linux.txt. Each part is a zip named by its SHA-256 and kept on the linux-parts release, so a
+A release publishes heylisten-linux.txt. Each part is a zip named by its SHA-256 and kept on the linux-parts release, so a
 part whose files did not change is not downloaded again. The player's copy lives at
-$XDG_DATA_HOME/hookshot/builder/versions/<tag> (AppRun at its root, the same layout as the AppImage). An unchanged part
+$XDG_DATA_HOME/heylisten/builder/versions/<tag> (AppRun at its root, the same layout as the AppImage). An unchanged part
 is copied from the builder that is running now (the mounted AppImage, or the version installed last time).
 
     tag <tag>
@@ -22,9 +22,9 @@ import zipfile
 
 from part_links import SYSROOT_PART, is_absolute_link, relative_sysroot_link
 
-LIST_NAME = "hookshot-linux.txt"
-LATEST_LIST = "https://github.com/NotRexed/HeyListen/releases/latest/download/" + LIST_NAME
-LATEST_API = "https://api.github.com/repos/NotRexed/HeyListen/releases/latest"
+LIST_NAME = "heylisten-linux.txt"
+LATEST_LIST = "https://github.com/Sacrappy/HeyListen/releases/latest/download/" + LIST_NAME
+LATEST_API = "https://api.github.com/repos/Sacrappy/HeyListen/releases/latest"
 
 
 class Part(object):
@@ -48,7 +48,7 @@ class Manifest(object):
 
 def data_root():
     base = os.environ.get("HOOKSHOT_BUILDER_HOME") or os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "hookshot", "builder")
+    return os.path.join(base, "heylisten", "builder")
 
 
 def parse_list(text, local=True):
@@ -438,12 +438,12 @@ def _finish_tree(dest):
     apprun = os.path.join(dest, "AppRun")
     shutil.copyfile(os.path.join(tools, "builder", "linux", "AppRun"), apprun)
     os.chmod(apprun, 0o755)   # (rwxr-xr-x: the launcher must run; only its owner may change it)
-    icon = os.path.join(tools, "assets", "hookshot.png")
+    icon = os.path.join(tools, "assets", "heylisten.png")
     if os.path.isfile(icon):
-        shutil.copyfile(icon, os.path.join(dest, "hookshot.png"))
-    desktop = os.path.join(tools, "builder", "linux", "hookshot-builder.desktop")
+        shutil.copyfile(icon, os.path.join(dest, "heylisten.png"))
+    desktop = os.path.join(tools, "builder", "linux", "heylisten-builder.desktop")
     if os.path.isfile(desktop):
-        shutil.copyfile(desktop, os.path.join(dest, "hookshot-builder.desktop"))
+        shutil.copyfile(desktop, os.path.join(dest, "heylisten-builder.desktop"))
     return apprun
 
 

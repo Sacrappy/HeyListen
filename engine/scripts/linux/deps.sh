@@ -192,10 +192,10 @@ fi
 if ! done_for licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER-$TCLTK_VER"; then
     L=$DEPS/licenses
     rm -rf "$L" && mkdir -p "$L"
-    curl -fsSL -o "$L/LLVM-LICENSE.TXT" "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$LLVM_VER/llvm/LICENSE.TXT"
-    curl -fsSL -o "$L/FFmpeg-COPYING.LGPLv2.1" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$FFMPEG_VER/COPYING.LGPLv2.1"
-    curl -fsSL -o "$L/FFmpeg-LICENSE.md" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$FFMPEG_VER/LICENSE.md"
-    curl -fsSL -o "$L/dav1d-COPYING" "https://code.videolan.org/videolan/dav1d/-/raw/$DAV1D_VER/COPYING"
+    "${CURL[@]}" -sS -o "$L/LLVM-LICENSE.TXT" "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$LLVM_VER/llvm/LICENSE.TXT"
+    "${CURL[@]}" -sS -o "$L/FFmpeg-COPYING.LGPLv2.1" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$FFMPEG_VER/COPYING.LGPLv2.1"
+    "${CURL[@]}" -sS -o "$L/FFmpeg-LICENSE.md" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$FFMPEG_VER/LICENSE.md"
+    "${CURL[@]}" -sS -o "$L/dav1d-COPYING" "https://code.videolan.org/videolan/dav1d/-/raw/$DAV1D_VER/COPYING"
     cp "$DEPS/sdl2/LICENSE.txt" "$L/SDL2-LICENSE.txt"
     cp "$DEPS/tk/Tk-license.terms" "$L/Tk-license.terms"
     # (Debian and Ubuntu: /usr/share/doc/<package>/copyright; Arch: /usr/share/licenses/<package>/COPYING; Fedora: /usr/share/licenses/<package>/)

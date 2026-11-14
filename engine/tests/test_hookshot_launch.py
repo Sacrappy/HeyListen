@@ -151,7 +151,7 @@ class LaunchTests(unittest.TestCase):
         self.assertNotIn("Hookshot-launcher-", script)
         apprun = (ROOT / "builder" / "linux" / "AppRun").read_text(encoding="utf-8")
         self.assertIn("hookshot-launch", apprun)
-        desktop = (ROOT / "builder" / "linux" / "hookshot-builder.desktop").read_text(encoding="utf-8")
+        desktop = (ROOT / "builder" / "linux" / "heylisten-builder.desktop").read_text(encoding="utf-8")
         self.assertIn("Actions=Play;", desktop)
         self.assertIn("Exec=AppRun --play\n", desktop)
 

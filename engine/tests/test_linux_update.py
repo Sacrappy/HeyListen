@@ -80,7 +80,7 @@ class UpdateTests(unittest.TestCase):
                 with self.subTest(case=label):
                     case = root / label
                     home = case / "home"
-                    versions = home / "hookshot" / "builder" / "versions"
+                    versions = home / "heylisten" / "builder" / "versions"
                     previous = versions / "v1"
                     previous.mkdir(parents=True)
                     (previous / "kept").write_bytes(b"previous version")
@@ -194,7 +194,7 @@ class UpdateTests(unittest.TestCase):
                         self.assertNotIn(linux_update.LIST_NAME, zipped.namelist())
                     payloads[part.url] = archive.read_bytes()
                 home = root / "publisher-home"
-                versions = home / "hookshot" / "builder" / "versions"
+                versions = home / "heylisten" / "builder" / "versions"
                 versions.mkdir(parents=True)
                 canary = versions / "canary"
                 canary.write_bytes(b"publisher sibling canary")
@@ -214,7 +214,7 @@ class UpdateTests(unittest.TestCase):
             with self.subTest(target_exists=exists), tempfile.TemporaryDirectory(prefix="hookshot-stage-") as tmp:
                 root = Path(tmp).resolve()
                 home = root / "home"
-                versions = home / "hookshot" / "builder" / "versions"
+                versions = home / "heylisten" / "builder" / "versions"
                 versions.mkdir(parents=True)
                 target = root / "outside-stage"
                 sentinel = root / "sentinel"
@@ -263,7 +263,7 @@ class UpdateTests(unittest.TestCase):
                 if linked_home:
                     home.symlink_to(real_home, target_is_directory=True)
                 self.assertIn(root, home.resolve().parents)
-                versions = home / "hookshot" / "builder" / "versions"
+                versions = home / "heylisten" / "builder" / "versions"
                 old = versions / "v1"
                 old.mkdir(parents=True)
                 (old / "kept").write_text("old", encoding="utf-8")
@@ -370,7 +370,7 @@ class UpdateTests(unittest.TestCase):
             root = Path(tmp) / "rc"
             appdir(root)
             (root / "usr" / "share" / "hookshot" / "VERSION").write_text("v1.1-rc.1\n", encoding="utf-8")
-            (root / "hookshot-linux.txt").write_text(
+            (root / "heylisten-linux.txt").write_text(
                 "tag v1.1-rc.1\npart %s 10 usr/share/hookshot file://%s/rc.zip\nfile nx2/marker.py\n" % ("a" * 64, tmp),
                 encoding="utf-8")
             stable = "tag v1.0\npart %s 10 usr/share/hookshot https://example.invalid/old.zip\nfile nx2/marker.py\n" % ("b" * 64)
@@ -389,7 +389,7 @@ class UpdateTests(unittest.TestCase):
             # an AppImage at the latest release keeps using its bundled list (nothing was ever reinstalled there)
             release = Path(tmp) / "release"
             appdir(release)     # (VERSION v1)
-            (release / "hookshot-linux.txt").write_text(
+            (release / "heylisten-linux.txt").write_text(
                 "tag v1\npart %s 10 usr/share/hookshot file://%s/release.zip\nfile nx2/marker.py\n" % ("e" * 64, tmp),
                 encoding="utf-8")
             same = "tag v1\npart %s 10 usr/share/hookshot https://example.invalid/old.zip\nfile nx2/marker.py\n" % ("b" * 64)
@@ -412,7 +412,7 @@ class UpdateTests(unittest.TestCase):
                 make_parts.main()
             finally:
                 sys.argv = argv
-            manifest = linux_update.parse_list((first / "hookshot-linux.txt").read_text(encoding="utf-8"))
+            manifest = linux_update.parse_list((first / "heylisten-linux.txt").read_text(encoding="utf-8"))
             home = root / "home"
             os.environ["HOOKSHOT_BUILDER_HOME"] = str(home)
             self.addCleanup(lambda: os.environ.pop("HOOKSHOT_BUILDER_HOME", None))
@@ -425,7 +425,7 @@ class UpdateTests(unittest.TestCase):
 
             linux_update.install(manifest, str(old), manifest, get=get)
             self.assertEqual(downloaded, [])
-            installed = home / "hookshot" / "builder" / "versions" / "v1"
+            installed = home / "heylisten" / "builder" / "versions" / "v1"
             self.assertTrue((installed / "AppRun").stat().st_mode & stat.S_IXUSR)
             self.assertEqual((installed / "usr" / "share" / "hookshot" / "nx2" / "marker.py").read_text(encoding="utf-8"), "print('one')\n")
 
@@ -438,7 +438,7 @@ class UpdateTests(unittest.TestCase):
                 make_parts.main()
             finally:
                 sys.argv = argv
-            nxt = linux_update.parse_list((second / "hookshot-linux.txt").read_text(encoding="utf-8"))
+            nxt = linux_update.parse_list((second / "heylisten-linux.txt").read_text(encoding="utf-8"))
             downloaded.clear()
 
             def get2(url):
@@ -449,10 +449,10 @@ class UpdateTests(unittest.TestCase):
             linux_update.install(nxt, str(installed), manifest, get=get2)
             self.assertEqual(len(downloaded), 1)
             self.assertIn("usr-share-hookshot", downloaded[0])
-            built = home / "hookshot" / "builder" / "versions" / "v2"
+            built = home / "heylisten" / "builder" / "versions" / "v2"
             self.assertEqual((built / "usr" / "share" / "hookshot" / "nx2" / "marker.py").read_text(encoding="utf-8"), "print('two')\n")
             self.assertEqual((built / "usr" / "lib" / "hookshot" / "hookshot_vk.so").read_bytes(), b"vk")
-            self.assertFalse((home / "hookshot" / "builder" / "versions" / "v1").exists())
+            self.assertFalse((home / "heylisten" / "builder" / "versions" / "v1").exists())
 
     def test_an_installed_builder_finds_its_own_root(self):
         with tempfile.TemporaryDirectory(prefix="hookshot-root-") as tmp:
@@ -498,9 +498,9 @@ class UpdateTests(unittest.TestCase):
                 (out / name).write_bytes(b"old " + name.encode())
             with mock.patch.dict(os.environ, {"HOOKSHOT_TOOLS": str(ROOT)}):
                 exec(finish, make_game.__dict__, {"built": str(built), "out": str(out), "work": str(work)})
-            self.assertEqual((out / "hookshot").read_bytes(), (ROOT / "builder" / "linux" / "hookshot-folder").read_bytes())
-            self.assertTrue((out / "hookshot").stat().st_mode & stat.S_IXUSR)
-            self.assertEqual(sorted(p.name for p in out.iterdir()), ["bin", "hookshot", "image.bin"])
+            self.assertEqual((out / "HeyListen").read_bytes(), (ROOT / "builder" / "linux" / "hookshot-folder").read_bytes())
+            self.assertTrue((out / "HeyListen").stat().st_mode & stat.S_IXUSR)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["HeyListen", "bin", "image.bin"])
             self.assertEqual(sorted(p.name for p in (out / "bin").iterdir()), sorted(make_game.BESIDE))
             self.assertEqual((out / "bin" / "hookshot").read_bytes(), b"new hookshot")
 
@@ -540,14 +540,14 @@ class UpdateTests(unittest.TestCase):
 
     def test_the_folder_launcher_finds_the_builder_under_the_builder_home(self):
         # HOOKSHOT_BUILDER_HOME is the data directory, as XDG_DATA_HOME is: linux_update installs to
-        # <home>/hookshot/builder and host/hos_update.c looks there, so the launcher must too
+        # <home>/heylisten/builder and host/hos_update.c looks there, so the launcher must too
         with tempfile.TemporaryDirectory(prefix="hookshot-folder-") as tmp:
             root = Path(tmp)
             game = root / "game"
             (game / "bin").mkdir(parents=True)
             home = root / "home"
             started = root / "started"
-            installed = home / "hookshot" / "builder"
+            installed = home / "heylisten" / "builder"
             (installed / "versions" / "v9").mkdir(parents=True)
             (installed / "current").write_text("v9\n", encoding="utf-8")
             apprun = installed / "versions" / "v9" / "AppRun"

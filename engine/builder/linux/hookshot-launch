@@ -1,8 +1,8 @@
 #!/bin/sh
-# Start the game Hookshot Builder wrote, from that folder, without the AppImage's libraries.
+# Start the game HeyListen Builder wrote, from that folder, without the AppImage's libraries.
 # The builder AppImage calls this for --play. The window's Play button does the same thing.
 #
-#   hookshot-launch                      the out= folder in ~/.config/hookshot/builder.ini
+#   hookshot-launch                      the out= folder in ~/.config/heylisten/builder.ini
 #   hookshot-launch /path/to/the/game    that folder
 #   HOOKSHOT_LAUNCH_CONFIG=<file>        read that ini instead (a test)
 set -eu
@@ -11,7 +11,7 @@ ini_path() {
     if [ -n "${HOOKSHOT_LAUNCH_CONFIG:-}" ]; then
         printf '%s\n' "$HOOKSHOT_LAUNCH_CONFIG"
     else
-        printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/hookshot/builder.ini"
+        printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/heylisten/builder.ini"
     fi
 }
 
@@ -44,7 +44,7 @@ if ! ready "$folder"; then
     # (HOOKSHOT_LAUNCH_CONFIG is a test: it must not open a dialog)
     if [ -z "${HOOKSHOT_LAUNCH_CONFIG:-}" ]; then
         if command -v zenity >/dev/null 2>&1; then
-            zenity --error --title=Hookshot --text="No built game to start. Build one with HeyListen Builder first." || true
+            zenity --error --title=HeyListen --text="No built game to start. Build one with HeyListen Builder first." || true
         elif command -v kdialog >/dev/null 2>&1; then
             kdialog --error "No built game to start. Build one with HeyListen Builder first." || true
         fi

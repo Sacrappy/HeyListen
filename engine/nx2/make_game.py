@@ -53,6 +53,8 @@ LINUX, CROSS = not _toolchain.windows(), _toolchain.windows() and os.name != "nt
 BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["HeyListen.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
 # (HeyListen: the Windows game and its launcher were hookshot.exe before; a folder built then has them, removed once the new ones are in)
 OLD_EXES = [] if LINUX else ["hookshot.exe", "hookshot.map"]
+# (Linux) the game folder's launcher script (builder/linux/hookshot-folder); the game itself is bin/hookshot, which the engine and the launcher both expect
+LAUNCHER = "HeyListen"
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
              ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh-Hans", "Chinese (Simplified)"),
@@ -183,7 +185,7 @@ KEEP_BUILDS = 20
 
 def times_path(work):
     """Where the builds' times are kept: beside the object cache, in the builder's own folder (LOCALAPPDATA\\HookshotBuilder
-    on Windows, ~/.cache/hookshot-builder on Linux). A builder update keeps it, so the next build still knows what this PC
+    on Windows, ~/.cache/heylisten-builder on Linux). A builder update keeps it, so the next build still knows what this PC
     took, and the one after that can compare."""
     return os.path.join(work, "build_times.json")
 
@@ -1201,7 +1203,7 @@ def parse_args():
     p.add_argument("--exefs")
     p.add_argument("--out")
     p.add_argument("--work", default=os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
-                                                  "hookshot-builder-windows" if CROSS else "hookshot-builder")   # (the objects apart)
+                                                  "heylisten-builder-windows" if CROSS else "heylisten-builder")   # (the objects apart)
                    if os.name != "nt" else os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "HookshotBuilder"))
     # (HOOKSHOT_JOBS: fewer compilers on a PC short of memory; the AppImage's builds pass no --jobs)
     p.add_argument("--jobs", type=int)
@@ -1485,7 +1487,7 @@ def main(a=None):
             staged.append((src, os.path.join(game_dir, n)))
     staged.append((os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin")))
     if launcher:
-        staged.append((launcher, os.path.join(out, BESIDE[0])))
+        staged.append((launcher, os.path.join(out, LAUNCHER if LINUX else BESIDE[0])))
     for src, dst in staged:
         try:
             if os.path.exists(dst + ".new"):
@@ -1512,7 +1514,8 @@ def main(a=None):
                 pass
     if launcher:   # (a folder built before the launcher: its libraries left the folder for bin\; hookshot is the launcher now)
         stale = [] if LINUX else sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
-        for n in BESIDE[1:] + stale + ["hookshot.map", "hookshot-game.exe"]:
+        # (Linux: the launcher was called hookshot before, or the game itself was, in a folder built without one; the game is bin/hookshot now)
+        for n in BESIDE[1:] + stale + ["hookshot.map", "hookshot-game.exe"] + (["hookshot"] if LINUX else []):
             try:
                 if os.path.isfile(os.path.join(out, n)):
                     os.remove(os.path.join(out, n))
@@ -1532,9 +1535,9 @@ def main(a=None):
     elif run(PY + [os.path.join(HERE, "prompt_assets.py"), "--romfs", romfs, "--out", prompts], check=False, output=sys.stderr):
         print("the button prompts of other controllers were not made: the game shows its own", flush=True)
         shutil.rmtree(prompts, ignore_errors=True)
-    icon = os.path.join(ROOT, "assets", "hookshot.png")
+    icon = os.path.join(ROOT, "assets", "heylisten.png")
     if LINUX and os.path.exists(icon):   # (the window's icon: host/posix/display_sdl.c)
-        copy_writable(icon, os.path.join(out, "hookshot.png"))   # (a second build overwrites the first's)
+        copy_writable(icon, os.path.join(out, "heylisten.png"))   # (a second build overwrites the first's)
     seed_pipelines(out)
     ship_state_list(out)
     language = os.path.join(out, "language.txt")   # (the same text as host/nn_applet.c writes)

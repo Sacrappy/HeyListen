@@ -240,7 +240,7 @@ static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
 
 void hos_update_check(void);   /* (host/hos_update.c) */
 #ifndef _WIN32
-/* (linux) Saves live in $XDG_DATA_HOME/hookshot (~/.local/share/hookshot), so a rebuilt game folder still finds them.
+/* (linux) Saves live in $XDG_DATA_HOME/heylisten (~/.local/share/heylisten), so a rebuilt game folder still finds them.
    A user/ folder beside the executable from before is moved there the first time, entry by entry. Anything that
    cannot be moved keeps the old place. --user still wins. */
 static int is_dir(const char *p) {
@@ -306,7 +306,7 @@ static const char *saves_dir(const char *beside) {
         snprintf(dir, sizeof dir, "%s/.local/share", home);
     } else return beside;
     CreateDirectoryA(dir, NULL);
-    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/hookshot");
+    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/heylisten");
     CreateDirectoryA(dir, NULL);
     if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return beside;
     char pattern[MAX_PATH];

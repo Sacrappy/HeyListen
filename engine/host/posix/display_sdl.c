@@ -13,7 +13,7 @@
 #include "../hos_sdl.h"
 
 /* (the window's app id: the applications menu's entry names it as its StartupWMClass, builder/linux/hookshot_builder.py) */
-#define HOS_APP_ID "io.github.NotRexed.Hookshot"
+#define HOS_APP_ID "io.github.Sacrappy.HeyListen"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,7 +188,7 @@ int hos_display_init(void) {
         fprintf(stderr, "display: no SDL: no window\n");
         return -1;
     }
-    hos_sdl_identity("Hookshot", HOS_APP_ID);
+    hos_sdl_identity("HeyListen", HOS_APP_ID);
     hos_sdl_hint("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
     hos_sdl_hint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     /* (bundled SDL tries x11 before wayland. NVIDIA's X11 surface has no mailbox, and an immediate
@@ -242,12 +242,12 @@ void hos_display_loop(void) {
     }
     vk_window.window = window;
     hos_posix_window[0] = 1;
-    {   /* the window's icon: hookshot.png beside the game (make_game.py puts it there), for X11 and the compositors that
+    {   /* the window's icon: heylisten.png beside the game (make_game.py puts it there), for X11 and the compositors that
            take one from the window; the others find it through the menu entry */
         char png[MAX_PATH];
         DWORD n = GetModuleFileNameA(NULL, png, MAX_PATH);
         while (n && png[n - 1] != '/') n--;
-        snprintf(png + n, sizeof png - n, "hookshot.png");
+        snprintf(png + n, sizeof png - n, "heylisten.png");
         hos_sdl_icon(window, png);
     }
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(1);
