@@ -69,8 +69,8 @@ typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSet
                  QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage; } MemCounters;
 
 /* ---- owners */
-enum { G_GUEST, G_TAG, G_HEAP, G_STACK, G_IMAGE, G_DRIVER_IMAGE, G_MAPPED, G_OTHER, G_N };
-static const char *const group_name[G_N] = {"guest window (see HOS_MEM_SPLIT)", "tagged by this engine", "C and Windows heaps",
+enum { G_GUEST, G_TAG, G_BAR, G_HEAP, G_STACK, G_IMAGE, G_DRIVER_IMAGE, G_MAPPED, G_OTHER, G_N };
+static const char *const group_name[G_N] = {"guest window (see HOS_MEM_SPLIT)", "tagged by this engine", "tagged: VRAM mapped through the BAR (not RAM)", "C and Windows heaps",
                                             "host thread stacks", "images (exe, back end, system DLLs)", "images of graphics drivers",
                                             "mapped sections and files", "private, no owner (the driver's, or no one known)"};
 typedef struct { char name[72]; int group; uint64_t committed, resident, count, last_alloc; } Owner;
@@ -270,7 +270,7 @@ static void census(const char *why) {
     const int nthreads = paint_stacks();
     paint_heaps();
     AcquireSRWLockShared(&tags_lock);
-    for (int i = 0; i < ntags; i++) paint(tags[i].lo, tags[i].lo + tags[i].size, owner_of(tags[i].name, G_TAG));
+    for (int i = 0; i < ntags; i++) paint(tags[i].lo, tags[i].lo + tags[i].size, owner_of(tags[i].name, strstr(tags[i].name, ", BAR") ? G_BAR : G_TAG));
     ReleaseSRWLockShared(&tags_lock);
 
     /* pass 1: every region, grouped by allocation */
@@ -393,13 +393,26 @@ static void census(const char *why) {
         hos_log("hostsplit: -- every private allocation outside the window, by the size of the allocation --");
         for (int k = 6; k >= 0; k--) hos_log("hostsplit: %-52s %9llu %9llu %6llu", cls[k], MB(c[k]), MB(r[k]), (unsigned long long)n[k]);
     }
-    const uint64_t window_res = owners[0].resident, window_com = owners[0].committed;
-    const int64_t gap_ws = (int64_t)mc.WorkingSetSize - (int64_t)total_resident;
+    const uint64_t window_res = owners[0].resident, window_com = owners[0].committed, bar_res = gr[G_BAR];
+    /* (pages of VRAM that the driver mapped into the process: QueryWorkingSetEx calls them valid, the working set does not count them) */
+    const uint64_t ram_counted = total_resident - bar_res;
+    const int64_t gap_ws = (int64_t)mc.WorkingSetSize - (int64_t)ram_counted;
     const int64_t gap_pr = (int64_t)mc.PrivateUsage - (int64_t)private_committed;
-    hos_log("hostsplit: totals: pages counted in RAM %llu MB (guest window %llu, the rest %llu) against the working set %llu MB (peak %llu): %lld MB not counted",
-            MB(total_resident), MB(window_res), MB(total_resident - window_res), MB(mc.WorkingSetSize), MB(mc.PeakWorkingSetSize), (long long)(gap_ws / (1 << 20)));
-    hos_log("hostsplit: totals: private pages committed %llu MB (guest window %llu, the rest %llu) against the process's private commit %llu MB: %lld MB not counted; all committed %llu MB, address space reserved with nothing committed %llu MB",
+    hos_log("hostsplit: totals: RAM counted %llu MB (guest window %llu, the rest %llu; %llu MB of VRAM mapped through the BAR left out) against the working set %llu MB (peak %llu): working set less counted %lld MB",
+            MB(ram_counted), MB(window_res), MB(ram_counted - window_res), MB(bar_res), MB(mc.WorkingSetSize), MB(mc.PeakWorkingSetSize), (long long)(gap_ws / (1 << 20)));
+    hos_log("hostsplit: totals: private pages committed %llu MB (guest window %llu, the rest %llu) against the process's private commit %llu MB: commit charge less pages counted %lld MB; all committed %llu MB, address space reserved with nothing committed %llu MB",
             MB(private_committed), MB(window_com), MB(private_committed - window_com), MB(mc.PrivateUsage), (long long)(gap_pr / (1 << 20)), MB(total_committed), MB(reserved_total));
+    {   /* (one line a census, to follow a run: RAM first, then what is only committed) */
+        static const char *const classes[] = {"private 512 MB and up", "private 128-512 MB", "private 64-128 MB", "private 32-64 MB", "private 8-32 MB", "private 1-8 MB", "private under 1 MB"};
+        uint64_t cr[7] = {0}, cc[7] = {0};
+        for (int i = 0; i < nowners; i++)
+            for (int k = 0; k < 7; k++)
+                if (!strcmp(owners[i].name, classes[k])) cr[k] = owners[i].resident, cc[k] = owners[i].committed;
+        hos_log("hostsplit: timeline %.0f s: RAM, MB: window %llu, tagged %llu, heaps %llu, images %llu, stacks %llu, mapped %llu, private by size 512+ %llu, 128-512 %llu, 64-128 %llu, 32-64 %llu, 8-32 %llu, under 8 %llu; "
+                "counted %llu against the working set %llu; committed only: private 512+ %llu, 128-512 %llu, 32-128 %llu, BAR %llu, commit charge %llu",
+                (double)(hos_now_ns() - start_ns) / 1e9, MB(window_res), MB(gr[G_TAG]), MB(gr[G_HEAP]), MB(gr[G_IMAGE] + gr[G_DRIVER_IMAGE]), MB(gr[G_STACK]), MB(gr[G_MAPPED]),
+                MB(cr[0]), MB(cr[1]), MB(cr[2]), MB(cr[3]), MB(cr[4]), MB(cr[5] + cr[6]), MB(ram_counted), MB(mc.WorkingSetSize), MB(cc[0]), MB(cc[1]), MB(cc[2] + cc[3]), MB(gc[G_BAR]), MB(mc.PrivateUsage));
+    }
     if (tags_dropped) hos_log("hostsplit: %d tags did not fit", tags_dropped);
     hos_log_flush();
     ReleaseSRWLockExclusive(&census_lock);
