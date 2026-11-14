@@ -26,7 +26,9 @@ enum class PrepareRoute : uint8_t {
     NoMaterial,       ///< the drawable's material entry is empty: the function returns 0 at once (native)
     Cached,           ///< state and program already applied (native)
     ProgramBound,     ///< another program whose interface's buffers and textures are the ones applied: bound alone (native)
-    StateChanged,     ///< the drawable's state key or its material state differs: the render state is recorded again
+    StateApplied,     ///< the state step taken (the render state copied, recorded again when it changed), the rest as on
+                      ///< the two paths above (native)
+    StateChanged,     ///< the state step (left: only with HL_GFX_PREP's state step off)
     ProgramChanged,   ///< another program whose interface differs: its buffers or textures are bound
     Masked,           ///< pending bits the block has not applied yet
     DrawableBlock,    ///< the per-drawable uniform block is bound
@@ -38,9 +40,45 @@ enum class PrepareRoute : uint8_t {
 inline constexpr uint32_t kPrepareRoutes = (uint32_t)PrepareRoute::Count;
 const char* route_name(PrepareRoute r);
 
+/// The render state as the block keeps it for the preparation's state step: what the step compares and rewrites, then
+/// what its record reads.
+struct PrepareState {
+    uint8_t applied_key = 0;            ///< the drawable state key applied
+    uint32_t applied_material = 0;      ///< the material state applied
+    uint8_t offset_enables = 0;         ///< bit 0: the polygon offsets on (bits 1, 2 compared too)
+    uint8_t cull_face = 0;
+    uint8_t polygon_mode[2] = {};       ///< (the block keeps it twice)
+    uint8_t depth_test = 0, depth_write = 0, depth_func = 0;
+    uint32_t blend_targets = 0;         ///< the targets blending is on for
+    uint32_t blend_color[4] = {};       ///< (four floats' bits)
+    uint8_t blend[8][6] = {};           ///< a target's factors and equations
+    // (read only)
+    uint32_t channel_masks = 0;
+    uint8_t stencil_test = 0, stencil_func = 0, stencil_ops[3] = {};
+    uint32_t stencil_ref = 0, stencil_value_mask = 0;
+    uint32_t offset_clamp[3] = {};      ///< (three floats' bits)
+    uint8_t depth_clamp = 0;
+};
+
+/// The drawable's material state (read when the block's mode bit 0 asks for it).
+struct MaterialState {
+    uint32_t id = 0;
+    uint8_t kind = 0;                   ///< (its low three bits: 5 and 2 carry a depth state, other kinds blending only)
+    uint32_t blend = 0;                 ///< not 0: blending on (the block's blend target mask then says where)
+    uint32_t color[4] = {};
+    uint8_t targets[8][6] = {};
+    uint8_t depth_test = 0, depth_write = 0, depth_func = 0;
+};
+
 /// What the cached path reads, in the function's order (a field past the point where the call leaves that path is not
 /// read and keeps its default).
 struct PrepareInputs {
+    // The state step's.
+    uint64_t flags = 0;                 ///< the block's (bit 6: reversed depth; bit 16: no blend copy; bit 17: no record)
+    uint8_t state_bits = 0;             ///< the block's byte the state key is combined with
+    uint8_t blend_target_mask = 0;
+    PrepareState state;
+    MaterialState material_state_in;
     bool material = false;              ///< the material entry's first word is not 0
     uint8_t state_key = 0;              ///< the drawable's
     uint8_t applied_state_key = 0;      ///< the block's
@@ -79,6 +117,10 @@ struct PrepareInputs {
 struct PrepareOutputs {
     PrepareRoute route = PrepareRoute::NoMaterial;
     uint32_t result = 0;                ///< the function's w0 (bit 0: go on)
+    // The state step: the block's render state as it leaves it, and whether it records it.
+    bool state_step = false;            ///< the state key or the material state differed (the fields below written)
+    bool state_recorded = false;
+    PrepareState state;
     // The program step: the program bound and what the block records of it.
     bool program_bound = false;         ///< BindProgram, and the block's program (its +0xd0 cleared)
     uint64_t program = 0;               ///< the block's new program
@@ -100,6 +142,9 @@ struct PrepareOutputs {
 /// Where the commands point (BindProgram's object is the recording context's +0x188: PrepareInputs::context).
 inline constexpr uint64_t kProgramBinder = 0x188;
 struct PrepareHandles {
+    // The state record's: the command buffer, the five state objects in the function's frame, the block's blend color.
+    uint64_t state_buffer = 0;
+    uint64_t blend = 0, color = 0, channel_mask = 0, depth_stencil = 0, polygon = 0, blend_color = 0;
     uint64_t command_buffer = 0;
     uint64_t command_list = 0;          ///< the list's handle in the material entry (its address: a list of one)
 };
@@ -107,9 +152,15 @@ struct PrepareHandles {
 class Prepare {
 public:
     static bool native(PrepareRoute r) {
-        return r == PrepareRoute::NoMaterial || r == PrepareRoute::Cached || r == PrepareRoute::ProgramBound;
+        return r == PrepareRoute::NoMaterial || r == PrepareRoute::Cached || r == PrepareRoute::ProgramBound ||
+               r == PrepareRoute::StateApplied;
     }
-    static PrepareOutputs decide(const PrepareInputs& in);
+    /// `state_step`: take the state step natively (else a call that needs it is left, route StateChanged).
+    static PrepareOutputs decide(const PrepareInputs& in, bool state_step = true);
+    /// The state step alone: `s` as the step leaves it; true when it records the render state.
+    static bool apply_state(PrepareState& s, uint8_t key, uint8_t state_bits, uint32_t mode, uint64_t flags,
+                            uint8_t blend_target_mask, const MaterialState& m);
+    static void emit_state(const PrepareState& s, const PrepareHandles& at, CommandSink& sink);
     static void emit(const PrepareOutputs& out, const PrepareHandles& at, CommandSink& sink);
 };
 

@@ -397,6 +397,7 @@ using hl::bridge::PrepareBridge;
 using hl::gfx::PrepareRoute;
 
 PrepareBridge* g_prep;
+bool g_prep_state;   // (the state step native: HL_GFX_PREP_STATE)
 hl::gfx::StateCheck* g_prep_check;
 // (every call by route; with the check, the translated NVN calls of the calls of each route too)
 std::atomic<uint64_t> g_prep_routes[hl::gfx::kPrepareRoutes], g_prep_nvn[hl::gfx::kPrepareRoutes];
@@ -444,19 +445,21 @@ void file_shape(uint64_t s) {
 
 extern "C" uint64_t hl_gfx_prep_address(void) { return hl::bridge::kPrepareSubmesh; }
 
-extern "C" int hl_gfx_prep_start(const hl_guest_host* host, const hl_gfx_host* gfx, int check) {
+extern "C" int hl_gfx_prep_start(const hl_guest_host* host, const hl_gfx_host* gfx, int check, int state) {
     if (g_prep) return 1;
+    g_prep_state = state != 0;
     if (!gfx_host(host, gfx)) return 0;
     if (check) g_prep_check = new hl::gfx::StateCheck("preparation", state_log, &g_runtime->gfx);
     g_prep = new PrepareBridge(*g_runtime);
     return 1;
 }
 
-extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t* result) {
+extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t sp, uint64_t* result) {
     hl::gfx::PrepareInputs in;
     hl::gfx::PrepareHandles at;
     g_prep->read(block, drawable, in, at);
-    const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in);
+    const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in, g_prep_state);
+    if (out.state_recorded) g_prep->state_handles(block, sp, at);
     g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
     if (!hl::gfx::Prepare::native(out.route)) return 0;
     // (the block and the mark first: the function writes them before its call)
@@ -467,12 +470,13 @@ extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t* re
     return 1;
 }
 
-extern "C" void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable) {
+extern "C" void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable, uint64_t sp) {
     PrepCall& t = t_prep;
     t.block = block, t.drawable = drawable;
     hl::gfx::PrepareInputs in;
     g_prep->read(block, drawable, in, t.at);
-    const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in);
+    const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in, g_prep_state);
+    if (out.state_recorded) g_prep->state_handles(block, sp, t.at);
     g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
     t.route = out.route;
     t.result = out.result;

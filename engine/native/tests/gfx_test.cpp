@@ -499,7 +499,7 @@ void the_draw_bridge_reads_and_writes_in_place() {
 gfx::PrepareInputs cached_inputs() {
     gfx::PrepareInputs in;
     in.material = true;
-    in.state_key = in.applied_state_key = 4;
+    in.state_key = in.applied_state_key = in.state.applied_key = 4;
     in.mode_bits = 0x8;
     in.program = in.applied_program = 0x1234;
     in.list_flags = 3;
@@ -522,12 +522,17 @@ void the_preparation_decides_its_route_in_order() {
 
     in = cached_inputs();
     in.applied_state_key = 5;
-    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::StateChanged);
+    CHECK(gfx::Prepare::decide(in, false).route == gfx::PrepareRoute::StateChanged);
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::StateApplied && out.state_step && out.state.applied_key == 4 && out.call_list);
     in = cached_inputs();
     in.material_state = 7;   // (compared only with mode bit 0)
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::Cached);
     in.mode_bits |= 1;
-    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::StateChanged);
+    in.material_state_in.id = 7;
+    CHECK(gfx::Prepare::decide(in, false).route == gfx::PrepareRoute::StateChanged);
+    out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::StateApplied && out.state.applied_material == 7 && !out.state_recorded);
     in.applied_material_state = 7;
     CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::Cached);
 
@@ -632,6 +637,94 @@ void the_preparation_decides_its_route_in_order() {
     CHECK(r.calls.size() == 1 && r.calls[0].op == (uint32_t)gfx::Proc::CommandBufferCallCommands);
     CHECK(r.calls[0].x[0] == 0xcb && r.calls[0].x[1] == 1 && r.calls[0].x[2] == 0x710);
     CHECK(std::string(gfx::route_name(gfx::PrepareRoute::Cached)) == "cached");
+}
+
+void the_preparation_state_step_derives_and_records() {
+    gfx::MaterialState none;
+    // (the key: offset enables, cull face and polygon mode from the bits, mode bit 9 forcing the two low bits)
+    gfx::PrepareState s;
+    s.applied_key = 1;
+    s.offset_enables = 0x10;
+    s.cull_face = 3, s.polygon_mode[0] = s.polygon_mode[1] = 2;
+    CHECK(!gfx::Prepare::apply_state(s, 1, 0, 0, 0, 0, none));   // (same key: nothing)
+    CHECK(gfx::Prepare::apply_state(s, 0x14, 0, 0, 0, 0, none));   // (bit 2: offsets on; bits 4-5 = 1: mode 1)
+    CHECK(s.applied_key == 0x14 && s.offset_enables == 0x11 && s.cull_face == 3 && s.polygon_mode[0] == 1 && s.polygon_mode[1] == 1);
+    CHECK(gfx::Prepare::apply_state(s, 0x08, 0x05, 0, 0, 0, none));   // (block bits 0x05 | key 0x08 = 0x0d: cull 1, mode 2)
+    CHECK(s.cull_face == 1 && s.polygon_mode[0] == 2 && (s.offset_enables & 1) == 1);
+    CHECK(gfx::Prepare::apply_state(s, 0x20, 0, 0x200, 0, 0, none));   // (mode bit 9: key | 3 = 0x23: cull 0, mode 0)
+    CHECK(s.cull_face == 0 && s.polygon_mode[0] == 0 && (s.offset_enables & 1) == 0);
+    // (bit 0 equal but bits 1, 2 not: rewritten, bit 0 only)
+    s = gfx::PrepareState{};
+    s.offset_enables = 0x06, s.cull_face = 3, s.polygon_mode[0] = s.polygon_mode[1] = 2, s.applied_key = 9;
+    CHECK(gfx::Prepare::apply_state(s, 0, 0, 0, 0, 0, none) && s.offset_enables == 0x06);
+
+    // (the material state: kind 5, blend on, the depth function reversed by flags bit 6)
+    gfx::MaterialState m;
+    m.id = 3, m.kind = 0x15, m.blend = 1;
+    const float c[4] = {0.0f, 1.0f, 0.5f, 0.25f};
+    std::memcpy(m.color, c, sizeof c);
+    m.targets[2][0] = 9, m.targets[2][5] = 7;
+    m.depth_test = 1, m.depth_write = 1, m.depth_func = 4;
+    s = gfx::PrepareState{};
+    const float neg[4] = {-0.0f, 1.0f, 0.5f, 0.25f};   // (-0 equals +0: no copy)
+    std::memcpy(s.blend_color, neg, sizeof neg);
+    CHECK(gfx::Prepare::apply_state(s, 0, 0, 3, 0x40, 0x0f, m));
+    CHECK(s.applied_material == 3 && s.blend_color[0] == 0x80000000u && s.blend[2][0] == 9 && s.blend[2][5] == 7);
+    CHECK(s.blend_targets == 0x0f && s.depth_test == 1 && s.depth_write == 1 && s.depth_func == 7);
+    // (the same again: nothing; then only the depth function differs: recorded all the same)
+    s.applied_material = 0;
+    CHECK(!gfx::Prepare::apply_state(s, 0, 0, 3, 0x40, 0x0f, m));
+    s.applied_material = 0, s.depth_func = 4;
+    CHECK(gfx::Prepare::apply_state(s, 0, 0, 3, 0x40, 0x0f, m) && s.depth_func == 7);
+    // (no mode bit 1: no depth; flags bit 16: no blend targets copied)
+    s = gfx::PrepareState{};
+    CHECK(gfx::Prepare::apply_state(s, 0, 0, 1, 0x10000, 0x01, m) && s.blend[2][0] == 0 && s.depth_func == 0);
+    // (kind 2: depth test on, writes off, less-or-equal; blend off: no targets)
+    m.kind = 2, m.blend = 0;
+    s = gfx::PrepareState{};
+    s.blend_targets = 5;
+    CHECK(gfx::Prepare::apply_state(s, 0, 0, 3, 0, 0x0f, m));
+    CHECK(s.blend_targets == 0 && s.depth_test == 1 && s.depth_write == 0 && s.depth_func == 4);
+    // (another kind: only the id)
+    m.kind = 1;
+    s = gfx::PrepareState{};
+    CHECK(!gfx::Prepare::apply_state(s, 0, 0, 3, 0, 0x0f, m) && s.applied_material == 3);
+
+    // (the record: blend targets from the mask, the stencil values when the test is on, offsets all or none)
+    s = gfx::PrepareState{};
+    s.blend_targets = 0x05;
+    s.blend[2][0] = 1, s.blend[2][1] = 2, s.blend[2][2] = 3, s.blend[2][3] = 4, s.blend[2][4] = 5, s.blend[2][5] = 6;
+    s.channel_masks = 0x0000f00a;
+    s.stencil_test = 1, s.stencil_ref = 0x22, s.stencil_value_mask = 0x33;
+    s.offset_enables = 1, s.offset_clamp[2] = 0x3f800000;
+    gfx::PrepareHandles h;
+    h.state_buffer = 0xcb, h.blend = 0x10, h.color = 0x18, h.channel_mask = 0x14, h.depth_stencil = 0x20, h.polygon = 0x24;
+    h.blend_color = 0x1f8;
+    Recorder r;
+    gfx::Prepare::emit_state(s, h, r);
+    CHECK(r.calls.size() == 28 + 2 * 5 + 3);
+    CHECK(r.calls[2].op == (uint32_t)gfx::Proc::ColorStateSetBlendEnable && r.calls[2].x[1] == 0);
+    const gfx::Command& f = r.calls[2 + 5 + 2];   // (target 2's blend function: factors 0, 2, 1, 3)
+    CHECK(f.op == (uint32_t)gfx::Proc::BlendStateSetBlendFunc && f.x[1] == 1 && f.x[2] == 3 && f.x[3] == 2 && f.x[4] == 4);
+    const gfx::Command& mask0 = r.calls[2 + 10 + 3];   // (target 0: 0xa)
+    CHECK(mask0.op == (uint32_t)gfx::Proc::ChannelMaskStateSetChannelMask && mask0.x[1] == 0 && mask0.x[2] == 0 && mask0.x[3] == 1 && mask0.x[5] == 1);
+    const gfx::Command& clamp = r.calls[r.calls.size() - 2];
+    CHECK(clamp.op == (uint32_t)gfx::Proc::CommandBufferSetPolygonOffsetClamp && clamp.f[2] == 0x3f800000);
+    CHECK(r.calls[r.calls.size() - 4].op == (uint32_t)gfx::Proc::PolygonStateSetPolygonOffsetEnables && r.calls[r.calls.size() - 4].x[1] == 7);
+
+    // (decide: bit 17 derives and writes but records nothing)
+    gfx::PrepareInputs in = cached_inputs();
+    in.applied_state_key = 5;
+    in.state.applied_key = 5;
+    in.flags = 0x20000;
+    gfx::PrepareOutputs out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::StateApplied && out.state_step && !out.state_recorded);
+    in.flags = 0;
+    out = gfx::Prepare::decide(in);
+    CHECK(out.state_recorded);
+    Recorder all;
+    gfx::Prepare::emit(out, h, all);
+    CHECK(all.calls.size() == 28 + 1 && all.calls.back().op == (uint32_t)gfx::Proc::CommandBufferCallCommands);
 }
 
 void the_prepare_bridge_reads_in_the_functions_order() {
@@ -773,6 +866,7 @@ int main() {
     the_submission_picks_its_path_and_counts();
     the_draw_bridge_reads_and_writes_in_place();
     the_preparation_decides_its_route_in_order();
+    the_preparation_state_step_derives_and_records();
     the_prepare_bridge_reads_in_the_functions_order();
     std::printf("gfx: ok\n");
     return 0;

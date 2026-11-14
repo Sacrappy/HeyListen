@@ -872,6 +872,51 @@ of 10 s), hence its smaller counts. The first build (cached path only) gave the 
 Memory with both paths (game RAM / GPU pools / process RAM / commit / VRAM, MB): kokiri-idle 2,319 / 1,303 / 5,817 /
 17,822 / 5,604; castle-move 2,923 / 1,526 / 6,525 / 18,916 / 6,363; hyrule-walk 2,517 / 1,440 / 6,248 / 18,443 / 5,995
 (the brick allocates nothing: these are the build's figures).
+### Outside Castle Town, and the state step (PC 3050, the save library, 2026-11-14)
+
+The three scripted scenes all load one save in Castle Town. These runs load the owner's saves by zone
+(`pc.sh run --save <zone>`), with `HL_GFX_CHECK=1` and the state step on (`HL_GFX_PREP_STATE=1`, below).
+
+**The state step** (route "state applied", `Prepare::apply_state` / `emit_state`): when the drawable's state key or its
+material state differs, the block's render state is derived as the function does (from the key: polygon offsets, cull
+face, polygon mode; from a material state of kind 5 or 2: the blend color compared as floats, the eight targets, the
+targets enabled, depth test and writes, the depth function reversed under flags bit 6), written back, and recorded
+again when anything changed (or the depth function alone): 28 NVN calls of the render-state function's set, plus each
+enabled target's five and the three stencil values when stencil test is on, with the five state objects at the
+function's own frame addresses (the caller's sp minus 0x70, 0x78, 0x74, 0x80, 0x84) and the blend color at B+0xf8.
+The rest of the call then goes as on the two other native paths; a call whose program then binds buffers or textures
+is still left whole. Its commands go through `NvnSink` (the procedures write the frame's state objects, as the
+translation's do); `RecordSink` covers these procedures but was not checked for this caller (its seeding of the
+frame's objects), so it is not used here.
+
+| Zone | Calls | cached | program bound | state applied | left: program | left: drawable block | Native share | Compared, mismatched |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| hyrule-field | 43,927 | 29,830 | 4,257 | 327 | 9,133 | 380 | 78.3% | 34,414, 0 |
+| kokiri-forest | 64,334 | 39,470 | 6,271 | 1,160 | 16,668 | 765 | 72.9% | 46,901, 0 |
+| kakariko-village | 1,453,406 | 1,048,192 | 112,404 | 12,178 | 260,387 | 20,245 | 80.7% | 1,172,774, 0 |
+| death-mountain-trail | 520,376 | 163,889 | 128,352 | 9,819 | 213,776 | 4,540 | 58.0% | 302,062, 0 |
+| zora-river | 848,863 | 411,728 | 123,749 | 31,555 | 277,537 | 4,294 | 66.8% | 567,032, 0 |
+| inside-deku-tree | 69,878 | 35,687 | 10,509 | 1,148 | 21,793 | 741 | 67.8% | 47,347, 0 |
+| lost-woods | 132,580 | 42,741 | 27,454 | 4,551 | 56,280 | 1,554 | 56.4% | 74,745, 0 |
+
+0 mismatched calls in the seven zones (2.24 M calls compared, 60,738 of them through the state step). The native
+paths' share is 56-81% outside Castle Town (78-79% there): Death Mountain Trail and the Lost Woods change to programs
+with new buffers or textures far more often. No call took the no-material, pending-bits, streams, inline or clusters
+routes in any zone. The counts vary with when the scene came in: the PC 3050 spends 40-145 s of a run on its shader
+start-up (its pipeline cache is not kept when a run ends before the driver's part finishes).
+
+**Native, by picture** (`HL_GFX_PREP=1 HL_GFX_PREP_STATE=1`, shots every 600 frames): Hyrule Field (1.28 M native
+calls; the field, the castle, the HUD), Kokiri Forest (3.18 M, a 200 s run; the forest path at night), Zora's River
+(329 k; the river gorge) and Death Mountain Trail (538 k, a 170 s run; the trail) ran to the end with the scene right in
+their last shots. Kakariko Village was not seen: in two runs the scene did not come in (start-up), and a five-minute
+run ended in an out-of-commit fault of the resource loader (`mem: ... could not be committed on first touch (error
+1455)`: the PC's commit limit, with a second game in the other slot), outside this function's path. It is checked
+(1.17 M calls, 0 mismatches) but not seen native in a shot. The Kokiri Forest shot shows the minimap over a dark
+translucent rectangle: the owner's second defect of 2026-11-13, seen here at 1280x720; not studied.
+
+Defaults since these runs: `HL_GFX_PREP=1` and `HL_GFX_PREP_STATE=1`. Not run on the main PC: the state step, and any
+zone outside Castle Town.
+
 ## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`

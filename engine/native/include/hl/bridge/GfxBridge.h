@@ -36,7 +36,7 @@ struct RenderStateBlock {
     uint8_t _30[8];
     uint8_t cluster;         ///< the cluster entry's index (the sub-mesh submission; the preparation's cluster calls)
     uint8_t depth_mode;      ///< (also the pass: the preparation's index into the drawable's pass slots)
-    uint8_t _3a;
+    uint8_t state_bits;      ///< combined with the drawable's state key by the preparation's state step
     uint8_t geometry_mode;   ///< the geometry processing mode applied last (the sub-mesh submission)
     uint8_t _3c[20];
     uint32_t triangles;      ///< the triangles submitted (the sub-mesh submission adds each sub-mesh's)
@@ -87,7 +87,7 @@ struct RenderStateBlock {
     uint8_t stencil_ops[3];
     uint8_t stencil_func;
     uint8_t polygon_mode;
-    uint8_t _15c;
+    uint8_t polygon_mode_b;  ///< (the preparation keeps the polygon mode here too)
     uint8_t polygon_offset;
     uint8_t depth_clamp;
     uint8_t _15f;
@@ -96,6 +96,8 @@ static_assert(offsetof(RenderStateBlock, material) == 24);
 static_assert(offsetof(RenderStateBlock, renderer) == 40);
 static_assert(offsetof(RenderStateBlock, cluster) == 0x38);
 static_assert(offsetof(RenderStateBlock, depth_mode) == 57);
+static_assert(offsetof(RenderStateBlock, state_bits) == 0x3a);
+static_assert(offsetof(RenderStateBlock, polygon_mode_b) == 0x15c);
 static_assert(offsetof(RenderStateBlock, state_key_applied) == 0x59);
 static_assert(offsetof(RenderStateBlock, drawable_block) == 0x60);
 static_assert(offsetof(RenderStateBlock, pass_slot) == 0x62);
@@ -236,6 +238,35 @@ static_assert(offsetof(Program, part) == 0);
 static_assert(offsetof(Program, object) == 0x20);
 static_assert(offsetof(Program, stages) == 0x28);
 static_assert(offsetof(Program, flags) == 0x30);
+/// The drawable's material state (its +0x70): the render state the preparation copies into the block.
+struct MaterialStateObject {
+    uint8_t _0[0xe0];
+    uint8_t depth_test, depth_write;
+    uint8_t _e2[2];
+    uint32_t blend;              ///< not 0: blending on
+    uint32_t color[4];           ///< the blend color (floats' bits)
+    uint8_t _f8[0x10];
+    uint8_t targets[8][6];       ///< each target's factors and equations
+    uint8_t _138[0xc];
+    uint8_t depth_func;
+    uint8_t _145[0xf];
+    uint32_t id;
+    uint8_t _158;
+    uint8_t kind;                ///< low three bits: 5 and 2 carry a depth state
+};
+static_assert(offsetof(MaterialStateObject, depth_test) == 0xe0);
+static_assert(offsetof(MaterialStateObject, depth_write) == 0xe1);
+static_assert(offsetof(MaterialStateObject, blend) == 0xe4);
+static_assert(offsetof(MaterialStateObject, color) == 0xe8);
+static_assert(offsetof(MaterialStateObject, targets) == 0x108);
+static_assert(offsetof(MaterialStateObject, depth_func) == 0x144);
+static_assert(offsetof(MaterialStateObject, id) == 0x154);
+static_assert(offsetof(MaterialStateObject, kind) == 0x159);
+/// The preparation's frame (below the caller's sp) and its five state objects there, as the render state's record names
+/// them.
+inline constexpr uint64_t kPrepBlend = 0x70, kPrepColor = 0x78, kPrepChannelMask = 0x74, kPrepDepthStencil = 0x80,
+                          kPrepPolygon = 0x84;
+
 /// The game's default binding words (globals): the first part's three, then the second part's two.
 inline constexpr uint64_t kDefaultWordsA = 0x84ea2848, kDefaultWordsB = 0x84ea2854;
 static_assert(offsetof(MaterialEntry, lists) == 0x10);
@@ -444,6 +475,9 @@ public:
     /// Reads the call in the function's order, stopping where it leaves the cached path (decide() on the result says
     /// where); `at`: the command buffer and the list, when the list is called.
     void read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs& in, gfx::PrepareHandles& at) const;
+    /// The state record's handles (`sp` the caller's stack pointer: the state objects are in the function's frame);
+    /// asked only when the call records the state (the function reads the command buffer only then).
+    void state_handles(GuestAddr block, uint64_t sp, gfx::PrepareHandles& at) const;
     void write(GuestAddr block, const gfx::PrepareHandles& at, const gfx::PrepareOutputs& out) const;
 
     void snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t* bytes) const;
