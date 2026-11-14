@@ -320,6 +320,7 @@ void hos_commit_init(void) {
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
     { void hos_memsplit_init(void); hos_memsplit_init(); }   /* (HOS_MEM_SPLIT, hos_memsplit.c) */
+    { void hos_hostsplit_init(void); hos_hostsplit_init(); }   /* (HOS_HOST_SPLIT, hos_hostsplit.c) */
     { void hl_trace_gates(void); hl_trace_gates(); }         /* (HL_TRACE, hl_trace.c) */
 }
 

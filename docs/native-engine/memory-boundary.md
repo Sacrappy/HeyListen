@@ -1368,3 +1368,78 @@ What it says:
 - The spill changes the brick's nature: the restore's bytes are a copy this module wrote at the drop (exact: compared with
   the source, and hashed); the source (the file, the mirror) is what proves that the bytes may go. A copy on disk is held
   for every dropped granule (1.0-1.6 GB in these runs), in the temporary folder.
+
+## 16. Where the process's memory is outside the game's (`HOS_HOST_SPLIT`, 2026-11-14)
+
+The play session at 2560x1440 (`build/s5/play8.orch.log`) had the game's memory at 2.9 GB of RAM against a working set of
+10-11 GB and a private commit of 25-28 GB. This section is the census of the rest, made with a new instrument.
+
+### The instrument (`host/hos_hostsplit.c`, off by default)
+
+`HOS_HOST_SPLIT=<seconds>[,<every>]` walks the whole address space (`VirtualQuery`) at that time, again every `<every>` seconds,
+and at a normal exit; every committed page gets an owner and is counted as committed and as resident (`QueryWorkingSetEx`).
+Owners, strongest first: a tag (`hos_mem_tag(ptr, size, name)`, exported by the executable; the back end finds it by name as
+it does `hos_noaccess_import`); blocks of 256 KB and more of the C and Windows heaps (`HeapWalk`), then the heaps' regions;
+host thread stacks (TEB); images by module, and by section for the executable and the back end; the guest window as one line;
+files mapped, by name; the rest, private allocations by the size of their allocation. Tagged today: the back end's mapped
+host-visible buffers by kind and memory class (`vk captures, cached`, `vk staging, BAR`, `vk BC cache, cached` ...; new
+`MemKind::BcCache`), the job trace's records, the granule marks. Not tagged (their tests cut the functions out of the
+sources, and a call to the tag would not link there): the trace's tables, the capture table, the pipeline cache save's
+buffer; they show as heap blocks of their size. The log has the table, the heaps against `HeapSummary`, a histogram of the
+heaps' big blocks, the 30 largest allocations, the private allocations by size class, two lines of totals and one
+`timeline` line a census. The walk takes 0.4-0.6 s of the process's address space (the heaps are locked for 60-160 ms).
+
+What the totals showed, and a trap: **pages of VRAM that the driver maps into the process through the BAR** (the staging
+arenas, the streams) are "valid" to `QueryWorkingSetEx` and are not in the process's working set. Counted apart, the
+reconciliation is exact: pages in RAM against the working set, **-12 to +38 MB** in every census of the good runs (a census
+takes half a second while pages move). The private commit charge exceeds the committed private pages by a constant
+**248-267 MB** that the walk cannot see (not the BAR: it does not follow it; probably charge for reservations such as thread stacks).
+
+Not done: which call of the back end made a driver allocation. A `VirtualAlloc` hook around the back end's Vulkan calls would
+say, and was not written; the driver's memory is reported by the size of its allocations and by when it appears.
+
+### What it found (main PC, RTX 5070, market save, scripted idle, window 1280x720, game output 2560x1440, `HOS_HOST_SPLIT=14,9` and `35,30`; RAM in MB)
+
+Non-game RAM at 60-98 s, in order of size, and its commit:
+
+| # | What | RAM | Committed | When |
+|---|---|---:|---:|---|
+| 1 | **The driver's arenas**: two private allocations of 1.0 GB each (a third of 0.3-0.4 GB until the first scene change) | 1.6-2.4 GB | 2.0-2.6 GB | **already 1.9 GB resident at 14 s, on the title**, before any scene |
+| 2 | **The pipeline cache's save**: `vkGetPipelineCacheData` into one vector, fully resident (`vk_draw.cpp pipeline_cache_save`) | **1.17 GB**, peaks only | the same | 30-45 s: each time 32 pipelines were built since the last save (a scene load); the heaps go from 0.17 to 1.6-1.7 GB and back to 0.5 |
+| 3 | **Commit beside VRAM**: 130 private regions of 32-64 MB (plus 3 of 64-128) | 0.07 GB | **4.2 GB** | grows with the scene's VRAM use: 0.3 GB at 14 s, 4.2-4.5 GB at 73-98 s |
+| 4 | The C heaps outside the peak: 0.26 GB of small blocks (the texture shadow, tables) and 0.1-0.2 GB of blocks over 256 KB | 0.4-0.55 GB | 0.45-0.5 GB | |
+| 5 | Images: `HeyListen.exe` (.text 436 MB committed, 100-116 resident; .data 180) and the driver's DLLs | 0.15-0.28 GB | 0.85-1.05 GB | |
+| 6 | Tagged: capture buffers (cached host memory) | 0.1-0.23 GB | the same | |
+| - | VRAM mapped through the BAR (not RAM): staging 76-620 MB, streams 96, other 28 | 0 | 0.2-0.7 GB | |
+
+Sums (market, 720 window, 98 s): the game 3.7 GB (window), **non-game RAM 3.4 GB** (+ 1.17 GB at the pipeline cache's save), working
+set 7.2 GB; commit charge 15.7 GB, of which the game's window 6-7 GB and the non-game 9 GB (item 3: 4.2, item 1: 2.6, images 1.0, heaps 0.5, rest).
+So in a scripted run **about 3.4 GB of RAM and 9 GB of commit are not the game's**. The play session's 8 GB of RAM is not
+reproduced by a 110 s scripted run: the run has what a session starts with; what grows in a session (pipelines built in
+play into the arenas, more scene changes with a save each, the driver's allocations beside VRAM) was not seen. Of this
+session's 8 GB, items 1 and 2 (about 2.5-3.5 GB) are what was found and are present from the first minute.
+
+### What would remove each
+
+1. **Arenas (1.6-2.4 GB RAM, 2-2.6 GB commit).** Present on the title, so it comes from what the back end makes at start (the
+   precompile of the program cache and the pipelines in the driver). The audit of `docs/perf-audit.md` measured 5.1 GB with the
+   precompile and 1.8 GB without it, and -0.7 GB for compute programs let go (not re-measured here). Lever: build compute
+   pipelines on demand (the Market binds ~110 of the ~7800), and let the shader modules go.
+2. **Pipeline cache save (+1.17 GB peak).** One buffer for the whole cache, 2-3 times a session, exactly when a scene loads
+   and the game's memory is highest. Lever: save at exit or when nothing loads (a rule on idle time), or not at all while
+   the cache is only appended to; a smaller cache (the driver's data for 40,000 pipelines: build fewer).
+3. **Commit beside VRAM (4.2 GB commit, no RAM).** The driver charges system commit for the VRAM it hands out in 32-64 MB
+   blocks; the lever is VRAM use itself (textures, mirrors, render targets). Takes no RAM; counts only against the commit limit.
+4. **The C heaps (0.4-0.55 GB).** Nothing unbounded found in these runs; the big blocks are the capture table (13 MB) and
+   buffers of the back end; the transient of item 2 is the only large one.
+5. **Images (0.15-0.28 GB RAM).** The executable's code and data: 100 MB of its .text is touched; PGO ordering or splitting cold code
+   is the only lever; small.
+
+### Not verified
+
+- **The 2560x1440 window and `hyrule-field`:** not run. The one 2560x1440 run (`h1-m1440`) did not reach the scene (VRAM
+  1 GB at the end, textures 132 MB), so its table is of the title and loading and shows nothing about resolution; the owner
+  needed the main PC and the last runs were not made. Resolution, as the bench sets it, is `HOS_WINDOW_SIZE=<w>x<h>` for the
+  window and `HOS_OUTPUT_RES` (`output_res=` in `hookshot_options.ini`, 1 = 2560x1440) for the game's frame, which the slots already have at 2560x1440.
+- The census of a long session; which call made which driver allocation; `RX_VK_PRECOMPILE=0` against these numbers.
+- The `at exit` census (the harness kills the game).

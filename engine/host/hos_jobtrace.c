@@ -110,6 +110,7 @@ void hos_jt_start(void) {
     if (!path || !*path) return;
     recs = (JtRec *)VirtualAlloc(NULL, (SIZE_T)JT_CAP * sizeof(JtRec), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!recs) return;
+    hos_mem_tag(recs, (uint64_t)JT_CAP * sizeof(JtRec), "job trace records (HOS_JOBTRACE)");
     static char keep[MAX_PATH];
     snprintf(keep, sizeof keep, "%s", path);
     HANDLE h = CreateThread(NULL, 0, jt_thread, keep, 0, NULL);

@@ -1280,7 +1280,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             BcCacheEntry entry;   // (TICK-051: a whole one with no alpha found for a BC1 image: its blocks kept)
             if (cache_key && !alpha) {
                 entry.bytes = bcc_size(tex, pieces);
-                MemKindScope mem_kind_(MemKind::Staging);
+                MemKindScope mem_kind_(MemKind::BcCache);
                 if (!create_buffer_cached(entry.bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, entry.buf,
                                           entry.alloc, nullptr))
                     entry = BcCacheEntry{};
