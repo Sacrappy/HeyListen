@@ -197,6 +197,7 @@ void hos_mark_written(const void *p, size_t n) {
 __attribute__((constructor)) static void hos_gran_init(void) {
     a64_gran = (uint8_t *)VirtualAlloc(NULL, A64_DIRTY_PAGES * 8, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!a64_gran) { fprintf(stderr, "a64_gran: no address space\n"); abort(); }
+    hos_mem_tag(a64_gran, (uint64_t)A64_DIRTY_PAGES * 8, "granule marks (committed, untouched)");
 }
 /* The granule marks of n pages taken (read and cleared): masks[i] bit k = the page's k-th 512 bytes were written. 0 for a
    page whose mark came without them (a page given back to the marks: the whole page then). Exported: the Vulkan back end finds

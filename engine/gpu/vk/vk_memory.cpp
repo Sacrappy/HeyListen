@@ -666,9 +666,19 @@ void stamp_page(uint64_t p, uint32_t g) {
 } // namespace
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
-namespace { int cap_only_gpu(); bool cap_excl_hit(uint64_t lo, uint64_t hi); }   // (RX_VK_CAP_ONLY_GPU: below)
+namespace { int cap_only_gpu(); bool cap_excl_hit(uint64_t lo, uint64_t hi); void cap_born_take(std::vector<std::pair<uint64_t, uint64_t>>& out); }   // (RX_VK_CAP_ONLY_GPU: below)
+// (RX_VK_CAP_ONLY_GPU's report of a read into a left-out range: the back end's record of the game's pool at g, below)
+bool nvn_pool_record_at(uint64_t g, uint64_t* lo, uint64_t* hi, uint32_t* flags, uint64_t* made_ns);
+// (RX_VK_CAP_ONLY_GPU: every pool the back end has a record of, page-aligned, appended to out; below)
+void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out);
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
 void memory_collect_written() {
+    if (cap_only_gpu() == 1) {   // (pools made since: their pages' earlier writes were dropped as heap memory's, see below)
+        static thread_local std::vector<std::pair<uint64_t, uint64_t>> born;
+        cap_born_take(born);
+        for (const auto& [lo, hi] : born) memory_stamp(lo, hi - lo);
+        born.clear();
+    }
     uint32_t* pages = nullptr;
     const int64_t n = host->collect_written(&pages);
     if (n > 0) {
@@ -1176,6 +1186,16 @@ void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
             v.push_back({list[i][0] & ~4095ull, (list[i][0] + list[i][1] + 4095) & ~4095ull});
     }
     pool_first_seen.swap(seen);
+    {   // (RX_VK_CAP_ONLY_GPU: the host's live pools, which hos_gpu_pools' mapping list can lose: see cap_pool_born)
+        using LivePools = int (*)(uint64_t (*)[2], int);
+        static const LivePools live = (LivePools)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_live_pools");
+        if (live && cap_only_gpu()) {
+            static std::vector<std::array<uint64_t, 2>> lp(16384);
+            const int k = live(reinterpret_cast<uint64_t(*)[2]>(lp.data()), (int)lp.size());
+            for (int i = 0; i < k; i++)
+                if (lp[i][1] > lp[i][0] && lp[i][0] < (1ull << 40)) every.push_back({lp[i][0] & ~4095ull, (lp[i][1] + 4095) & ~4095ull});
+        }
+    }
     all_pool_ranges = ranges_merged(std::move(every));
     cap_ranges_ver++;
     std::sort(v.begin(), v.end());
@@ -1370,7 +1390,14 @@ std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked() {
     std::vector<std::pair<uint64_t, uint64_t>> imp = cap_ranges;
     if (cap_only_gpu()) {
         imp = ranges_merged(imp);
-        std::vector<std::pair<uint64_t, uint64_t>> keep = all_pool_ranges;
+        // (2026-11-14, play9) the GPU-visible memory: the host's pools and every pool the back end has a record of since the game
+        // made it (until another pool is made over it). The host's counted list lost live pools: one bound for 46 s was in no
+        // pool of it (a pool object finalized twice untracked a newer pool's entry: nvn_native.c), and a pool finalized after a
+        // submission's capture may still be bound by its replay. A record stays: never left out while it can be bound
+        std::vector<std::pair<uint64_t, uint64_t>> gpu = all_pool_ranges;
+        nvn_pool_record_ranges(gpu);
+        gpu = ranges_merged(std::move(gpu));
+        std::vector<std::pair<uint64_t, uint64_t>> keep = gpu;
         keep.insert(keep.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
         keep = ranges_merged(keep);
         std::vector<std::pair<uint64_t, uint64_t>> excl = ranges_clip(imp, keep, false);
@@ -1378,28 +1405,93 @@ std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked() {
             std::lock_guard lk(cap_excl_mu);
             cap_excl.swap(excl);
         }
-        if (cap_only_gpu() == 1) imp = ranges_clip(imp, all_pool_ranges, true);
+        if (cap_only_gpu() == 1) imp = ranges_clip(imp, gpu, true);
     }
     imp.insert(imp.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
     imp.insert(imp.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
     return ranges_merged(std::move(imp));
 }
+/// whether [lo, hi) reaches into one of the ranges of v (sorted, merged)
+bool ranges_hit(const std::vector<std::pair<uint64_t, uint64_t>>& v, uint64_t lo, uint64_t hi) {
+    auto it = std::upper_bound(v.begin(), v.end(), std::make_pair(lo, ~uint64_t(0)));
+    if (it != v.begin() && lo < std::prev(it)->second) return true;
+    return it != v.end() && it->first < hi;
+}
 /// (RX_VK_CAP_ONLY_GPU) whether [lo, hi) of guest memory reaches into the left-out ranges
 bool cap_excl_hit(uint64_t lo, uint64_t hi) {
     std::lock_guard lk(cap_excl_mu);
-    auto it = std::upper_bound(cap_excl.begin(), cap_excl.end(), std::make_pair(lo, ~uint64_t(0)));
-    if (it != cap_excl.begin() && lo < std::prev(it)->second) return true;
-    return it != cap_excl.end() && it->first < hi;
+    return ranges_hit(cap_excl, lo, hi);
+}
+/// (2026-11-14) a pool just made, [lo, hi): one of the pools at once, and out of the left-out ranges at once, so no binding
+/// of it can come before (the play session's reads into left-out ranges came after zone changes: pools made since the last
+/// pool-list refresh, and pools the host's mapping list had lost (hos_gpu_pools: a pool made over an older one's memory
+/// lost its entry at the older one's finalize), were left out while bound)
+void cap_pool_born(std::vector<std::pair<uint64_t, uint64_t>>& pools, std::vector<std::pair<uint64_t, uint64_t>>& excl,
+                   uint64_t lo, uint64_t hi) {
+    pools.push_back({lo & ~4095ull, (hi + 4095) & ~4095ull});
+    pools = ranges_merged(std::move(pools));
+    excl = ranges_clip(excl, {{lo & ~4095ull, (hi + 4095) & ~4095ull}}, false);
+}
+std::mutex born_mu;
+std::vector<std::pair<uint64_t, uint64_t>> born_stamp;   // (pools made since the replay's last collection: stamped there; born_mu)
+/// (RX_VK_CAP_ONLY_GPU) nvnMemoryPoolInitialize, on the game's thread (memory_pool_flags): the pool joins the pools and leaves
+/// the left-out ranges before the call returns. With 1 its pages, whose writes before the pool existed were dropped as heap
+/// memory's (memory_collect_written), are stamped at the replay's next collection: a mirror over them copies them again
+void cap_pool_born_now(uint64_t gpu, uint64_t size) {
+    if (!cap_only_gpu() || !size || gpu >= (1ull << 40)) return;
+    {
+        std::lock_guard lk(cap_ranges_mu);
+        std::lock_guard ek(cap_excl_mu);
+        cap_pool_born(all_pool_ranges, cap_excl, gpu, gpu + size);
+        cap_ranges_ver++;
+    }
+    if (cap_only_gpu() == 1) {
+        std::lock_guard bk(born_mu);
+        born_stamp.push_back({gpu, gpu + size});
+    }
+}
+void cap_born_take(std::vector<std::pair<uint64_t, uint64_t>>& out) {
+    std::lock_guard bk(born_mu);
+    out.swap(born_stamp);
+    born_stamp.clear();
 }
 /// (RX_VK_CAP_ONLY_GPU) a replay read or a buffer binding of [gpu, gpu + n): counted, and the first 20 logged, when it reaches
 /// into the left-out ranges
-void cap_excl_note(uint64_t gpu, uint64_t n, const char* who) {
+void cap_excl_note(uint64_t gpu, uint64_t n, const char* who, const void* caller = nullptr) {
     if (!n) return;
     const uint64_t g = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
     if (!g || !cap_excl_hit(g, g + n)) return;
-    if (st_excl_reads.fetch_add(1, std::memory_order_relaxed) < 20)
-        logf("vk: RX_VK_CAP_ONLY_GPU: %s of %#llx +%#llx reaches memory the capture leaves out", who, (unsigned long long)gpu,
-             (unsigned long long)n);
+    const int64_t k = st_excl_reads.fetch_add(1, std::memory_order_relaxed);
+    // (2026-11-14) the first 40 in full, and then one in 1000: the left-out range met, the game's pool there now (the host's live
+    // list, the back end's record: flags, when it was made), and whether the binding runs past its pool's end
+    if (k >= 40 && k % 1000) return;
+    uint64_t elo = 0, ehi = 0;
+    {
+        std::lock_guard lk(cap_excl_mu);
+        auto it = std::upper_bound(cap_excl.begin(), cap_excl.end(), std::make_pair(g, ~uint64_t(0)));
+        if (it != cap_excl.begin() && g < std::prev(it)->second) --it;
+        if (it != cap_excl.end()) elo = it->first, ehi = it->second;
+    }
+    uint64_t llo = 0, lhi = 0;
+    {
+        using LivePools = int (*)(uint64_t (*)[2], int);
+        static const LivePools live = (LivePools)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_live_pools");
+        static thread_local std::vector<std::array<uint64_t, 2>> lp(16384);
+        const int m = live ? live(reinterpret_cast<uint64_t(*)[2]>(lp.data()), (int)lp.size()) : 0;
+        for (int i = 0; i < m; i++)
+            if (g >= lp[i][0] && g < lp[i][1]) llo = lp[i][0], lhi = lp[i][1];
+    }
+    uint64_t rlo = 0, rhi = 0, rmade = 0;
+    uint32_t rflags = 0;
+    nvn_pool_record_at(g, &rlo, &rhi, &rflags, &rmade);
+    static const uintptr_t dll = (uintptr_t)GetModuleHandleA("hookshot_vk.dll");
+    logf("vk: RX_VK_CAP_ONLY_GPU: %s of %#llx +%#llx (guest %#llx, from v+%#llx) reaches memory the capture leaves out (#%lld): "
+         "left-out range %#llx..%#llx; live pool there %#llx..%#llx%s; the back end's pool record %#llx..%#llx flags %#x made %.3f s ago",
+         who, (unsigned long long)gpu, (unsigned long long)n, (unsigned long long)g,
+         (unsigned long long)(caller && dll ? (uintptr_t)caller - dll : 0), (long long)k + 1, (unsigned long long)elo,
+         (unsigned long long)ehi, (unsigned long long)llo, (unsigned long long)lhi,
+         llo && g + n > lhi ? " (the binding runs past its end)" : llo ? "" : " (none)", (unsigned long long)rlo,
+         (unsigned long long)rhi, rflags, rmade ? (host->now_ns() - (int64_t)rmade) / 1e9 : -1.0);
 }
 } // namespace
 
@@ -3906,6 +3998,7 @@ struct NvnPool {
     uint64_t hi = 0;
     uint32_t flags = 0;
     uint64_t first_wb = 0;   // (mirror_epoch + 1 of its first write-back)
+    uint64_t made_ns = 0;    // (host->now_ns() when the game made it)
     bool eager = false, skipped = false;
     uint8_t why = 0;   // (eager: 1 read by the CPU, 2 written by it)
 };
@@ -4187,6 +4280,17 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
 // NVN's CPU_NO_ACCESS flag keep no zero pages in RAM. The back end's part: no import of such a pool's pages for another pool's
 // binding (clip_noaccess below), and no upload of a texture whose storage lies in such a pool and is all reserved
 // (texture_touch: the image is made cleared to zero, which is what the storage reads as)
+void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out) {
+    std::lock_guard lk(nvn_pools_mu);
+    for (const auto& [lo, np] : nvn_pools) out.push_back({lo & ~4095ull, (np.hi + 4095) & ~4095ull});
+}
+bool nvn_pool_record_at(uint64_t g, uint64_t* lo, uint64_t* hi, uint32_t* flags, uint64_t* made_ns) {
+    std::lock_guard lk(nvn_pools_mu);
+    const NvnPool* np = nvn_pool_at(g, lo);
+    if (!np) return false;
+    *hi = np->hi, *flags = np->flags, *made_ns = np->made_ns;
+    return true;
+}
 bool memory_nvn_pool_of(uint64_t guest, uint64_t* lo, uint64_t* hi, uint32_t* flags) {
     std::lock_guard lk(nvn_pools_mu);
     const NvnPool* np = nvn_pool_at(guest, lo);
@@ -5109,6 +5213,7 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
 
 void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {   // (TICK-015: the game's pools and their flags, for the write-backs left out)
     if (!size || gpu >= (1ull << 40)) return;
+    cap_pool_born_now(gpu, size);   // (RX_VK_CAP_ONLY_GPU: a pool from the moment it is made)
     std::lock_guard lk(nvn_pools_mu);
     auto it = nvn_pools.upper_bound(gpu);
     if (it != nvn_pools.begin() && std::prev(it)->second.hi > gpu) --it;
@@ -5118,6 +5223,7 @@ void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {   // (TICK
         for (uint64_t q = gpu >> kPageShift; q < (gpu + size + 4095) >> kPageShift; q++) skipped_pages.erase((uint32_t)q);
     NvnPool np;
     np.hi = gpu + size, np.flags = flags;
+    np.made_ns = (uint64_t)host->now_ns();
     nvn_pools[gpu] = np;
     nvn_pools_gen.fetch_add(1, std::memory_order_relaxed);
 }
@@ -5245,7 +5351,7 @@ thread_local BindMemo bind_memo[256];
 
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
-    if (cap_only_gpu()) cap_excl_note(gpu, size, "a buffer binding");
+    if (cap_only_gpu()) cap_excl_note(gpu, size, written ? "a buffer binding (written)" : "a buffer binding", __builtin_return_address(0));
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
     // two translations are for the virtual pools above)
     uint64_t guest = gpu;
