@@ -59,7 +59,7 @@ HeyListen's `engine/` is Hookshot's source imported with its history and kept in
 - Game speed correct at 60 to 360 fps (it ran 12% too fast at 120).
 - Floating-point code lifted as real SIMD instead of lane by lane, with slow paths cut and an optimization profile recorded on the game's hot code (`profile/`); results are bit-identical.
 - Castle Town move and turn drops fixed (31-43 to 51-57 fps at the time).
-- Slow-link mode, chosen from the GPU's PCIe link: late-page deferral, a capture that also hashes pages, and chunk-diff mirror syncs (+18-21% on PCIe x4 cards).
+- Slow-link mode, chosen from the GPU's PCIe link (NVIDIA's NVML; on Linux, for any card, the narrowest link from the card up to the CPU in sysfs): late-page deferral, a capture that also hashes pages, and chunk-diff mirror syncs (+18-21% on PCIe x4 cards).
 
 *Smoothness and memory*
 - Fewer stutters: pipelines used once are recorded and precompiled at the next start, a texture descriptor cache, batched ASTC transcodes with a system-RAM BC cache.
@@ -74,6 +74,7 @@ HeyListen's `engine/` is Hookshot's source imported with its history and kept in
 - Measurement tools: a bench harness (`tools/bench/`), frame job tracing and critical-path tools, GPU segment timestamps, a hot-function map and a hash-gated native-replacement framework.
 - A large set of measured performance switches (off by default unless adopted), each with its ticket and benchmark in `docs/tickets/` and `docs/benchmarks/`, plus static analyses of the remaining frame time in `docs/research/`.
 - Engine tests brought up to date with current code.
+- Linux: the engine builds again (the Win32 calls it gained since Hookshot, GCC fixes), and a Linux workflow (`.github/workflows/linux.yml`) runs the game-free checks on Ubuntu 24.04 and makes the AppImage on Ubuntu 22.04 for every pull request. Not yet tried with the game on Linux.
 
 ## Repository layout
 
@@ -82,6 +83,7 @@ HeyListen's `engine/` is Hookshot's source imported with its history and kept in
 - `tools/`: bench, release and orchestration scripts
 - `profile/`: the optimization profile for the lifted code
 - `references/`: manifest of the comparison repos and builds (kept in place, not committed)
+- `.github/workflows/`: the Linux checks and AppImage (`linux.yml`); `engine/.github/workflows` are Hookshot's and do not run here
 
 Maintainers: `tools/release/make_release.ps1 -Tag vX.Y.Z` makes the release assets (see the script's header); the icon is `engine/assets/heylisten.svg` (original art, drawn by `tools/release/make_icon.py`).
 
