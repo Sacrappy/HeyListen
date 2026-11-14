@@ -5226,10 +5226,29 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     return true;
 }
 
-BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
+bool memory_pool_mirror_on() { return pool_mirror_on(); }
+BufferRef gpu_buffer(uint64_t gpu, uint64_t size, int use) {
     uint64_t avail = 0;
     if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
     const uint64_t guest = host->gpu_guest(gpu);
+    if (pool_mirror_on()) {   // (RX_VK_POOL_MIRROR: a never-imported pool is read through its mirror, bound as any buffer; the GPU
+        bool never = false;   // unswizzle has its CPU path instead)
+        {
+            std::lock_guard lk(pools_mu);
+            const Pool* p = pool_of(guest, size);
+            never = p && p->never_imported && !p->memory;
+        }
+        if (never) {
+            if (use == kGpuBufferUnswizzle) return {};
+            BufferRef r = gpu_buffer_bind(gpu, size, use == kGpuBufferWritten);
+            if (r) {
+                VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                da.buffer = r.buffer;
+                r.address = vkGetBufferDeviceAddress(dev.device, &da) + r.offset;
+            }
+            return r;
+        }
+    }
     std::lock_guard lk(pools_mu);
     Pool* p = pool_of(guest, size);
     if (!p || (!p->memory && !import_again(*p, kAgainTexture))) return {};
@@ -5498,7 +5517,8 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     }
     if (written) {   // (RX_VK_NO_HOST_IMPORT: its write-backs go through the import: kept from now on)
         p->gpu_written = true;
-        if (!p->memory && !import_again(*p, kAgainWrite)) return {};
+        // (RX_VK_POOL_MIRROR: a never-imported pool's go through staging, memory_end_submission)
+        if (!p->memory && !p->never_imported && !import_again(*p, kAgainWrite)) return {};
     }
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
     if (written) {
@@ -5583,6 +5603,7 @@ void reap_mirrors() {   // (pools_mu held)
 // the staged write-back is the next step), readback refreshes and texel views over the pool. Never-imported mirrors are not given
 // back as idle (the GPU would have nothing to read there). RX_VK_POOL_MIRROR_CHECK=1 compares mirrors with guest memory (below).
 void pool_mirror_check_start();   // (RX_VK_POOL_MIRROR_CHECK: at the end of this file)
+extern int64_t st_sw_runs, st_sw_bytes, st_sw_pages_written, st_sw_pages_cpu, st_sw_pages_dead;   // (the staged write-backs: below)
 namespace {   // (with their declarations at the top)
 bool pool_mirror_on() {
     static const bool v = [] {
@@ -5649,6 +5670,9 @@ void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
          (long long)st_pm_again[kAgainTexture], (long long)st_pm_again[kAgainFree], (long long)st_pm_again[kAgainWb], imported_n,
          (unsigned long long)(imp_b >> 20), (long long)st_pm_why[0], (long long)st_pm_why[1], (long long)st_pm_why[2], (long long)st_pm_why[3],
          (long long)st_pm_why[4], (long long)st_pm_why[5]);
+    logf("vk: write-backs of never-imported pools through staging (RX_VK_POOL_MIRROR): %lld runs, %lld MB; pages written into guest "
+         "memory %lld, left as the CPU wrote them since %lld, no live pool there %lld", (long long)st_sw_runs, (long long)(st_sw_bytes >> 20),
+         (long long)st_sw_pages_written, (long long)st_sw_pages_cpu, (long long)st_sw_pages_dead);
 }
 }  // namespace
 
@@ -5854,7 +5878,8 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     static const bool keep_lazy = getenv("RX_VK_KEEP_LAZY_MIRRORS") != nullptr;
     if (!keep_lazy)
         for (auto& [lo, p] : imported)
-            if (p.mstate == Pool::MIRROR_ON && p.lazy_held && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed &&
+            if (p.mstate == Pool::MIRROR_ON && p.lazy_held && !(p.never_imported && !p.memory) &&   // (RX_VK_POOL_MIRROR: kept)
+                mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed &&
                 (mirror_epoch - p.synced_epoch > kLongIdle || mirror_bytes + want_bytes > mirror_budget()) &&
                 std::find(lazy_release.begin(), lazy_release.end(), &p) == lazy_release.end())
                 lazy_release.push_back(&p);
@@ -6636,9 +6661,59 @@ void lazy_apply() {
         it = lazy_stages.erase(it);
     }
 }
+// ---- (RX_VK_POOL_MIRROR) the write-backs of never-imported pools, through staging ----
+// The GPU's writes into a mirror reached guest memory by a GPU copy into the pool's import, done when the submission's timeline
+// value is. Without an import the submission copies the written runs into a host-cached staging buffer instead, and the first
+// thread to see that value done (memory_staged_apply: vk_replay.cpp's completed() and its waits, before they report it) writes them
+// into guest memory, page by page through the host's hos_gpu_write_live (only inside a live NVN pool, and not over a page the CPU
+// wrote since its last collection: the staged lazy release's rules), so whoever then reads guest memory finds them there, as it did
+// through the import.
+struct StagedWb {
+    uint64_t value = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    void* map = nullptr;
+    uint64_t bytes = 0;
+    std::vector<std::array<uint64_t, 3>> runs;   // (guest address, offset in the staging buffer, size)
+};
+std::mutex staged_mu;
+std::deque<StagedWb> staged_wbs;   // (by value; staged_mu)
+std::vector<std::pair<VkBuffer, VmaAllocation>> staged_free;   // (applied: destroyed at a submission's end; staged_mu)
+std::atomic<uint64_t> staged_min{~0ull};
+int64_t st_sw_runs = 0, st_sw_bytes = 0, st_sw_pages_written = 0, st_sw_pages_cpu = 0, st_sw_pages_dead = 0;
+}  // namespace mkwvk
+void mkwvk::memory_staged_apply(uint64_t done) {
+    if (staged_min.load(std::memory_order_acquire) > done) return;
+    using WriteLive = int (*)(uint64_t, const void*, uint64_t);
+    static const WriteLive write_live = (WriteLive)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_write_live");
+    std::lock_guard lk(staged_mu);
+    while (!staged_wbs.empty() && staged_wbs.front().value <= done) {
+        StagedWb& s = staged_wbs.front();
+        invalidate_mapped(s.alloc, s.bytes);
+        for (const auto& [guest, off, size] : s.runs)
+            for (uint64_t a = guest; a < guest + size;) {
+                const uint64_t e = std::min(guest + size, ((a >> 12) + 1) << 12);
+                const uint8_t* src = static_cast<const uint8_t*>(s.map) + off + (a - guest);
+                const int r = write_live ? write_live(a, src, e - a) : (host->gpu_write(a, src, e - a) ? 1 : 0);
+                (r == 1 ? st_sw_pages_written : r == 2 ? st_sw_pages_cpu : st_sw_pages_dead)++;
+                a = e;
+            }
+        staged_free.push_back({s.buffer, s.alloc});
+        staged_wbs.pop_front();
+    }
+    staged_min.store(staged_wbs.empty() ? ~0ull : staged_wbs.front().value, std::memory_order_release);
+}
+namespace mkwvk {
+
 void memory_end_submission(VkCommandBuffer cmd) {
     std::lock_guard lk(pools_mu);
     lazy_apply();
+    {   // (RX_VK_POOL_MIRROR: the staging buffers of write-backs applied, given back)
+        std::lock_guard sk(staged_mu);
+        for (auto& [b, a] : staged_free) destroy_buffer(b, a);
+        staged_free.clear();
+    }
+    StagedWb staged;   // (this submission's write-backs of never-imported pools, below)
     for (const PresyncNote& n : presync_notes) {   // (TICK-048: a pool the presync synced that no binding used after it)
         const auto it = imported.find(n.key);
         if (it != imported.end() && &it->second == n.p && n.p->last_value == n.bound_before) sst.pre_unbound += n.bytes;
@@ -6789,6 +6864,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
         static thread_local std::vector<VkBufferCopy> fills, odd;
         chunks.clear(), chunk_src.clear();
         bool filled = false;
+        std::vector<std::pair<Pool*, std::vector<VkBufferCopy>>> staged_pools;   // (RX_VK_POOL_MIRROR)
         for (size_t i = 0; i < writebacks.size();) {
             Pool* p = writebacks[i].pool;
             runs.clear();
@@ -6802,6 +6878,16 @@ void memory_end_submission(VkCommandBuffer cmd) {
             cut_cpu_words(*p, runs);
             if (wb_lazy_on()) lazy_filter(*p, runs);   // (TICK-015)
             if (runs.empty()) continue;
+            if (!p->memory && p->never_imported) {   // (RX_VK_POOL_MIRROR: into this submission's staging, written at its value)
+                for (const VkBufferCopy& r : runs) {
+                    staged.runs.push_back({p->lo + r.dstOffset, staged.bytes, r.size});
+                    staged.bytes += r.size;
+                    wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
+                    st_wb_bytes += (int64_t)r.size, gp.bytes += r.size;
+                }
+                staged_pools.push_back({p, runs});
+                continue;
+            }
             if (!p->memory && !import_again(*p, kAgainWb)) continue;   // (RX_VK_NO_HOST_IMPORT: never so: written pools keep theirs)
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
@@ -6901,6 +6987,37 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 vkCmdPushConstants(cmd, wbd_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
                 const uint32_t n = (uint32_t)chunks.size();
                 vkCmdDispatch(cmd, std::min<uint32_t>(n, 65535u), (n + 65534u) / 65535u, 1);
+            }
+        }
+        if (staged.bytes) {   // (RX_VK_POOL_MIRROR: the never-imported pools' runs into one host-cached staging buffer)
+            bool ok;
+            {
+                MemKindScope mem_kind_(MemKind::Readback);
+                ok = create_buffer_cached(staged.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, staged.buffer, staged.alloc, &staged.map);
+            }
+            if (ok && staged.map) {
+                uint64_t at = 0;
+                for (auto& [p, rs] : staged_pools) {
+                    std::vector<VkBufferCopy> to;
+                    for (const VkBufferCopy& r : rs) to.push_back({r.dstOffset, at, r.size}), at += r.size;
+                    vkCmdCopyBuffer(cmd, p->mirror, staged.buffer, (uint32_t)to.size(), to.data());
+                    st_sw_runs += (int64_t)to.size();
+                }
+                VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the copies before the host reads the buffer)
+                hb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, hb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                hb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, hb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+                VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                hd.memoryBarrierCount = 1, hd.pMemoryBarriers = &hb;
+                vkCmdPipelineBarrier2(cmd, &hd);
+                st_sw_bytes += (int64_t)staged.bytes;
+                staged.value = mem_rec_value;
+                std::lock_guard sk(staged_mu);
+                staged_wbs.push_back(std::move(staged));
+                staged_min.store(staged_wbs.front().value, std::memory_order_release);
+            } else {
+                if (ok) destroy_buffer(staged.buffer, staged.alloc);
+                static int logged;
+                if (logged++ < 8) logf("vk: a staged write-back of %llu KB found no staging buffer: left out", (unsigned long long)(staged.bytes >> 10));
             }
         }
         transfer_barrier(cmd);
@@ -7232,28 +7349,32 @@ int memory_mirror_read(uint64_t guest, uint64_t size, void* out) {
 // after the comparison) may differ and is not counted; any other difference is a mismatch: the mirror does not hold the pool's bytes.
 // Counted, the first 20 logged with the pool, the page and its flags. Zero is the bar.
 namespace {
-std::atomic<int64_t> st_pmc_pools{0}, st_pmc_pages{0}, st_pmc_skipped{0}, st_pmc_bad{0};
+std::atomic<int64_t> st_pmc_pools{0}, st_pmc_pages{0}, st_pmc_skipped{0}, st_pmc_bad{0}, st_pmc_written{0}, st_pmc_busy{0};
 void pool_mirror_check_main() {
     std::vector<uint8_t> mir(4ull << 20), mem(4ull << 20);
     uint64_t next = 0;
     for (;;) {
         Sleep(2000);
-        uint64_t lo = 0, hi = 0;
+        uint64_t lo = 0, hi = 0, bound = 0;
         uint32_t synced = 0;
+        bool written = false;
         {
+            // (a pool the GPU writes too, its write-backs staged (B3), once its last binding's work is done: then guest memory must
+            // hold what the mirror holds, the staged write-backs applied at that value; checked again after: bound since, left out)
             std::lock_guard lk(pools_mu);
             auto it = imported.upper_bound(next);
             for (int tries = 0; tries < 2 && !hi; tries++, it = imported.begin())
                 for (; it != imported.end(); ++it) {
                     const Pool& p = it->second;
-                    if (p.never_imported && !p.memory && p.mstate == Pool::MIRROR_ON && p.mirror && !p.gpu_written && !p.lazy_held &&
-                        p.synced_epoch < mirror_epoch) {
-                        lo = p.lo, hi = p.hi, synced = p.synced_gen;
+                    if (p.never_imported && !p.memory && p.mstate == Pool::MIRROR_ON && p.mirror && !p.lazy_held &&
+                        p.synced_epoch < mirror_epoch && (!p.gpu_written || p.last_value <= mem_completed)) {
+                        lo = p.lo, hi = p.hi, synced = p.synced_gen, bound = p.last_value, written = p.gpu_written;
                         break;
                     }
                 }
         }
         if (!hi) continue;
+        if (written) (void)vk_timeline_completed();   // (the staged write-backs up to now applied)
         next = lo;
         st_pmc_pools++;
         std::vector<uint64_t> differ;
@@ -7269,6 +7390,15 @@ void pool_mirror_check_main() {
         // (a CPU write is stamped with a generation when the next submits collect the write marks: given time, a page the CPU
         // wrote after the mirror's sync shows as written since it; one that still does not differs for another reason)
         if (!differ.empty()) Sleep(500);
+        if (written) {   // (bound again meanwhile: the GPU may have written it since; this round says nothing)
+            std::lock_guard lk(pools_mu);
+            const auto it = imported.find(lo);
+            if (it == imported.end() || it->second.last_value != bound || it->second.lazy_held) {
+                st_pmc_busy++;
+                continue;
+            }
+            st_pmc_written++;
+        }
         for (const uint64_t pg : differ) {
             if (memory_written_since(pg, 4096, synced)) { st_pmc_skipped++; continue; }   // (the CPU wrote it since the sync)
             const int64_t bad = ++st_pmc_bad;
@@ -7286,9 +7416,10 @@ void pool_mirror_check_main() {
         static int64_t logged_at = -1;
         if (st_pmc_pools / 16 != logged_at) {
             logged_at = st_pmc_pools / 16;
-            logf("vk: pool mirror check (RX_VK_POOL_MIRROR_CHECK): %lld pools, %lld pages compared, %lld written since their sync, "
-                 "MISMATCHES %lld", (long long)st_pmc_pools.load(), (long long)st_pmc_pages.load(), (long long)st_pmc_skipped.load(),
-                 (long long)st_pmc_bad.load());
+            logf("vk: pool mirror check (RX_VK_POOL_MIRROR_CHECK): %lld pools (%lld written by the GPU, their write-backs staged; %lld "
+                 "more bound again during the check, not counted), %lld pages compared, %lld written since their sync, MISMATCHES %lld",
+                 (long long)st_pmc_pools.load(), (long long)st_pmc_written.load(), (long long)st_pmc_busy.load(),
+                 (long long)st_pmc_pages.load(), (long long)st_pmc_skipped.load(), (long long)st_pmc_bad.load());
         }
     }
 }
