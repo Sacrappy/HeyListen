@@ -273,6 +273,49 @@ uint16_t u16(const GuestRuntime& rt, GuestAddr a) {
 }
 }   // namespace
 
+namespace {
+// (the block's render state for the preparation's state step, and back)
+void read_state(const guest::RenderStateBlock& b, gfx::PrepareState& s) {
+    s.applied_key = b.state_key_applied;
+    s.applied_material = b.done;
+    s.offset_enables = b.polygon_offset;
+    s.cull_face = b.cull_face;
+    s.polygon_mode[0] = b.polygon_mode, s.polygon_mode[1] = b.polygon_mode_b;
+    s.depth_test = b.depth_test, s.depth_write = b.depth_write, s.depth_func = b.depth_func;
+    s.blend_targets = b.blend_targets;
+    std::memcpy(s.blend_color, b.blend_color, sizeof s.blend_color);
+    std::memcpy(s.blend, b.blend, sizeof s.blend);
+    s.channel_masks = b.channel_masks;
+    s.stencil_test = b.stencil_test, s.stencil_func = b.stencil_func;
+    std::memcpy(s.stencil_ops, b.stencil_ops, sizeof s.stencil_ops);
+    s.stencil_ref = b.stencil_ref, s.stencil_value_mask = b.stencil_value_mask;
+    std::memcpy(s.offset_clamp, b.offset_clamp, sizeof s.offset_clamp);
+    s.depth_clamp = b.depth_clamp;
+}
+void put_state(guest::RenderStateBlock& b, const gfx::PrepareState& s) {
+    b.state_key_applied = s.applied_key;
+    b.done = s.applied_material;
+    b.polygon_offset = s.offset_enables;
+    b.cull_face = s.cull_face;
+    b.polygon_mode = s.polygon_mode[0], b.polygon_mode_b = s.polygon_mode[1];
+    b.depth_test = s.depth_test, b.depth_write = s.depth_write, b.depth_func = s.depth_func;
+    b.blend_targets = s.blend_targets;
+    std::memcpy(b.blend_color, s.blend_color, sizeof b.blend_color);
+    std::memcpy(b.blend, s.blend, sizeof b.blend);
+}
+}   // namespace
+
+void PrepareBridge::state_handles(GuestAddr block, uint64_t sp, gfx::PrepareHandles& h) const {
+    const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
+    h.state_buffer = at<guest::Renderer>(runtime_, b.renderer).command_buffer;
+    h.blend = sp - guest::kPrepBlend;
+    h.color = sp - guest::kPrepColor;
+    h.channel_mask = sp - guest::kPrepChannelMask;
+    h.depth_stencil = sp - guest::kPrepDepthStencil;
+    h.polygon = sp - guest::kPrepPolygon;
+    h.blend_color = block + offsetof(guest::RenderStateBlock, blend_color);
+}
+
 GuestAddr PrepareBridge::material(GuestAddr block, GuestAddr drawable) const {
     const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
     // (the block's slot, or the drawable's pass slot for the block's pass: an unsigned byte index)
@@ -297,11 +340,22 @@ void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs
     in.state_key = d.state_key;
     in.applied_state_key = b.state_key_applied;
     in.mode_bits = b.mode_bits;
-    if (in.state_key != in.applied_state_key) return;
+    // (the state step's: the block's own fields, and the material state where the function reads it)
+    in.flags = b.flags;
+    in.state_bits = b.state_bits;
+    in.blend_target_mask = b.blend_target_mask;
+    read_state(b, in.state);
     if (in.mode_bits & 1) {
-        in.material_state = u32(runtime_, d.material_state + guest::kMaterialStateId);
+        const guest::MaterialStateObject& s = at<guest::MaterialStateObject>(runtime_, d.material_state);
+        gfx::MaterialState& ms = in.material_state_in;
+        ms.id = s.id;
+        ms.kind = s.kind;
+        ms.blend = s.blend;
+        std::memcpy(ms.color, s.color, sizeof ms.color);
+        std::memcpy(ms.targets, s.targets, sizeof ms.targets);
+        ms.depth_test = s.depth_test, ms.depth_write = s.depth_write, ms.depth_func = s.depth_func;
+        in.material_state = s.id;
         in.applied_material_state = b.done;
-        if (in.material_state != in.applied_material_state) return;
     }
     in.program = e.program;
     in.applied_program = b.program;
@@ -380,6 +434,10 @@ void put_program(guest::RenderStateBlock& b, const gfx::PrepareOutputs& out) {
 }   // namespace
 
 void PrepareBridge::write(GuestAddr block, const gfx::PrepareHandles& h, const gfx::PrepareOutputs& out) const {
+    if (out.state_step) {
+        put_state(*static_cast<guest::RenderStateBlock*>(runtime_.ptr(block)), out.state);
+        runtime_.written(block, sizeof(guest::RenderStateBlock));
+    }
     if (out.program_bound) {
         put_program(*static_cast<guest::RenderStateBlock*>(runtime_.ptr(block)), out);
         // (the fields the step may write: +0x5c to +0xdf)
@@ -401,9 +459,10 @@ void PrepareBridge::snapshot(GuestAddr block, GuestAddr command_buffer, uint8_t*
 }
 
 void PrepareBridge::expect(uint8_t* bytes, const gfx::PrepareOutputs& out) {
-    if (out.program_bound) {
+    if (out.state_step || out.program_bound) {
         guest::RenderStateBlock b;
         std::memcpy(&b, bytes, sizeof b);
+        if (out.state_step) put_state(b, out.state);
         put_program(b, out);
         std::memcpy(bytes, &b, sizeof b);
     }
