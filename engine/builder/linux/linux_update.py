@@ -23,8 +23,8 @@ import zipfile
 from part_links import SYSROOT_PART, is_absolute_link, relative_sysroot_link
 
 LIST_NAME = "hookshot-linux.txt"
-LATEST_LIST = "https://github.com/NotRexed/HeyListen/releases/latest/download/" + LIST_NAME
-LATEST_API = "https://api.github.com/repos/NotRexed/HeyListen/releases/latest"
+LATEST_LIST = "https://github.com/Sacrappy/HeyListen/releases/latest/download/" + LIST_NAME
+LATEST_API = "https://api.github.com/repos/Sacrappy/HeyListen/releases/latest"
 
 
 class Part(object):
