@@ -426,6 +426,11 @@ struct InitRedirect {
     InitRedirect(const InitRedirect&) = delete;
     InitRedirect& operator=(const InitRedirect&) = delete;
 };
+}  // namespace
+// (RX_VK_POOL_MIRROR, vk_memory.cpp) a never-imported pool's mirror made by a segment's worker goes the same way
+void* upload_to_earliest_begin() { return new InitRedirect(true); }
+void upload_to_earliest_end(void* h) { delete static_cast<InitRedirect*>(h); }
+namespace {
 
 // ---- staging: host-visible arenas, reused once the submission that filled them completed ----
 struct Arena {

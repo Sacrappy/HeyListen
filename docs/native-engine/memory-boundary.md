@@ -1700,6 +1700,121 @@ submissions ago.
 | 7 | The texture-storage commit dropped once uploaded (the drop, section 14, on by default) | | 0 (already cold) | ~1.0-1.5 GB | the main PC's validation of `HL_MEM_DROP` | restore hitches |
 | 8 | Write-back shadows (261 MB) and BC scratch (160 MB) made only while used | ~0.4 GB | | | shadows' 85/95% rule; scratch freed after a load | a stall at the next transcode |
 
+### The owner's reference session (play10: about 18 minutes, zone changes, levers off; `build/s5/play10.orch.log`)
+
+Ledger tables every 60 s, 60 to 1083 s, MB:
+
+| Time | Console | Game committed | Game RAM | Mirrors | Images | Imports | Chunks: live pools / finalized pools / no pool | VRAM used (free in VMA blocks) | Working set | Commit |
+|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|
+| 60 s | 9618 | 7370 | 2662 | 1100 | 2311 | 1260 | 749 / 80 / 430 | 5906 (668) | 8179 | 19129 |
+| 603 s | 12997 | 11419 | 4360 | 2235 | 3113 | 3503 | 2215 / 144 / 1143 | 9139 (1733) | 11310 | 28506 |
+| 1083 s | 13100 | 11527 | 6041 | 1754 | 3124 | 3854 | 2622 / 100 / 1131 | 9414 (2704) | 10440 | 28926 |
+
+- **The growth is the game's own live pools plus the chunks' reach, not ended pools.**
+  - Chunks with no live pool left: 1 to 11, 80-240 MB of import, and few of them hold a mirror. Retiring at finalize
+    (`RX_VK_POOL_FINALIZE`) would have released at most 0.24 GB here.
+  - The live pools in the chunks grew 0.75 -> 2.6 GB. Vertex buffers alone went 136 -> 842 MB as the models of the zones
+    visited stay loaded: the game's memory, bounded by its 9.8 GB.
+  - Memory in chunks that no pool covers grew 0.43 -> 1.13 GB.
+- **RAM.**
+  - The game: +3.4 GB. Its pools went 1.5 -> 4.8 GB in RAM because the imports pin them (+2.6 GB), and cold pages cannot take
+    out pinned pages.
+  - The BC cache: +1.0 GB (at its 1 GB cap from 363 s, when VRAM reached 93% and the lazy trigger fired).
+  - C heaps 0.52 -> 0.86 GB; captures +0.2 GB.
+  - The driver's arenas: 4.6 GB committed throughout; their RAM fell 4.4 -> 1.5 GB at about 780 s (Windows trimming,
+    *(inference)*).
+- **Commit** +9.8 GB: the window +4.2, the driver's private regions of 32-128 MB beside VRAM 0.1 -> 9.5 GB (census; they track
+  VRAM use), the BC cache and captures +1.2.
+- **VRAM** +3.5 GB: images +0.8, mirrors +0.65, **free space in VMA blocks 0.67 -> 2.7 GB** (image blocks 1.7, render-target
+  blocks 0.9). That free space is fragmentation, and `RX_VK_IMAGE_GENERATIONS` (off) is its lever.
+
+### Lever B: a mirror per pool, the import gone (design)
+
+What exists already:
+- `RX_VK_IMPORT_CHUNK_MB=0` imports and mirrors the game's pool itself instead of a 16 MB chunk. The chunk exists only for the
+  driver's import cost (5-45 ms each, 11.3) and its limit of about 4,096 memory objects. 1,773 pools were bound in play10.
+- `RX_VK_NO_HOST_IMPORT=1` gives the import back once the mirror holds a pool that was never written (section 14).
+
+Together they are most of lever B: mirrors per pool, and imports only for pools the GPU writes and for the time a mirror is
+being filled. **Stage B1 is a measurement of those two switches** (the runs below). The remaining stages:
+
+- **B2: fill without an import.** `mirror_make` copies the whole pool from its import (`vkCmdCopyBuffer(p->buffer, ...)`).
+  Instead, copy guest memory into staging (CPU memcpy, ~1.6 ms per 16 MB) and from there into the mirror. Pages written since
+  then come from the captures, as they do today.
+- **B3: no import for pools the GPU writes.** Write-backs go GPU -> host staging -> guest memory. The staged lazy release
+  already does this (`LazyStage`, `hos_gpu_write_live`, with its checks). An invalidate then waits for that copy too.
+- **B4: no fallback to guest memory.** A pool with no usable mirror (budget refused, given back as idle) is read by the GPU
+  through its import today. Without imports such a pool must get a mirror at its binding (made and filled in the upload
+  command buffer, as now). The idle give-back then frees only the mirror, and a later binding makes it again.
+
+The check: `RX_VK_POOL_MIRROR_CHECK=1` reads each mirror back at a submission's end, after its syncs, and compares it with
+guest memory page by page for every page with no CPU write since its sync (`PageX::syn`) and no pending GPU write. Mismatches
+are counted, and the first few are logged with the page, its pool's flags and the last writer. Zero is the bar.
+
+What it is worth, in play10's terms:
+- imports 3854 -> 0 MB pinned, so cold pages and the drop can take the pools' pages: the game's RAM would sit closer to the
+  field run's 2.3 GB than 6.0;
+- mirrors 1754 -> the bound pools' own size: the 528 MB outside every pool and the 433 MB never bound go.
+
+What could break:
+- the fill's CPU copy on the replay's thread at a scene load;
+- write-back latency at an invalidate (12 functions read pools back);
+- pools made and bound every frame (the actor heap's 8 KB pools): mirrors made and freed often. VMA's block suballocation
+  keeps that cheap.
+
+### Lever B, first version (`RX_VK_POOL_MIRROR`, default 0; `RX_VK_POOL_MIRROR_CHECK`)
+
+Built in `gpu/vk/vk_memory.cpp` (the "a mirror per pool, never imported" block) and `vk_texture.cpp` (`upload_to_earliest_begin`).
+- A pool that is bound as a buffer gets a table entry with no import, cut to the game's pool. A pool larger than a chunk keeps
+  16 MB chunks, cut to the pool. Nothing outside a pool is mirrored.
+- Its mirror is made at its first binding and filled from guest memory through a host-visible staging buffer: a CPU copy,
+  then a GPU copy in the recording's uploads. The staging buffer is freed once the GPU is past it.
+- In a parallel segment the mirror is recorded into the earliest open segment's init command buffer. No segment has bound the
+  pool before (a binding without a mirror would have imported it), and every segment's init is submitted before its uploads.
+- CPU writes reach the mirror from the captures, as before; "live" pages (no kept capture holds them) go through staging.
+- Never-imported mirrors are not given back as idle: they are all the GPU has of the pool.
+- What still imports is counted by why, and the pool is then marked imported:
+  - a binding for writing (its write-backs go through the import; that is the next stage);
+  - texel views over the pool;
+  - readback refreshes;
+  - a binding with no mirror possible: no recording, budget refused, `RX_VK_MIRROR_DEFER`.
+- `RX_VK_POOL_MIRROR_CHECK=1`: every 2 s a thread reads a never-imported mirror back (`memory_mirror_read`) and compares it with
+  guest memory page by page. Pages that differ are looked at again 500 ms later, once the next submits have collected the write
+  marks. A page the CPU wrote after the mirror's last sync is left out; any other difference is a mismatch. The first version
+  counted 3 mismatches on CPU-uncached (`0x22`) per-frame pages: writes not yet stamped. They disappeared with the wait.
+
+Run (main PC, `hyrule-field` save, scripted walk, 110 s, build `r1-pm3`):
+- **0 mismatches** over 32 pools and 74,937 pages (2,407 written by the CPU since their sync, left out).
+- 674 table entries were made with no import; 576 were still never imported at the end. Fills: 668, 707 MB through staging.
+  Imported after all: 92 bound for writing, 6 for texel views, 0 bindings in parallel segments.
+- At 100 s: mirrors **707 MB** (15 MB outside every pool) against 1,580 with the chunks (500 outside); imports held **402 MB**
+  against 828-1,768; VRAM 4,358 MB.
+- No crash. The shots at 1500 and 1600 presents are right. The run summary shows no large slowdown (not a speed claim).
+- Per-pool imports with the existing switches (`RX_VK_IMPORT_CHUNK_MB=0 RX_VK_NO_HOST_IMPORT=1`) were worse: a binding in a pool
+  refused a mirror (over 1 GB: `agl::TextureDataMgr`'s 2.4 GB) imports it whole, and 3.3 GB were held.
+
+What then makes a page of a live pool droppable:
+- **A pool never imported** has no pinned page: the substrate's refusal of a granule ever imported (`hos_gp_drop` -2) does not
+  apply. A cold page with no CPU write since its mirror's last sync is held, exactly, by the mirror, and by the file when it is
+  a decoded resource.
+- `HL_MEM_DROP_POOLS`' candidate rule (a mirror on, never bound for writing, compared byte for byte with guest memory at the
+  drop, into the spill) applies as it is. The `hos_mirror_held` notice must also be sent for never-imported pools (today it is
+  sent when an import is given back): **not done yet**.
+- The hitch of section 15 (a re-import restored 280 MB of dropped granules at once on the back end's thread) cannot happen for
+  these pools: there is no import to make again.
+- What remains are the restores the touches need:
+  - the game's own touches (rare; section 7);
+  - the back end's staging reads of live pages and fills of a mirror made again. Those are bounded: a fill reads only the
+    pool's own pages, and only when its mirror is made, once a pool's life unless it is retired.
+- The restore reads the spill. Reading the mirror back at the touch is still not built, for the reason of section 14: a touch
+  on the replay's thread holds the back end's locks.
+
+Next stages:
+- B3: write-backs through staging, for pools the GPU writes (the staged lazy release's path: GPU -> host staging ->
+  `hos_gpu_write_live`), with the wait at an invalidate.
+- The `hos_mirror_held` notice for never-imported pools, so `HL_MEM_DROP_POOLS` can drop their cold granules.
+- Three zones and a hand-played session with the check on.
+
 ## 20. The commit budget of the 30-minute reference session (`play10.orch.log`, 2026-11-14)
 
 Sources: the census (`HOS_HOST_SPLIT=60,60`, 19 tables, a column below is one of them) and R1's ledger (`RX_VK_LEDGER=60`, 18 tables;
