@@ -109,8 +109,61 @@ def main():
         os.remove(host / "hl_x.c")
         check(hl_gates.apply(str(gen), str(host), quiet=True) == 0, "no gate wanted")
         check(code.read_text(encoding="utf-8") == CODE, "the lifted code is as the lift wrote it")
+    step_hooks()
     jobs_gates_all_or_nothing()
     print("hl gates: ok")
+
+
+STEP_CODE = '''#include "a64.h"
+void f_80004000(Ctx *__restrict A64_NOESC c) {
+    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[1],4);memcpy(&_b,c->vreg[0],4);_z=(_a^_b)&0x80000000;
+    (void)_z;
+    _v=a64_fpx_div32_div32(c,_a,_b);
+    a64_vset64(c->vreg[8],_v);}
+return;
+}
+void f_80005000(Ctx *__restrict A64_NOESC c) {
+    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[1],4);memcpy(&_b,c->vreg[0],4);_z=(_a^_b)&0x80000000;
+    (void)_z;
+    _v=a64_fpx_div32_div32(c,_a,_b);
+    a64_vset64(c->vreg[0],_v);}
+return;
+}
+'''
+
+
+def step_hooks():
+    """The step hooks (host/hl_step.c): a line after each asked-for divide, the function's hash unchanged by it, both or
+    neither, taken out when no tree source asks for them (an older hl_gates.py takes them out too: the marker of an odd
+    address it does not want)."""
+    import re
+    with tempfile.TemporaryDirectory(prefix="hl-steps-") as tmp:
+        gen, host = Path(tmp) / "gen", Path(tmp) / "host"
+        gen.mkdir()
+        host.mkdir()
+        code = gen / "code_000.c"
+        code.write_text(STEP_CODE, encoding="utf-8", newline="")
+        h4, h5 = hl_gates.text_hash(STEP_CODE, "80004000"), hl_gates.text_hash(STEP_CODE, "80005000")
+        (host / "hl_s.c").write_text('HL_STEP_HOOK(80004000, "%s", 8, 1);\nHL_STEP_HOOK(80005000, "%s", 0, 0);\n' % (h4, h5),
+                                     encoding="utf-8")
+        hl_gates.apply(str(gen), str(host), quiet=True)
+        s = code.read_text(encoding="utf-8")
+        check(s.count("hos_frame_seconds_bits") == 4 and s.count("hos_step_probe = c->x[19]") == 1, "both divides hooked")
+        check("/* hl gate 80004001 */" in s and "/* hl gate 80005001 */" in s, "the hooks' markers")
+        check(s.index("hl gate 80004001") > s.index("a64_fpx_div32_div32") and
+              s.index("hl gate 80004001") < s.index("a64_vset64(c->vreg[8]"), "right after the divide")
+        check(hl_gates.text_hash(s, "80004000") == h4 and hl_gates.text_hash(s, "80005000") == h5, "hashes unchanged")
+        # (an older hl_gates.py, which knows nothing of step hooks, takes them out: its stale-marker rule)
+        old = re.compile(r"^.*/\* hl gate ([0-9a-f]{8}) \*/\n", re.M).sub("", s)
+        check(old == STEP_CODE, "an older tree's gates script restores the lift")
+        # (one of the two divides not found: neither hooked)
+        (host / "hl_s.c").write_text('HL_STEP_HOOK(80004000, "%s", 8, 1);\nHL_STEP_HOOK(80005000, "%s", 0, 0);\n' % (h4, "0" * 16),
+                                     encoding="utf-8")
+        hl_gates.apply(str(gen), str(host), quiet=True)
+        check(code.read_text(encoding="utf-8") == STEP_CODE, "both or neither")
+        os.remove(host / "hl_s.c")
+        hl_gates.apply(str(gen), str(host), quiet=True)
+        check(code.read_text(encoding="utf-8") == STEP_CODE, "none asked: the lift as it was")
 
 
 def jobs_gates_all_or_nothing():

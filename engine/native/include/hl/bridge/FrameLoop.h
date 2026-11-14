@@ -123,6 +123,9 @@ public:
     struct Options {
         bool check = false;   ///< count the invariants below
         bool log = false;     ///< one line of counters in the game's log every 10 s (from the main thread, at a frame's end)
+        /// the host's published frame time (a float's bits; 0: none), for the global step as the lifted divide's hook makes it
+        /// (host/hl_step.c): 60 x it in place of 60 / the nominal rate. Null: none
+        const volatile uint32_t* frame_seconds = nullptr;
     };
     /// The framework's virtual steps, in the frame function's order (between the frame's tasks and its present).
     static constexpr uint32_t kSteps[4] = {0xf0, 0x70, 0x120, 0xe8};
