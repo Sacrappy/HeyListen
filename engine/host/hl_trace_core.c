@@ -253,6 +253,17 @@ int hl_trace_lookup(uint64_t addr, HlTraceRecord *live, HlTraceFree *fr) {
     return got;
 }
 
+void hl_trace_live_each(void (*fn)(const HlTraceRecord *, void *), void *user) {
+    if (!hl_trace_mask) return;
+    for (int k = 0; k < STRIPES; k++) {
+        Stripe *s = &stripes[k];
+        lock(s);
+        for (uint32_t i = 0; i < stripe_slots; i++)
+            if (s->slot[i].addr) fn(&s->slot[i], user);
+        unlock(s);
+    }
+}
+
 /* ---- the report ---- */
 
 static void outf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
