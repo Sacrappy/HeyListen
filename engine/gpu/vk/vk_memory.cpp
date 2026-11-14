@@ -119,7 +119,7 @@ bool import_again(Pool& p, int why);
 bool pool_mirror_on();
 int64_t st_pm_made = 0, st_pm_fills = 0, st_pm_fill_bytes = 0, st_pm_live_bytes = 0, st_pm_again[kAgainKinds] = {};
 int64_t st_pm_why[6] = {};   // (a binding imported: no recording, refused, parallel segment, deferred, written here, the mirror not made)
-bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs);
+bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs, VkCommandBuffer cmd = VK_NULL_HANDLE);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
     SRWLOCK l = SRWLOCK_INIT;
     void lock() { AcquireSRWLockExclusive(&l); }
@@ -355,7 +355,9 @@ bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
 }
 #endif
 
+int64_t st_imports_asked = 0;   // (every import asked for, whatever its path: RX_VK_POOL_MIRROR's must stay 0)
 bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
+    st_imports_asked++;
     import_cooling = false;
     import_result = VK_SUCCESS;
     if (import_on_hold(lo, hi)) return false;   // (tried recently and failed: not again until the hold ends)
@@ -5184,7 +5186,7 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         --pit;
         Pool& p = pit->second;
         if (g < p.lo || g >= p.hi || p.mstate != Pool::MIRROR_ON || !p.mirror) continue;
-        if (!p.memory && !import_again(p, kAgainRb)) continue;   // (RX_VK_NO_HOST_IMPORT)
+        if (!p.memory && !p.never_imported && !import_again(p, kAgainRb)) continue;   // (RX_VK_NO_HOST_IMPORT)
         const uint64_t a = std::max(g + span_lo, p.lo) - p.lo, b = std::min(g + span_hi, p.hi) - p.lo;
         if (b <= a) continue;
         if (joined && (!ahead_made || written_ahead(p.lo + a, p.lo + b))) {   // (not here: see above)
@@ -5212,6 +5214,10 @@ bool memory_rb_refresh(VkCommandBuffer up) {
                 if (rs[k].srcOffset + rs[k].size == rs[i].srcOffset) rs[k].size += rs[i].size;
                 else rs[++k] = rs[i];
             rs.resize(k + 1);
+            if (!pp->memory && pp->never_imported) {   // (RX_VK_POOL_MIRROR: guest memory through staging, into this same command buffer)
+                staging_into_mirror(*pp, rs, up);
+                continue;
+            }
             if (scatter_add(pp->address, buffer_address(pp->mirror), rs)) continue;
             vkCmdCopyBuffer(up, pp->buffer, pp->mirror, (uint32_t)rs.size(), rs.data());
             gp.items += (int)rs.size();
@@ -5616,7 +5622,8 @@ bool pool_mirror_on() {
 }
 /// The runs [srcOffset, +size) of p's guest memory copied into its mirror at dstOffset, through a staging buffer freed once the
 /// GPU is past this recording (pools_mu held). False when no staging buffer could be made
-bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs) {
+bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs, VkCommandBuffer cmd) {
+    if (!cmd) cmd = upload_command_buffer();
     uint64_t total = 0;
     for (const VkBufferCopy& r : runs) total += r.size;
     if (!total || !p.mirror) return false;
@@ -5641,9 +5648,9 @@ bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs) {
     }
     flush_mapped(sa, total);
     {
-        GprofSpan gp(upload_command_buffer(), "pool mirror copies (guest memory through staging -> mirror)");
+        GprofSpan gp(cmd, "pool mirror copies (guest memory through staging -> mirror)");
         gp.items = (int)out.size(), gp.bytes = total;
-        vkCmdCopyBuffer(upload_command_buffer(), sb, p.mirror, (uint32_t)out.size(), out.data());
+        vkCmdCopyBuffer(cmd, sb, p.mirror, (uint32_t)out.size(), out.data());
     }
     dead_mirrors.push_back({sb, sa, mem_rec_value});   // (freed with the retired mirrors, once the GPU is past this recording)
     st_pm_live_bytes += (int64_t)total;
@@ -5671,8 +5678,9 @@ void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
          (unsigned long long)(imp_b >> 20), (long long)st_pm_why[0], (long long)st_pm_why[1], (long long)st_pm_why[2], (long long)st_pm_why[3],
          (long long)st_pm_why[4], (long long)st_pm_why[5]);
     logf("vk: write-backs of never-imported pools through staging (RX_VK_POOL_MIRROR): %lld runs, %lld MB; pages written into guest "
-         "memory %lld, left as the CPU wrote them since %lld, no live pool there %lld", (long long)st_sw_runs, (long long)(st_sw_bytes >> 20),
-         (long long)st_sw_pages_written, (long long)st_sw_pages_cpu, (long long)st_sw_pages_dead);
+         "memory %lld, left as the CPU wrote them since %lld, no live pool there %lld; IMPORTS ASKED FOR %lld", (long long)st_sw_runs,
+         (long long)(st_sw_bytes >> 20), (long long)st_sw_pages_written, (long long)st_sw_pages_cpu, (long long)st_sw_pages_dead,
+         (long long)st_imports_asked);
 }
 }  // namespace
 
