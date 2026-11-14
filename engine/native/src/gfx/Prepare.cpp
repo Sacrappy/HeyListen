@@ -141,6 +141,10 @@ void Prepare::emit_state(const PrepareState& s, const PrepareHandles& at, Comman
 }
 
 namespace {
+// (a stage and the byte of a binding word that holds its slot, 0xff none: tag 0xff stages 0, 1, 2 from bytes 0, 2, 1; tag
+// 0xfe stages 1, 6, 7 from bytes 2, 0, 1)
+constexpr uint32_t kStages[2][3][2] = {{{0, 0}, {1, 2}, {2, 1}}, {{1, 2}, {6, 0}, {7, 1}}};
+
 // One binding word's uniform buffer binds (a changed word): false when the call must go to the translation (an object
 // whose methods are not the game's known ones, a storage buffer, a tag other than 0xff and 0xfe, the inline switch).
 bool bind_word(const PrepareInputs& in, const BufferObject& b, uint32_t word, PrepareOutputs& out) {
@@ -158,7 +162,6 @@ bool bind_word(const PrepareInputs& in, const BufferObject& b, uint32_t word, Pr
     const uint64_t address = b.base + (uint64_t)step * rounded;
     // (a stage and the byte of the word that holds its slot, 0xff none: tag 0xff stages 0, 1, 2 from bytes 0, 2, 1; tag 0xfe
     // stages 1, 6, 7 from bytes 2, 0, 1)
-    static constexpr uint32_t kStages[2][3][2] = {{{0, 0}, {1, 2}, {2, 1}}, {{1, 2}, {6, 0}, {7, 1}}};
     for (const auto& [stage, at] : kStages[tag == 0xff ? 0 : 1]) {
         const uint32_t byte = (word >> (8 * at)) & 0xff;
         if (byte == 0xff) continue;
@@ -169,6 +172,40 @@ bool bind_word(const PrepareInputs& in, const BufferObject& b, uint32_t word, Pr
         d.address = address;
         d.size = b.size;
         out.bind_marked = true;
+    }
+    return true;
+}
+
+// The texture part's binds (a new id with slots): false when the call must go to the translation (a texture object being
+// made ready, a tag other than 0xff and 0xfe, the inline switch for a deferred bind). With mode bit 7 each slot binds the
+// handle the block's table holds for it (BindTexturesDeferred, the command buffer marked); without, a handle is asked of
+// the device for the slot's texture object and bound (BindTexture).
+bool bind_textures(const PrepareInputs& in, uint32_t mode, PrepareOutputs& out) {
+    const bool deferred = mode & 0x80;
+    for (uint32_t i = 0; i < 30; i++) {
+        if (!((in.texture_mask >> i) & 1)) continue;
+        const PrepareInputs::TextureSlot& s = in.textures[i];
+        if (s.word == 0xffffffffu) continue;
+        const uint32_t tag = s.word >> 24;
+        if (!deferred) {
+            if (s.ready) return false;   // (the function waits for the texture or registers it: guest code)
+            if (s.texture == 0xffffffffu || s.sampler == -1) continue;
+        }
+        // (without bit 7 the handle is asked whatever the tag; the binds by the tag, as the uniform blocks')
+        if (tag != 0xff && tag != 0xfe) return false;
+        PrepareOutputs::Texture& d = out.textures[out.texture_count++];
+        d.deferred = deferred;
+        d.entry = s.entry;
+        d.texture = s.texture;
+        d.sampler = (uint32_t)(int32_t)s.sampler;
+        for (const auto& [stage, at] : kStages[tag == 0xff ? 0 : 1]) {
+            const uint32_t byte = (s.word >> (8 * at)) & 0xff;
+            if (byte == 0xff) continue;
+            if (deferred && in.inline_switch) return false;
+            d.stage[d.stages] = stage;
+            d.slot[d.stages++] = (uint32_t)(int32_t)(int8_t)byte;
+            if (deferred) out.bind_marked = true;
+        }
     }
     return true;
 }
@@ -246,10 +283,10 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
         // (the textures: unless bit 15, a new id with any slot binds them)
         if (!(mode & 0x8000) && in.interface_id[2] != in.applied_interface_id[2]) {
             out.id_written[2] = true, out.ids[2] = in.interface_id[2];
-            if (in.texture_mask & 0x3fffffffu) return left(PrepareRoute::ProgramChanged);
+            if ((in.texture_mask & 0x3fffffffu) && !bind_textures(in, mode, out)) return left(PrepareRoute::ProgramChanged);
         }
         out.mode_bits = mode;
-        if (out.bind_count && route == PrepareRoute::ProgramBound) route = PrepareRoute::ProgramBuffers;
+        if ((out.bind_count || out.texture_count) && route == PrepareRoute::ProgramBound) route = PrepareRoute::ProgramBuffers;
     }
     if (in.pending) {
         // (the pending bits less the drawable's; any the block has not applied go to the translation, else they are the
@@ -259,8 +296,14 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
         out.mask_written = true;
         out.applied_mask = (uint16_t)bits;
     }
-    if (in.view_blocks && in.drawable_block != applied_drawable_block && block_binding != 0xffffffffu)
-        return left(PrepareRoute::DrawableBlock);
+    out.tail_binds = out.bind_count;
+    if (in.view_blocks && in.drawable_block != applied_drawable_block && block_binding != 0xffffffffu) {
+        // (the drawable's entry of the per-drawable blocks, bound by the block's binding word; its first use makes it ready
+        // through guest code)
+        if (!in.drawable_ready || !bind_word(in, in.drawable_buffer, block_binding, out)) return left(PrepareRoute::DrawableBlock);
+        out.drawable_bound = true, out.drawable_block = in.drawable_block;
+        if (route == PrepareRoute::Cached || route == PrepareRoute::ProgramBound) route = PrepareRoute::ProgramBuffers;
+    }
     if (!(mode & 8) || !(in.list_flags & 1)) return left(PrepareRoute::Streams);
     if (in.list_flags & 2) {
         if (in.inline_switch) return left(PrepareRoute::Inline);
@@ -276,7 +319,22 @@ void Prepare::emit(const PrepareOutputs& out, const PrepareHandles& at, CommandS
     if (out.state_recorded && with_state) emit_state(out.state, at, sink);
     if (out.program_bound)
         sink.emit(command(Proc::CommandBufferBindProgram, out.binder, out.program_object, out.program_stages));
-    for (uint32_t i = 0; i < out.bind_count; i++) {
+    for (uint32_t i = 0; i < out.tail_binds; i++) {
+        const PrepareOutputs::Bind& b = out.binds[i];
+        sink.emit(command(Proc::CommandBufferBindUniformBuffer, at.bind_buffer, b.stage, b.slot, b.address, b.size));
+    }
+    for (uint32_t i = 0; i < out.texture_count; i++) {
+        const PrepareOutputs::Texture& x = out.textures[i];
+        if (x.deferred) {
+            for (uint32_t k = 0; k < x.stages; k++)
+                sink.emit(command(Proc::CommandBufferBindTexturesDeferred, at.bind_buffer, x.stage[k], x.slot[k], 1, x.entry));
+            continue;
+        }
+        sink.emit(command(Proc::DeviceGetTextureHandle, at.device, x.texture, x.sampler));
+        for (uint32_t k = 0; k < x.stages; k++)
+            sink.emit(command(Proc::CommandBufferBindTexture, at.bind_buffer, x.stage[k], x.slot[k], at.handles[i]));
+    }
+    for (uint32_t i = out.tail_binds; i < out.bind_count; i++) {
         const PrepareOutputs::Bind& b = out.binds[i];
         sink.emit(command(Proc::CommandBufferBindUniformBuffer, at.bind_buffer, b.stage, b.slot, b.address, b.size));
     }

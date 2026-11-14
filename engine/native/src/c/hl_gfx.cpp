@@ -443,6 +443,19 @@ void file_shape(uint64_t s) {
 }
 }   // namespace
 
+namespace {
+// The texture handles a call binds, asked of the NVN device in its order (a query: it changes nothing; the check's
+// recording carries it too)
+void ask_handles(const hl::gfx::PrepareInputs& in, const hl::gfx::PrepareOutputs& out, hl::gfx::PrepareHandles& at) {
+    if (!out.texture_count || !hl::gfx::Prepare::native(out.route)) return;
+    at.device = in.device;
+    for (uint32_t i = 0; i < out.texture_count; i++)
+        if (!out.textures[i].deferred)
+            at.handles[i] = g_nvn.ask(hl::gfx::command(hl::gfx::Proc::DeviceGetTextureHandle, in.device,
+                                                   out.textures[i].texture, out.textures[i].sampler));
+}
+}   // namespace
+
 extern "C" uint64_t hl_gfx_prep_address(void) { return hl::bridge::kPrepareSubmesh; }
 
 extern "C" int hl_gfx_prep_start(const hl_guest_host* host, const hl_gfx_host* gfx, int check, int state) {
@@ -459,7 +472,8 @@ extern "C" int hl_gfx_prep_apply(uint64_t block, uint64_t drawable, uint64_t sp,
     hl::gfx::PrepareHandles at;
     g_prep->read(block, drawable, in, at);
     const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in, g_prep_state);
-    if (out.state_recorded || out.bind_count) g_prep->state_handles(block, sp, at);
+    if (out.state_recorded || out.bind_count || out.texture_count) g_prep->state_handles(block, sp, at);
+    ask_handles(in, out, at);
     g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
     if (!hl::gfx::Prepare::native(out.route)) return 0;
     // (the block and the mark first: the function writes them before its call)
@@ -482,7 +496,8 @@ extern "C" void hl_gfx_prep_check_begin(uint64_t block, uint64_t drawable, uint6
     hl::gfx::PrepareInputs in;
     g_prep->read(block, drawable, in, t.at);
     const hl::gfx::PrepareOutputs out = hl::gfx::Prepare::decide(in, g_prep_state);
-    if (out.state_recorded || out.bind_count) g_prep->state_handles(block, sp, t.at);
+    if (out.state_recorded || out.bind_count || out.texture_count) g_prep->state_handles(block, sp, t.at);
+    ask_handles(in, out, t.at);
     g_prep_routes[(int)out.route].fetch_add(1, std::memory_order_relaxed);
     t.route = out.route;
     t.result = out.result;
