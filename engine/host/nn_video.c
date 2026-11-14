@@ -93,6 +93,8 @@ typedef struct {
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
     int64_t clock_ns, clock_pts;
     int64_t last_pts;                /* the pts of the last picture handed out */
+    int last_slot;                   /* (HeyListen) the buffer it went into, plus one (0: none yet) */
+    int64_t held;                    /* (HeyListen) acquisitions answered with that picture again (ahead of the clock) */
     int64_t log_submits;             /* (HOS_VIDEO_LOG) submissions still to log, after a flush or the end */
     SRWLOCK lock;
 } Dec;
@@ -635,6 +637,37 @@ static void dec_acquire(Ctx *c) {
         }
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
     }
+    {   /* (HeyListen) And above 60 fps the game still takes one picture a frame: at 120 the movie ran at twice its speed,
+           ended early and stayed black while its sound and voice lines went on (the owner's v0.3.2 report). A picture
+           ahead of the movie's clock (by more than half a frame at 60) is not handed out yet: the buffer gets the last
+           picture again, as a display shows a frame until the next one is due. Only for pools the game reads through
+           the API (OoT's): nothing in guest memory to keep. HOS_VIDEO_NO_HOLD=1: as before */
+        static int no_hold = -1;
+        if (no_hold < 0) no_hold = getenv("HOS_VIDEO_NO_HOLD") != NULL;
+        const int64_t due = d->clock_pts + (hos_now_ns() - d->clock_ns), early = 8000000;
+        const int prev = d->last_slot - 1;
+        Pool *to = (Pool *)host_of(d->slots[slot], POOL_MAGIC);
+        Pool *from = prev >= 0 && prev < MAX_SLOTS ? (Pool *)host_of(d->slots[prev], POOL_MAGIC) : NULL;
+        if (!no_hold && from && to && to->read_by_api && !d->queue[d->qhead].last && d->queue[d->qhead].pts > due + early &&
+            (prev == slot || (to->w == from->w && to->h == from->h && to->nv12 && from->nv12))) {
+            if (prev != slot) {
+                memcpy(to->nv12, from->nv12, (size_t)to->w * to->h * 3 / 2);
+                to->rgba_stale = 1;   /* (made from the NV12 picture if a reader asks for RGBA) */
+            }
+            d->slot_pts[slot] = d->last_pts;
+            d->slot_last[slot] = 0;
+            d->busy[slot] = 1;
+            d->last_slot = slot + 1;
+            d->held++;
+            if (video_log() && d->held % 120 == 1)
+                hos_log("video: acquire %lld: the last picture again (the next is %.1f ms ahead of the movie's clock; %lld so far)",
+                        (long long)d->acquires, (double)(d->queue[d->qhead].pts - due) / 1e6, (long long)d->held);
+            ReleaseSRWLockExclusive(&d->lock);
+            if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
+            RET(0);
+            return;
+        }
+    }
     Picture *p = &d->queue[d->qhead];
     Pool *o = (Pool *)host_of(d->slots[slot], POOL_MAGIC);
     /* (the picture at the pool's size: rows and columns past either are left out) */
@@ -664,6 +697,7 @@ static void dec_acquire(Ctx *c) {
         }
     }
     d->slot_pts[slot] = d->last_pts = p->pts;
+    d->last_slot = slot + 1;
     d->slot_last[slot] = p->last;
     d->busy[slot] = 1;
     {   /* (hookshot) HOS_VIDEO_LOG: the picture's time against this decoder's movie clock, to see it fall behind the sound */
