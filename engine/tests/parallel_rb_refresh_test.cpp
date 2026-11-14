@@ -69,6 +69,8 @@ void memory_protect_gpu(uint64_t, uint64_t) {}
 void diff_gpu_wrote(uint64_t, uint64_t) {}   // (TICK-048: the chunk diff's GPU-write note; off in the model)
 void late_shadow_void_range(uint64_t, uint64_t) {}   // (TICK-053: the late-merge shadows' void; RX_VK_LATE_MERGE is off by default, so no shadows)
 bool slow_desc_timing() { return false; }
+constexpr uint16_t kUseStorage = 8;   // (vk_ledger.h, RX_VK_LEDGER: off in the model)
+struct LedgerUse { explicit LedgerUse(uint16_t) {} };
 uint64_t texture_segment();
 void memory_rb_recording_begun();
 void memory_rb_segments_begin(uint64_t base, uint64_t n);
