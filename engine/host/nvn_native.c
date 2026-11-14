@@ -1069,11 +1069,12 @@ static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: f
    MKW writes some of a frame's data in place right after its submit, as the console's GPU has read it by then.
    HOS_NVN_HOLD=1: every submit held. HOS_NVN_HOLD=2 (below; the default since TICK-054, =0: none held): only those of threads
    other than the presenting one, replayed ~20 us later by a host thread. */
-typedef struct { int n; uint64_t h[64]; uint64_t queue; uint32_t *pages; int64_t npages; uint8_t *copy; int64_t t; int64_t f; } held_submit;
+typedef struct { int n; uint64_t h[64]; uint64_t queue; uint32_t *pages; int64_t npages; uint8_t *copy; int64_t t; } held_submit;
 /* (HeyListen, RX_VK_LAG_LOG: the back end's measurement of the replay's lag, gpu/vk/vk_lag.cpp) when the game made the submit now being
    handed over, and the game's presents then; read by the back end through hos_lag_sub. And the counts of the game's sync calls
    by kind and of the held submits' flushes by cause (hos_lag_counts). */
 static __thread int64_t lag_t_sub, lag_f_sub;
+static int64_t lag_held_ts[256], lag_held_f[256], lag_local_ts[256], lag_local_f[256];   /* (the held submits' own: indexed as held[]) */
 static volatile LONG64 lag_c[24];
 enum { LC_SYNC, LC_NEVER, LC_FENCED, LC_OTHER, LC_SAT, LC_ALREADY, LC_TIMEOUT, LC_POLL, LC_EVENT, LC_FINISH, LC_FENCE };
 extern volatile LONG64 hos_present_count;   /* display.c */
@@ -1164,6 +1165,7 @@ static void held_flush_why(int why) {
     EnterCriticalSection(&held_cs);
     n = nheld;
     memcpy(local, held, sizeof *held * (size_t)n);
+    memcpy(lag_local_ts, lag_held_ts, sizeof *lag_held_ts * (size_t)n), memcpy(lag_local_f, lag_held_f, sizeof *lag_held_f * (size_t)n);
     nheld = 0;
     LeaveCriticalSection(&held_cs);
     if (n) {
@@ -1178,7 +1180,7 @@ static void held_flush_why(int why) {
                 local[i].pages = NULL, local[i].copy = NULL;
             }
             HOS_JT(JT_MARK, 1, (uint64_t)i);   /* (TICK-054: the held submit's capture and replay, on this thread) */
-            lag_t_sub = local[i].t, lag_f_sub = local[i].f;
+            lag_t_sub = lag_local_ts[i], lag_f_sub = lag_local_f[i];
             if (hold_on == 2) rx_nvn_submit_q(local[i].h, local[i].n, local[i].queue);
             else rx_nvn_submit(local[i].h, local[i].n);
             HOS_JT(JT_MARK, 2, (uint64_t)i);
@@ -2742,7 +2744,8 @@ NV(nvnQueueSubmitCommands) {
     memcpy(hs->h, h, 8 * (size_t)n);
     hs->queue = (uint64_t)(uintptr_t)q;
     hs->pages = NULL, hs->copy = NULL, hs->npages = 0;
-    hs->t = lag_t_sub, hs->f = lag_f_sub;
+    hs->t = hos_now_ns();
+    lag_held_ts[hs - held] = lag_t_sub, lag_held_f[hs - held] = lag_f_sub;
     if (hold_check) hs->npages = hos_hold_snapshot(&hs->pages, &hs->copy);
     nheld++;
     if (hold_linger_ns > 0) hold_linger_thread = (void *)hos_self(), InterlockedExchange64(&hold_linger_until, hs->t + hold_linger_ns);

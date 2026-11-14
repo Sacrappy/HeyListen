@@ -653,10 +653,9 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         nsig++;
         std::lock_guard mk(rec_map_mu);
-        for (uint64_t v : rec_open_values) {
-            value_rec.emplace(v, seq);
-            if (sync_honest_on()) value_end[v] = seq;   // (RX_VK_SYNC_HONEST: the recording its last piece went into)
-        }
+        for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
+        if (sync_honest_on())   // (RX_VK_SYNC_HONEST: the recording the last piece of each went into)
+            for (uint64_t v : rec_open_values) value_end[v] = seq;
         if (r.value) value_rec.emplace(r.value, seq);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
