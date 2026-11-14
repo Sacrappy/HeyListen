@@ -174,11 +174,12 @@ static DWORD WINAPI dump_after(void *p) {
 }
 
 /* ---- HL_STEP_SCAN=<s> (with HL_TRACE=1): which of the game's objects count frames and which count time ----
-   At <s> seconds every live block of 16 KB or less (512 MB at most) is copied; one second later each 32-bit word is
-   compared with its copy. Over that second P frames were presented: a word that went up by exactly P is a frame counter,
-   one that went up by 60 (+-1) counts the game's time in 1/60 s; a float that went up by P, by 60 or by 1.0 (+-2%) the
+   At <s> seconds every live block of 16 KB or less (512 MB at most) is copied; W seconds later (HL_STEP_SCAN_SECS, 5) each 32-bit word is
+   compared with its copy. Over those W seconds P frames were presented: a word that went up by P (+-1) is a frame counter,
+   one that went up by 60 W (+-3%) counts the game's time in 1/60 s; a float that went up by P, by 60 W or by W (+-3%) the
    same in floats. Words are summed by the allocation site of their block (its caller chain's first two return
-   addresses): at a frame rate other than 60 (HL_FPS_LIMIT=120 in a run) the frame-counted objects and their makers stand
+   addresses): at a frame rate 10% or more away from 60 (HL_FPS_LIMIT=120, or HOS_FRAME_SLEEP_MS for a slower one) the
+   frame-counted objects and their makers stand
    apart from the time-counted ones. The table goes to the log and to hl_step_scan.txt. */
 typedef struct {
     uint64_t addr, size, off;
@@ -222,8 +223,10 @@ static DWORD WINAPI step_scan(void *p) {
     hl_trace_live_each(scan_take, &s);
     const int64_t p0 = hos_vi_presents();
     for (size_t k = 0; k < s.n; k++) memcpy(s.bytes + s.blocks[k].off, GP(s.blocks[k].addr), s.blocks[k].size);
-    Sleep(1000);
-    const int64_t P = hos_vi_presents() - p0;
+    const char *ws = getenv("HL_STEP_SCAN_SECS");
+    const int W = ws && atoi(ws) > 0 ? atoi(ws) : 5;
+    Sleep((DWORD)W * 1000);
+    const int64_t P = hos_vi_presents() - p0, T = 60 * W;   /* (frames presented; the game's time in 1/60 s) */
     enum { SITES = 1 << 16 };
     Site *sites = calloc(SITES, sizeof *sites);
     if (!sites) return 0;
@@ -246,24 +249,26 @@ static DWORD WINAPI step_scan(void *p) {
             if (a == c) continue;
             st->words++;
             const int64_t d = (int64_t)(int32_t)(c - a);
-            if (d == P && P != 60) st->frames++, frames++;
-            else if (d >= 59 && d <= 61 && (P < 57 || P > 63)) st->time++, time++;
+            const int apart = P < T * 9 / 10 || P > T * 11 / 10;   /* (frames and time told apart) */
+            if (apart && d >= P - 1 && d <= P + 1) st->frames++, frames++;
+            else if (apart && d >= T * 97 / 100 && d <= T * 103 / 100) st->time++, time++;
             float fa, fc;
             memcpy(&fa, &a, 4);
             memcpy(&fc, &c, 4);
             const float df = fc - fa;
             if (fa == fa && fc == fc && fa > -1e7f && fa < 1e7f && fc > -1e7f && fc < 1e7f) {
-                if (P != 60 && df > 0.98f * P && df < 1.02f * P) st->fframes++, frames++;
-                else if ((P < 57 || P > 63) && df > 58.8f && df < 61.2f) st->ftime++, time++;
-                else if (df > 0.98f && df < 1.02f) st->fsec++, time++;
+                const int apart = P < T * 9 / 10 || P > T * 11 / 10;
+                if (apart && df > 0.98f * P && df < 1.02f * P) st->fframes++, frames++;
+                else if (apart && df > 0.97f * T && df < 1.03f * T) st->ftime++, time++;
+                else if (apart && df > 0.97f * W && df < 1.03f * W) st->fsec++, time++;
             }
         }
     }
     FILE *f = fopen("hl_step_scan.txt", "w");
     char line[256];
 #define SCAN_OUT(...) do { snprintf(line, sizeof line, __VA_ARGS__); hos_log("%s", line); if (f) fprintf(f, "%s\n", line); } while (0)
-    SCAN_OUT("hl step scan: %llu blocks (%llu MB) compared over 1 s with %lld frames presented: %llu words counting frames, "
-             "%llu counting time", (unsigned long long)s.n, (unsigned long long)(s.used >> 20), (long long)P,
+    SCAN_OUT("hl step scan: %llu blocks (%llu MB) compared over %d s with %lld frames presented: %llu words counting frames, "
+             "%llu counting time", (unsigned long long)s.n, (unsigned long long)(s.used >> 20), W, (long long)P,
              (unsigned long long)frames, (unsigned long long)time);
     qsort(sites, SITES, sizeof *sites, by_frames);
     for (int k = 0; k < 40 && sites[k].frames + sites[k].fframes; k++)
