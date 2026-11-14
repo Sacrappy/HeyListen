@@ -82,6 +82,8 @@ std::mutex pools_mu;
 // (RX_VK_NO_HOST_IMPORT: every pool of the model keeps its import, so it is never imported again)
 enum { kAgainRb = 4 };
 bool import_again(Pool&, int) { return true; }
+// (RX_VK_POOL_MIRROR: off in the model, every pool imported: never reached)
+bool staging_into_mirror(Pool&, std::vector<VkBufferCopy>&, VkCommandBuffer = VK_NULL_HANDLE) { return false; }
 std::map<uint64_t, Pool> imported;
 uint64_t mirror_epoch = 0;
 bool mirror_upload = false;

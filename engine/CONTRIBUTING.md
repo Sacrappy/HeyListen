@@ -82,7 +82,7 @@ about 10 GB of RAM.
 
 ### Linux
 
-Either use the `Hookshot-<version>-x86_64.AppImage` from the Releases page, or build the environment and the AppImage
+Either use the `HeyListen-<version>-x86_64.AppImage` from the Releases page, or build the environment and the AppImage
 yourself:
 
 ```sh
@@ -174,7 +174,8 @@ cache in `RX_CPM` or `build-linux/deps/cpm`), or the `zstandard` package. A chec
 says so; CI passes `--strict`, which fails it instead. The checked-in shader headers are compared with glslang
 16.6.0's output, so an older `glslangValidator` on PATH (Ubuntu 22.04's is 11) fails those comparisons. The skip list at the top of `tests/run_all.py` names the checks
 that cannot run in CI (a GPU, the game, a Visual Studio prompt) and the few that run on Linux only; `--no-skip` runs
-them anyway.
+them anyway, as naming a check does. The two GPU checks (`present_aspect_vulkan`, `bc_storage_views`) run on Windows or
+Linux with a Vulkan device; nothing in CI builds them, so run them after changing the code they copy.
 
 In HeyListen, GitHub runs only the root `.github/workflows`: `linux.yml` runs these checks with `--strict` on Ubuntu 24.04
 (clang, spirv-tools, glslang 16.6.0 and the pinned SPIR-V and Vulkan headers, as `engine/.github/workflows/source-regressions.yml`

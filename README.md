@@ -1,6 +1,6 @@
 # HeyListen
 
-A native Windows port of *The Legend of Zelda: Ocarina of Time* (**Nintendo Switch 2** build, title `0400486024DEC000`), made by statically recompiling **your own** copy of the game, with a Vulkan back end. HeyListen is a performance-focused fork of [Hookshot](https://github.com/NotRexed/Hookshot) by NotRexed.
+A native Windows and Linux port of *The Legend of Zelda: Ocarina of Time* (**Nintendo Switch 2** build, title `0400486024DEC000`), made by statically recompiling **your own** copy of the game, with a Vulkan back end. HeyListen is a performance-focused fork of [Hookshot](https://github.com/NotRexed/Hookshot) by NotRexed.
 
 This repository contains **no game code, keys, ROM or generated files**. Everything derived from the game is built locally from the user's own copy. HeyListen is not affiliated with or endorsed by Nintendo.
 
@@ -16,8 +16,8 @@ This repository contains **no game code, keys, ROM or generated files**. Everyth
 Full guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 **You need**
-- Windows 10 or 11 (64-bit), a CPU with AVX2, 16 GB of RAM or more.
-- A GPU with Vulkan 1.3 and mesh shaders; 12 GB of VRAM recommended. Tested on NVIDIA RTX only.
+- Windows 10 or 11 (64-bit), or Linux (an AppImage since v0.3.2, new and little tested: [the guide's Linux section](docs/USER_GUIDE.md#linux)); a CPU with AVX2, 16 GB of RAM or more.
+- A GPU with Vulkan 1.3 and mesh shaders; 12 GB of VRAM recommended. Tested on NVIDIA RTX (Windows); on Linux a contributor plays on an AMD Radeon RX 9070 XT (Mesa's RADV driver), natively, with no Wine or Proton. AMD on Windows and Intel are untested.
 - About 60 GB free while building and a connection for the first download (about 500 MB).
 - Your own game, dumped from your Switch 2 as a `.nup` (program `0400486024DEC000`, update v131072, build `e0f3ccfa`). HeyListen does not help with dumping and never asks for keys or firmware.
 
@@ -97,7 +97,11 @@ git subtree pull --prefix=engine upstream-hookshot main
 
 ## Credits
 
-HeyListen is **made by Sacrappy**, on top of the work of many people. Everything below is credit due to Hookshot's own contributors, whose recompiler, builder and renderer do the work:
+HeyListen is **made by Sacrappy**, with contributions from:
+
+- **[Mooseca](https://github.com/Mooseca)**: Linux (the engine builds again, the CI job, the game tested on a Radeon RX 9070 XT, what the players' guide says about it), the shaders prepared again when the program cache lost them, and the checks that build and run again.
+
+It stands on the work of many people. Everything below is credit due to Hookshot's own contributors, whose recompiler, builder and renderer do the work:
 
 - **NotRexed**: [Hookshot](https://github.com/NotRexed/Hookshot), BlueShell (Mario Kart World), Skybound (Tears of the Kingdom) and the a64-kit tools.
 - **[Eden](https://git.eden-emu.dev/eden-emu/eden)** and **Eglantine**: the shader recompiler and Switch 2 shader work.

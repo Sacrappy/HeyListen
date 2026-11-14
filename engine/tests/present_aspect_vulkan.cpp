@@ -2,6 +2,7 @@
 // production helpers/present block at the markers below; no game content is used.
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +15,7 @@ using namespace mkwvk;
 VkDevice device;
 VkPhysicalDevice physical;
 VkPhysicalDeviceMemoryProperties memory_props;
-struct { VkExtent2D swap_extent; } dev;
+struct { VkExtent2D swap_extent; bool hdr; } dev;
 float display_aspect;
 float get_aspect() { return display_aspect; }
 struct Host { float (*aspect_ratio)(); } host_object{get_aspect};
@@ -22,6 +23,11 @@ Host* host = &host_object;
 VkImage framegen_scale(VkCommandBuffer,VkImageView,VkImage,uint32_t,uint32_t,const int*,uint32_t,uint32_t) {
     return VK_NULL_HANDLE; // This GPU fixture exercises direct blits; filtered routing is covered by L1.
 }
+// The HDR route needs a view of the game's picture, which this fixture never has (view stays null): these only link.
+std::atomic<bool> present_native_pq{false};
+VkImageView framegen_scaled_view() { return VK_NULL_HANDLE; }
+VkImage framegen_hdr(VkCommandBuffer,VkImageView,uint32_t,uint32_t,const int*,uint32_t,uint32_t) { return VK_NULL_HANDLE; }
+void full_barrier(VkCommandBuffer,const char* = nullptr) {}
 // @PRODUCTION_HELPERS@
 void record_actual(VkCommandBuffer command,VkImage src,uint32_t sw,uint32_t sh,const int* crop,VkImage dst) {
     struct { VkCommandBuffer cmd; } f{command};

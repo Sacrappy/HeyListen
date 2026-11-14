@@ -35,7 +35,7 @@ def main():
 #include <vector>
 #define CHECK(x) do { if(!(x)){std::fprintf(stderr,"FAIL:%d %s\\n",__LINE__,#x);std::exit(1);} }while(0)
 struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false,never_imported=false; };
-bool pool_mirror_on() { return false; } int64_t st_pm_made=0;   // (RX_VK_POOL_MIRROR: off in the fixture: every pool imported)
+bool pool_mirror_on() { return false; } int64_t st_pm_made=0, st_imports_asked=0;   // (RX_VK_POOL_MIRROR: off in the fixture: every pool imported)
 struct GuestPool { uint64_t lo,hi; };
 std::vector<GuestPool> guest_pools;
 std::map<uint64_t,Pool> imported;

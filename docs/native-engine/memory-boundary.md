@@ -1881,3 +1881,65 @@ MB in use from 423 s to the end.
 2. The window's growth (+4.2 GB) is the game's heaps: the memory manager's job (section 4).
 3. The arenas (4.6 GB commit, 3.9 GB RAM at the peak): start-up work (section 16 item 1).
 4. The BC cache's 1 GB of RAM when VRAM is above 3/4 of its budget (section 11.1): it earns its memory only if textures are made again.
+
+### Lever B, complete: no pool imported (B3), cold pages of live pools dropped (B4), measured (B5)
+
+**B3: the write-backs through staging; nothing imports** (`vk_memory.cpp` "the write-backs of never-imported pools, through
+staging"; `vk_replay.cpp`).
+- A never-imported pool the GPU writes has its written runs copied, inside the submission, from its mirror into a host-cached
+  staging buffer. Staging buffers are kept and taken again: making and freeing one every submission, about 200 a second, slowed
+  the game to 43-52 fps in two builds.
+- The first thread that sees that submission's timeline value done writes the runs into guest memory
+  (`memory_staged_apply`). That is `completed()` and every wait in `vk_replay.cpp`, before they report the value. So anything
+  that then reads guest memory finds the GPU's bytes there, as it did through the import.
+- Each page goes through `hos_gpu_write_live`: written only inside a live pool, and not over a page the CPU wrote since its
+  last collection. A page already equal in guest memory is left alone: 17.0 M pages equal, 2.2 M written in a 110 s run.
+- Readback refreshes and live pages go through staging too. Texel views read through the mirror and are bound at every use, so
+  they are synced and written back like any buffer. The GPU unswizzle uses its CPU path for these pools.
+- `IMPORTS ASKED FOR`, counted in `import_pool` itself, so every path is covered: **0 in every run with the switch.**
+- Nothing in these runs needed an import. What it costs instead: the write-backs (about 2 MB a submit) cross PCIe into host
+  memory and are compared and written by the CPU, where the GPU used to write guest memory itself.
+
+**B4: the drop told** (`hos_mirror_held`, once a never-imported pool's mirror fill is done and the GPU never wrote it).
+`HL_MEM_DROP_POOLS` then drops the pool's cold granules into the spill, after comparing them with the mirror read back.
+- Restores come from the spill. The re-import that restored 280 MB at once (1.57 s, section 15) no longer exists.
+- The longest touch was **0.47 ms in a 110 s run and 20-49 ms in the 420 s runs**.
+- The worst cost left is on the drop's own thread: a mirror read of up to 1.0 s, which no game thread waits for.
+
+**B5: 420 s runs, one game of mine at a time** (another stream's game ran in slot b during them: the working sets are not
+comparable between runs, and the fps are not either). The ledger's table at 360 s, MB:
+
+| Zone, configuration | Game RAM (pools) | Game committed | Process commit | VRAM | Mirrors | Imports | Mirror check | Dropped (of mirrors) | Longest touch |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| hyrule-field, levers off | 1398 (1027) | 9294 | 20560 | 5552 | 1608 | 1768 | - | - | - |
+| hyrule-field, B | 535 (358) | 8545 | 18417 | 4010 | 779 | **0** | 0 mismatches | - | - |
+| hyrule-field, B + drop | 503 (332) | **5357** | **15705** | 4151 | 775 | **0** | 0 mismatches | 3174 (486) | 20 ms |
+| market, levers off | 441 (241) | 7407 | 17816 | 4614 | 1351 | 1511 | - | - | - |
+| market, B | 477 (290) | 7334 | 18438 | 4643 | 760 | **0** | 0 mismatches | - | - |
+| market, B + drop | 617 (435) | **5549** | **17283** | 5703 | 1171 | **0** | 2 (see below) | 2470 (833) | 49 ms |
+
+What it says:
+- **Imports go from 1.5-1.8 GB to 0 and mirrors halve** (1608 -> 779, 1351 -> 760 MB).
+- With the drop the game's committed memory falls by 1.9-3.9 GB (9.3 -> 5.4 GB in the field) and the process commit by
+  0.5-4.9 GB.
+- VRAM falls 1.5 GB in the field with B. In the market it does not: the textures' VRAM varies between runs by more than the
+  mirrors' 0.6 GB.
+- The game's RAM at 360 s is low in every run (cold pages and the trims of a machine running two games), so these runs do not
+  measure the RAM gain. The owner's session will.
+- The market B + drop run's mirror check counted 2 mismatches, both on the first page of a CPU-uncached (`0x22`) pool. The
+  check waited 500 ms for the write marks' collection, and during a load there may be no submit in that time. The check now
+  waits for two of the game's submits (5 s at most) and counts what is still unsettled apart. The rerun is below.
+- The rerun with the stricter check (`r1-pm9`, market, B + drop, 420 s) finished clean:
+  - mirror check: 144 pools, 12 of them written by the GPU, 47,354 pages compared, 0 unsettled, **0 mismatches**;
+  - drop check: 0 mismatches; imports asked for: 0;
+  - at 360 s: game committed 5034 MB, process commit 15667 MB, VRAM 4406 MB, mirrors 744 MB, 2199 MB dropped (482 MB of it
+    mirrored pools);
+  - longest touch 10 ms; last shots right.
+
+Switches for a hand-played session with lever B:
+`RX_VK_POOL_MIRROR=1 RX_VK_POOL_MIRROR_CHECK=1 HOS_GUEST_PAGES=1 HL_MEM_DROP=1 HL_MEM_DROP_POOLS=1 HL_MEM_DROP_CHECK=1 HL_MEM_DROP_LOG=1 RX_VK_LEDGER=60 RX_VK_RES_LOG=1`.
+Lines to read:
+- `vk: pool mirror check` (MISMATCHES must stay 0);
+- `vk: write-backs of never-imported pools through staging` (IMPORTS ASKED FOR must stay 0);
+- `hl drop:` (MISMATCHES 0, the longest touch);
+- the ledger's tables.

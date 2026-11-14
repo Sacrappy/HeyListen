@@ -185,7 +185,9 @@ struct Texture {   // (the fields texture.cpp's astc_trace_note reads (TICK-051 
     uint32_t levels = 1, layers = 1, width = 0, height = 0, nvn_format = 0;
     uint64_t gpu = 0;
 };
+namespace {   // (the cut leaves vk_texture.cpp's anonymous namespace and opens it again, around upload_to_earliest_*)
 #include "init_upload.inc"
+}  // namespace
 #include "init_hooks.inc"
 
 // ---- create()'s initialization of a new image ----

@@ -1556,7 +1556,7 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     default: return false;
     }
     if (!unswizzle_ready()) return false;
-    const BufferRef src = gpu_buffer(tex.gpu, total);
+    const BufferRef src = gpu_buffer(tex.gpu, total, kGpuBufferUnswizzle);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;
     st_import_unswizzle_bytes.fetch_add((int64_t)total, std::memory_order_relaxed);   // (TICK-019: read in guest memory; an upper bound)
@@ -4027,12 +4027,17 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
     // (a formatted store into it: textures over that memory are uploaded again once the GPU is done)
     if (storage) texture_gpu_wrote(t->gpu, size);
     static std::unordered_map<uint64_t, VkBufferView> views;
-    const uint64_t key = mix(mix(t->gpu, (uint64_t)f << 1 | storage), size);
+    // (RX_VK_POOL_MIRROR: a pool never imported is read through its mirror, bound at every use as any buffer is: synced with the
+    // CPU's writes, and written back when the view is a storage one; the view kept by buffer and offset too)
+    BufferRef b;
+    const bool every_use = memory_pool_mirror_on();
+    if (every_use) b = gpu_buffer(t->gpu, size, storage ? kGpuBufferWritten : kGpuBufferRead);
+    const uint64_t key = mix(mix(mix(t->gpu, (uint64_t)f << 1 | storage), size), every_use ? mix((uint64_t)b.buffer, b.offset) : 0);
     st_import_texel_views.fetch_add(1, std::memory_order_relaxed);   // (TICK-019: a view of the imported pool itself, never its mirror)
     st_import_texel_bytes.fetch_add((int64_t)size, std::memory_order_relaxed);
     auto it = views.find(key);
     if (it != views.end()) return it->second;
-    BufferRef b = gpu_buffer(t->gpu, size);
+    if (!every_use) b = gpu_buffer(t->gpu, size);
     VkBufferView bv = VK_NULL_HANDLE;
     if (b && b.offset % std::max<uint64_t>(dev.props.limits.minTexelBufferOffsetAlignment, 1) == 0) {
         VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};

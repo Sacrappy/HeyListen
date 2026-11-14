@@ -196,6 +196,7 @@ void recording_wait(Recording& r) {
 uint64_t completed() {
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(dev.device, timeline, &v);
+    memory_staged_apply(v);   // (RX_VK_POOL_MIRROR: the write-backs staged up to v in guest memory before anyone is told v is done)
     return v;
 }
 // ---- (test) RX_VK_BATCH=1: the replay's submits held and sent as one vkQueueSubmit2 ----
@@ -258,6 +259,7 @@ void vk_timeline_wait_sent(uint64_t v) {
     wi.pSemaphores = &timeline;
     wi.pValues = &v;
     for (int i = 0; i < 8 && vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT; i++) {}
+    (void)completed();   // (RX_VK_POOL_MIRROR: its staged write-backs applied)
 }
 // (TICK-060) Before taking the queue's lock to send something: a pending late fix's value waited for here, outside the lock, so the
 // flush under it does not wait there and hold up the threads that only hold their recordings back meanwhile (the Presentation
@@ -406,6 +408,7 @@ void wait_value(uint64_t v) {
     wi.pSemaphores = &timeline;
     wi.pValues = &v;
     vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
+    (void)completed();   // (RX_VK_POOL_MIRROR: its staged write-backs applied)
 }
 } // namespace
 uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
@@ -423,6 +426,7 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
         static std::atomic<int> logged{0};
         if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
     }
+    (void)completed();   // (RX_VK_POOL_MIRROR: its staged write-backs applied)
     {   // (TICK-010) what the capture waits for: how long, how far ahead of the GPU, and how long the GPU had it by then
         static std::mutex mu;
         static int64_t n, unsub, wait_ns, max_ns, gpu_had_ns, ahead, n_traced;
@@ -3416,6 +3420,7 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     wi.pSemaphores = &rec_timeline;
     wi.pValues = &seq;
     *ok = vkWaitSemaphores(dev.device, &wi, timeout_ns) == VK_SUCCESS;
+    (void)completed();   // (RX_VK_POOL_MIRROR: the staged write-backs of what is done applied)
     return true;
 }
 uint64_t fence();
@@ -3540,6 +3545,7 @@ int wait_inner(uint64_t f, uint64_t timeout_ns) {
     wi.pValues = &f;
     queue_flush_for(FR_WAIT);
     const VkResult res = vkWaitSemaphores(dev.device, &wi, timeout_ns);
+    if (res == VK_SUCCESS) (void)completed();   // (RX_VK_POOL_MIRROR: its staged write-backs applied)
     static int logged;
     if (res != VK_SUCCESS && timeout_ns > 1000000000ull && logged++ < 8)
         logf("vk: wait for fence %llu (done %llu, pushed %llu): %d", (unsigned long long)f,

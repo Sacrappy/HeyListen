@@ -94,7 +94,8 @@ executors instead of six (patches in `docs/research/`).
 - **Occlusion is off** (a fixed value, as in Hookshot): real occlusion queries break the picture; some scenes draw more than
   they need.
 - **12 GB of VRAM recommended.** 8 GB cards are untested.
-- **Tested on NVIDIA RTX only.** AMD and Intel cards are untested in HeyListen (see Hookshot's notes for them).
+- **Tested on NVIDIA RTX on Windows.** AMD and Intel cards are untested on Windows in HeyListen (see Hookshot's notes for
+  them). On Linux a contributor plays on an AMD Radeon RX 9070 XT (RADV): see the guide's Linux section.
 - **Frame generation is off by default** (turn it on in the Insert menu if you want to try it).
 - The first build takes a long time (tens of minutes, then shader preparation); later updates rebuild only what changed.
 - The in-game update offer is opt-in (set `HOOKSHOT_UPDATE_CHECK=1` in the game folder's `hookshot_env.txt`); the builder
