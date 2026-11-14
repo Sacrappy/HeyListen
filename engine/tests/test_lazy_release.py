@@ -52,6 +52,10 @@ def main():
     for want in ("LOCK();", "tracked[i].lo", "a64_dirty[", "UNLOCK();"):
         if want not in live_write:
             raise SystemExit(f"hos_gpu_write_live does not use {want!r}")
+    # the host's live list must not lose a live pool: a pool object finalized twice untracks its range once only
+    finalize = block((ROOT / "host" / "nvn_native.c").read_text(encoding="utf-8"), "NV(nvnMemoryPoolFinalize)")
+    if "o->mem && o->magic == NVN_MAGIC('P', 'O', 'O', 'L')" not in finalize:
+        raise SystemExit("a pool finalized twice untracks its range twice (a newer live pool's entry)")
     apply_verdict = block(source, "int lazy_apply_verdict(")
     host_verdict = block(source, "int lazy_host_verdict(")
     fixture = f'''#include <algorithm>
