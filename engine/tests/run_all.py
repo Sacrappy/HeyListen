@@ -151,7 +151,7 @@ SKIP = {
     "nx2/test_dll.py": ({"linux", "windows"}, "needs a full game build (work/build/hookshot_game.dll) and Unicorn"),
     # (a GPU)
     "tests/test_present_aspect_vulkan.py": ({"linux", "windows"}, "needs a Vulkan 1.3 device for offscreen transfer/readback"),
-    "nx2/test_bc_storage_views.py": ({"linux", "windows"}, "needs a Windows Vulkan device"),
+    "nx2/test_bc_storage_views.py": ({"linux", "windows"}, "needs a Vulkan device"),
     # (Linux only)
     "tests/test_appimage_source_headers.py": ({"windows"}, "the AppImage source-copy block uses POSIX Bash and cp"),
     "tests/test_appimage_package_retry.py": ({"windows"}, "the AppImage package bootstrap is POSIX shell; exercised on Linux"),
