@@ -26,6 +26,7 @@ extern volatile int hl_gate_on_80706be0;     /* (the check's gate, below) */
    (lr 0x8348c770) for the real-time step (nn_vi.c, TICK-014). The native loop's present phase reads the tick from
    another place: the loop tells it the framework itself (the same object every frame). */
 extern volatile uint64_t hos_gfx_module;
+extern volatile uint32_t hos_frame_seconds_bits;   /* (hl_step.c: the frame's seconds for the global step, 0: none) */
 
 static const uint64_t loop_gates[] = {0x809667b0};
 static const uint64_t check_gates[] = {0x80706be0};
@@ -46,7 +47,8 @@ static int mainloop_on(void) {
     const int check = env_flag("HL_MAINLOOP_CHECK", 0) == 1 && GATES_IN("HL_MAINLOOP_CHECK", check_gates);
     const int log = check || getenv("HL_MAINLOOP_LOG") != NULL;
     const uint64_t scratch = hos_sys_alloc(32, 16);
-    if (!hl_bridge_mainloop_start(HL_MAINLOOP_NATIVE | (check ? HL_MAINLOOP_CHECK : 0) | (log ? HL_MAINLOOP_LOG : 0), scratch)) {
+    if (!hl_bridge_mainloop_start(HL_MAINLOOP_NATIVE | (check ? HL_MAINLOOP_CHECK : 0) | (log ? HL_MAINLOOP_LOG : 0), scratch,
+                                  &hos_frame_seconds_bits)) {
         hos_log("hl mainloop: off: the native loop did not start");
         return 0;
     }

@@ -119,11 +119,11 @@ extern "C" int hl_bridge_report(char* out, size_t cap) {
     return n + g_dispatcher->report(out + n, cap - (size_t)n);
 }
 
-extern "C" int hl_bridge_mainloop_start(int flags, uint64_t scratch) {
+extern "C" int hl_bridge_mainloop_start(int flags, uint64_t scratch, const volatile uint32_t* frame_seconds) {
     if (g_frames) return 1;
     if (!g_bridge || !(flags & HL_MAINLOOP_NATIVE) || !scratch) return 0;
     g_frames = new hl::bridge::FrameLoop(*g_runtime, *g_jobs, scratch,
-                                         {.check = (flags & HL_MAINLOOP_CHECK) != 0, .log = (flags & HL_MAINLOOP_LOG) != 0});
+                                         {.check = (flags & HL_MAINLOOP_CHECK) != 0, .log = (flags & HL_MAINLOOP_LOG) != 0, .frame_seconds = frame_seconds});
     return 1;
 }
 

@@ -24,6 +24,10 @@ void hl_answer(uint64_t guest, A64Fn fn, HlOn on, const char *what);
    when the module's switch is on and hl_supported_build() says 1. */
 #define HL_GATE(addr, hash) volatile int hl_gate_on_##addr; int hl_gate_##addr(Ctx *c)
 
+/* HL_STEP_HOOK(80706be0, "<hash>", <vreg>, <probe>); a line nx2/hl_gates.py puts after f_80706be0's one float divide of a
+   time step, making it base x hos_frame_seconds_bits when that is not 0 (host/hl_step.c). Nothing in C. */
+#define HL_STEP_HOOK(addr, hash, reg, probe) extern const int hl_step_hook_##addr
+
 /* Whether the gates are in the lifted code: nx2/hl_gates.py puts, beside each gate it puts in, a constructor that calls
    hl_gate_present(address) at start; a gate left out (its function's text hashes otherwise in this lift) never says so.
    hl_gates_in: 1 when every one of the n addresses is in; otherwise 0, and one log line naming `what` and the missing

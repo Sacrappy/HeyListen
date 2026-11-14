@@ -159,3 +159,34 @@ the opening movie (a new game: a copy of the saves in a slot), each with the fra
 frame-counting objects by maker; each maker's update function then gets the 60 Hz tick above. Owner's checks once a
 system has its tick, at 120 fps against 60: the opening movie (voice lines one after the other, picture to its end), a
 cutscene with voice-over (no overlap), the Deku Tree boss (the same pace as at 60).
+
+**The movie: an OS-layer fault, fixed there.** The game's movie library takes one picture from the OS layer's video
+decoder (`engine/host/nn_video.c`) at each of its frames; the OS layer already skipped pictures that fell behind the
+movie's clock below 60 fps, but handed out the next picture at every acquisition however early. Measured on the main
+PC with `HOS_VIDEO_LOG=1` (title sequence's AV1 movie, `--fps-limit 360`, about 350 fps): from 20 s in, the pictures
+ran ahead of the movie's clock, 2.7 s ahead by its end, so the movie ended early while its sound went on. At a 120
+limit (the machine shared, about 93 fps) it stayed on time. Now a picture more than 8 ms ahead of the clock is not
+handed out: the buffer gets the last picture again (`HOS_VIDEO_NO_HOLD=1`: as before). Same run with the fix: the
+pictures on the clock to the end (within 0.02 s), the movie the same length as its sound. The new-game opening movie
+itself was not reached by the scripted input (the title's background and a save loaded instead); the fix is the same
+for any movie.
+
+**What actually ran fast, and the fix (2026-11-14, after upstream Hookshot a2a89ae11).** The engine makes its time step
+in two places, each a float divide "base / nominal rate": the module system's frame `0x80706be0` (the frame's step, the
+game clock at `+0xd58`, the frame-time object above) and the game framework's prepare `0x83b6ea90` (the **global step**,
+60 / nominal, the float at `0x84d61fc8`). The engine's controller puts its nominal rate back to 60 before the steps are
+made; TICK-014's real-time step wrote the reached rate in again just before the first divide only, so the frame's step
+and the game clock kept real time while the global step stayed a whole 1/60 s a frame: **everything that reads the
+global step ran at fps / 60** (the cutscenes' timing, the voice lines, the Deku Tree boss). Upstream's fix, ported:
+the host's measured frame time goes in at both divides (base x the frame's seconds), both or neither, published by
+`nn_vi.c` while the cap is above 60 (`hos_frame_seconds_bits`; the nominal rate kept at 60 at most then; `HOS_FPS_STEP=0`:
+as before; `HOS_FPS_LOG=1`: the game clock's and the global step's speeds).
+
+**The mechanism in this tree.** Upstream writes the hook into the lifted text with its post-lift patch script; here the
+lifted work folder is shared by every worktree and never lifted again, and a tree without the two host symbols must still
+link. So the two hooks are lines `nx2/hl_gates.py` puts in per tree, as it puts entry gates: `host/hl_step.c` asks for
+them (`HL_STEP_HOOK`, with each function's text hash), they go in after the one divide of each function only when both
+can, and they carry the marker of the address plus one (`hl gate 80706be1`), so that any tree that does not ask for
+them, an older `hl_gates.py` included, takes them out as stale gates before it builds. The native main loop's prepare
+(`HL_MAINLOOP=1`) makes the global step the same way. The 60 Hz tick designed above is not needed for the systems the
+owner reported; it stays the answer for anything found counting frames with the fix on.

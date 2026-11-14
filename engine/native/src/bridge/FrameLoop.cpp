@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "hl/bridge/JobGroup.h"
 
@@ -105,7 +106,16 @@ void FrameLoop::prepare() {
     if ((uint32_t)call(kFrameQuery2, fw_ + offsetof(guest::Framework, query_flag), ld(&f->perf_handle)))
         st(&f->query_flag, (uint8_t)0);
     call(slot(kPrepareSlot), fw_);
-    st(at<float>(kFrameRatio), 60.0f / (float)ld(&f->nominal_rate));
+    float ratio = 60.0f / (float)ld(&f->nominal_rate);
+    if (options_.frame_seconds) {   // (the lifted divide's step hook: 60 x the frame's seconds, when the host publishes them)
+        const uint32_t bits = *options_.frame_seconds;
+        if (bits) {
+            float secs;
+            std::memcpy(&secs, &bits, 4);
+            ratio = 60.0f * secs;
+        }
+    }
+    st(at<float>(kFrameRatio), ratio);
     call(kFrameRateTail, fw_ + offsetof(guest::Framework, rate_object));
 }
 

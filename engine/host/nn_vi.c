@@ -211,6 +211,8 @@ static void scan_dt(long long presents) {
    own limit holds it at 60). HOS_REALTIME_STEP=0: the shipping whole steps. */
 extern volatile uint64_t hos_gfx_module;
 extern volatile int hos_realtime_fps;   /* (nn_os_sync.c) */
+extern volatile uint32_t hos_frame_seconds_bits;   /* (hl_step.c) */
+extern volatile uint64_t hos_step_probe;
 volatile int hos_fixed_resolution = 0;   /* (the lifted code reads these: nx2/oot_patches.py) */
 volatile uint32_t hos_fixed_scale_bits = 0x3f800000;   /* (HOS_RES_SCALE: the fixed path's scale) */
 volatile int hos_dynres_runs = 0;   /* (the dynamic path's frames: it fills fields the 3D reads, +8 +16 +168) */
@@ -275,6 +277,27 @@ static void realtime_step(int64_t now) {
             hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x58.. %d %d %d %d", *limit, *(uint8_t *)GP(mod + 0x231),
                     *(uint8_t *)GP(mod + 0x232), *(int *)GP(mod + 0x2c8), *(int *)GP(mod + 0x270 + 0x58), *(int *)GP(mod + 0x270 + 0x28),
                     *(int *)GP(mod + 0x270 + 0x2c), *(int *)GP(mod + 0x270 + 0x30));
+        /* (HeyListen) and the global step (f_83b6ea90's float at 0x84d61fc8, 60 / nominal or 60 x the frame's seconds) summed
+           over the same frames: what reads it runs at that speed (TICK-014's old way timed the clock, not this one) */
+        static double global_sum;
+        if (log_on) {
+            float g;
+            memcpy(&g, GP(0x84d61fc8), 4);
+            global_sum += g;
+        }
+        if (log_on && !((n - 1) % 300) && hos_step_probe) {   /* (game speed: the game clock's 1/60 s a second of wall time) */
+            static double clock_before;
+            static int64_t at_before;
+            double game_clock;
+            memcpy(&game_clock, GP(hos_step_probe + 0xd58), 8);
+            if (at_before && now > at_before) {
+                const double rate = (game_clock - clock_before) * 1e9 / (double)(now - at_before);
+                const double global = global_sum * 1e9 / (double)(now - at_before);
+                hos_log("vi: game clock %.1f: %.2f a second of wall time (speed %.3f) at %.1f fps; global step %.2f a second (speed "
+                        "%.3f)", game_clock, rate, rate / 60.0, 300e9 / (double)(now - at_before), global, global / 60.0);
+            }
+            clock_before = game_clock, at_before = now, global_sum = 0;
+        }
         const int cap = fps_limit();
         if (cap > 60 && target < cap) target = cap;   /* (the Insert menu's limit raises the game's own limiter too) */
         if (target && *limit > 0 && *limit < target) *limit = target;
@@ -284,6 +307,7 @@ static void realtime_step(int64_t now) {
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
         hos_realtime_fps = 0;
+        hos_frame_seconds_bits = 0;
         return;
     }
     static int64_t last;
@@ -292,7 +316,10 @@ static void realtime_step(int64_t now) {
     static long long steps;
     const double dt = (now - last) / 1e9;
     last = now;
-    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; hos_realtime_fps = 0; return; }   /* (a load: the average starts again) */
+    if (dt <= 0 || dt > 0.25) {   /* (a load: the average starts again) */
+        count = next = 0, carry = 0, hos_realtime_fps = 0, hos_frame_seconds_bits = 0;
+        return;
+    }
     /* (HOS_REALTIME_WINDOW=<1-5>: frames averaged for the step; 1: each step the last frame's own time) */
     static int window = -1;
     if (window < 0) {
@@ -307,9 +334,30 @@ static void realtime_step(int64_t now) {
        difference and one longer kept it: +0.9% speed at the 60 limit) */
     const double owed = sum / count * 60.0 + carry;
     const int cap = fps_limit();
-    double ratio = owed < 60.0 / cap ? 60.0 / cap : owed > 4.0 ? 4.0 : owed;
+    /* (HeyListen, after upstream Hookshot a2a89ae11) A cap above 60: the engine's own rate is 60 / <whole display intervals>
+       and its controller puts 60 back over a higher +0x2c8 before its global step is made from it (f_83b6ea90), so what
+       reads that step ran fps / 60 too fast. The step is then the frames' own time at the two places the engine makes it
+       (host/hl_step.c: lines nx2/hl_gates.py puts after the two divides): this same average, at most 4/60 s and at least
+       1/480 s, and the rate under it stays the engine's, 60 at most. (Upstream's floor of 1/240 s raised the game's speed
+       to 1.024 at a cap of 240 in the market, about 237 fps: frames averaged shorter than it were counted as 1/240 s; the
+       limit here goes to 360.) HOS_FPS_STEP=0, or a lift without the hooks (hos_step_probe unset): the rate up to the cap,
+       as before */
+    static int timed_step = -1;
+    if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
+    const int timed = cap > 60 && timed_step && hos_step_probe;
+    if (timed) {
+        const double secs = sum / count;
+        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < 1.0 / 480.0 ? 1.0 / 480.0 : secs);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        hos_frame_seconds_bits = bits;
+    } else {
+        hos_frame_seconds_bits = 0;
+    }
+    const int top = timed ? 60 : cap;
+    double ratio = owed < 60.0 / top ? 60.0 / top : owed > 4.0 ? 4.0 : owed;
     int fps = (int)(60.0 / ratio + 0.5);
-    fps = fps < 15 ? 15 : fps > cap ? cap : fps;
+    fps = fps < 15 ? 15 : fps > top ? top : fps;
     int *slot = (int *)GP(mod + 0x2c8);
     if (*slot < 15 || *slot > 360) {
         static int logged;
