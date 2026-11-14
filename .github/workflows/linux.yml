@@ -1,5 +1,6 @@
-# Linux: the engine's game-free checks and the AppImage (x86_64), built in Ubuntu 22.04 as engine/scripts/linux/deps.sh and
-# appimage.sh expect. GitHub runs only the repository root's workflows, so engine/.github/workflows (Hookshot's) never ran here
+# Linux: the engine's game-free checks (on the newest Ubuntu with clang and the pinned glslang, as Hookshot's
+# source-regressions.yml runs them) and the AppImage (x86_64, built in Ubuntu 22.04 as engine/scripts/linux/deps.sh and
+# appimage.sh expect: its glibc is the oldest the game supports). GitHub runs only the repository root's workflows, so engine/.github/workflows (Hookshot's) never ran here
 # and nothing told when the Linux build broke. No game data is involved.
 name: Linux
 on:
@@ -17,7 +18,54 @@ defaults:
     working-directory: engine
 
 jobs:
+  tests:
+    name: Game-free checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (the versions scripts/linux/deps.sh builds the Vulkan back end with)
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 04f10f650d514df88b76d25e83db360142c7b174 # vulkan-sdk-1.4.341.0
+          path: _deps/spirv-headers
+          persist-credentials: false
+      - name: Check out pinned Vulkan headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 74d8a6cb930c68ef617b202c3ff3c59d919e086b # v1.4.345
+          path: _deps/vulkan-headers
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Python packages for the tests
+        run: python -m pip install --disable-pip-version-check --no-deps zstandard==0.25.0
+      - name: Compilers and the SPIR-V validator
+        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools
+      - name: Pinned glslang for generated shader comparisons
+        run: |
+          # (the checked-in shader headers are generated with glslang 16.6.0; older ones lower some GLSL differently)
+          tool_dir="$RUNNER_TEMP/glslang-16.6.0"
+          mkdir -p "$tool_dir"
+          curl -fL --retry 3 -o "$tool_dir/glslang.tar.gz" https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz
+          echo '2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce  '"$tool_dir/glslang.tar.gz" | sha256sum --check --strict
+          tar -xzf "$tool_dir/glslang.tar.gz" -C "$tool_dir"
+          "$tool_dir/bin/glslangValidator" --version
+          echo "$tool_dir/bin" >> "$GITHUB_PATH"
+      - name: Every test
+        env:
+          HOOKSHOT_SPIRV_HEADERS: ${{ github.workspace }}/_deps/spirv-headers/include
+          HOOKSHOT_VULKAN_HEADERS: ${{ github.workspace }}/_deps/vulkan-headers/include
+        run: python -I -B tests/run_all.py --strict
+
   linux:
+    name: AppImage
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     timeout-minutes: 90
@@ -36,7 +84,7 @@ jobs:
               build-essential gcc-12 g++-12 libstdc++-12-dev nasm meson ninja-build cmake pkg-config \
               libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxinerama-dev \
               libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgles-dev libdrm-dev libgbm-dev \
-              libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libxft-dev libfontconfig1-dev zlib1g-dev spirv-tools glslang-tools; then
+              libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libxft-dev libfontconfig1-dev zlib1g-dev; then
               break
             else
               package_status=$?
@@ -44,8 +92,6 @@ jobs:
             if [ "$try" = 3 ]; then exit "$package_status"; fi
             sleep 20
           done
-          # (the tests' C++20: g++ 13)
-          update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 130 --slave /usr/bin/gcc gcc /usr/bin/gcc-13
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,9 +111,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/linux/deps.sh
-
-      - name: Game-free checks
-        run: build-linux/deps/python/bin/python3 -I -B tests/run_all.py
 
       - name: AppImage
         run: scripts/linux/appimage.sh
