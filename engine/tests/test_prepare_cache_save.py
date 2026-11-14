@@ -16,6 +16,8 @@ std::vector<int> calls;
 bool prepare_run(void(*)(size_t,size_t),bool background=false){if(background)std::exit(3);calls.push_back(1);return true;}
 void predict_run(void(*)(size_t,size_t)){calls.push_back(5);}
 void precompile_run(void(*)(size_t,size_t)){calls.push_back(2);}
+bool state_list_pending(){return false;}   // (no shipped list newer than the prepare: nothing to note)
+void state_list_run(){std::exit(4);}
 void pipeline_cache_save(bool force){if(!force)std::exit(2);calls.push_back(3);}
 std::string skipped_path(){return "sentinel";}
 int fake_remove(const char*){calls.push_back(4);return 0;}

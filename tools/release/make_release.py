@@ -152,6 +152,12 @@ def main():
         sys.exit("dotnet publish made no HeyListenBuilder.exe")
 
     # 4. the package folder (builder, setup, LICENSE, tracked engine sources under tools/, profile, prebuilt third_party)
+    #    (the pipeline state list in profile/ is shipped only when it holds nothing but hashes, formats and draw state:
+    #    tools/release/check_states.py; HL_STATES_TITLE_IDS=<hex>[,<hex>] adds the search for those title ids)
+    states = os.path.join(ROOT, "profile", "pipeline_states.bin")
+    if os.path.isfile(states):
+        ids = [t for t in os.environ.get("HL_STATES_TITLE_IDS", "").split(",") if t]
+        run(py + [os.path.join(ROOT, "tools", "release", "check_states.py"), states] + ["--title-id=" + t for t in ids])
     package = os.path.join(work, "package")
     #    (TICK-045: the play profile from the repository's profile/, recorded on this lifter's default lift, not the previous release's)
     run(py + [parts_py, "package", package, "--publish", publish, "--setup", setup, "--list", previous,

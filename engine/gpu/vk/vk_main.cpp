@@ -709,6 +709,7 @@ void prepare_with_screen() {
     std::thread worker([] {
         const bool update = prepare_is_update();   // (an update, RX_VK_PREPARE_BACKGROUND=1: what the notes name now, the rest in play)
         const bool prepared = !update && prepare_run(prep_progress, false);
+        if (!update && !prepared && !prepare_stopped() && state_list_pending()) state_list_run();
         if (prepared && !prepare_stopped()) {   // (a first start only: the pipelines the notes predict, into the driver's cache)
             prep_done.store(0), prep_total.store(0);
             prep_stage.store(1);
@@ -809,6 +810,7 @@ bool started_up() {
         fflush(stdout);
         part = 0;
         const bool prepared = prepare_run(progress, false);
+        if (!prepared && state_list_pending()) state_list_run();   // (the builder's step: a list shipped after the last prepare)
         part = 1;
         if (prepared) predict_run(progress);
         part = 2;
@@ -868,6 +870,7 @@ bool started_up() {
         };
         const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
         if (!update && prepare_run(progress, false)) predict_run(progress);
+        else if (!update && state_list_pending()) state_list_run();
         if (update) state_list_run();
         precompile_run(progress, precompile_blocking());   // (TICK-008: queued and built behind the game unless waited for)
         if (update) prepare_background();

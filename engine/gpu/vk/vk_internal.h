@@ -338,6 +338,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
 bool prepare_is_update();
 void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
+/// (HL_SHIPPED_STATES, on unless 0) the shipped pipeline state list changed since state_list_prepare last went through it: the
+/// start calls state_list_run when the shaders needed no preparing, so that precompile_run builds its pipelines
+bool state_list_pending();
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 /// (hookshot) The window was closed while the shaders were prepared: prepare_run and precompile_run take nothing more and return,
 /// what is done kept (the program cache, the driver's) and not counted as a start that ended inside them
