@@ -7324,6 +7324,11 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
              program_cache_kept(), (unsigned long long)prepared_for.kept);
     const size_t programs = seed_open();
     if (!programs) return false;
+    // (the record goes while the shaders are prepared and is written again when they are: a preparation closed or killed part
+    // way left the old record standing, and the next start trusted it whenever the cache held more than half of what it had held,
+    // or anything at all under a record from before the count: thousands of programs were then translated in play. With no
+    // record the next start prepares again, and only what the cache does not hold yet)
+    remove(path.c_str());
     const size_t total = programs * 3;   // (each program for float, one and two integer bone inputs)
     // The driver's part: each program's stage libraries, built once and let go, for the driver's own disk cache. What stays with us is
     // nothing: a kept library costs memory, and our pipeline cache would be read in whole at every start. A driver whose compiler
