@@ -5627,12 +5627,34 @@ bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs, VkCommandBuff
     uint64_t total = 0;
     for (const VkBufferCopy& r : runs) total += r.size;
     if (!total || !p.mirror) return false;
+    // (the buffers are kept and taken again once the GPU is past their copies: a fill or a sync made one and freed it every time,
+    // ~200 a second with the live pages and the readback refreshes; up to 32 spares and 128 MB)
+    struct UpStage { VkBuffer buf; VmaAllocation alloc; void* map; uint64_t cap, value; };
+    static std::mutex up_mu;
+    static std::deque<UpStage> in_flight;
+    static std::vector<UpStage> spare;
     VkBuffer sb = VK_NULL_HANDLE;
     VmaAllocation sa = nullptr;
     void* map = nullptr;
+    uint64_t cap = 0;
     {
+        std::lock_guard uk(up_mu);
+        while (!in_flight.empty() && in_flight.front().value <= mem_completed) spare.push_back(in_flight.front()), in_flight.pop_front();
+        uint64_t held = 0;
+        for (const UpStage& u : spare) held += u.cap;
+        while (!spare.empty() && (spare.size() > 32 || held > (128ull << 20))) held -= spare.front().cap, destroy_buffer(spare.front().buf, spare.front().alloc), spare.erase(spare.begin());
+        size_t best = spare.size();
+        for (size_t k = 0; k < spare.size(); k++)
+            if (spare[k].cap >= total && (best == spare.size() || spare[k].cap < spare[best].cap)) best = k;
+        if (best < spare.size()) {
+            sb = spare[best].buf, sa = spare[best].alloc, map = spare[best].map, cap = spare[best].cap;
+            spare.erase(spare.begin() + (std::ptrdiff_t)best);
+        }
+    }
+    if (!sb) {
         MemKindScope mem_kind_(MemKind::Staging);
-        if (!create_buffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, sb, sa, &map) || !map) {
+        cap = std::max<uint64_t>(total, 1ull << 20);
+        if (!create_buffer(cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, sb, sa, &map) || !map) {
             if (sb) destroy_buffer(sb, sa);
             return false;
         }
@@ -5652,7 +5674,10 @@ bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs, VkCommandBuff
         gp.items = (int)out.size(), gp.bytes = total;
         vkCmdCopyBuffer(cmd, sb, p.mirror, (uint32_t)out.size(), out.data());
     }
-    dead_mirrors.push_back({sb, sa, mem_rec_value});   // (freed with the retired mirrors, once the GPU is past this recording)
+    {
+        std::lock_guard uk(up_mu);
+        in_flight.push_back({sb, sa, map, cap, mem_rec_value});   // (taken again once the GPU is past this recording)
+    }
     st_pm_live_bytes += (int64_t)total;
     return true;
 }
@@ -6681,12 +6706,14 @@ struct StagedWb {
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
     void* map = nullptr;
-    uint64_t bytes = 0;
+    uint64_t bytes = 0, cap = 0;   // (what it holds, and the buffer's size)
     std::vector<std::array<uint64_t, 3>> runs;   // (guest address, offset in the staging buffer, size)
 };
 std::mutex staged_mu;
 std::deque<StagedWb> staged_wbs;   // (by value; staged_mu)
-std::vector<std::pair<VkBuffer, VmaAllocation>> staged_free;   // (applied: destroyed at a submission's end; staged_mu)
+// (applied: kept for the next submissions' write-backs, up to 16 buffers and 256 MB; staged_mu. A buffer made and freed every
+// submission, ~200 a second, cost the replay more than the copies)
+std::vector<StagedWb> staged_free;
 std::atomic<uint64_t> staged_min{~0ull};
 int64_t st_sw_runs = 0, st_sw_bytes = 0, st_sw_pages_written = 0, st_sw_pages_cpu = 0, st_sw_pages_dead = 0, st_sw_pages_same = 0;
 }  // namespace mkwvk
@@ -6714,7 +6741,8 @@ void mkwvk::memory_staged_apply(uint64_t done) {
                 (r == 1 ? st_sw_pages_written : r == 2 ? st_sw_pages_cpu : st_sw_pages_dead)++;
                 a = e;
             }
-        staged_free.push_back({s.buffer, s.alloc});
+        s.runs.clear(), s.bytes = 0;
+        staged_free.push_back(std::move(s));
         staged_wbs.pop_front();
     }
     staged_min.store(staged_wbs.empty() ? ~0ull : staged_wbs.front().value, std::memory_order_release);
@@ -6724,10 +6752,15 @@ namespace mkwvk {
 void memory_end_submission(VkCommandBuffer cmd) {
     std::lock_guard lk(pools_mu);
     lazy_apply();
-    {   // (RX_VK_POOL_MIRROR: the staging buffers of write-backs applied, given back)
+    {   // (RX_VK_POOL_MIRROR: beyond 16 spare staging buffers or 256 MB of them, the oldest given back)
         std::lock_guard sk(staged_mu);
-        for (auto& [b, a] : staged_free) destroy_buffer(b, a);
-        staged_free.clear();
+        uint64_t held = 0;
+        for (const StagedWb& s : staged_free) held += s.cap;
+        while (!staged_free.empty() && (staged_free.size() > 16 || held > (256ull << 20))) {
+            held -= staged_free.front().cap;
+            destroy_buffer(staged_free.front().buffer, staged_free.front().alloc);
+            staged_free.erase(staged_free.begin());
+        }
     }
     StagedWb staged;   // (this submission's write-backs of never-imported pools, below)
     for (const PresyncNote& n : presync_notes) {   // (TICK-048: a pool the presync synced that no binding used after it)
@@ -7006,10 +7039,23 @@ void memory_end_submission(VkCommandBuffer cmd) {
             }
         }
         if (staged.bytes) {   // (RX_VK_POOL_MIRROR: the never-imported pools' runs into one host-cached staging buffer)
-            bool ok;
-            {
+            bool ok = false;
+            {   // (a spare that fits, the smallest; else one made, 4 MB at least)
+                std::lock_guard sk(staged_mu);
+                size_t best = staged_free.size();
+                for (size_t k = 0; k < staged_free.size(); k++)
+                    if (staged_free[k].cap >= staged.bytes && (best == staged_free.size() || staged_free[k].cap < staged_free[best].cap)) best = k;
+                if (best < staged_free.size()) {
+                    StagedWb& f = staged_free[best];
+                    staged.buffer = f.buffer, staged.alloc = f.alloc, staged.map = f.map, staged.cap = f.cap;
+                    staged_free.erase(staged_free.begin() + (std::ptrdiff_t)best);
+                    ok = true;
+                }
+            }
+            if (!ok) {
                 MemKindScope mem_kind_(MemKind::Readback);
-                ok = create_buffer_cached(staged.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, staged.buffer, staged.alloc, &staged.map);
+                staged.cap = std::max<uint64_t>(staged.bytes, 4ull << 20);
+                ok = create_buffer_cached(staged.cap, VK_BUFFER_USAGE_TRANSFER_DST_BIT, staged.buffer, staged.alloc, &staged.map);
             }
             if (ok && staged.map) {
                 uint64_t at = 0;
