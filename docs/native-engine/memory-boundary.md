@@ -1929,3 +1929,17 @@ What it says:
 - The market B + drop run's mirror check counted 2 mismatches, both on the first page of a CPU-uncached (`0x22`) pool. The
   check waited 500 ms for the write marks' collection, and during a load there may be no submit in that time. The check now
   waits for two of the game's submits (5 s at most) and counts what is still unsettled apart. The rerun is below.
+- The rerun with the stricter check (`r1-pm9`, market, B + drop, 420 s) finished clean:
+  - mirror check: 144 pools, 12 of them written by the GPU, 47,354 pages compared, 0 unsettled, **0 mismatches**;
+  - drop check: 0 mismatches; imports asked for: 0;
+  - at 360 s: game committed 5034 MB, process commit 15667 MB, VRAM 4406 MB, mirrors 744 MB, 2199 MB dropped (482 MB of it
+    mirrored pools);
+  - longest touch 10 ms; last shots right.
+
+Switches for a hand-played session with lever B:
+`RX_VK_POOL_MIRROR=1 RX_VK_POOL_MIRROR_CHECK=1 HOS_GUEST_PAGES=1 HL_MEM_DROP=1 HL_MEM_DROP_POOLS=1 HL_MEM_DROP_CHECK=1 HL_MEM_DROP_LOG=1 RX_VK_LEDGER=60 RX_VK_RES_LOG=1`.
+Lines to read:
+- `vk: pool mirror check` (MISMATCHES must stay 0);
+- `vk: write-backs of never-imported pools through staging` (IMPORTS ASKED FOR must stay 0);
+- `hl drop:` (MISMATCHES 0, the longest touch);
+- the ledger's tables.
