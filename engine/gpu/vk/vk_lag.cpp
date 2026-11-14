@@ -41,8 +41,9 @@ namespace {
 constexpr uint64_t kRing = 8192;
 struct Rec {
     uint64_t value = 0;
-    int64_t t_sub = 0, f_sub = 0, t_bq = 0, f_bq = 0, t_rs = 0, f_rs = 0, t_re = 0, f_re = 0, t_gpu = 0, f_gpu = 0, t_grec = 0, f_grec = 0;
-    int flags = 0;   // (1: stopped at an event wait at least once)
+    int64_t t_sub = 0, f_sub = 0, t_bq = 0, f_bq = 0, t_rs = 0, f_rs = 0, t_re = 0, f_re = 0, t_gpu = 0, f_gpu = 0, t_grec = 0, f_grec = 0, t_gend = 0, f_gend = 0;
+    uint64_t seq_end = 0;   // (the recording the last piece of its work went into)
+    int flags = 0;   // (1: stopped at an event wait, 2: queued behind a stopped submission of its queue)
     bool row = false;   // (the S row written)
 };
 Rec ring[kRing];
@@ -72,16 +73,19 @@ void write_row(const char* fmt, ...) {
     va_end(ap);
 }
 
-// (S: t_sub f_sub t_bq f_bq t_rs f_rs t_re f_re, then t_gpu f_gpu: the timeline semaphore reached the value, t_grec f_grec: the GPU
-// finished the recording the value's work ended in (a game fence waits for that), flags)
+// (S: t_sub f_sub t_bq f_bq t_rs f_rs t_re f_re, then t_gpu f_gpu: the timeline semaphore reached the value; t_grec f_grec: the GPU
+// finished the recording the back end maps the value to (value_rec, what a game fence waits for: the recording where the work began
+// or ended); t_gend f_gend: the GPU finished the recording the last piece of the work went into; flags)
 void flush_row(Rec& r) {   // (mu held)
-    if (r.row || !r.t_gpu || !r.t_grec) return;
+    if (r.row || !r.t_gpu || !r.t_grec || !r.t_gend) return;
     r.row = true;
-    write_row("S,%llu,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d\n", (unsigned long long)r.value, (long long)r.t_sub,
-              (long long)r.f_sub, (long long)r.t_bq, (long long)r.f_bq, (long long)r.t_rs, (long long)r.f_rs, (long long)r.t_re,
-              (long long)r.f_re, (long long)r.t_gpu, (long long)r.f_gpu, (long long)r.t_grec, (long long)r.f_grec, r.flags);
+    write_row("S,%llu,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d\n", (unsigned long long)r.value,
+              (long long)r.t_sub, (long long)r.f_sub, (long long)r.t_bq, (long long)r.f_bq, (long long)r.t_rs, (long long)r.f_rs,
+              (long long)r.t_re, (long long)r.f_re, (long long)r.t_gpu, (long long)r.f_gpu, (long long)r.t_grec, (long long)r.f_grec,
+              (long long)r.t_gend, (long long)r.f_gend, r.flags);
 }
 std::vector<uint64_t> pend;   // (the values whose recording the GPU has not finished yet; mu)
+std::vector<uint64_t> waiting_end;   // (whole in a burst: the recording that ends it is the next one submitted; mu)
 uint64_t (*rec_of_fn)(uint64_t) = nullptr;
 
 // (the thread that stamps the GPU's completions: it spins on the timeline, so a value is stamped within microseconds of its
@@ -100,9 +104,14 @@ void poller_main() {
             if (rc > last_rec && rec_of_fn)
                 for (size_t i = 0; i < pend.size();) {
                     Rec& r = ring[pend[i] % kRing];
-                    const uint64_t seq = r.value == pend[i] ? rec_of_fn(pend[i]) : 0;
-                    if (r.value != pend[i]) pend[i] = pend.back(), pend.pop_back();
-                    else if (seq && seq <= rc) r.t_grec = t, r.f_grec = f, flush_row(r), pend[i] = pend.back(), pend.pop_back();
+                    if (r.value != pend[i]) { pend[i] = pend.back(), pend.pop_back(); continue; }
+                    if (!r.t_grec) {
+                        const uint64_t seq = rec_of_fn(pend[i]);
+                        if (seq && seq <= rc) r.t_grec = t, r.f_grec = f;
+                    }
+                    if (!r.t_gend && r.seq_end && r.seq_end <= rc) r.t_gend = t, r.f_gend = f;
+                    flush_row(r);
+                    if (r.t_grec && r.t_gend) pend[i] = pend.back(), pend.pop_back();
                     else i++;
                 }
             for (uint64_t v = last + 1; v <= c && c - last < kRing; v++) {
@@ -150,7 +159,7 @@ int stride() {
 }
 bool gpu_done(uint64_t value) {   // (mu held)
     const Rec& r = ring[value % kRing];
-    return r.value == value && r.t_grec != 0;
+    return r.value == value && r.t_gend != 0;
 }
 }  // namespace
 
@@ -177,11 +186,21 @@ void lag_submit(uint64_t value) {
     pend.push_back(value);
 }
 
-void lag_note_stop(uint64_t value) {
+void lag_note_stop(uint64_t value, int bit) {
     if (!lag_on()) return;
     std::lock_guard lk(mu);
     Rec& r = ring[value % kRing];
-    if (r.value == value) r.flags |= 1;
+    if (r.value == value) r.flags |= bit;
+}
+
+void lag_recording_submitted(uint64_t seq) {
+    if (!lag_on()) return;
+    std::lock_guard lk(mu);
+    for (uint64_t v : waiting_end) {
+        Rec& r = ring[v % kRing];
+        if (r.value == v) r.seq_end = seq;
+    }
+    waiting_end.clear();
 }
 
 void lag_run_start(uint64_t value) {
@@ -192,7 +211,7 @@ void lag_run_start(uint64_t value) {
     if (r.value == value && !r.t_rs) r.t_rs = t, r.f_rs = f;
 }
 
-void lag_run_end(uint64_t value) {
+void lag_run_end(uint64_t value, uint64_t seq_now, bool burst) {
     if (!lag_on()) return;
     const int64_t t = now(), f = frames();
     // (the pages' bytes against guest memory as the recording ends: the writes the capture protected the replay from)
@@ -200,7 +219,11 @@ void lag_run_end(uint64_t value) {
     {
         std::lock_guard lk(mu);
         Rec& r = ring[value % kRing];
-        if (r.value == value) r.t_re = t, r.f_re = f;
+        if (r.value == value) {
+            r.t_re = t, r.f_re = f;
+            if (burst) waiting_end.push_back(value);
+            else r.seq_end = seq_now;
+        }
         // (the last capture of the submission: a submission that stopped at an event wait has another taken where it goes on, for what
         // the game wrote up to its signal; the window of the check starts there)
         CapKeep* k = nullptr;

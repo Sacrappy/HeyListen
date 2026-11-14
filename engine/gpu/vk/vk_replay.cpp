@@ -634,6 +634,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     uint64_t seq = 0;
     if (rec_timeline) {   // (and its number on the recordings' timeline; every caller holds replay_mu: in order)
         seq = ++rec_seq;
+        lag_recording_submitted(seq);   // (RX_VK_LAG_LOG)
         signals[nsig].semaphore = rec_timeline;
         signals[nsig].value = seq;
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -3182,7 +3183,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         q.waiting = true;
         q.handles.assign(handles, handles + n);
         q.cb = cb, q.p = stop, q.value = value;
-        lag_note_stop(value);   // (RX_VK_LAG_LOG)
+        lag_note_stop(value, 1);   // (RX_VK_LAG_LOG)
         if (st_stops++ < 12) {
             const nvn_p_wait_event w = wait_at(stop);
             logf("vk: submission %llu (queue %#llx) stopped at command buffer %d's wait for event %#llx %s %u (has %u)",
@@ -3200,7 +3201,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     if (pushed.load() < value) pushed = value;
     st_submits++;
     if (!burst_open && dump_pending()) wait_value(value), dump_write();
-    lag_run_end(value);   // (RX_VK_LAG_LOG: the recording is whole)
+    lag_run_end(value, rec_seq, burst_open);   // (RX_VK_LAG_LOG: the recording is whole)
     return true;
 }
 void do_submit(const uint64_t* handles, int n) {   // (RX_VK_ASYNC=0: on the submitting thread, in its order)
@@ -3388,7 +3389,7 @@ void submit_job(std::vector<uint64_t>& handles, uint64_t value, uint64_t queue) 
         if (frame_submits.empty()) frame_first_value = value;
         frame_submits.emplace_back(handles);
         submit_memory_work(value);
-        lag_note_stop(value);   // (RX_VK_LAG_LOG: behind a stopped submission of its queue)
+        lag_note_stop(value, 2);   // (RX_VK_LAG_LOG: behind a stopped submission of its queue)
         it->second.later.push_back({std::move(handles), value});
         return;
     }

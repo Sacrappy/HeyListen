@@ -20,7 +20,7 @@ void lag_bq_enter();
 void lag_submit(uint64_t value);
 void lag_run_start(uint64_t value);
 /// The recording of the submission is whole (not stopped at a wait): the capture check of the submit is made here
-void lag_run_end(uint64_t value);
+void lag_run_end(uint64_t value, uint64_t rec_seq_now, bool burst_open);
 /// A submission's capture just taken (vk_memory.cpp take_capture): its sampled pages, for the checks
 void lag_cap_taken(uint64_t value, uint32_t gen, const uint32_t* pages, const uint32_t* slots, size_t n, const uint8_t* late_mark);
 /// Before the next recording: the captures of submits the GPU has finished, compared again
@@ -32,7 +32,9 @@ void lag_finish(int64_t t0, int64_t t1, uint64_t q_values, uint64_t completed, u
 /// The GPU's counters, and the recording a submission value ended in (0: not known yet)
 void lag_set_timelines(uint64_t (*completed)(), uint64_t (*rec_completed)(), uint64_t (*rec_of)(uint64_t));
 /// The submission stopped at a wait for an event (the work waits for the game's own signal)
-void lag_note_stop(uint64_t value);
+void lag_note_stop(uint64_t value, int bit);   // (bit 1: stopped itself, 2: queued behind a stopped one)
+/// A recording went to the queue with this number on the recordings' timeline: the submissions whose recording was whole in a burst end in it
+void lag_recording_submitted(uint64_t seq);
 void lag_present();
 
 // (vk_memory.cpp) the comparisons
