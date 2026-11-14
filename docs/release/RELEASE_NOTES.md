@@ -20,14 +20,31 @@ repository (the engine under `engine/`).
 
 **v0.3.2 fixes crashes when moving between areas**, which have been there since v0.3.0. When graphics memory got tight
 (more likely at high resolutions and after several areas), a memory-saving step could copy stale GPU data over memory the
-game had just reused for its own objects, and the game crashed shortly after, usually while an area loaded. The data is now
-written back only into memory the game still uses for graphics, and only if the game has not written it since. Played by
-hand for 35 and 20 minutes through every area reachable from our save without a crash, where every earlier session crashed
-within 3 to 21 minutes. The update downloads only the builder's own few MB; the game is built again once.
+game had just reused for its own objects, and the game crashed shortly after, usually while an area loaded or when an
+area was entered again. The data is now written back only into memory the game still uses for graphics, and only if the
+game has not written it since. Played by hand for 35, 20, 45 and 28 minutes through every area reachable from our save
+without a crash, where every earlier session crashed within 3 to 21 minutes.
 
-Known and not fixed in this release: on a first play, each area's graphics pipelines are compiled as they are first seen,
-which shows as missing buildings over a white background, low frame rates and stalls for the first seconds or minutes in
-a new area (worse on some drivers). It gets better as the game learns them; a proper fix is being worked on.
+**A first play no longer starts with missing buildings.** Until now each area's graphics pipelines were compiled the first
+time they were seen, which showed as buildings and ground missing over a white background, low frame rates and stalls of
+up to a minute in a new area. The builder now ships a list of 9,854 pipeline states (hashes, formats and draw state only:
+no game code or data) recorded over 17 areas, and compiles them once: at the end of the build, or at the first start after
+this update, with a progress count (about one to two minutes on a recent PC, longer on a slow one). Measured on a cold
+start in Castle Town: draws left out 75,574 -> 332, the longest stall 21 s -> under 8 s. That last stall is not gone: about
+70 pipelines of a first visit cannot be known ahead yet and are still compiled when first seen.
+
+**GPUs without mesh shaders** (GeForce GTX 10 series and older, older Radeon and integrated graphics): three errors in how
+the engine used Vulkan on such cards are fixed (shader execution modes declared without checking that the card has them,
+start-up programs prepared as if the card had mesh shaders, a missing vertex stream). Current drivers of newer cards
+tolerated them; an older one may lose the GPU device instead, as reported after the first cutscene on a GTX 1060. We
+could not reproduce that loss on our hardware, so this is a likely fix, not a confirmed one: if the game still closes
+there, `docs/support/no-mesh-diagnostic.md` lists three settings to try and what to send us. On these cards the shader
+cache is rebuilt once after the update.
+
+Also fixed: a graphics memory pool destroyed twice by the game could make the engine forget a newer pool made at the same
+address.
+
+The update downloads only the builder's own few MB; the game is built again once.
 
 v0.3.1 repaired the installation: the setup downloaded four of the builder's tools from the Hookshot repository, which is
 no longer online; they are now served from this repository, byte for byte the same files.
