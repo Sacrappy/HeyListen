@@ -216,10 +216,27 @@ static void thread_finish(DWORD code) {
     self_thread = NULL;
     thread_unref(t);
 }
+/* (thread priorities: only lowered, with nice values: an unprivileged process cannot raise them, nor take back a lowering.
+   A thread's id is only known once it runs, and CreateThread's caller often sets the priority before that (hos_thread_pin
+   lowering OptimizeChangeBank): the priority is kept and whichever of the two comes second applies it) */
+static void thread_nice(HThread *t) {
+    const int p = __atomic_load_n(&t->priority, __ATOMIC_SEQ_CST);
+    const pid_t tid = __atomic_load_n(&t->tid, __ATOMIC_SEQ_CST);
+    const int nice = p <= THREAD_PRIORITY_IDLE ? 19 : p <= THREAD_PRIORITY_LOWEST ? 10 : p == THREAD_PRIORITY_BELOW_NORMAL ? 5 : 0;
+    if (nice && tid) setpriority(PRIO_PROCESS, (id_t)tid, nice);
+}
+BOOL SetThreadPriority(HANDLE h, int p) {
+    HThread *t = thread_of(h);
+    if (!t) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
+    __atomic_store_n(&t->priority, p, __ATOMIC_SEQ_CST);
+    thread_nice(t);
+    return TRUE;
+}
 static void *thread_entry(void *p) {
     HThread *t = (HThread *)p;
     self_thread = t;
-    t->tid = (pid_t)syscall(SYS_gettid);
+    __atomic_store_n(&t->tid, (pid_t)syscall(SYS_gettid), __ATOMIC_SEQ_CST);
+    thread_nice(t);   /* (a SetThreadPriority from the creator before this thread had its id: applied here) */
     thread_finish(t->fn(t->arg));
     return NULL;
 }
@@ -268,15 +285,7 @@ BOOL DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, HANDLE *out, DWORD access
     *out = t;
     return TRUE;
 }
-/* (thread priorities: only lowered, with nice values: an unprivileged process cannot raise them, nor take back a lowering) */
-BOOL SetThreadPriority(HANDLE h, int p) {
-    HThread *t = thread_of(h);
-    if (!t) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
-    t->priority = p;
-    const int nice = p <= THREAD_PRIORITY_IDLE ? 19 : p <= THREAD_PRIORITY_LOWEST ? 10 : p == THREAD_PRIORITY_BELOW_NORMAL ? 5 : 0;
-    if (nice && t->tid) setpriority(PRIO_PROCESS, (id_t)t->tid, nice);
-    return TRUE;
-}
+
 int GetThreadPriority(HANDLE h) {
     HThread *t = thread_of(h);
     return t ? t->priority : 0;
