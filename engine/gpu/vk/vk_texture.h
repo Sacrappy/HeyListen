@@ -135,6 +135,10 @@ void texture_segment_worker(int index);
 /// to it (submit it before the segment's uploads), 0: nothing, -1: something did and it could not be ended (lost: the
 /// replay stops)
 int texture_segment_end(int index);
+/// (RX_VK_POOL_MIRROR) on a parallel segment's worker, upload_command_buffer() is the earliest open segment's init command buffer
+/// from the begin call to the end call (a mirror made there is filled before any segment that could read it); elsewhere nothing
+void* upload_to_earliest_begin();
+void upload_to_earliest_end(void* h);
 /// Changes with every submission (a texture touched in it is not checked again in it)
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)

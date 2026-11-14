@@ -118,6 +118,7 @@ bool import_again(Pool& p, int why);
 // (RX_VK_POOL_MIRROR: pools made with no import; see "a mirror per pool, never imported" below)
 bool pool_mirror_on();
 int64_t st_pm_made = 0, st_pm_fills = 0, st_pm_fill_bytes = 0, st_pm_live_bytes = 0, st_pm_again[kAgainKinds] = {};
+int64_t st_pm_why[6] = {};   // (a binding imported: no recording, refused, parallel segment, deferred, written here, the mirror not made)
 bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
     SRWLOCK l = SRWLOCK_INIT;
@@ -5446,6 +5447,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
+        if (p->never_imported && !p->memory) st_pm_why[!mirror_upload ? 0 : 1]++;   // (RX_VK_POOL_MIRROR: why imported)
         if (!p->memory && !import_again(*p, kAgainBind)) return {};   // (RX_VK_NO_HOST_IMPORT)
         if (p->lazy_held) st_lazy_direct.fetch_add(1, std::memory_order_relaxed);
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
@@ -5460,7 +5462,17 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // before it found the mirror in the page table and read it unfilled (houses, rocks and bushes missing, geometry
     // torn, the more the segments the worse; #994 with RX_VK_PARALLEL). RX_VK_MIRROR_DEFER=1: at the next submission, as before)
     static const bool defer = getenv("RX_VK_MIRROR_DEFER") != nullptr;
-    if (p->mstate == Pool::MIRROR_NONE && !defer && !par && p->direct_write_epoch != mirror_epoch && mirror_make(*p)) {
+    // (RX_VK_POOL_MIRROR: a never-imported pool has nothing else the GPU can read, so in a parallel segment too, recorded into the
+    // earliest open segment's init command buffer: no segment has bound it yet (a binding without a mirror imports it), and every
+    // segment's init is submitted before its uploads)
+    const bool pm_par = par && p->never_imported && !p->memory;
+    bool made = false;
+    if (p->mstate == Pool::MIRROR_NONE && !defer && (!par || pm_par) && p->direct_write_epoch != mirror_epoch) {
+        void* redirect = pm_par ? upload_to_earliest_begin() : nullptr;
+        made = mirror_make(*p);
+        if (redirect) upload_to_earliest_end(redirect);
+    }
+    if (made) {
         publish_cap_ranges();
         static int64_t made_now;
         if (++made_now % 200 == 1)
@@ -5473,6 +5485,8 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     }
     if (p->mstate != Pool::MIRROR_ON) {
         if (written) p->gpu_written = true;
+        if (p->never_imported && !p->memory)   // (RX_VK_POOL_MIRROR: why no mirror now: a parallel segment, deferred, written here, refused)
+            st_pm_why[par ? 2 : defer ? 3 : p->direct_write_epoch == mirror_epoch ? 4 : 5]++;
         if (!p->memory && !import_again(*p, written ? kAgainWrite : kAgainBind)) return {};   // (RX_VK_NO_HOST_IMPORT)
         auto& e = direct_by_pool[p->lo];
         e.first++, e.second = (int)p->mstate;
@@ -5628,11 +5642,13 @@ void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
     }
     logf("vk: pools mirrored, never imported (RX_VK_POOL_MIRROR): %zu now (%llu MB), %lld made; fills %lld (%lld MB), live pages %lld MB, "
          "through staging; imported after all, by why: bind %lld, written %lld, sync %lld, mirror made %lld, readback %lld, texture %lld, "
-         "mirror freed %lld, write-back %lld; imports live %zu (%llu MB)", never, (unsigned long long)(never_b >> 20), (long long)st_pm_made,
+         "mirror freed %lld, write-back %lld; imports live %zu (%llu MB); bindings imported as: no recording %lld, refused %lld, a "
+         "parallel segment %lld, deferred %lld, written in guest memory this part %lld, the mirror not made %lld", never, (unsigned long long)(never_b >> 20), (long long)st_pm_made,
          (long long)st_pm_fills, (long long)(st_pm_fill_bytes >> 20), (long long)(st_pm_live_bytes >> 20), (long long)st_pm_again[kAgainBind],
          (long long)st_pm_again[kAgainWrite], (long long)st_pm_again[kAgainSync], (long long)st_pm_again[kAgainMake], (long long)st_pm_again[kAgainRb],
          (long long)st_pm_again[kAgainTexture], (long long)st_pm_again[kAgainFree], (long long)st_pm_again[kAgainWb], imported_n,
-         (unsigned long long)(imp_b >> 20));
+         (unsigned long long)(imp_b >> 20), (long long)st_pm_why[0], (long long)st_pm_why[1], (long long)st_pm_why[2], (long long)st_pm_why[3],
+         (long long)st_pm_why[4], (long long)st_pm_why[5]);
 }
 }  // namespace
 
@@ -7240,26 +7256,31 @@ void pool_mirror_check_main() {
         if (!hi) continue;
         next = lo;
         st_pmc_pools++;
+        std::vector<uint64_t> differ;
         for (uint64_t a = lo; a < hi; a += mir.size()) {
             const uint64_t n = std::min<uint64_t>(mir.size(), hi - a);
             if (!memory_mirror_read(a, n, mir.data())) break;
             if (!host->gpu_read(a, mem.data(), n)) break;
             for (uint64_t o = 0; o < n; o += 4096) {
-                const uint64_t k = std::min<uint64_t>(4096, n - o);
                 st_pmc_pages++;
-                if (!std::memcmp(mir.data() + o, mem.data() + o, k)) continue;
-                if (memory_written_since(a + o, k, synced)) { st_pmc_skipped++; continue; }   // (the CPU wrote it since the sync)
-                const int64_t bad = ++st_pmc_bad;
-                if (bad <= 20) {
-                    uint64_t plo = 0;
-                    uint32_t flags = 0;
-                    {
-                        std::lock_guard lk(nvn_pools_mu);
-                        if (const NvnPool* np = nvn_pool_at(a + o, &plo)) flags = np->flags;
-                    }
-                    logf("vk: pool mirror check: MISMATCH at %#llx (mirror %#llx..%#llx, game pool at %#llx flags %#x, synced gen %u)",
-                         (unsigned long long)(a + o), (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)plo, flags, synced);
+                if (std::memcmp(mir.data() + o, mem.data() + o, std::min<uint64_t>(4096, n - o))) differ.push_back(a + o);
+            }
+        }
+        // (a CPU write is stamped with a generation when the next submits collect the write marks: given time, a page the CPU
+        // wrote after the mirror's sync shows as written since it; one that still does not differs for another reason)
+        if (!differ.empty()) Sleep(500);
+        for (const uint64_t pg : differ) {
+            if (memory_written_since(pg, 4096, synced)) { st_pmc_skipped++; continue; }   // (the CPU wrote it since the sync)
+            const int64_t bad = ++st_pmc_bad;
+            if (bad <= 20) {
+                uint64_t plo = 0;
+                uint32_t flags = 0;
+                {
+                    std::lock_guard lk(nvn_pools_mu);
+                    if (const NvnPool* np = nvn_pool_at(pg, &plo)) flags = np->flags;
                 }
+                logf("vk: pool mirror check: MISMATCH at %#llx (mirror %#llx..%#llx, game pool at %#llx flags %#x, synced gen %u)",
+                     (unsigned long long)pg, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)plo, flags, synced);
             }
         }
         static int64_t logged_at = -1;
