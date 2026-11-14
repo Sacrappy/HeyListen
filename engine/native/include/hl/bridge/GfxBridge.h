@@ -31,7 +31,7 @@ struct RenderStateBlock {
     uint64_t flags;   ///< (bit 17: derive and write only, record nothing)
     uint8_t _8[16];
     GuestAddr material;
-    uint8_t _20[8];
+    GuestAddr textures;      ///< the preparation's texture objects, one pointer a texture slot
     GuestAddr renderer;
     GuestAddr buffer;        ///< the buffer object the preparation binds binding word 0's uniform blocks from
     uint8_t cluster;         ///< the cluster entry's index (the sub-mesh submission; the preparation's cluster calls)
@@ -94,6 +94,7 @@ struct RenderStateBlock {
 };
 static_assert(offsetof(RenderStateBlock, material) == 24);
 static_assert(offsetof(RenderStateBlock, renderer) == 40);
+static_assert(offsetof(RenderStateBlock, textures) == 0x20);
 static_assert(offsetof(RenderStateBlock, buffer) == 0x30);
 static_assert(offsetof(RenderStateBlock, cluster) == 0x38);
 static_assert(offsetof(RenderStateBlock, depth_mode) == 57);
@@ -294,6 +295,23 @@ inline constexpr uint64_t kBufferAlignMethod = 0x28, kBufferBindMethod = 0x50;
 /// bind.
 inline constexpr uint64_t kAlignFixedSlot = 0x84cb56e0, kAlignFieldSlot = 0x84cb4fa8, kBindUniformSlot = 0x84cb56e8,
                           kBindStorageSlot = 0x84cb4fb8;
+
+/// A texture object of the block's table: its texture and sampler ids and a word that is not 0 while it is being made
+/// ready (the preparation then waits for it or registers it: guest code).
+struct TextureObject {
+    uint8_t _0[0x68];
+    uint32_t texture;
+    uint8_t _6c[0x80];
+    uint32_t ready;
+    uint8_t _f0[2];
+    int16_t sampler;
+};
+static_assert(offsetof(TextureObject, texture) == 0x68);
+static_assert(offsetof(TextureObject, ready) == 0xec);
+static_assert(offsetof(TextureObject, sampler) == 0xf2);
+/// The NVN device the texture handles are asked of: a GOT slot holding the address of a global that points at an object
+/// whose +0x170 is the device.
+inline constexpr uint64_t kDeviceHolderSlot = 0x84cacc98, kDeviceOffset = 0x170;
 
 /// The game's default binding words (globals): the first part's three, then the second part's two.
 inline constexpr uint64_t kDefaultWordsA = 0x84ea2848, kDefaultWordsB = 0x84ea2854;

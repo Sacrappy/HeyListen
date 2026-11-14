@@ -26,7 +26,7 @@ enum class PrepareRoute : uint8_t {
     NoMaterial,       ///< the drawable's material entry is empty: the function returns 0 at once (native)
     Cached,           ///< state and program already applied (native)
     ProgramBound,     ///< another program whose interface's buffers and textures are the ones applied: bound alone (native)
-    ProgramBuffers,   ///< another program, its changed uniform-block words bound from the known buffer objects (native)
+    ProgramBuffers,   ///< another program, its changed uniform-block words or its textures bound (native)
     StateApplied,     ///< the state step taken (the render state copied, recorded again when it changed), the rest as on
                       ///< the two paths above (native)
     StateChanged,     ///< the state step (left: only with HL_GFX_PREP's state step off)
@@ -121,6 +121,15 @@ struct PrepareInputs {
     uint32_t words[5] = {};             ///< the parts' binding words (three, then two)
     uint32_t applied_words[5] = {};
     uint32_t texture_mask = 0;          ///< the texture part's slots
+    /// The texture part's slots (read when its id is new, mode bit 7 clear): each slot's binding word and the texture
+    /// object of the block's table at that slot (its ready word, texture id and sampler id).
+    struct TextureSlot {
+        uint32_t word = 0;
+        uint32_t ready = 0, texture = 0;
+        int16_t sampler = 0;
+    };
+    TextureSlot textures[30];
+    uint64_t device = 0;                ///< the NVN device the texture handles are asked of
     // The rest: the block's and the drawable's fields are read whatever the route (decide() uses what the program
     // step leaves in their place).
     uint16_t pending = 0;               ///< the block's pending bits
@@ -164,6 +173,16 @@ struct PrepareOutputs {
         uint64_t slot = 0, address = 0, size = 0;
     };
     Bind binds[9];
+    /// The texture binds, in order: a handle asked for each texture (texture id, sampler id as the registers hold them),
+    /// then its stages and slots.
+    struct Texture {
+        uint64_t texture = 0, sampler = 0;
+        uint32_t stages = 0;
+        uint32_t stage[3] = {};
+        uint64_t slot[3] = {};
+    };
+    Texture textures[30];
+    uint32_t texture_count = 0;
     uint32_t bind_count = 0;
     bool bind_marked = false;           ///< a uniform bind sets the command buffer's mark byte
     bool mask_cleared = false;          ///< the block's applied bits cleared (before the pending step)
@@ -178,7 +197,9 @@ inline constexpr uint64_t kProgramBinder = 0x188;
 struct PrepareHandles {
     // The state record's: the command buffer, the five state objects in the function's frame, the block's blend color.
     uint64_t state_buffer = 0;
-    uint64_t bind_buffer = 0;           ///< the uniform binds' command buffer
+    uint64_t bind_buffer = 0;           ///< the uniform and texture binds' command buffer
+    uint64_t device = 0;
+    uint64_t handles[30] = {};          ///< the texture handles asked (PrepareOutputs::textures' order)
     uint64_t blend = 0, color = 0, channel_mask = 0, depth_stencil = 0, polygon = 0, blend_color = 0;
     uint64_t command_buffer = 0;
     uint64_t command_list = 0;          ///< the list's handle in the material entry (its address: a list of one)

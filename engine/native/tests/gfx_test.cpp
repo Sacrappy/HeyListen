@@ -264,7 +264,7 @@ void the_bridge_reads_and_writes_the_block_in_place() {
     rt.put<uint64_t>(callback + 16, 0x1234);
     CHECK(!sb.read(block, 0x104, sp, in, at));
     // (the procedures' globals: one a procedure)
-    for (uint32_t p = 0; p < gfx::kProcCount; p++) CHECK(bridge::proc_global(p) >= 0x84d67000 && bridge::proc_global(p) < 0x84d68000);
+    for (uint32_t p = 0; p < gfx::kProcCount; p++) CHECK(bridge::proc_global(p) >= 0x84d66f00 && bridge::proc_global(p) < 0x84d68600);   // (the loader's globals)
     CHECK(bridge::proc_global(gfx::kProcCount) == 0);
 }
 
@@ -782,6 +782,41 @@ void the_preparation_binds_changed_uniform_words() {
     CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.word_written[4] && out.bind_count == 1 && out.binds[0].stage == 0);
 }
 
+void the_preparation_binds_new_textures() {
+    gfx::PrepareInputs in = cached_inputs();
+    in.applied_program = 0x5678;
+    in.interface_id[2] = 4;
+    in.texture_mask = 0x40000005;   // (slots 0 and 2; bit 30 is past the slots)
+    in.textures[0] = {0xff02ff01, 0, 7, 3};    // (tag 0xff: stage 0 slot 1, stage 1 slot 2)
+    in.textures[2] = {0xfeffff05, 0, 9, -2};   // (tag 0xfe: stage 6 slot 5)
+    gfx::PrepareOutputs out = gfx::Prepare::decide(in);
+    CHECK(out.route == gfx::PrepareRoute::ProgramBuffers && out.texture_count == 2 && out.id_written[2]);
+    CHECK(out.textures[0].texture == 7 && out.textures[0].sampler == 3 && out.textures[0].stages == 2);
+    CHECK(out.textures[0].stage[0] == 0 && out.textures[0].slot[0] == 1 && out.textures[0].stage[1] == 1 && out.textures[0].slot[1] == 2);
+    CHECK(out.textures[1].sampler == 0xfffffffeu && out.textures[1].stages == 1 && out.textures[1].stage[0] == 6);
+    Recorder r;
+    gfx::PrepareHandles h;
+    h.bind_buffer = 0xcb, h.device = 0xde, h.handles[0] = 0x111, h.handles[1] = 0x222;
+    gfx::Prepare::emit(out, h, r);
+    CHECK(r.calls.size() == 1 + 3 + 2 + 1);   // (program, handle and two binds, handle and one bind, the list)
+    CHECK(r.calls[1].op == (uint32_t)gfx::Proc::DeviceGetTextureHandle && r.calls[1].x[0] == 0xde && r.calls[1].x[1] == 7);
+    CHECK(r.calls[3].op == (uint32_t)gfx::Proc::CommandBufferBindTexture && r.calls[3].x[2] == 2 && r.calls[3].x[3] == 0x111);
+    CHECK(r.calls[5].x[1] == 6 && r.calls[5].x[3] == 0x222);
+    // (a word -1, a texture id -1: nothing; a texture not ready, mode bit 7, another tag: left)
+    in.textures[2].word = 0xffffffffu;
+    in.textures[0].texture = 0xffffffffu;
+    CHECK(gfx::Prepare::decide(in).texture_count == 0);
+    in.textures[0].texture = 7;
+    in.textures[0].ready = 1;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in.textures[0].ready = 0;
+    in.mode_bits |= 0x80;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+    in.mode_bits &= ~0x80u;
+    in.textures[0].word = 0xfd02ff01;
+    CHECK(gfx::Prepare::decide(in).route == gfx::PrepareRoute::ProgramChanged);
+}
+
 void the_prepare_bridge_reads_in_the_functions_order() {
     SparseRuntime rt;
     const uint64_t drawable = 0x100000, block = 0x200000, context = 0x300000, cb = 0x310000, materials = 0x400000,
@@ -923,6 +958,7 @@ int main() {
     the_preparation_decides_its_route_in_order();
     the_preparation_state_step_derives_and_records();
     the_preparation_binds_changed_uniform_words();
+    the_preparation_binds_new_textures();
     the_prepare_bridge_reads_in_the_functions_order();
     std::printf("gfx: ok\n");
     return 0;

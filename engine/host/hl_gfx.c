@@ -455,7 +455,11 @@ static int prep_init(void) {
 
 /* The translated preparation, compared call by call (and its shape filed in the histogram). */
 static void prep_checked(Ctx *c) {
+    /* (the native side asks NVN queries on this context: the translated body runs with the registers it was given) */
+    uint64_t keep[32];
+    memcpy(keep, c->x, sizeof keep);
     hl_gfx_prep_check_begin(c->x[0], c->x[1], c->x[31]);
+    memcpy(c->x, keep, sizeof keep);
     t_prep_inside = 1;
     prep_recording = 1;
     prepare_translated(c);

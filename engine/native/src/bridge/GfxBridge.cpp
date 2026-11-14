@@ -31,6 +31,7 @@ GuestAddr proc_global(uint32_t proc) {
         0x84d674a8, 0x84d67d68,               // buffer address, indexed instanced draw
         // (read from the shared preparation)
         0x84d67c60, 0x84d67c78,               // bind program, bind uniform buffer
+        0x84d66f50, 0x84d67cd0,               // texture handle, bind texture
     };
     return proc < gfx::kProcCount ? kGlobals[proc] : 0;
 }
@@ -432,6 +433,24 @@ void PrepareBridge::read_program(GuestAddr block, gfx::PrepareInputs& in) const 
     if (!(mode & 0x8000)) {
         in.interface_id[2] = u32(runtime_, p.part[2]);
         in.texture_mask = u32(runtime_, p.part[2] + 4);
+        // (the slots, where the function reads them: a new id with slots, without mode bit 7; the texture object only
+        // for a word not -1, the device only once a handle is asked)
+        if (in.interface_id[2] != in.applied_interface_id[2] && (in.texture_mask & 0x3fffffffu) && !(mode & 0x80)) {
+            bool ask = false;
+            for (uint32_t i = 0; i < 30; i++) {
+                if (!((in.texture_mask >> i) & 1)) continue;
+                gfx::PrepareInputs::TextureSlot& s = in.textures[i];
+                s.word = u32(runtime_, p.part[2] + 8 + 4 * i);
+                if (s.word == 0xffffffffu) continue;
+                const GuestAddr o = u64(runtime_, b.textures + 8 * i);
+                const guest::TextureObject& x = at<guest::TextureObject>(runtime_, o);
+                s.ready = __atomic_load_n(&x.ready, __ATOMIC_ACQUIRE);
+                if (s.ready) break;   // (the function goes no further natively)
+                s.texture = x.texture, s.sampler = x.sampler;
+                ask |= s.texture != 0xffffffffu && s.sampler != -1;
+            }
+            if (ask) in.device = u64(runtime_, u64(runtime_, u64(runtime_, guest::kDeviceHolderSlot)) + guest::kDeviceOffset);
+        }
     }
 }
 
