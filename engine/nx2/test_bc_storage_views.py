@@ -1,4 +1,4 @@
-"""Create BC/raw views using the actual image flags and make_view; Windows Vulkan device required.
+"""Create BC/raw views using the actual image flags and make_view; a Vulkan device required (Windows or Linux).
 
 python nx2/test_bc_storage_views.py --headers <Vulkan-Headers/include> [--cxx clang++]
 Enable the Khronos validation layer through VK_LAYER_PATH/VK_INSTANCE_LAYERS.
@@ -6,7 +6,7 @@ No game data, shader, or image contents are used; this checks creation, not stor
 """
 import argparse
 from pathlib import Path
-import subprocess,tempfile
+import os,subprocess,tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
 def block(text,marker):
@@ -21,9 +21,21 @@ def main():
     start=text.index('    const VkFormatProperties fp = format_props(x.format);')
     end=text.index('    if (x.type == VK_IMAGE_TYPE_2D',start)
     flags=text[start:end]
-    fixture=r'''#define WIN32_LEAN_AND_MEAN
-#define VK_NO_PROTOTYPES
+    fixture=r'''#define VK_NO_PROTOTYPES
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+typedef HMODULE Loader;
+static Loader open_loader(){return LoadLibraryA("vulkan-1.dll");}
+static void* lookup(Loader l,const char* n){return (void*)GetProcAddress(l,n);}
+static void close_loader(Loader l){FreeLibrary(l);}
+#else
+#include <dlfcn.h>
+typedef void* Loader;
+static Loader open_loader(){return dlopen("libvulkan.so.1",RTLD_NOW);}
+static void* lookup(Loader l,const char* n){return dlsym(l,n);}
+static void close_loader(Loader l){dlclose(l);}
+#endif
 #include <vulkan/vulkan.h>
 #include <cstdio>
 #include <cstdlib>
@@ -32,13 +44,14 @@ def main():
 #define API_LIST(X) X(vkCreateInstance) X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) X(vkCreateDevice) X(vkDestroyDevice) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView)
 #define DECLARE(n) PFN_##n n;
 API_LIST(DECLARE)
-struct {VkDevice device;VkPhysicalDevice physical;} dev{};
-struct Texture {VkImage image;VkFormat format;VkImageUsageFlags usage;VkSampleCountFlagBits samples;VkImageType type;} ;
+struct {VkDevice device;VkPhysicalDevice physical;bool view_2d_of_3d;} dev{};
+struct Texture {VkImage image;VkFormat format;VkImageUsageFlags usage;VkSampleCountFlagBits samples;VkImageType type;bool bc;uint32_t width,height,depth,layers;} ;
+#define logf(...) std::printf(__VA_ARGS__)
 VkFormatProperties format_props(VkFormat f){VkFormatProperties p{};vkGetPhysicalDeviceFormatProperties(dev.physical,f,&p);return p;}
-''' + block(text,'bool is_bc(VkFormat f) {')+'\n'+block(text,'bool is_astc(VkFormat f) {')+'\n'+block(text,'VkImageView make_view(')+r'''
+''' + block(text,'bool is_bc(VkFormat f) {')+'\n'+block(text,'bool is_astc(VkFormat f) {')+'\n'+block(text,'VkFormat linear_twin(VkFormat f) {')+'\n'+block(text,'bool half_byte_bc(VkFormat f) {')+'\n'+block(text,'VkImageView make_view(')+r'''
 int main() {
-    HMODULE loader=LoadLibraryA("vulkan-1.dll");CHECK(loader);
-#define LOAD(n) n=(PFN_##n)GetProcAddress(loader,#n);CHECK(n);
+    Loader loader=open_loader();CHECK(loader);
+#define LOAD(n) n=(PFN_##n)lookup(loader,#n);CHECK(n);
     API_LIST(LOAD)
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};app.apiVersion=VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};ici.pApplicationInfo=&app;
@@ -59,9 +72,9 @@ int main() {
     struct Case{VkFormat compressed,raw;int bytes;} cases[]={{VK_FORMAT_BC1_RGBA_UNORM_BLOCK,VK_FORMAT_R32G32_UINT,8},
         {VK_FORMAT_BC3_UNORM_BLOCK,VK_FORMAT_R32G32B32A32_UINT,16},{VK_FORMAT_BC4_UNORM_BLOCK,VK_FORMAT_R16G16B16A16_UINT,8},
         {VK_FORMAT_BC5_UNORM_BLOCK,VK_FORMAT_R32G32B32A32_UINT,16},{VK_FORMAT_BC7_UNORM_BLOCK,VK_FORMAT_R32G32B32A32_UINT,16}};
-    int storage_views=0;
+    int storage_views=0,target_views=0;
     for(auto c:cases){
-        Texture x{};x.format=c.compressed;x.type=VK_IMAGE_TYPE_2D;x.samples=VK_SAMPLE_COUNT_1_BIT;bool depth=false;int bpb=c.bytes;
+        Texture x{};x.format=c.compressed;x.type=VK_IMAGE_TYPE_2D;x.samples=VK_SAMPLE_COUNT_1_BIT;x.bc=true;x.width=32;x.height=16;x.depth=1;x.layers=2;bool depth=false;int bpb=c.bytes;
 ''' +flags+r'''
         const bool storage=(x.usage & VK_IMAGE_USAGE_STORAGE_BIT)!=0;
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};ci.flags=flags;ci.imageType=VK_IMAGE_TYPE_2D;ci.format=x.format;
@@ -75,19 +88,24 @@ int main() {
         auto sampled=make_view(&x,VK_IMAGE_VIEW_TYPE_2D_ARRAY,c.compressed,VK_IMAGE_ASPECT_COLOR_BIT,0,3,0,2,cm,VK_IMAGE_USAGE_SAMPLED_BIT);CHECK(sampled);
         auto raw=make_view(&x,VK_IMAGE_VIEW_TYPE_2D,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,1,1,1,1,cm,VK_IMAGE_USAGE_STORAGE_BIT);CHECK(bool(raw)==storage);storage_views+=bool(raw);
         CHECK(!make_view(&x,VK_IMAGE_VIEW_TYPE_2D,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,0,2,0,1,cm,VK_IMAGE_USAGE_STORAGE_BIT));
-        CHECK(!make_view(&x,VK_IMAGE_VIEW_TYPE_2D_ARRAY,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,2,cm,VK_IMAGE_USAGE_STORAGE_BIT));
+        // several layers: as asked where the driver takes them, else its first layer (make_view's Vulkan 1.1 fallback)
+        auto layers=make_view(&x,VK_IMAGE_VIEW_TYPE_2D_ARRAY,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,2,cm,VK_IMAGE_USAGE_STORAGE_BIT);
+        CHECK(bool(layers)==storage);if(layers)vkDestroyImageView(dev.device,layers,nullptr);
         CHECK(!make_view(&x,VK_IMAGE_VIEW_TYPE_2D,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1,cm,0));
-        CHECK(!make_view(&x,VK_IMAGE_VIEW_TYPE_2D,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1,cm,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
+        // raw colour attachment views where the image took that usage (OoT's BC4 noise volumes, #1151)
+        const bool attach=(x.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)!=0;
+        auto target=make_view(&x,VK_IMAGE_VIEW_TYPE_2D,c.raw,VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1,cm,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        CHECK(bool(target)==attach);target_views+=bool(target);if(target)vkDestroyImageView(dev.device,target,nullptr);
         if(raw)vkDestroyImageView(dev.device,raw,nullptr);vkDestroyImageView(dev.device,sampled,nullptr);vkDestroyImage(dev.device,x.image,nullptr);vkFreeMemory(dev.device,mem,nullptr);
     }
-    vkDestroyDevice(dev.device,nullptr);vkDestroyInstance(instance,nullptr);FreeLibrary(loader);
-    CHECK(storage_views>0);std::printf("PASS: five BC formats, %d raw storage views, sampled arrays/mips, rejected empty/unsupported usages\n",storage_views);
+    vkDestroyDevice(dev.device,nullptr);vkDestroyInstance(instance,nullptr);close_loader(loader);
+    CHECK(storage_views>0);std::printf("PASS: five BC formats, %d raw storage views, %d raw colour attachment views, sampled arrays/mips, rejected empty/unsupported usages\n",storage_views,target_views);
 }
 '''
     work=ROOT/'work';work.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='bc-views-',dir=work) as temp:
         directory=Path(temp).resolve();directory.relative_to(work.resolve());cpp=directory/'fixture.cpp';exe=directory/'fixture.exe';cpp.write_text(fixture,encoding='utf-8')
-        subprocess.run([a.cxx,'-std=c++20','-O2','-I'+str(a.headers),str(cpp),'-o',str(exe)],check=True)
+        subprocess.run([a.cxx,'-std=c++20','-O2','-I'+str(a.headers),str(cpp),'-o',str(exe)]+([] if os.name=='nt' else ['-ldl']),check=True)
         r=subprocess.run([str(exe)],capture_output=True,text=True);print(r.stdout+r.stderr,end='');r.check_returncode()
         assert 'Validation Error' not in r.stderr+r.stdout
 if __name__=='__main__':main()
