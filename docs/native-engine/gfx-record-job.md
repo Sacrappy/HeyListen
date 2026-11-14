@@ -970,6 +970,14 @@ does not load in scripted runs):
 from the "program" route; what is left there is mostly the texture part (shapes with 5-8 textures bound lead it in every
 zone) and word 1. The state step now also covers calls whose program then binds buffers, hence its larger counts.
 
+**Native, by picture** (`HL_GFX_PREP=1` and `HL_GFX_REC=1` at their defaults, `HL_GFX_REC_CHECK=1`, 170 s runs, shots every
+600 frames): Hyrule Field, Kokiri Forest, Lake Hylia, Death Mountain Trail and the Lost Woods ran to the end with no
+crash line and the scene right in the last shots (2.58-4.99 M native preparations a run; 54-83 k of them with buffer
+binds). The record check over the same runs (the render-state function's records and now the preparation's state
+records, RecordSink against the NVN procedures, call by call): 134,083 / 174,102 / 161,615 / 145,959 / 137,990 calls
+compared, 0 mismatched, accounting included. Kakariko Village's save does not load in scripted runs (for any stream):
+Lake Hylia stands in for it. The Kokiri Forest shot shows the minimap's dark rectangle, as before these bricks.
+
 ## Not established
 
 - Who builds the runner's item lists (R+1244..R+1280), the pass and target objects, the slot table of `0x80364080`
