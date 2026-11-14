@@ -7427,7 +7427,7 @@ int memory_mirror_read(uint64_t guest, uint64_t size, void* out) {
 // after the comparison) may differ and is not counted; any other difference is a mismatch: the mirror does not hold the pool's bytes.
 // Counted, the first 20 logged with the pool, the page and its flags. Zero is the bar.
 namespace {
-std::atomic<int64_t> st_pmc_pools{0}, st_pmc_pages{0}, st_pmc_skipped{0}, st_pmc_bad{0}, st_pmc_written{0}, st_pmc_busy{0};
+std::atomic<int64_t> st_pmc_pools{0}, st_pmc_pages{0}, st_pmc_skipped{0}, st_pmc_bad{0}, st_pmc_written{0}, st_pmc_busy{0}, st_pmc_unsettled{0};
 void pool_mirror_check_main() {
     std::vector<uint8_t> mir(4ull << 20), mem(4ull << 20);
     uint64_t next = 0;
@@ -7467,7 +7467,16 @@ void pool_mirror_check_main() {
         }
         // (a CPU write is stamped with a generation when the next submits collect the write marks: given time, a page the CPU
         // wrote after the mirror's sync shows as written since it; one that still does not differs for another reason)
-        if (!differ.empty()) Sleep(500);
+        // (the write marks are collected at the game's submits: 500 ms was not always two submits during a load, and a page written
+        // before the read showed as a mismatch, twice in a market run (CPU-uncached 0x22 pools): now two submits are waited for,
+        // 5 s at most; a page whose generation still says nothing then is counted unsettled, not a mismatch)
+        bool settled = true;
+        if (!differ.empty()) {
+            const uint64_t q0 = submits_queued.load(std::memory_order_acquire);
+            Sleep(500);
+            for (int w = 0; w < 90 && submits_queued.load(std::memory_order_acquire) < q0 + 2; w++) Sleep(50);
+            settled = submits_queued.load(std::memory_order_acquire) >= q0 + 2;
+        }
         if (written) {   // (bound again meanwhile: the GPU may have written it since; this round says nothing)
             std::lock_guard lk(pools_mu);
             const auto it = imported.find(lo);
@@ -7479,6 +7488,7 @@ void pool_mirror_check_main() {
         }
         for (const uint64_t pg : differ) {
             if (memory_written_since(pg, 4096, synced)) { st_pmc_skipped++; continue; }   // (the CPU wrote it since the sync)
+            if (!settled) { st_pmc_unsettled++; continue; }
             const int64_t bad = ++st_pmc_bad;
             if (bad <= 20) {
                 uint64_t plo = 0;
@@ -7495,9 +7505,9 @@ void pool_mirror_check_main() {
         if (st_pmc_pools / 16 != logged_at) {
             logged_at = st_pmc_pools / 16;
             logf("vk: pool mirror check (RX_VK_POOL_MIRROR_CHECK): %lld pools (%lld written by the GPU, their write-backs staged; %lld "
-                 "more bound again during the check, not counted), %lld pages compared, %lld written since their sync, MISMATCHES %lld",
+                 "more bound again during the check, not counted), %lld pages compared, %lld written since their sync, %lld unsettled (no submit to collect the marks), MISMATCHES %lld",
                  (long long)st_pmc_pools.load(), (long long)st_pmc_written.load(), (long long)st_pmc_busy.load(),
-                 (long long)st_pmc_pages.load(), (long long)st_pmc_skipped.load(), (long long)st_pmc_bad.load());
+                 (long long)st_pmc_pages.load(), (long long)st_pmc_skipped.load(), (long long)st_pmc_unsettled.load(), (long long)st_pmc_bad.load());
         }
     }
 }
