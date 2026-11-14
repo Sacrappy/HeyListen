@@ -277,6 +277,14 @@ static void realtime_step(int64_t now) {
             hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x58.. %d %d %d %d", *limit, *(uint8_t *)GP(mod + 0x231),
                     *(uint8_t *)GP(mod + 0x232), *(int *)GP(mod + 0x2c8), *(int *)GP(mod + 0x270 + 0x58), *(int *)GP(mod + 0x270 + 0x28),
                     *(int *)GP(mod + 0x270 + 0x2c), *(int *)GP(mod + 0x270 + 0x30));
+        /* (HeyListen) and the global step (f_83b6ea90's float at 0x84d61fc8, 60 / nominal or 60 x the frame's seconds) summed
+           over the same frames: what reads it runs at that speed (TICK-014's old way timed the clock, not this one) */
+        static double global_sum;
+        if (log_on) {
+            float g;
+            memcpy(&g, GP(0x84d61fc8), 4);
+            global_sum += g;
+        }
         if (log_on && !((n - 1) % 300) && hos_step_probe) {   /* (game speed: the game clock's 1/60 s a second of wall time) */
             static double clock_before;
             static int64_t at_before;
@@ -284,10 +292,11 @@ static void realtime_step(int64_t now) {
             memcpy(&game_clock, GP(hos_step_probe + 0xd58), 8);
             if (at_before && now > at_before) {
                 const double rate = (game_clock - clock_before) * 1e9 / (double)(now - at_before);
-                hos_log("vi: game clock %.1f: %.2f a second of wall time (speed %.3f) at %.1f fps", game_clock, rate, rate / 60.0,
-                        300e9 / (double)(now - at_before));
+                const double global = global_sum * 1e9 / (double)(now - at_before);
+                hos_log("vi: game clock %.1f: %.2f a second of wall time (speed %.3f) at %.1f fps; global step %.2f a second (speed "
+                        "%.3f)", game_clock, rate, rate / 60.0, 300e9 / (double)(now - at_before), global, global / 60.0);
             }
-            clock_before = game_clock, at_before = now;
+            clock_before = game_clock, at_before = now, global_sum = 0;
         }
         const int cap = fps_limit();
         if (cap > 60 && target < cap) target = cap;   /* (the Insert menu's limit raises the game's own limiter too) */
