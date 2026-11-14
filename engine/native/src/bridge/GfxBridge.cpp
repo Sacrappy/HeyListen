@@ -30,7 +30,7 @@ GuestAddr proc_global(uint32_t proc) {
         0x84d67d90, 0x84d67c10, 0x84d67d98,   // geometry processing mode, call commands, mesh tasks
         0x84d674a8, 0x84d67d68,               // buffer address, indexed instanced draw
         // (read from the shared preparation)
-        0x84d67c60,                           // bind program
+        0x84d67c60, 0x84d67c78,               // bind program, bind uniform buffer
     };
     return proc < gfx::kProcCount ? kGlobals[proc] : 0;
 }
@@ -307,7 +307,7 @@ void put_state(guest::RenderStateBlock& b, const gfx::PrepareState& s) {
 
 void PrepareBridge::state_handles(GuestAddr block, uint64_t sp, gfx::PrepareHandles& h) const {
     const guest::RenderStateBlock& b = at<guest::RenderStateBlock>(runtime_, block);
-    h.state_buffer = at<guest::Renderer>(runtime_, b.renderer).command_buffer;
+    h.state_buffer = h.bind_buffer = at<guest::Renderer>(runtime_, b.renderer).command_buffer;
     h.blend = sp - guest::kPrepBlend;
     h.color = sp - guest::kPrepColor;
     h.channel_mask = sp - guest::kPrepChannelMask;
@@ -359,6 +359,12 @@ void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs
     }
     in.program = e.program;
     in.applied_program = b.program;
+    // (the global switch and the known methods: the game's own globals, read whatever the route)
+    in.inline_switch = u32(runtime_, u64(runtime_, kInlineCallSwitchSlot)) != 0;
+    in.known.align_fixed = u64(runtime_, guest::kAlignFixedSlot);
+    in.known.align_field = u64(runtime_, guest::kAlignFieldSlot);
+    in.known.bind_uniform = u64(runtime_, guest::kBindUniformSlot);
+    in.known.bind_storage = u64(runtime_, guest::kBindStorageSlot);
     if (in.program != in.applied_program) read_program(block, in);
     // (the block's and the drawable's own fields whatever the route; the material's table as the function reads it at
     // every call that gets this far)
@@ -376,7 +382,6 @@ void PrepareBridge::read(GuestAddr block, GuestAddr drawable, gfx::PrepareInputs
     if (!(in.list_flags & 1)) return;
     if (in.list_flags & 2) {
         h.command_buffer = at<guest::Renderer>(runtime_, b.renderer).command_buffer;
-        in.inline_switch = u32(runtime_, u64(runtime_, kInlineCallSwitchSlot)) != 0;
         if (in.inline_switch) return;
         h.command_list = m + offsetof(guest::MaterialEntry, lists) + list * sizeof(guest::MaterialEntry::List);
     }
@@ -412,6 +417,18 @@ void PrepareBridge::read_program(GuestAddr block, gfx::PrepareInputs& in) const 
         const GuestAddr w = defaults2 ? guest::kDefaultWordsB : p.part[1] + 0x28;
         for (int i = 0; i < 2; i++) in.words[3 + i] = u32(runtime_, w + 4 * i);
     }
+    // (the buffer objects of the words that changed: word 0's at the block's +0x30, words 3 and 4's in the material)
+    const GuestAddr objects[3] = {b.buffer, 0, 0};
+    const int word_of[3] = {0, 3, 4};
+    for (int i = 0; i < 3; i++) {
+        if (in.words[word_of[i]] == in.applied_words[word_of[i]]) continue;
+        const GuestAddr o = i ? at<guest::Material>(runtime_, b.material).buffers[i - 1] : objects[0];
+        const guest::BufferObjectG& g = at<guest::BufferObjectG>(runtime_, o);
+        gfx::BufferObject& d = in.buffers[i];
+        d.align_method = u64(runtime_, g.vtable + guest::kBufferAlignMethod);
+        d.bind_method = u64(runtime_, g.vtable + guest::kBufferBindMethod);
+        d.size = g.size, d.slot = g.slot, d.stride = g.stride, d.base = g.base, d.alignment = g.alignment;
+    }
     if (!(mode & 0x8000)) {
         in.interface_id[2] = u32(runtime_, p.part[2]);
         in.texture_mask = u32(runtime_, p.part[2] + 4);
@@ -427,6 +444,9 @@ void put_program(guest::RenderStateBlock& b, const gfx::PrepareOutputs& out) {
     if (out.id_written[0]) b.interface_id_a = out.ids[0];
     if (out.mode_written) b.mode_bits = out.mode_bits;
     if (out.binding_written) b.block_binding = out.block_binding, b.drawable_block = 0xff;
+    if (out.word_written[0]) b.words_a[0] = out.words[0];
+    if (out.word_written[3]) b.words_b[0] = out.words[3];
+    if (out.word_written[4]) b.words_b[1] = out.words[4];
     if (out.id_written[1]) b.interface_id_b = out.ids[1];
     if (out.mask_cleared) b.applied_bits = 0;
     if (out.id_written[2]) b.texture_id = out.ids[2];
@@ -448,9 +468,10 @@ void PrepareBridge::write(GuestAddr block, const gfx::PrepareHandles& h, const g
         static_cast<guest::RenderStateBlock*>(runtime_.ptr(block))->applied_bits = out.applied_mask;
         runtime_.written(block + offsetof(guest::RenderStateBlock, applied_bits), 2);
     }
-    if (out.marked) {
-        *static_cast<uint8_t*>(runtime_.ptr(h.command_buffer + guest::kCommandBufferMark)) = 1;
-        runtime_.written(h.command_buffer + guest::kCommandBufferMark, 1);
+    if (out.marked || out.bind_marked) {
+        const GuestAddr cb = out.marked ? h.command_buffer : h.bind_buffer;
+        *static_cast<uint8_t*>(runtime_.ptr(cb + guest::kCommandBufferMark)) = 1;
+        runtime_.written(cb + guest::kCommandBufferMark, 1);
     }
 }
 
@@ -467,7 +488,7 @@ void PrepareBridge::expect(uint8_t* bytes, const gfx::PrepareOutputs& out) {
         std::memcpy(bytes, &b, sizeof b);
     }
     if (out.mask_written) std::memcpy(bytes + offsetof(guest::RenderStateBlock, applied_bits), &out.applied_mask, 2);
-    if (out.marked) bytes[sizeof(guest::RenderStateBlock)] = 1;
+    if (out.marked || out.bind_marked) bytes[sizeof(guest::RenderStateBlock)] = 1;
 }
 
 }   // namespace hl::bridge

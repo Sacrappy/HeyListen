@@ -12,7 +12,7 @@
 namespace hl::gfx {
 
 const char* route_name(PrepareRoute r) {
-    static const char* const kNames[kPrepareRoutes] = {"no material",  "cached",         "program bound",
+    static const char* const kNames[kPrepareRoutes] = {"no material",  "cached",         "program bound", "program buffers",
                                                        "state applied", "state",         "program",        "pending bits",
                                                        "drawable block", "streams",      "inline",
                                                        "clusters"};
@@ -140,6 +140,40 @@ void Prepare::emit_state(const PrepareState& s, const PrepareHandles& at, Comman
     sink.emit(command(Proc::CommandBufferSetDepthClamp, cb, s.depth_clamp));
 }
 
+namespace {
+// One binding word's uniform buffer binds (a changed word): false when the call must go to the translation (an object
+// whose methods are not the game's known ones, a storage buffer, a tag other than 0xff and 0xfe, the inline switch).
+bool bind_word(const PrepareInputs& in, const BufferObject& b, uint32_t word, PrepareOutputs& out) {
+    // (the alignment method is asked before anything else, the word -1 included)
+    uint32_t align;
+    if (b.align_method == in.known.align_fixed) align = 0x100;
+    else if (b.align_method == in.known.align_field) align = b.alignment;
+    else return false;
+    if (word == 0xffffffffu) return true;
+    const uint32_t tag = word >> 24;
+    if (tag != 0xff && tag != 0xfe) return false;
+    // (the ring's slot times the size rounded up to the alignment, in 32 bits, from the base)
+    const uint32_t step = (uint32_t)b.slot * (uint32_t)(b.stride >> 4);
+    const uint32_t rounded = (b.size + align - 1) & (0u - align);
+    const uint64_t address = b.base + (uint64_t)step * rounded;
+    // (a stage and the byte of the word that holds its slot, 0xff none: tag 0xff stages 0, 1, 2 from bytes 0, 2, 1; tag 0xfe
+    // stages 1, 6, 7 from bytes 2, 0, 1)
+    static constexpr uint32_t kStages[2][3][2] = {{{0, 0}, {1, 2}, {2, 1}}, {{1, 2}, {6, 0}, {7, 1}}};
+    for (const auto& [stage, at] : kStages[tag == 0xff ? 0 : 1]) {
+        const uint32_t byte = (word >> (8 * at)) & 0xff;
+        if (byte == 0xff) continue;
+        if (b.bind_method != in.known.bind_uniform || in.inline_switch) return false;
+        PrepareOutputs::Bind& d = out.binds[out.bind_count++];
+        d.stage = stage;
+        d.slot = (uint32_t)(int32_t)(int8_t)byte;
+        d.address = address;
+        d.size = b.size;
+        out.bind_marked = true;
+    }
+    return true;
+}
+}   // namespace
+
 PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
     PrepareOutputs out;
     auto left = [](PrepareRoute r) {
@@ -181,8 +215,11 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
             mode = defaults1 ? (mode | 0x1000) : (mode & ~0x1000u);
             out.mode_written = true;
             if (changed) {
-                if (in.words[0] != in.applied_words[0] || in.words[1] != in.applied_words[1])
-                    return left(PrepareRoute::ProgramChanged);
+                if (in.words[0] != in.applied_words[0]) {
+                    if (!bind_word(in, in.buffers[0], in.words[0], out)) return left(PrepareRoute::ProgramChanged);
+                    out.word_written[0] = true, out.words[0] = in.words[0];
+                }
+                if (in.words[1] != in.applied_words[1]) return left(PrepareRoute::ProgramChanged);
                 if (in.words[2] != in.applied_words[2]) {
                     // (no bind: the per-drawable block's binding word, and its entry marked to be bound again)
                     out.binding_written = true;
@@ -197,8 +234,11 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
             out.mode_written = true;
             if (in.interface_id[1] != in.applied_interface_id[1]) {
                 out.id_written[1] = true, out.ids[1] = in.interface_id[1];
-                if (in.words[3] != in.applied_words[3] || in.words[4] != in.applied_words[4])
-                    return left(PrepareRoute::ProgramChanged);
+                for (int w = 3; w < 5; w++)
+                    if (in.words[w] != in.applied_words[w]) {
+                        if (!bind_word(in, in.buffers[w - 2], in.words[w], out)) return left(PrepareRoute::ProgramChanged);
+                        out.word_written[w] = true, out.words[w] = in.words[w];
+                    }
                 changed = true;
             }
         }
@@ -209,6 +249,7 @@ PrepareOutputs Prepare::decide(const PrepareInputs& in, bool state_step) {
             if (in.texture_mask & 0x3fffffffu) return left(PrepareRoute::ProgramChanged);
         }
         out.mode_bits = mode;
+        if (out.bind_count && route == PrepareRoute::ProgramBound) route = PrepareRoute::ProgramBuffers;
     }
     if (in.pending) {
         // (the pending bits less the drawable's; any the block has not applied go to the translation, else they are the
@@ -235,6 +276,10 @@ void Prepare::emit(const PrepareOutputs& out, const PrepareHandles& at, CommandS
     if (out.state_recorded) emit_state(out.state, at, sink);
     if (out.program_bound)
         sink.emit(command(Proc::CommandBufferBindProgram, out.binder, out.program_object, out.program_stages));
+    for (uint32_t i = 0; i < out.bind_count; i++) {
+        const PrepareOutputs::Bind& b = out.binds[i];
+        sink.emit(command(Proc::CommandBufferBindUniformBuffer, at.bind_buffer, b.stage, b.slot, b.address, b.size));
+    }
     if (out.call_list) sink.emit(command(Proc::CommandBufferCallCommands, at.command_buffer, 1, at.command_list));
 }
 

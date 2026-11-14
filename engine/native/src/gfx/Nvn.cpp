@@ -48,6 +48,7 @@ constexpr ProcInfo kProcs[kProcCount] = {
     {"nvnBufferGetAddress", {1, 0, true}},
     {"nvnCommandBufferDrawElementsInstanced", {8, 0}},
     {"nvnCommandBufferBindProgram", {3, 0}},
+    {"nvnCommandBufferBindUniformBuffer", {5, 0}},
 };
 }   // namespace
 
