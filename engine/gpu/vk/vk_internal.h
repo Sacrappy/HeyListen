@@ -322,8 +322,12 @@ bool has_stencil(VkFormat f);
 
 // (TICK-038) what each allocation is for, by kind and where it landed (RX_VK_RES_LOG=1: counted, and logged every 600 presents).
 // A call site sets the kind for the allocations it makes with MemKindScope; images are told apart by their usage
-enum class MemKind : uint8_t { Other, Texture, Target, Mirror, WbShadow, Capture, Stream, Staging, Readback, Scratch, Count };
+enum class MemKind : uint8_t { Other, Texture, Target, Mirror, WbShadow, Capture, Stream, Staging, Readback, Scratch, BcCache, Count };
 extern thread_local MemKind mem_kind_tag;
+// (HOS_HOST_SPLIT, host/hos_hostsplit.c: vk_vma.cpp) name a range of this process's memory for the census of what is outside the game's;
+// nothing when the executable lacks the export or the switch is off
+void host_tag(const void* ptr, uint64_t size, const char* name);
+void host_untag(const void* ptr);
 struct MemKindScope {
     MemKind prev;
     explicit MemKindScope(MemKind k) : prev(mem_kind_tag) { mem_kind_tag = k; }

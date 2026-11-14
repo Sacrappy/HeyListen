@@ -12,6 +12,9 @@
 #include <mutex>
 #include <map>
 #include <unordered_map>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace mkwvk {
 
@@ -58,7 +61,7 @@ MemKind image_kind(const VkImageCreateInfo& ci) {
 void mem_kinds_log() {
     if (!res_log_on()) return;
     static const char* const names[] = {"other", "textures", "render targets", "mirrors", "write-back shadows", "captures",
-                                        "streams", "staging", "readback", "scratch"};
+                                        "streams", "staging", "readback", "scratch", "BC cache"};
     char line[1600];
     int n = snprintf(line, sizeof line, "vk: allocations by kind, MB (VRAM / VRAM mapped / system cached / system uncached, count):");
     std::lock_guard lk(acct_mu);
@@ -76,6 +79,42 @@ void mem_kinds_log() {
              (unsigned long long)(tot[1] >> 20), (unsigned long long)(tot[2] >> 20), (unsigned long long)(tot[3] >> 20));
     logf("%s", line);
 }
+
+// ---- (HOS_HOST_SPLIT, host/hos_hostsplit.c) the census of the process's memory outside the game's: host-visible buffers named ----
+// A buffer the back end maps (the captures, the BC cache, staging, readbacks) is a range of this process's address space that the
+// driver made: tagged with its kind and memory class, it is told apart there from the driver's own memory. Only an executable with
+// the export (and the switch on) counts them.
+void host_tag(const void* ptr, uint64_t size, const char* name) {
+#ifdef _WIN32
+    using Tag = void (*)(const void*, uint64_t, const char*);
+    static const Tag tag = (Tag)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_mem_tag");
+    if (tag) tag(ptr, size, name);
+#else
+    (void)ptr, (void)size, (void)name;
+#endif
+}
+void host_untag(const void* ptr) {
+#ifdef _WIN32
+    using Untag = void (*)(const void*);
+    static const Untag untag = (Untag)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_mem_untag");
+    if (untag) untag(ptr);
+#else
+    (void)ptr;
+#endif
+}
+namespace {
+void tag_mapped(const VmaAllocationInfo& info, MemKind kind) {
+    static const bool named = getenv("HOS_HOST_SPLIT") != nullptr;
+    if (!named || !info.pMappedData) return;
+    static const char* const names[] = {"other", "textures", "render targets", "mirrors", "write-back shadows", "captures",
+                                        "streams", "staging", "readback", "scratch", "BC cache"};
+    const VkMemoryPropertyFlags f = dev.memory.memoryTypes[info.memoryType].propertyFlags;
+    const char* where = (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "BAR" : (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "cached" : "uncached";
+    char name[40];
+    snprintf(name, sizeof name, "vk %s, %s", names[(int)kind], where);
+    host_tag(info.pMappedData, info.size, name);
+}
+}  // namespace
 
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
@@ -350,6 +389,7 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
+    tag_mapped(info, mem_kind_tag);
     note_alloc(allocation, mem_kind_tag);
     return true;
 }
@@ -367,6 +407,7 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
+    tag_mapped(info, mem_kind_tag);
     note_alloc(allocation, mem_kind_tag);
     return true;
 }
@@ -377,6 +418,12 @@ void invalidate_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaInvalidateAllocation(vma, allocation, 0, size);
 }
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
+    static const bool named = getenv("HOS_HOST_SPLIT") != nullptr;
+    if (named && allocation) {   // (HOS_HOST_SPLIT: its range is no longer named)
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(vma, allocation, &info);
+        if (info.pMappedData) host_untag(info.pMappedData);
+    }
     note_free(allocation);
     vmaDestroyBuffer(vma, buffer, allocation);
 }

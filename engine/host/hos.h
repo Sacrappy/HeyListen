@@ -177,6 +177,11 @@ uint64_t hos_ticks(void);
 void hos_sleep_ns(int64_t ns);
 int64_t hos_now_ns(void);
 
+/* ---- (HOS_HOST_SPLIT, hos_hostsplit.c) a range this engine made, named for the census of the process's memory outside the guest window
+   (one load and a branch with the switch off); the Vulkan back end finds both by name in the executable */
+void hos_mem_tag(const void *ptr, uint64_t size, const char *name);
+void hos_mem_untag(const void *ptr);
+
 /* ---- (TICK-039) HOS_JOBTRACE=<path>: blocking and waking of every thread for a short window (hos_jobtrace.c) */
 extern volatile int hos_jt_on;
 void hos_jt_rec(int type, uint64_t a, uint64_t b);

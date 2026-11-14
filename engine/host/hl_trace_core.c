@@ -1,6 +1,8 @@
 /* (HeyListen native engine) The crash recorder's core (hl_trace.h): the threads' rings, the live and freed blocks' tables,
    the report and the file. Plain C11 with no OS layer, so that tests/hl_trace_test.c runs it with no game. */
 #include "hl_trace.h"
+#include <stdint.h>
+void hos_mem_tag(const void *ptr, uint64_t size, const char *name);   /* (hos_hostsplit.c) */
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -85,11 +87,14 @@ int hl_trace_start(uint32_t mask, const HlTraceConfig *config) {
     freed_mask = nfreed - 1;
     freed = calloc(nfreed, sizeof *freed);
     gpu = calloc(GPU_RECORDS, sizeof *gpu);
+    hos_mem_tag(freed, (uint64_t)nfreed * sizeof *freed, "trace: freed table (HL_TRACE)");
+    hos_mem_tag(gpu, (uint64_t)GPU_RECORDS * sizeof *gpu, "trace: GPU records (HL_TRACE)");
     if (!freed || !gpu) return 0;
     for (int s = 0; s < STRIPES; s++) {
         atomic_flag_clear(&stripes[s].lock);
         stripes[s].slot = calloc(stripe_slots, sizeof(HlTraceRecord));
         if (!stripes[s].slot) return 0;
+        hos_mem_tag(stripes[s].slot, (uint64_t)stripe_slots * sizeof(HlTraceRecord), "trace: live blocks (HL_TRACE)");
     }
     /* (the clock: ticks against the wall clock over about 20 ms) */
     const uint64_t w0 = wall_ns(), t0 = hl_trace_now();
@@ -109,6 +114,7 @@ static Ring *ring(void) {
     if (i >= MAX_RINGS) return NULL;
     r = &rings[i];
     r->ev = calloc((size_t)ring_mask + 1, sizeof(Event));
+    hos_mem_tag(r->ev, ((uint64_t)ring_mask + 1) * sizeof(Event), "trace: thread rings (HL_TRACE)");
     r->tid = i;
     const char *name = cfg.thread_name ? cfg.thread_name() : NULL;
     snprintf(r->name, sizeof r->name, "%s", name ? name : "?");
