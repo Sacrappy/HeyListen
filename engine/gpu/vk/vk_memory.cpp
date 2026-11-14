@@ -5609,7 +5609,7 @@ void reap_mirrors() {   // (pools_mu held)
 // the staged write-back is the next step), readback refreshes and texel views over the pool. Never-imported mirrors are not given
 // back as idle (the GPU would have nothing to read there). RX_VK_POOL_MIRROR_CHECK=1 compares mirrors with guest memory (below).
 void pool_mirror_check_start();   // (RX_VK_POOL_MIRROR_CHECK: at the end of this file)
-extern int64_t st_sw_runs, st_sw_bytes, st_sw_pages_written, st_sw_pages_cpu, st_sw_pages_dead;   // (the staged write-backs: below)
+extern int64_t st_sw_runs, st_sw_bytes, st_sw_pages_written, st_sw_pages_cpu, st_sw_pages_dead, st_sw_pages_same;   // (the staged write-backs: below)
 namespace {   // (with their declarations at the top)
 bool pool_mirror_on() {
     static const bool v = [] {
@@ -5678,8 +5678,8 @@ void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
          (unsigned long long)(imp_b >> 20), (long long)st_pm_why[0], (long long)st_pm_why[1], (long long)st_pm_why[2], (long long)st_pm_why[3],
          (long long)st_pm_why[4], (long long)st_pm_why[5]);
     logf("vk: write-backs of never-imported pools through staging (RX_VK_POOL_MIRROR): %lld runs, %lld MB; pages written into guest "
-         "memory %lld, left as the CPU wrote them since %lld, no live pool there %lld; IMPORTS ASKED FOR %lld", (long long)st_sw_runs,
-         (long long)(st_sw_bytes >> 20), (long long)st_sw_pages_written, (long long)st_sw_pages_cpu, (long long)st_sw_pages_dead,
+         "memory %lld (left alone as already equal %lld), left as the CPU wrote them since %lld, no live pool there %lld; IMPORTS ASKED FOR %lld", (long long)st_sw_runs,
+         (long long)(st_sw_bytes >> 20), (long long)st_sw_pages_written, (long long)st_sw_pages_same, (long long)st_sw_pages_cpu, (long long)st_sw_pages_dead,
          (long long)st_imports_asked);
 }
 }  // namespace
@@ -6688,12 +6688,13 @@ std::mutex staged_mu;
 std::deque<StagedWb> staged_wbs;   // (by value; staged_mu)
 std::vector<std::pair<VkBuffer, VmaAllocation>> staged_free;   // (applied: destroyed at a submission's end; staged_mu)
 std::atomic<uint64_t> staged_min{~0ull};
-int64_t st_sw_runs = 0, st_sw_bytes = 0, st_sw_pages_written = 0, st_sw_pages_cpu = 0, st_sw_pages_dead = 0;
+int64_t st_sw_runs = 0, st_sw_bytes = 0, st_sw_pages_written = 0, st_sw_pages_cpu = 0, st_sw_pages_dead = 0, st_sw_pages_same = 0;
 }  // namespace mkwvk
 void mkwvk::memory_staged_apply(uint64_t done) {
     if (staged_min.load(std::memory_order_acquire) > done) return;
     using WriteLive = int (*)(uint64_t, const void*, uint64_t);
     static const WriteLive write_live = (WriteLive)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_write_live");
+    static uint8_t* const base = host->guest_base ? host->guest_base() : nullptr;
     std::lock_guard lk(staged_mu);
     while (!staged_wbs.empty() && staged_wbs.front().value <= done) {
         StagedWb& s = staged_wbs.front();
@@ -6702,6 +6703,13 @@ void mkwvk::memory_staged_apply(uint64_t done) {
             for (uint64_t a = guest; a < guest + size;) {
                 const uint64_t e = std::min(guest + size, ((a >> 12) + 1) << 12);
                 const uint8_t* src = static_cast<const uint8_t*>(s.map) + off + (a - guest);
+                // (most of what a write-back copies is what guest memory already holds: the same bytes left alone, no host call.
+                // The import's GPU copy wrote them all, for free on the CPU; here each page written costs a call under the host's lock)
+                if (base && !std::memcmp(base + a, src, e - a)) {
+                    st_sw_pages_same++;
+                    a = e;
+                    continue;
+                }
                 const int r = write_live ? write_live(a, src, e - a) : (host->gpu_write(a, src, e - a) ? 1 : 0);
                 (r == 1 ? st_sw_pages_written : r == 2 ? st_sw_pages_cpu : st_sw_pages_dead)++;
                 a = e;
