@@ -338,14 +338,16 @@ static void realtime_step(int64_t now) {
        and its controller puts 60 back over a higher +0x2c8 before its global step is made from it (f_83b6ea90), so what
        reads that step ran fps / 60 too fast. The step is then the frames' own time at the two places the engine makes it
        (host/hl_step.c: lines nx2/hl_gates.py puts after the two divides): this same average, at most 4/60 s and at least
-       1/240 s, and the rate under it stays the engine's, 60 at most. HOS_FPS_STEP=0, or a lift without the hooks
-       (hos_step_probe unset): the rate up to the cap, as before */
+       1/480 s, and the rate under it stays the engine's, 60 at most. (Upstream's floor of 1/240 s raised the game's speed
+       to 1.024 at a cap of 240 in the market, about 237 fps: frames averaged shorter than it were counted as 1/240 s; the
+       limit here goes to 360.) HOS_FPS_STEP=0, or a lift without the hooks (hos_step_probe unset): the rate up to the cap,
+       as before */
     static int timed_step = -1;
     if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
     const int timed = cap > 60 && timed_step && hos_step_probe;
     if (timed) {
         const double secs = sum / count;
-        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < 1.0 / 240.0 ? 1.0 / 240.0 : secs);
+        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < 1.0 / 480.0 ? 1.0 / 480.0 : secs);
         uint32_t bits;
         memcpy(&bits, &f, 4);
         hos_frame_seconds_bits = bits;
