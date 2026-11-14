@@ -104,7 +104,10 @@ void memory_table_begin();                         // (hookshot: a recording's p
 bool memory_table_flush();
 uint64_t memory_guest_pages();                        // (hookshot: the device address of guest memory's page table, 0: none)
 void memory_sync();                                   // (at each submit: pools the game made or let go)
-BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool holds the range)
+/// (RX_VK_POOL_MIRROR: what the buffer is for: a texel view read or written, or the GPU unswizzle, which has a CPU path)
+enum { kGpuBufferRead, kGpuBufferWritten, kGpuBufferUnswizzle };
+bool memory_pool_mirror_on();   // (RX_VK_POOL_MIRROR)
+BufferRef gpu_buffer(uint64_t gpu, uint64_t size, int use = kGpuBufferRead);   // (empty when no pool holds the range)
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
@@ -197,6 +200,9 @@ struct ParLock {
 void memory_pool_created(uint64_t gpu, uint64_t size);
 /// (TICK-015) a game pool made, with its NVNmemoryPoolFlags (the export mkwvk_pool_flags)
 void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags);
+/// (RX_VK_POOL_MIRROR) the timeline reached `done`: the staged write-backs of never-imported pools up to it written into guest memory
+/// (vk_replay.cpp calls it wherever it learns a value is done, before reporting it)
+void memory_staged_apply(uint64_t done);
 /// (RX_VK_POOL_FINALIZE) a live game pool finalized (the export mkwvk_pool_finalized): its chunks retire once no live pool is left in them
 void memory_pool_finalized(uint64_t gpu, uint64_t size);
 /// (TICK-015) the CPU is about to read [guest, guest + size) (invalidate): its game pool's write-backs are made from now on

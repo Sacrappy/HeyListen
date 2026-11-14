@@ -66,7 +66,7 @@ def main():
         "rb_bufferref.inc": block(internal, "struct BufferRef {") + ";\n",
         "rb_pool.inc": block(memory, "struct Pool {") + ";\n",
         "rb_writeback.inc": block(memory, "struct WriteBack {") + ";\n",
-        "rb_refresh.inc": cut(memory, "// ---- (from PR 430, YunaraDebugs) Readback pages", "BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {"),
+        "rb_refresh.inc": cut(memory, "// ---- (from PR 430, YunaraDebugs) Readback pages", "bool memory_pool_mirror_on() {"),
         "rb_bindtail.inc": cut(block(memory, "BufferRef gpu_buffer_bind("),
                                "if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);",
                                "return remember({p->mirror"),
