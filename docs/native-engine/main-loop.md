@@ -159,3 +159,14 @@ the opening movie (a new game: a copy of the saves in a slot), each with the fra
 frame-counting objects by maker; each maker's update function then gets the 60 Hz tick above. Owner's checks once a
 system has its tick, at 120 fps against 60: the opening movie (voice lines one after the other, picture to its end), a
 cutscene with voice-over (no overlap), the Deku Tree boss (the same pace as at 60).
+
+**The movie: an OS-layer fault, fixed there.** The game's movie library takes one picture from the OS layer's video
+decoder (`engine/host/nn_video.c`) at each of its frames; the OS layer already skipped pictures that fell behind the
+movie's clock below 60 fps, but handed out the next picture at every acquisition however early. Measured on the main
+PC with `HOS_VIDEO_LOG=1` (title sequence's AV1 movie, `--fps-limit 360`, about 350 fps): from 20 s in, the pictures
+ran ahead of the movie's clock, 2.7 s ahead by its end, so the movie ended early while its sound went on. At a 120
+limit (the machine shared, about 93 fps) it stayed on time. Now a picture more than 8 ms ahead of the clock is not
+handed out: the buffer gets the last picture again (`HOS_VIDEO_NO_HOLD=1`: as before). Same run with the fix: the
+pictures on the clock to the end (within 0.02 s), the movie the same length as its sound. The new-game opening movie
+itself was not reached by the scripted input (the title's background and a save loaded instead); the fix is the same
+for any movie.
