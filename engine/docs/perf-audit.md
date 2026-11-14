@@ -892,6 +892,10 @@ Experiments (env only, the game-folder build; fps / 1% low / p99 / log mean 70-1
 The ticket's baseline was 56.6. The run-to-run spread here is 54-61 fps. Neither lowering OptimizeChangeBanc's Windows
 priority nor moving it off the game's cores moves the frame. Nothing was kept.
 
+Linux: hos_thread_pin's lowering of OptimizeChangeBank (THREAD_PRIORITY_LOWEST, nice 10 there) never took effect, because
+host/posix/win32_posix.c's SetThreadPriority skipped a thread whose Linux id was not known yet, and the creator calls it
+right after CreateThread. The thread now applies a priority set before it ran (`tests/test_thread_priority_posix.py`).
+
 Replay per-draw cost: across the workers, build_descriptors is the largest self function (~13% of their running samples),
 then draw and gpu_buffer_bind. It is spread, and off the path at this spot (above), so it was not changed.
 
