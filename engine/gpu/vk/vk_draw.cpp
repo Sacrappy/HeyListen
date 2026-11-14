@@ -8211,6 +8211,8 @@ void pipeline_cache_save(bool force) {
             size_t n = 0;
             if (vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) == VK_SUCCESS && n) {
                 std::vector<uint8_t> data(n);
+                host_tag(data.data(), n, "vk pipeline cache save (vector)");   // (HOS_HOST_SPLIT)
+                struct Untag { const void* p; ~Untag() { host_untag(p); } } untag{data.data()};
                 if (vkGetPipelineCacheData(dev.device, pcache, &n, data.data()) == VK_SUCCESS) {
                     const std::string tmp = pcache_path + ".tmp";
                     if (FILE* f = fopen(tmp.c_str(), "wb")) {

@@ -384,6 +384,15 @@ static void census(const char *why) {
         if (heap_notes[i].committed >= (1u << 20))
             hos_log("hostsplit: heap %d: %llu MB in use of %llu MB committed; walk: regions %llu MB committed, %d blocks over 256 KB of %llu MB", i,
                     MB(heap_notes[i].allocated), MB(heap_notes[i].committed), MB(heap_notes[i].region_committed), heap_notes[i].large_n, MB(heap_notes[i].large_bytes));
+    {
+        char top[160] = "";
+        int at = 0;
+        for (int k = 0; k < BIG_TOP && big_top[k] && at < (int)sizeof top - 12; k++) at += snprintf(top + at, sizeof top - (size_t)at, " %llu", MB(big_top[k]));
+        hos_log("hostsplit: heap blocks over 256 KB, MB (count): %s %llu (%llu), %s %llu (%llu), %s %llu (%llu), %s %llu (%llu), %s %llu (%llu); the largest, MB:%s",
+                big_bin_name[0], MB(big_bytes[0]), (unsigned long long)big_count[0], big_bin_name[1], MB(big_bytes[1]), (unsigned long long)big_count[1],
+                big_bin_name[2], MB(big_bytes[2]), (unsigned long long)big_count[2], big_bin_name[3], MB(big_bytes[3]), (unsigned long long)big_count[3],
+                big_bin_name[4], MB(big_bytes[4]), (unsigned long long)big_count[4], top);
+    }
     /* the largest allocations outside the window */
     qsort(allocs, (size_t)nallocs, sizeof(Alloc), by_committed_desc);
     hos_log("hostsplit: -- the 30 largest allocations outside the guest window: base, committed, in RAM, protection, type, owner of its first page --");
