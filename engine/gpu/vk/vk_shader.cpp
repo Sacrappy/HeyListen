@@ -2186,6 +2186,15 @@ bool key_listed(const char* hex, const char* var) {
     return false;
 }
 uint64_t program_cache_stamp() { return disk_stamp(); }
+/// (hookshot) How many program keys the program cache holds now (SIZE_MAX: it is off). vk_draw.cpp's prepare check compares it with
+/// what the last prepare left there: a cache cut short or made again under another stamp (a start with other shader settings,
+/// stopped before it prepared) has lost what the record says was prepared
+size_t program_cache_kept() {
+    disk_init();
+    if (!disk_on) return SIZE_MAX;
+    std::lock_guard lk(disk_mu);
+    return disk_records.size();
+}
 /// (the precompile, before the game: vk_draw.cpp) the kept compute programs and those named, ready, each given to fn. The rest of the
 /// game's programs stay on disk until a draw asks for one
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn, bool computes) {

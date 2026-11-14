@@ -33,7 +33,8 @@ PC. Keep it: updates rebuild from the copy kept in the game folder, but it is yo
 
 The first build reads your game, translates its code to C and compiles it: expect about 10 to 45 minutes depending on your CPU and memory (you can use your PC meanwhile). Then
 the game prepares its shaders on first start (a few minutes, with a progress window). Leave both to finish; later starts are
-quick. The builder keeps its build files in `%LOCALAPPDATA%\HeyListenBuilder` so updates only recompile what changed
+quick. If the preparation is closed early, or the shader cache (`hookshot_programs.bin`) loses what was prepared, the next
+start prepares again. The builder keeps its build files in `%LOCALAPPDATA%\HeyListenBuilder` so updates only recompile what changed
 (*Free up space* on the last page removes them).
 
 ## 4. Play
