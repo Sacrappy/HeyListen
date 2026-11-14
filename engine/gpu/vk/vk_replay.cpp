@@ -133,6 +133,19 @@ bool fence_poll_fast_on() {
     return v;
 }
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
+// (HeyListen, RX_VK_SYNC_HONEST=1, default off) value_rec keeps the FIRST recording a value was put in (emplace): a submission stopped at an
+// event wait is mapped to the recording of its piece before the wait, and a game fence for it was answered as soon as that one was
+// done, while the rest of its work (after the wait) was still on the GPU (RX_VK_LAG_LOG: 96% of the answers the game gets, 8 ms early).
+// With the switch a fence waits for the recording its last piece went into (value_end), or for the timeline while none is known.
+std::map<uint64_t, uint64_t> value_end;
+bool sync_honest_on() {
+    static const bool v = [] {
+        const bool on = getenv("RX_VK_SYNC_HONEST") && atoi(getenv("RX_VK_SYNC_HONEST")) != 0;
+        if (on) logf("vk: fence waits honest (RX_VK_SYNC_HONEST): a fence waits for the recording its work ended in");
+        return on;
+    }();
+    return v;
+}
 std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (sync_order_mu)
 std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (sync_order_mu)
 std::atomic<uint64_t> pushed{0};
@@ -640,10 +653,14 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         nsig++;
         std::lock_guard mk(rec_map_mu);
-        for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
+        for (uint64_t v : rec_open_values) {
+            value_rec.emplace(v, seq);
+            if (sync_honest_on()) value_end[v] = seq;   // (RX_VK_SYNC_HONEST: the recording its last piece went into)
+        }
         if (r.value) value_rec.emplace(r.value, seq);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
+        while (value_end.size() > 8192) value_end.erase(value_end.begin());
         // (TICK-058: after value_rec has them, so a poll that sees the mark finds the recording; see wait_inner)
         for (uint64_t v : rec_open_qvalues) whole_val[v & (kWholeSlots - 1)].store(v, std::memory_order_release);
         rec_open_qvalues.clear();
@@ -3410,8 +3427,9 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     uint64_t seq = 0;
     {
         std::lock_guard mk(rec_map_mu);
-        auto it = value_rec.find(f);
-        if (it == value_rec.end()) return false;
+        const bool honest = sync_honest_on();
+        auto it = honest ? value_end.find(f) : value_rec.find(f);
+        if (honest ? it == value_end.end() : it == value_rec.end()) return false;
         seq = it->second;
     }
     // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
