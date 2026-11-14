@@ -109,6 +109,16 @@ on CachyOS with a Radeon RX 9070 XT (Mesa's RADV driver). Expect problems and re
   `~/.local/share/heylisten/builder`; then it builds your game folder again from the game files the folder keeps. A
   release that has no Linux files yet cannot be installed on Linux: wait for its AppImage to appear on the release page.
 
+## Mods
+
+File mods work as in Hookshot: put them in a `mods` folder in the game folder, beside `HeyListen.exe`, in the layout
+emulators use: `mods\<name>\romfs\...` holds files that replace or add to the game's own. A folder whose name starts with
+`-` or `_` is off; when two mods have the same file, the folder whose name sorts last wins (name them `01-...`, `02-...`).
+Nothing is rebuilt: the game reads them at its next start, and `hookshot_log.txt` names each mod and the files read from it.
+Code patches (`exefs`, `.pchtxt`, `.ips`) are not loaded: the game's code is compiled ahead of time. A mod that makes
+files bigger must ship the game's resource size table with its entries grown; the details are in `engine/readme.md`
+(Mods).
+
 ## Updates
 
 When a new HeyListen release is out, the builder says so when it opens (it asks GitHub for
