@@ -1679,3 +1679,56 @@ What could break:
 - write-back latency at an invalidate (12 functions read pools back);
 - pools made and bound every frame (the actor heap's 8 KB pools): mirrors made and freed often. VMA's block suballocation
   keeps that cheap.
+
+### Lever B, first version (`RX_VK_POOL_MIRROR`, default 0; `RX_VK_POOL_MIRROR_CHECK`)
+
+Built in `gpu/vk/vk_memory.cpp` (the "a mirror per pool, never imported" block) and `vk_texture.cpp` (`upload_to_earliest_begin`).
+- A pool that is bound as a buffer gets a table entry with no import, cut to the game's pool. A pool larger than a chunk keeps
+  16 MB chunks, cut to the pool. Nothing outside a pool is mirrored.
+- Its mirror is made at its first binding and filled from guest memory through a host-visible staging buffer: a CPU copy,
+  then a GPU copy in the recording's uploads. The staging buffer is freed once the GPU is past it.
+- In a parallel segment the mirror is recorded into the earliest open segment's init command buffer. No segment has bound the
+  pool before (a binding without a mirror would have imported it), and every segment's init is submitted before its uploads.
+- CPU writes reach the mirror from the captures, as before; "live" pages (no kept capture holds them) go through staging.
+- Never-imported mirrors are not given back as idle: they are all the GPU has of the pool.
+- What still imports is counted by why, and the pool is then marked imported:
+  - a binding for writing (its write-backs go through the import; that is the next stage);
+  - texel views over the pool;
+  - readback refreshes;
+  - a binding with no mirror possible: no recording, budget refused, `RX_VK_MIRROR_DEFER`.
+- `RX_VK_POOL_MIRROR_CHECK=1`: every 2 s a thread reads a never-imported mirror back (`memory_mirror_read`) and compares it with
+  guest memory page by page. Pages that differ are looked at again 500 ms later, once the next submits have collected the write
+  marks. A page the CPU wrote after the mirror's last sync is left out; any other difference is a mismatch. The first version
+  counted 3 mismatches on CPU-uncached (`0x22`) per-frame pages: writes not yet stamped. They disappeared with the wait.
+
+Run (main PC, `hyrule-field` save, scripted walk, 110 s, build `r1-pm3`):
+- **0 mismatches** over 32 pools and 74,937 pages (2,407 written by the CPU since their sync, left out).
+- 674 table entries were made with no import; 576 were still never imported at the end. Fills: 668, 707 MB through staging.
+  Imported after all: 92 bound for writing, 6 for texel views, 0 bindings in parallel segments.
+- At 100 s: mirrors **707 MB** (15 MB outside every pool) against 1,580 with the chunks (500 outside); imports held **402 MB**
+  against 828-1,768; VRAM 4,358 MB.
+- No crash. The shots at 1500 and 1600 presents are right. The run summary shows no large slowdown (not a speed claim).
+- Per-pool imports with the existing switches (`RX_VK_IMPORT_CHUNK_MB=0 RX_VK_NO_HOST_IMPORT=1`) were worse: a binding in a pool
+  refused a mirror (over 1 GB: `agl::TextureDataMgr`'s 2.4 GB) imports it whole, and 3.3 GB were held.
+
+What then makes a page of a live pool droppable:
+- **A pool never imported** has no pinned page: the substrate's refusal of a granule ever imported (`hos_gp_drop` -2) does not
+  apply. A cold page with no CPU write since its mirror's last sync is held, exactly, by the mirror, and by the file when it is
+  a decoded resource.
+- `HL_MEM_DROP_POOLS`' candidate rule (a mirror on, never bound for writing, compared byte for byte with guest memory at the
+  drop, into the spill) applies as it is. The `hos_mirror_held` notice must also be sent for never-imported pools (today it is
+  sent when an import is given back): **not done yet**.
+- The hitch of section 15 (a re-import restored 280 MB of dropped granules at once on the back end's thread) cannot happen for
+  these pools: there is no import to make again.
+- What remains are the restores the touches need:
+  - the game's own touches (rare; section 7);
+  - the back end's staging reads of live pages and fills of a mirror made again. Those are bounded: a fill reads only the
+    pool's own pages, and only when its mirror is made, once a pool's life unless it is retired.
+- The restore reads the spill. Reading the mirror back at the touch is still not built, for the reason of section 14: a touch
+  on the replay's thread holds the back end's locks.
+
+Next stages:
+- B3: write-backs through staging, for pools the GPU writes (the staged lazy release's path: GPU -> host staging ->
+  `hos_gpu_write_live`), with the wait at an invalidate.
+- The `hos_mirror_held` notice for never-imported pools, so `HL_MEM_DROP_POOLS` can drop their cold granules.
+- Three zones and a hand-played session with the check on.
