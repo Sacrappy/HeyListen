@@ -426,8 +426,8 @@ def run(args: argparse.Namespace) -> dict:
     first_seen_ns = None
     next_check = 0.0
     image = exe.name
-    if instances(image):
-        raise SystemExit(f"{image} is already running: refusing to start a second instance")
+    if instances(exe):
+        raise SystemExit(f"{exe} is already running: refusing to start a second instance of this game folder")
     # (2026-11-09: a scripted walk left the area, the game autosaved and the user's own save was overwritten) the run must leave
     # the saves exactly as they were: copied before, put back after
     save_dir = next((d / "user" / "save" for d in (exe.parent, exe.parent.parent) if (d / "user" / "save").is_dir()), None)
@@ -461,17 +461,20 @@ def run(args: argparse.Namespace) -> dict:
         dog.stop()  # kills game + monitor if still running, always
         log.close()
         # (2026-11-09: ~30 game windows appeared once after a session, cause unknown) none may outlive the run
+        # (only this folder's own exe: another slot's game runs on with its own run)
         for _ in range(10):
-            if not instances(image):
+            left = instance_pids(exe)
+            if not left:
                 break
-            subprocess.run(["taskkill", "/F", "/IM", image], capture_output=True)
+            for pid in left:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
             time.sleep(1)
-        if instances(image):
+        if instances(exe):
             warnings.append(f"{image} still running after the run")
         elif save_dir is not None:   # (only once no game can write them any more)
             shutil.rmtree(save_dir, ignore_errors=True)
             shutil.copytree(save_copy, save_dir)
-        if save_dir is not None and instances(image):
+        if save_dir is not None and instances(exe):
             warnings.append(f"saves NOT restored (game still running): the copy is in {save_copy}")
     wall = time.monotonic() - started
     if dog.fired:
@@ -571,13 +574,54 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def instances(image: str) -> int:
-    """Number of running processes with this image name (Windows tasklist; 0 elsewhere)."""
+def instance_pids(exe: Path) -> list[int]:
+    """Process ids of the running processes whose executable is exactly this file (Windows; [] elsewhere).
+
+    By full path, not by image name: several game folders (instance slots, build/s5/slot.sh) run the same HeyListen.exe
+    at once, and this run must see, refuse on and kill only its own folder's.
+    """
     if os.name != "nt":
-        return 0
-    out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
-                         capture_output=True, text=True, errors="replace").stdout
-    return sum(1 for line in out.splitlines() if line.lower().startswith(f'"{image.lower()}"'))
+        return []
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260)]
+
+    want = os.path.normcase(os.path.realpath(str(exe)))
+    name = exe.name.lower()
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+    pids: list[int] = []
+    e = Entry()
+    e.dwSize = ctypes.sizeof(Entry)
+    ok = k32.Process32FirstW(snap, ctypes.byref(e))
+    while ok:
+        if e.szExeFile.lower() == name:
+            h = k32.OpenProcess(0x1000, False, e.th32ProcessID)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if h:
+                buf = ctypes.create_unicode_buffer(1024)
+                n = wintypes.DWORD(1024)
+                if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) and os.path.normcase(os.path.realpath(buf.value)) == want:
+                    pids.append(int(e.th32ProcessID))
+                k32.CloseHandle(h)
+        ok = k32.Process32NextW(snap, ctypes.byref(e))
+    k32.CloseHandle(snap)
+    return pids
+
+
+def instances(exe: Path) -> int:
+    """Number of running processes of exactly this executable file."""
+    return len(instance_pids(exe))
 
 
 def main(argv: list[str] | None = None) -> int:
