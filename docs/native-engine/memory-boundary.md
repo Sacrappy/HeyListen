@@ -1525,3 +1525,177 @@ Not verified: that a killed run keeps what it compiled. A cold-cache run (`pcC`,
 inside the start-up precompile (1242 of 3675 pipelines) before any save, which is also what the old code does there (the
 precompile builds into the driver's cache and counts nothing, and the save at its end never came). With misses in play the
 rule is the old one (32 built, checked every 300 presents).
+
+## 19. The ledger: every copy, by class of resource (`RX_VK_LEDGER`, 2026-11-14)
+
+The console holds the game's resources once, in ~9.8 GB that the CPU and the GPU share. This engine holds them in guest memory
+(RAM and commit), in VRAM mirrors of the pools, in Vulkan images, in the BC cache, in staging and captures, and pins them through
+imports. Section 16 counted what is outside the game's memory; this section is the one table that says, class by class, how
+many times the game's own bytes are held.
+
+### The instrument (`gpu/vk/vk_ledger.cpp`, `host/hos_hostsplit.c`; off by default)
+
+`RX_VK_LEDGER=<seconds>`: a table every `<seconds>` and at a normal exit, lines `vk: ledger:`. Nothing else changes while it is off
+(not a mark, not a count). While it is on:
+- **Marks.** One 16-bit word for every 4 KB guest page below 1 TB, in 16 MB leaves made when first touched. The bindings OR in
+  what the GPU used the page for: vertex, index and uniform (marked at the draw, whichever way the block reaches the GPU),
+  storage, indirect, GPU-written, other bindings (copies, texel buffers). Texture storage is marked when the image is made,
+  rendered storage at every GPU write. A pool's marks are cleared when a pool is made over the range. A per-thread memo means
+  a range bound draw after draw is marked once.
+- **The snapshot**, taken on the replay's thread at a present: the live textures (storage address and size, the Vulkan image's
+  bytes and format, ASTC block size, rendered, finalized, depth), the game's pool flags, the live mirrors and imports, the
+  pool-table chunks (import, mirror, last bind, last sync), the spare and render-target-pool images, the BC cache.
+- **The count**, on a thread of its own:
+  - every page of every live pool (the host's counted list) gets a class. The class is the live texture over it (by NVN
+    storage: ASTC by block size, other compressed, uncompressed; or color, depth, or finalized-but-kept render targets), else
+    its marks, else its pool's flags (shader code, physical, never used by CPU access);
+  - the page's guest commit and residency come from the host (`hos_ledger_pages`: `VirtualQuery` and `QueryWorkingSetEx`,
+    nothing touched);
+  - the mirrors and imports are classified page by page the same way;
+  - the rest comes from the allocations by kind (`vk_vma.cpp`), VMA's block statistics, and a quiet census by the host
+    (`hos_hostsplit_totals`: the same walk as section 16, its groups, no report; the tags of `hos_mem_tag` are kept while the
+    ledger is on).
+- **Reconciliation.** VRAM: the rows (allocations by kind, plus free space in VMA blocks, plus VRAM outside VMA, plus
+  allocations not counted by kind) against the device heaps' use, which is the `VRAM breakdown` figure. RAM: the census's
+  pages against the working set. Each line prints its remainder.
+- **Cost.** The snapshot is 2,000-5,000 small records on the replay's thread. The count took 3.9 s on its thread at 90 s, of
+  which 0.86 s was the census, and that holds the C heaps' locks for 60-160 ms. Use 30 s or more between tables.
+
+### The ledger at the end of a long run (main PC, RTX 5070, build `r1-led2`, `hyrule-field` save, scripted walk, 420 s, the table at 360 s; window 1280x720, game output 2560x1440; MB)
+
+The run is `build/s5/r1long`. It ran to its end with no crash line, the game-speed ratio was normal, and nothing else ran on
+the machine. The table at 120 s and the one at 360 s are within a few MB of each other: the scripted walk never leaves Hyrule
+Field.
+
+| Class | Count | Console | Guest committed | Guest RAM | Mirror | Image | Import | Image / console |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| textures ASTC 4x4 | 31 | 11 | 10 | 10 | 1 | 13 | 1 | x1.18 (BC7) |
+| textures ASTC 5x5 | 525 | 353 | 228 | 9 | 0 | 600 | 2 | x1.70 (BC7) |
+| textures ASTC 6x6 | 167 | 43 | 24 | 1 | 0 | 57 | 0 | x1.32 (BC1 53, BC7 3) |
+| textures ASTC 8x5, 8x6 | 241 | 47 | 32 | 0 | 0 | 80 | 0 | x1.70-1.74 (BC1 59, BC7 21) |
+| textures ASTC 8x8 | 18 | 114 | 114 | 0 | 0 | 399 | 0 | **x3.49** (BC7 262, BC1 136) |
+| textures ASTC 10x8 to 12x12 | 69 | 3 | 1 | 0 | 0 | 11 | 0 | x3.2-5.8 |
+| textures BC and other compressed | 831 | 544 | 476 | 31 | 0 | 615 | 22 | x1.13 |
+| textures uncompressed | 149 | 157 | 156 | 109 | 71 | 158 | 110 | x1.01 |
+| render targets, color | 145 | 324 | 13 | 1 | 9 | 340 | 9 | x1.05 |
+| render targets, depth/stencil | 18 | 95 | 0 | 0 | 0 | 115 | 0 | x1.21 |
+| render targets, finalized, kept | 37 | 33 | 1 | 0 | 0 | 34 | 16 | x1.02 |
+| buffers: vertex / index / uniform | | 131 / 10 / 21 | the same | the same | the same | | the same | mirror x1.00 |
+| buffers: storage | | 279 | 279 | 279 | 279 | | 279 | mirror x1.00 |
+| buffers: indirect and GPU-written | | 118 | 118 | 118 | 118 | | 118 | mirror x1.00 |
+| pools: shader code | | 324 | 324 | 14 | 4 | | 4 | |
+| pools never used: CPU cached | | 3303 | 2668 | 465 | 389 | | 421 | |
+| pools never used: CPU no access / uncached | | 602 / 69 | 223 / 69 | 217 / 65 | 8 / 51 | | 8 / 51 | |
+| game memory outside pools | | 4522 | 4522 | 845 | 0 | | 0 | |
+| outside any pool (the import chunks' reach) | | | | | **493** | | **556** | |
+| **all game resources** | | **11115** | **9434** | **2336** | **1592** | **2431** | **1768** | VRAM x0.36, RAM x0.21 |
+
+What belongs to no game resource, and the reconciliation:
+- **VRAM, 5324 MB used, reconciled with 0 MB left over.** Texture images 2431. Other images 112 (88 of them the render-target
+  pool). Live mirrors 1592. Write-back shadows 261. Scratch (BC encode) 160. Streams 96. Staging 12. Other buffers 32. Free in
+  VMA blocks 397 (image blocks 120, render-target blocks 240, buffer blocks 36). Outside VMA 228 (pipelines, shader modules,
+  descriptor pools, swapchain, the driver's own).
+- **RAM: working set 6474 MB; the census counts 6486 (12 MB the other way).**
+  - The game's memory: 2336 (pools 1490, outside pools 845).
+  - **The driver's private arenas: 3079 in RAM of 3332 committed.** That is the largest single owner, larger than the game.
+  - C heaps 480; images 258; captures 146; the BC cache 0 (it stores lazily and nothing was evicted).
+  - Private commit 19275 MB: the window 9434, private memory with no owner 8706 (beside VRAM and the arenas, section 16).
+- Against the console: **VRAM 5.3 GB + RAM 6.5 GB = 11.8 GB, for 9.4 GB of the game's committed memory.** The game's own
+  memory is only 2.3 GB of the RAM.
+
+The market (`r1l1`, castle-move, 90 s; that run overlapped another game on the machine, so only its memory figures count) has
+the same structure. Mirrors 1422 MB (521 bound as buffers, 403 never bound, 494 outside every pool, 3 texture-only). Render
+targets 1518 MB of images: a **12288x12288 D16 target of 288 MB**, ten 2560x1440 R11G11B10 (150 MB), nine D32 (135 MB),
+twenty-three 1280x720 RGBA16F (172 MB), and 65 finalized but kept (212 MB). BC cache 466 MB. Driver arenas 1486 MB in RAM.
+
+### The structural questions, answered
+
+1. **Texture storage is not mirrored, and the pools are not mixed.**
+   - Of the 1592 MB of mirrors, 73 MB are pages that only ever held texture storage. 561 MB are pages bound as buffers. 454 MB
+     are pool pages never bound. 502 MB lie outside every pool. Market: 3 / 521 / 403 / 494 of 1422.
+   - Of 4933 live pools, 67 hold only texture storage (1216 MB of it) and 659 only buffers (561 MB bound). 6 are "mixed",
+     every one under 8 MB, and 0 MB was used both ways over the pools' lives.
+   - The mixing the owner feared is one level up: an import chunk is 16 MB around a binding (section 11.3), and it takes in
+     the neighbouring pools, texture pools among them, and memory outside every pool.
+   - **A mirror per bound range** would hold the buffer pages: 1,447 runs over 9,921 granules of 64 KB, 620 MB. By size:
+     404 runs of 4 KB or less, 733 of 64 KB or less (13 MB), 237 up to 1 MB (59 MB), 71 up to 16 MB (248 MB), 2 above
+     (236 MB). Per 64 KB granule that is about 620 MB, against 1592 of mirrors and 1768 of imports. The thousands of tiny
+     runs are 14 MB in all, so per-pool or per-granule mirrors can round them up.
+2. **After its upload, who reads a texture's guest bytes or its mirror.**
+   - The mirror: nobody. Texture pages are not in mirrors except where a chunk's reach covers them (73 MB).
+   - The guest bytes are read again only by the back end: a re-upload when an evicted texture is made again, the BC cache's
+     hash and the ASTC alpha scan (section 7), and `UnswizzleTexture` for non-ASTC uploads. The game itself touched under
+     1 MB of `0x024` in 35 s (section 7).
+   - In this run the textures' guest RAM is already low because cold pages took it out: 5x5 9 MB of 228 committed, 8x8 0
+     of 114. Only their commit remains.
+   - The BC cache stored 0 here (lazy, and no eviction on a 12 GB card); in the market run it held 466 MB because the lazy
+     trigger fired.
+3. **Render targets.**
+   - In the field at 2560x1440: 145 color targets of 340 MB and 18 depth of 115 MB. The largest are 2560x1440 RGBA8 x5
+     (75 MB), R11G11B10 x4 (60 MB), D32 x3 (45 MB), and a 512x512 RGB10A2 target of 64 MB (an array or volume).
+   - The sizes are the game's own: `texture_get` takes width and height from the NVN descriptor (`d.width`), and nothing in
+     the back end scales a target.
+   - The game sizes its frame from the display the host reports (`output_res`, `nn_applet.c`: 1 = 2560x1440 against the
+     console's 2048x1152 docked). That is +56% of pixels on every full-frame target.
+   - The 12288x12288 D16 shadow target (288 MB, market; also in the owner's and a player's logs) is the game's request.
+     Whether it follows the reported display is **not measured**: one `HOS_OUTPUT_RES=0` run against `=1` settles it.
+   - "Finalized, kept" (33 MB here, 212 MB in the market) are targets the game finalized that nothing frees under the
+     budget. `keep_finalized` (`RX_VK_KEEP_FINALIZED_MB`, 512) keeps the small drawn-once ones on purpose (issues 107, 386).
+     The large ones stay only because the eviction pass runs past 7/8 of the texture budget, or for targets drawn over.
+     `RX_VK_FREE_FINALIZED` (below) frees them.
+4. **The resource files in the heaps** are console bytes: the game holds them on the console too, in the same 9.8 GB. Here
+   they are 4522 MB committed outside pools, of which 845 MB is in RAM (cold pages, section 12). The "pools never used"
+   (3303 MB of CPU-cached storage) are, by `HOS_HEAP_SPLIT` in the same run, the pool-backed heaps whose data this scene does
+   not draw: `agl::TextureDataMgr` (2443 MB, 105 MB in RAM), `ProbeHeap` (214 MB), `Foliage Scene Heap`, `gsys::SystemTask`,
+   `CreateModelScene`, and the UI's `Common...bntx` (217 MB). These are console bytes as well. What is ours is only their
+   commit, which the drop (section 14) can give back.
+5. **The pipeline and program caches in memory** are the driver's private arenas: 3079 MB in RAM of 3332 committed in the
+   field (1486 in the market at 90 s). Add the transient 1.17 GB of `vkGetPipelineCacheData` at a save (section 16; H1's fix
+   is on main). The program cache is not held: each program is borrowed from `hookshot_programs.bin` (6.4 GB on disk) and let
+   go. 3216 graphics pipelines were made, of which 892 were bound.
+
+### What releases a chunk today
+
+The back end was told when a pool is made (`memory_pool_flags`), never when it ends. A chunk left the pool table only in
+three ways: a larger import took it in (`retire_pool`), the import-pressure rule fired (`RX_VK_IMPORT_HIGH`, off on Windows),
+or `RX_VK_NO_HOST_IMPORT` gave back its import alone (the entry and the mirror stay). A mirror goes only through the idle
+rules: 6000 mirror epochs, or 600 when the mirror budget or the 80% VRAM rule presses. So the chunks and mirrors of a zone the
+game has left stay for good unless VRAM presses. That is the play sessions' growth (H1: live imports 0.16 -> 6.6 GB over 17
+zones). In this run, with no zone change: 49 chunks of 1768 MB hold 1185 MB of live pools, 102 MB of finalized pools and
+480 MB of no pool at all. One chunk of 80 MB has no live pool left; it was written by the GPU and last bound 190,000
+submissions ago.
+
+### Two levers built behind switches (default 0)
+
+- `RX_VK_POOL_FINALIZE=1` (`host/nvn_native.c`, `host/rx_backend.c`, `gpu/vk/vk_memory.cpp` `finalize_retire`):
+  - the host tells the back end at a live pool's `nvnMemoryPoolFinalize` (the branch for a pool that is still live: not the
+    double-finalize case);
+  - once the replay has taken a capture made after every submit that came before that finalize, each chunk over its range
+    with no live pool left (`hos_gpu_live_pools`: a newer pool at the same address keeps the chunk) retires as `retire_pool`
+    does. Its mirror is freed after the GPU, its import is given back (`retired_imports_give_back`: on NVIDIA by default),
+    there is no inheritance, and the write-backs it left out are dropped;
+  - a chunk bound by the recording under way waits one submission, and that is counted;
+  - log line: `vk: chunks retired as their game pools all ended`.
+- `RX_VK_FREE_FINALIZED=1` (`gpu/vk/vk_texture.cpp`): a finalized render target that `keep_finalized` does not keep goes 3
+  presents after its last use, once the GPU is past it, whatever the budget. Nothing samples it after:
+  - the game cannot sample a texture it finalized;
+  - the BC cache holds ASTC transcodes only;
+  - the write-back before eviction is for live targets;
+  - the upscaler and the present read their own images and the frame's live target.
+
+  The one risk is a texture made again over the storage and sampled undrawn, for targets over 4 MB.
+- Neither switch has run in the game yet: the main PC was taken by the owner's sessions. Both are built (`r1-led2`), and the
+  game-free suite passes (the known `nx2/test_nup_paths.py` failure only).
+
+### The levers, ranked by MB (field 360 s; the zone-changing session will rescale the first)
+
+| # | Lever | VRAM | RAM | Commit | Needs | What could break |
+|---:|---|---:|---:|---:|---|---|
+| 1 | Chunks retired at their pools' finalize (`RX_VK_POOL_FINALIZE`, built) | the mirrors of zones left (play8: imports grew to 6.6 GB) | the pinned imports of zones left | the same | a hand-played session with zone changes | a binding of a retired range before the replay passed the finalize (ordered by captures; counted) |
+| 2 | Mirrors per pool or per bound granule, no import (section 17 lever B) | ~970 of 1592 (keep ~620) | the 1768 MB pinned, as cold pages and the drop can then take them | ~1.1 GB (576 outside every pool, 454 never bound) | fill, live pages and write-backs through staging (the lazy release's path); every bound pool mirrored while bound | write-back latency before an invalidate; small-pool churn |
+| 3 | The driver's arenas (precompiled pipelines; section 16) | | 1.5-3.1 GB | 3.3 GB | compute pipelines on demand, fewer kept graphics pipelines | first-use hitches |
+| 4 | ASTC 8x8 and larger blocks kept as BC1 where there is no alpha, instead of BC7 | ~260 of 399 (8x8 BC7 262 at x4 of ASTC) | | | the alpha scan already decides BC1 against BC7 per texture; widen BC1's use | quality on textures with alpha gradients |
+| 5 | Finalized render targets freed (`RX_VK_FREE_FINALIZED`, built) | 33-212 | | | a session | a target made again over its storage and sampled undrawn, over 4 MB |
+| 6 | Output resolution: the game's frame at 2048x1152, not 2560x1440 | ~-36% of full-frame targets (~170-300 MB) | | | an A/B run (`HOS_OUTPUT_RES`), and the shadow map's size against it | picture size, the owner's choice |
+| 7 | The texture-storage commit dropped once uploaded (the drop, section 14, on by default) | | 0 (already cold) | ~1.0-1.5 GB | the main PC's validation of `HL_MEM_DROP` | restore hitches |
+| 8 | Write-back shadows (261 MB) and BC scratch (160 MB) made only while used | ~0.4 GB | | | shadows' 85/95% rule; scratch freed after a load | a stall at the next transcode |
