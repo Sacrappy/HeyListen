@@ -106,19 +106,19 @@ The first start prepares the game's shaders, which takes a while. Later starts a
 
 ### On Linux
 
-1. Open the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) and download
-   `Hookshot-<version>-x86_64.AppImage`. It is Hookshot Builder with everything it needs inside.
+1. Open the [latest release](https://github.com/Sacrappy/HeyListen/releases/latest) and download
+   `HeyListen-<version>-x86_64.AppImage`. It is HeyListen Builder with everything it needs inside.
 2. Allow it to run as a program. In most file managers: right-click it, open **Properties**, and turn on
    "Allow executing file as program" (the words differ between desktops). Or in a terminal:
-   `chmod +x Hookshot-*-x86_64.AppImage`.
-3. Double-click it. The Hookshot Builder window opens.
+   `chmod +x HeyListen-*-x86_64.AppImage`.
+3. Double-click it. The HeyListen Builder window opens.
 4. Under **Game files**, choose **.nup file** or **romfs and exefs**, then press **Browse** to pick them. The builder
    checks the version.
-5. Under **Save the game to**, keep `~/Games/Hookshot` or choose another folder. Choose a **Language**.
+5. Under **Save the game to**, keep `~/Games/HeyListen` or choose another folder. Choose a **Language**.
 6. Press **Build**. It takes about 10 to 45 minutes, depending on your CPU and memory.
 7. When it says "Your game is ready", press **Play**.
 
-The game is also added to your applications menu as "Hookshot". That entry, and `hookshot` in the game folder, open the
+The game is also added to your applications menu as "HeyListen". That entry, and `HeyListen` in the game folder, open the
 launcher: **Play**, and **Update** when a newer release is out. Keep the AppImage where it is: the launcher uses it to
 update.
 
@@ -128,7 +128,7 @@ script: see [Linux, the AppImage from the command line](#build-from-source).
 ### Updating
 
 When a new release is out, the launcher says "Update available". Press **Update**: in `hookshot.exe` on Windows, or in
-`hookshot` (or the AppImage) on Linux. It downloads only the parts that changed and builds the game again in the same
+`HeyListen` (or the AppImage) on Linux. It downloads only the parts that changed and builds the game again in the same
 folder. The build files of the last build are gone by then (see [Where the files go](#where-the-files-go)), so an
 update takes about as long as the first build. Your saves and settings are kept. What changed is on the
 [Releases page](https://github.com/NotRexed/Hookshot/releases).
@@ -137,11 +137,11 @@ update takes about as long as the first build. Your saves and settings are kept.
 <summary>What an update keeps and replaces, and updating from the command line</summary>
 
 To be safe, copy your saves somewhere first: the `user` folder in the game folder on Windows, or
-`~/.local/share/hookshot` on Linux.
+`~/.local/share/heylisten` on Linux.
 
 | Kept | Replaced |
 |---|---|
-| Your saves (`user`, or `~/.local/share/hookshot` on Linux) | The game in `bin` and its files |
+| Your saves (`user`, or `~/.local/share/heylisten` on Linux) | The game in `bin` and its files |
 | `hookshot_options.ini`, the in-game menu's choices and your controls | `image.bin` and the shader list |
 | `hookshot_env.txt` | `language.txt`, written again with the game's language |
 | `mods` | |
@@ -156,13 +156,13 @@ with `--update <game folder>`.
 ### Where the files go
 
 - The build reads your game and never changes it. It writes to the folder you choose and to the builder's own folder:
-  `%LOCALAPPDATA%\HookshotBuilder` on Windows, `~/.cache/hookshot-builder` on Linux.
+  `%LOCALAPPDATA%\HookshotBuilder` on Windows, `~/.cache/heylisten-builder` on Linux.
 - The romfs is hard-linked instead of copied where the disk allows it.
 - The build files (about 4 GB: the translated code and the compiled objects) are deleted once the game is ready. None
   of them are needed to play. To keep them, so that an update compiles only what changed, set the environment variable
   `HOOKSHOT_KEEP_BUILD_FILES=1` for the builder; on Windows, **Free up space** on the "Your game is ready" page then
   deletes them when you want. The build files folder can be moved before a build (**Change**, **Default**).
-- Saves: the `user` folder in the game folder on Windows, `~/.local/share/hookshot` on Linux (a `user` folder from an
+- Saves: the `user` folder in the game folder on Windows, `~/.local/share/heylisten` on Linux (a `user` folder from an
   earlier Linux build is moved there once). `--user <folder>` puts them somewhere else ([command line
   arguments](#running-the-game-from-the-command-line)).
   To carry on with a save from an emulator (Lichii, Eglantine, Orchid, ...) or NX2navi, or to take yours there, see
@@ -436,16 +436,16 @@ You need:
 <summary>Linux, the AppImage from the command line</summary>
 
 ```sh
-./Hookshot-<version>-x86_64.AppImage --cli --nup ~/your-game.nup --out ~/Games/Hookshot   # make_game.py's options
-./Hookshot-<version>-x86_64.AppImage --play                    # the game the builder built last, without the window
-./Hookshot-<version>-x86_64.AppImage --play ~/Games/Hookshot   # the game in that folder
-./Hookshot-<version>-x86_64.AppImage --update ~/Games/Hookshot # the new release, and that folder built again
+./HeyListen-<version>-x86_64.AppImage --cli --nup ~/your-game.nup --out ~/Games/HeyListen   # make_game.py's options
+./HeyListen-<version>-x86_64.AppImage --play                    # the game the builder built last, without the window
+./HeyListen-<version>-x86_64.AppImage --play ~/Games/HeyListen   # the game in that folder
+./HeyListen-<version>-x86_64.AppImage --update ~/Games/HeyListen # the new release, and that folder built again
 ```
 
 `HOOKSHOT_JOBS=<n>` (or `--jobs <n>` with `--cli`) limits how many files compile at once.
 
-In a game folder, `hookshot` is the launcher and the game itself is `bin/hookshot`. The builder's settings are in
-`~/.config/hookshot/builder.ini`.
+In a game folder, `HeyListen` is the launcher and the game itself is `bin/hookshot`. The builder's settings are in
+`~/.config/heylisten/builder.ini`.
 
 </details>
 
@@ -467,7 +467,7 @@ the AppImage from them. A folder built from a source checkout has no launcher: `
 <summary>The Windows game, built on Linux</summary>
 
 Unpack llvm-mingw's Linux build (`ucrt-ubuntu-22.04-x86_64`), then run `make_game.py` with `RX_TARGET=windows` and
-`HOOKSHOT_MINGW` set to its folder. The objects go to `~/.cache/hookshot-builder-windows`, apart from the Linux game's.
+`HOOKSHOT_MINGW` set to its folder. The objects go to `~/.cache/heylisten-builder-windows`, apart from the Linux game's.
 The game folder runs under Proton or on Windows.
 
 </details>
@@ -483,7 +483,7 @@ use them.
 |---|---|
 | `image.bin` | The game image to run. Without it the game uses the `image.bin`, `romfs` and `user` in its folder |
 | `--romfs <folder>` | The extracted RomFS folder |
-| `--user <folder>` | Where the game keeps per-user data: saves, caches and temp files (and `mouse_sens.txt` when `HOS_MOUSE_SENS` is set; the menu keeps the sensitivity otherwise). Default: `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux; with an explicit image path, `user` in the current folder |
+| `--user <folder>` | Where the game keeps per-user data: saves, caches and temp files (and `mouse_sens.txt` when `HOS_MOUSE_SENS` is set; the menu keeps the sensitivity otherwise). Default: `user` in the game folder on Windows, `~/.local/share/heylisten` on Linux; with an explicit image path, `user` in the current folder |
 | `--trace` | Log every Horizon OS call (the same as `HOS_TRACE=1`) |
 | `--prepare-shaders` | Prepare the shaders as the first start does, then exit without starting the game (no build step runs it) |
 

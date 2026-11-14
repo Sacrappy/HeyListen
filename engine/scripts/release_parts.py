@@ -186,7 +186,10 @@ def copy(src, dst):
     shutil.copyfile(src, dst)
 
 
-PROFILE_FILES = ("hookshot_pieces.prof", "hot_funcs.txt", "hot_order.txt")
+# (pipeline_states.bin: the pipeline state list recorded on the development PC, hashes and draw state only (tools/release/check_states.py,
+# which make_release.py runs on it first); nx2/make_game.py puts it beside the game as hookshot_pipeline_states_shipped.bin, whose
+# pipelines the shaders' preparation builds before the title instead of each when it is first drawn)
+PROFILE_FILES = ("hookshot_pieces.prof", "hot_funcs.txt", "hot_order.txt", "pipeline_states.bin")
 
 
 def package(a):

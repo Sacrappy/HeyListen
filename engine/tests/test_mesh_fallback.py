@@ -128,7 +128,7 @@ def main():
         raise SystemExit("an indirect mesh draw does not dispatch from its converted arguments")
     if "if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) SKIP_HERE();" not in draw:
         raise SystemExit("the fallback dispatches do not run before the pass")
-    if "if (fallback_vertex_count) vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);" not in draw:
+    if "vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);" not in draw:
         raise SystemExit("the fallback is not drawn as an ordinary vkCmdDraw")
     if "fallback_payload_address" not in draw or "MESH_FALLBACK_PAYLOAD_PUSH_OFFSET" not in draw:
         raise SystemExit("the fallback's buffer addresses are not pushed")

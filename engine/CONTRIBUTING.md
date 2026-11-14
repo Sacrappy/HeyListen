@@ -181,6 +181,10 @@ In HeyListen, GitHub runs only the root `.github/workflows`: `linux.yml` runs th
 (clang, spirv-tools, glslang 16.6.0 and the pinned SPIR-V and Vulkan headers, as `engine/.github/workflows/source-regressions.yml`
 does) and builds the AppImage in an Ubuntu 22.04 container.
 
+In HeyListen, GitHub runs only the root `.github/workflows`: `linux.yml` runs these checks with `--strict` on Ubuntu 24.04
+(clang, spirv-tools, glslang 16.6.0 and the pinned SPIR-V and Vulkan headers, as `engine/.github/workflows/source-regressions.yml`
+does) and builds the AppImage in an Ubuntu 22.04 container.
+
 ### Checks that need your dump or a run
 
 These are slow and local, and they need `work/dump.txt` from `nx2/dump.py --set`:

@@ -53,7 +53,8 @@ struct Info {
 }
 #include "cache_types.inc"
 
-struct { uintptr_t device = 123; } dev;
+struct { uintptr_t device = 123; uint32_t denorm_preserve_widths = 7, denorm_flush_widths = 7; } dev;
+std::vector<uint32_t> strip_float_controls(const std::vector<uint32_t>&, uint32_t, uint32_t) { return {}; }   // (every width reported: make_module never calls it)
 std::map<VkShaderModule, unsigned> destroyed;
 unsigned attempts = 0, created = 0, releases = 0, fail_at = 0;
 int vkCreateShaderModule(uintptr_t device, const VkShaderModuleCreateInfo* info, const void* allocator,

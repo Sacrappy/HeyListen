@@ -566,7 +566,47 @@ std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = 
     return t;
 }
 
-VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
+/// The denorm modes (DenormPreserve, DenormFlushToZero) a shader declares for a width the device does not report, and their
+/// capability when it reports none of that kind, taken out of the module's preamble. Eden declares them for any program that
+/// uses them (the profile says every device has them), validation calls each one an error, and a driver that does not know a mode
+/// need not ignore it. A program loaded from the program cache is cleaned here too, so the cache stays as it was.
+std::vector<uint32_t> strip_float_controls(const std::vector<uint32_t>& spirv, uint32_t preserve, uint32_t flush) {
+    constexpr uint32_t kOpCapability = 17, kOpExecutionMode = 16, kOpFunction = 54;
+    constexpr uint32_t kModePreserve = 4459, kModeFlush = 4460, kCapPreserve = 4464, kCapFlush = 4465;
+    const auto width_bit = [](uint32_t w) { return w == 16 ? 1u : w == 32 ? 2u : w == 64 ? 4u : 0u; };
+    std::vector<uint32_t> out;
+    bool changed = false;
+    size_t i = 5;
+    while (i < spirv.size()) {
+        const uint32_t op = spirv[i] & 0xFFFF, wc = spirv[i] >> 16;
+        if (!wc || i + wc > spirv.size() || op == kOpFunction) break;
+        bool drop = false;
+        if (op == kOpExecutionMode && wc == 4) {
+            if (spirv[i + 2] == kModePreserve) drop = !(preserve & width_bit(spirv[i + 3]));
+            if (spirv[i + 2] == kModeFlush) drop = !(flush & width_bit(spirv[i + 3]));
+        } else if (op == kOpCapability) {
+            if (spirv[i + 1] == kCapPreserve) drop = !preserve;
+            if (spirv[i + 1] == kCapFlush) drop = !flush;
+        }
+        if (drop && !changed) {
+            changed = true;
+            out.assign(spirv.begin(), spirv.begin() + i);
+        }
+        if (changed && !drop) out.insert(out.end(), spirv.begin() + i, spirv.begin() + i + wc);
+        i += wc;
+    }
+    if (!changed) return {};
+    out.insert(out.end(), spirv.begin() + i, spirv.end());
+    return out;
+}
+
+VkShaderModule make_module(const std::vector<uint32_t>& spirv_in) {
+    // (RX_VK_KEEP_DENORM=1: the modules as translated, to compare a picture or a number with and without the strip)
+    static const bool keep = getenv("RX_VK_KEEP_DENORM") != nullptr;
+    const bool lacks = !keep && (dev.denorm_preserve_widths != 7 || dev.denorm_flush_widths != 7);
+    const std::vector<uint32_t> cleaned = lacks ? strip_float_controls(spirv_in, dev.denorm_preserve_widths, dev.denorm_flush_widths)
+                                                : std::vector<uint32_t>{};
+    const std::vector<uint32_t>& spirv = cleaned.empty() ? spirv_in : cleaned;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = spirv.size() * 4;
     ci.pCode = spirv.data();
@@ -1015,7 +1055,9 @@ uint64_t disk_stamp() {
     const uint32_t depth = host->depth_minus_w() != 0;   // (d3zessete's PR 54: programs made in either depth mode are kept apart)
     add(&depth, sizeof depth);
     // (and a GPU's mesh shaders: a file of native task and mesh programs is no use to the compute fallback, nor its to one)
-    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u);
+    // (the fallback's bit is 0x12, not 2: a file a start-up made with programs marked native mesh and fallback at once (seed_translate)
+    // is no use to it, and only a fallback GPU wrote one)
+    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 0x12u : 0u);
     add(&mesh, sizeof mesh);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)
@@ -2427,8 +2469,15 @@ std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], cons
     auto p = std::make_unique<Program>();
     p->key = key;
     p->compute = by_stage[5] != nullptr;
-    p->mesh = by_stage[7] != nullptr;
-    if (p->mesh)
+    // (a program made at start-up from the seed, as play makes it: on a GPU without mesh shaders it is a fallback program, an ordinary
+    // graphics pipeline with a vertex input state. It was marked native mesh too, and its pipelines were built with no vertex input
+    // and no input assembly state (the validation layer's VUID-VkGraphicsPipelineCreateInfo-pStages-02097) and a static topology, which
+    // the draws of the same program then used in place of the dynamic one: validation 07842 and 04879)
+    const bool is_mesh = by_stage[7] != nullptr;
+    if (is_mesh && !dev.mesh_shader && !dev.mesh_fallback) return nullptr;
+    p->mesh = is_mesh && dev.mesh_shader;
+    p->fallback = is_mesh && !dev.mesh_shader;
+    if (is_mesh)
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, color_types);
     else if (p->compute) {
         seed_cs_control = seed.blob.data() + by_stage[5]->control;

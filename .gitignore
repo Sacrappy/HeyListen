@@ -56,3 +56,4 @@ image/
 *.xcz
 *.sha1
 *.so
+!profile/pipeline_states.bin
