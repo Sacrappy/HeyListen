@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 3  # v3: fps_1pct_low, fps_0_1pct_low, over_*_ms_pct (TICK-013); v2: warmup_origin, launch_offset_s
-HARD_LIMIT_S = 120.0
+HARD_LIMIT_S = float(os.environ.get("HL_BENCH_LIMIT_S", "120"))   # (a run is killed at 2 minutes; the owner lifted it to 8 for single long runs: HL_BENCH_LIMIT_S=500)
 DEFAULT_DURATION_S = 90.0
 # Hookshot, measured on the TICK-004 traces (see README "Warm-up"): gameplay starts
 # ~29 s after launch in Kokiri and ~53-57 s in Hyrule Field, and the Hyrule scene-entry
