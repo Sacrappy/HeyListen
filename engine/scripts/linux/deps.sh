@@ -16,8 +16,15 @@
 #   appimagetool      the AppImage packer
 #   runtime-x86_64    the AppImage runtime it puts in front of the image (pinned: appimagetool's own download of the
 #                     'continuous' one, at packing time, fails whenever GitHub answers 504)
+#
+# Wants on the system: a C/C++ compiler, make, cmake, meson, ninja, nasm (dav1d), pkg-config, curl and the X11/Xft
+# development files (Ubuntu: build-essential cmake meson ninja-build nasm pkg-config libxft-dev; Arch: base-devel cmake meson
+# ninja nasm libxft).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+for t in cc c++ make cmake meson ninja nasm pkg-config curl; do
+    command -v "$t" > /dev/null || { echo "deps.sh: $t not found (see the list at the top of this script)"; exit 1; }
+done
 DEPS=${DEPS:-$PWD/build-linux/deps}
 DL=$DEPS/downloads
 mkdir -p "$DEPS" "$DL"
@@ -122,7 +129,10 @@ if ! done_for tk "$TCLTK_VER"; then
     cp "$DEPS/src-tk/unix/libtcl9tk9.0.so" "$DEPS/tk/"
     strip --strip-unneeded "$DEPS/tk/libtcl9tk9.0.so"
     readelf -d "$DEPS/tk/libtcl9tk9.0.so" | grep -q 'libXft\.so\.2' || { echo "Tk was built without Xft"; exit 1; }
-    cp -L /usr/lib/x86_64-linux-gnu/libXft.so.2 /usr/lib/x86_64-linux-gnu/libXrender.so.1 "$DEPS/tk/"
+    # (Debian and Ubuntu keep them in the multiarch folder; Arch, Fedora and others in /usr/lib or /usr/lib64)
+    XLIB=$(for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib; do [ -e "$d/libXft.so.2" ] && echo "$d" && break; done)
+    [ -n "$XLIB" ] || { echo "libXft.so.2 not found (install libXft)"; exit 1; }
+    cp -L "$XLIB/libXft.so.2" "$XLIB/libXrender.so.1" "$DEPS/tk/"
     cp "$DEPS/src-tk/license.terms" "$DEPS/tk/Tk-license.terms"
     rm -rf "$DEPS/src-tcl" "$DEPS/src-tk"
     mark tk "$TCLTK_VER"
@@ -188,8 +198,14 @@ if ! done_for licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER-$TCLTK_VER"; t
     curl -fsSL -o "$L/dav1d-COPYING" "https://code.videolan.org/videolan/dav1d/-/raw/$DAV1D_VER/COPYING"
     cp "$DEPS/sdl2/LICENSE.txt" "$L/SDL2-LICENSE.txt"
     cp "$DEPS/tk/Tk-license.terms" "$L/Tk-license.terms"
-    cp /usr/share/doc/libxft2/copyright "$L/libXft-copyright"
-    cp /usr/share/doc/libxrender1/copyright "$L/libXrender-copyright"
+    # (Debian and Ubuntu: /usr/share/doc/<package>/copyright; Arch: /usr/share/licenses/<package>/COPYING; Fedora: /usr/share/licenses/<package>/)
+    lic() { for f in "$@"; do [ -f "$f" ] && { echo "$f"; return; }; done; }
+    F=$(lic /usr/share/doc/libxft2/copyright /usr/share/licenses/libxft/COPYING /usr/share/licenses/libXft/COPYING)
+    [ -n "$F" ] || { echo "libXft's license not found"; exit 1; }
+    cp "$F" "$L/libXft-copyright"
+    F=$(lic /usr/share/doc/libxrender1/copyright /usr/share/licenses/libxrender/COPYING /usr/share/licenses/libXrender/COPYING)
+    [ -n "$F" ] || { echo "libXrender's license not found"; exit 1; }
+    cp "$F" "$L/libXrender-copyright"
     mark licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER-$TCLTK_VER"
 fi
 

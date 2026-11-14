@@ -1,0 +1,83 @@
+# Linux: the engine's game-free checks and the AppImage (x86_64), built in Ubuntu 22.04 as engine/scripts/linux/deps.sh and
+# appimage.sh expect. GitHub runs only the repository root's workflows, so engine/.github/workflows (Hookshot's) never ran here
+# and nothing told when the Linux build broke. No game data is involved.
+name: Linux
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    timeout-minutes: 90
+    steps:
+      - name: System packages
+        working-directory: /
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          for try in 1 2 3; do
+            if apt-get update &&
+              apt-get install -y --no-install-recommends software-properties-common gpg-agent &&
+              add-apt-repository -y ppa:ubuntu-toolchain-r/test &&
+              apt-get install -y --no-install-recommends g++-13 libstdc++-13-dev &&
+              apt-get install -y --no-install-recommends git ca-certificates curl xz-utils zstd file unzip python3 \
+              build-essential gcc-12 g++-12 libstdc++-12-dev nasm meson ninja-build cmake pkg-config \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxinerama-dev \
+              libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgles-dev libdrm-dev libgbm-dev \
+              libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libxft-dev libfontconfig1-dev zlib1g-dev spirv-tools glslang-tools; then
+              break
+            else
+              package_status=$?
+            fi
+            if [ "$try" = 3 ]; then exit "$package_status"; fi
+            sleep 20
+          done
+          # (the tests' C++20: g++ 13)
+          update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 130 --slave /usr/bin/gcc gcc /usr/bin/gcc-13
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Trust the checkout
+        working-directory: /
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: engine/build-linux/deps
+          key: linux-deps-${{ hashFiles('engine/scripts/linux/deps.sh', 'engine/nx2/prompt_requirements.txt') }}
+
+      - name: Dependencies (LLVM, Python, FFmpeg with dav1d, SDL2, Vulkan headers)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/linux/deps.sh
+
+      - name: Game-free checks
+        run: build-linux/deps/python/bin/python3 -I -B tests/run_all.py
+
+      - name: AppImage
+        run: scripts/linux/appimage.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: HeyListen-linux-x86_64
+          path: engine/build-linux/*.AppImage
+          if-no-files-found: error
+
+      # (a player's build from the AppImage, with no game, up to where the game's own files are needed)
+      - name: A player's build from the AppImage
+        run: scripts/linux/check_player_build.sh
