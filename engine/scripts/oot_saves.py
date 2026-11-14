@@ -12,7 +12,7 @@ pokedinner, eden, eglantine or nx2navi (to-lichii and to-hookshot still work: th
 lichii). --from/--to name the other side's folder instead of where it is looked for: the save folder itself (the one
 with account.sav and slot_*), or a folder above it (an emulator's data folder, a portable user folder, NX2navi's game
 folder), which is searched for the game's saves. --hookshot DIR does the same for Hookshot's side: its data folder
-(Linux: $XDG_DATA_HOME/hookshot, default ~/.local/share/hookshot) or, on Windows, its game folder (the one with
+(Linux: $XDG_DATA_HOME/heylisten, default ~/.local/share/heylisten) or, on Windows, its game folder (the one with
 image.bin and user\\), which has to be given there. The side being overwritten is copied first to
 <backup>/<import or export>-<name>-<YYYYmmdd-HHMMSS> (Linux: $XDG_DATA_HOME/oot-save-backups, Windows:
 %LOCALAPPDATA%\\Hookshot\\oot-save-backups; --backup-dir changes it). Close every game first: --force skips that check.
@@ -51,7 +51,7 @@ EMULATORS = [
                                    "windows": ["{localappdata}/Programs/NX2navi/game", "C:/Games/Ocarina"]},
             ["nx2navi", "ocarina"], []),
 ]
-HOOKSHOT = Program("hookshot", "Hookshot", {"linux": ["{data}/hookshot"], "windows": []}, ["hookshot", "heylisten"], [])   # (HeyListen: its Windows exe)
+HOOKSHOT = Program("hookshot", "Hookshot", {"linux": ["{data}/heylisten"], "windows": []}, ["hookshot", "heylisten"], [])   # (HeyListen: its Windows exe)
 FOLDER = Program("folder", "the folder", {"linux": [], "windows": []}, [], [])
 
 # Where the save folders sit under a data folder. "<id>" is one folder per user profile (its name is the id shown).

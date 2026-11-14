@@ -1,9 +1,9 @@
 #!/bin/bash
-# The Linux AppImage: Hookshot Builder with everything it needs to build the game on the player's PC. No game data and
+# The Linux AppImage: HeyListen Builder with everything it needs to build the game on the player's PC. No game data and
 # nothing made from it is in it: the game is built from the player's own copy, as on Windows.
 #
 #   scripts/linux/deps.sh        (first: the compiler, Python, FFmpeg, SDL2, headers into build-linux/deps)
-#   scripts/linux/appimage.sh    -> build-linux/Hookshot-<version>-x86_64.AppImage
+#   scripts/linux/appimage.sh    -> build-linux/HeyListen-<version>-x86_64.AppImage
 # The same image builds the game and, with --play, starts the one it saved.
 #
 # Built on the oldest system it is for (CI: Ubuntu 22.04): the sysroot it carries is that system's C library, so the
@@ -42,6 +42,8 @@ L=$APPDIR/usr/lib/hookshot
 
 # ---- the tools (the sources the player's build compiles, and the scripts) ----
 cp -a nx2 host LICENSE readme.md assets "$T/"
+# (HeyListen's credit to Hookshot and the licenses of what it carries: in the repository root, above engine/)
+[ -f ../THIRD_PARTY_NOTICES.md ] && cp ../THIRD_PARTY_NOTICES.md "$T/"
 printf '%s
 ' "$VERSION" > "$T/VERSION"   # (no git history in here: nx2/version.py reads the release name from it)
 mkdir -p "$T/builder" "$T/gpu/render" "$T/gpu/vk" "$T/third_party"
@@ -71,7 +73,7 @@ cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
 cp "$VK" "$L/hookshot_vk.so"
 cp "$DEPS/sdl2/libSDL2-2.0.so.0" "$L/libSDL2-2.0.so.0"
-cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides Hookshot)
+cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides HeyListen and Hookshot)
 # ---- the licences of the third-party parts compiled into hookshot_vk.so (tests/test_appimage_licenses.py) ----
 mkdir -p "$T/licenses/imgui" "$T/licenses/zstd" "$T/licenses/libertinus"
 cp third_party/imgui/LICENSE.txt third_party/imgui/PROVENANCE.md "$T/licenses/imgui/"
@@ -114,19 +116,19 @@ EOF
 
 # ---- the AppDir's own files ----
 cp builder/linux/AppRun "$APPDIR/AppRun"
-cp builder/linux/hookshot-builder.desktop "$APPDIR/"
-cp assets/hookshot.png "$APPDIR/hookshot.png"
+cp builder/linux/heylisten-builder.desktop "$APPDIR/"
+cp assets/heylisten.png "$APPDIR/heylisten.png"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-cp assets/hookshot.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/hookshot.png"
+cp assets/heylisten.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/heylisten.png"
 
-# (the update list, beside AppRun and not inside a hashed part: hookshot-linux.txt names each part's checksum)
+# (the update list, beside AppRun and not inside a hashed part: heylisten-linux.txt names each part's checksum)
 # (the parts are served from the linux-parts release of the repository this is built in, where
-# scripts/linux/publish_parts.sh uploads them: without --base the list named NotRexed/Hookshot's release, which a fork's
-# CI does not upload to, so a fork's update list named parts that were not there)
+# scripts/linux/publish_parts.sh uploads them: a fork's CI uploads to the fork, so its list names its own parts. Outside CI
+# the default is Sacrappy/HeyListen, the repository tools/release/make_release_linux.sh checks the list against)
 python3 scripts/linux/make_parts.py "$APPDIR" "$VERSION" "$B/parts" \
-    --base "https://github.com/${GITHUB_REPOSITORY:-NotRexed/Hookshot}/releases/download/linux-parts"
+    --base "https://github.com/${GITHUB_REPOSITORY:-Sacrappy/HeyListen}/releases/download/linux-parts"
 
-OUT=$B/Hookshot-$VERSION-x86_64.AppImage
+OUT=$B/HeyListen-$VERSION-x86_64.AppImage
 rm -f "$OUT"
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$DEPS/appimagetool" --runtime-file "$DEPS/runtime-x86_64" --comp zstd "$APPDIR" "$OUT"
 echo "$OUT: $(du -h "$OUT" | cut -f1)"

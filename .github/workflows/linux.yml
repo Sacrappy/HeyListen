@@ -2,16 +2,31 @@
 # source-regressions.yml runs them) and the AppImage (x86_64, built in Ubuntu 22.04 as engine/scripts/linux/deps.sh and
 # appimage.sh expect: its glibc is the oldest the game supports). GitHub runs only the repository root's workflows, so engine/.github/workflows (Hookshot's) never ran here
 # and nothing told when the Linux build broke. No game data is involved.
+#
+# The Linux files of a release come from here and from nowhere else (tools/release/make_release_linux.sh): publishing a
+# release on GitHub (the Windows files are attached by hand, as tools/release/make_release.py prints) starts this workflow
+# on that tag; it builds the AppImage, checks it and the update parts, puts the parts on the linux-parts release and
+# attaches the AppImage and heylisten-linux.txt to the tag's release. A pushed tag, a branch or a pull request builds and
+# checks the same and publishes nothing. Run by hand with a tag to attach the files of a release again.
 name: Linux
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
+    # (v*: not linux-parts or builder-parts, the parts' own releases, whose tags publishing creates)
+    tags: ['v*']
   pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'A release tag (v0.3.2) whose Linux files are built and attached to its release; empty: only build and check'
+        required: false
+        default: ''
 permissions:
   contents: read
 concurrency:
-  group: linux-${{ github.ref }}
+  group: linux-${{ github.event.release.tag_name || inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 defaults:
   run:
@@ -20,11 +35,14 @@ defaults:
 jobs:
   tests:
     name: Game-free checks
+    # (not for the parts' own releases, builder-parts and linux-parts, whose publishing is also a release event)
+    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || '' }}
           persist-credentials: false
       # (the versions scripts/linux/deps.sh builds the Vulkan back end with)
       - name: Check out pinned SPIR-V headers
@@ -64,8 +82,10 @@ jobs:
           HOOKSHOT_VULKAN_HEADERS: ${{ github.workspace }}/_deps/vulkan-headers/include
         run: python -I -B tests/run_all.py --strict
 
-  linux:
+  appimage:
     name: AppImage
+    # (not for the parts' own releases, builder-parts and linux-parts, whose publishing is also a release event)
+    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     timeout-minutes: 90
@@ -95,6 +115,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || '' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -102,15 +123,33 @@ jobs:
         working-directory: /
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # (a release builds what the AppImage carries from the checked downloads: no built dependencies from a cache, which other
+      # runs write. Other runs take the built ones)
+      - if: ${{ !(github.event.release.tag_name || inputs.tag || startsWith(github.ref, 'refs/tags/')) }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: engine/build-linux/deps
           key: linux-deps-${{ hashFiles('engine/scripts/linux/deps.sh', 'engine/nx2/prompt_requirements.txt') }}
+      - if: ${{ github.event.release.tag_name || inputs.tag || startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: engine/build-linux/deps/downloads
+          key: linux-deps-downloads-${{ hashFiles('engine/scripts/linux/deps.sh') }}
 
       - name: Dependencies (LLVM, Python, FFmpeg with dav1d, SDL2, Vulkan headers)
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/linux/deps.sh
+
+      # The play profile and the pipeline state list, as the Windows release ships them (tools/release/make_release.py): the
+      # repository's profile/ (function names, hashes and counts from playing; no game code), the state list only after
+      # tools/release/check_states.py has accepted it. appimage.sh carries work/ along.
+      - name: Play profile and pipeline state list
+        run: |
+          python3 -I ../tools/release/check_states.py ../profile/pipeline_states.bin
+          mkdir -p work
+          cp ../profile/hookshot_pieces.prof ../profile/hot_funcs.txt ../profile/hot_order.txt ../profile/pipeline_states.bin work/
+          ls -l work
 
       - name: AppImage
         run: scripts/linux/appimage.sh
@@ -124,3 +163,51 @@ jobs:
       # (a player's build from the AppImage, with no game, up to where the game's own files are needed)
       - name: A player's build from the AppImage
         run: scripts/linux/check_player_build.sh
+
+      # (the update parts and their list, for the release job. Not on branches and pull requests: about 240 MB)
+      - if: ${{ github.event.release.tag_name || inputs.tag || startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: HeyListen-linux-parts
+          path: engine/build-linux/parts/
+          if-no-files-found: error
+
+  # The release's Linux files, from the artifacts above and not from anybody's PC. tools/release/make_release_linux.sh
+  # refuses a list whose links lead anywhere but this repository's linux-parts release, anything that looks like game data,
+  # keys or a cache in the AppImage or a part, and files that do not belong to the tag; then the parts go to the linux-parts
+  # release (a part already there keeps its name: it is named by its checksum) and the AppImage with heylisten-linux.txt
+  # go to the tag's release, which has to exist: the Windows files and the notes are put there by hand.
+  release:
+    name: Release files
+    if: ${{ startsWith(github.event.release.tag_name || inputs.tag, 'v') }}
+    needs: [tests, appimage]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: HeyListen-linux-x86_64
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: HeyListen-linux-parts
+          path: dist/parts
+      - name: Check the files
+        run: tools/release/make_release_linux.sh "$RELEASE_TAG" dist
+      - name: Parts to the linux-parts release
+        run: engine/scripts/linux/publish_parts.sh dist/parts
+      - name: AppImage and list to the tag's release
+        run: gh release upload "$RELEASE_TAG" --clobber dist/HeyListen-*-x86_64.AppImage dist/parts/heylisten-linux.txt dist/SHA256SUMS-linux.txt

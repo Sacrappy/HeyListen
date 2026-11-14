@@ -1,4 +1,4 @@
-"""Hookshot Builder for Linux: what builder/HookshotBuilder (WPF) is on Windows, in Tk. It runs nx2/make_game.py and
+"""HeyListen Builder for Linux: what builder/HookshotBuilder (WPF) is on Windows, in Tk. It runs nx2/make_game.py and
 follows its @@ lines (make_game.py's docstring), then offers to start the game. The AppImage starts it (builder/linux/AppRun),
 with the compiler, sysroot and libraries it brings in the environment.
 
@@ -28,7 +28,7 @@ import linux_update  # noqa: E402  (the release check and the part download)
 import make_game  # noqa: E402  (LANGUAGES, BUILD_ID)
 import toolchain  # noqa: E402  (default_jobs: RX_JOBS)
 
-CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "hookshot", "builder.ini")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "heylisten", "builder.ini")
 STAGES = {"read": "Reading your game files", "lift": "Translating the game to PC code", "compile": "Compiling",
           "finish": "Putting the game folder together", "shaders": "Preparing shaders"}
 
@@ -87,27 +87,27 @@ def desktop_exec(path):
     return '"%s"' % escaped.replace("%", "%%")
 
 
-APP_ID = "io.github.NotRexed.HeyListen"   # (the game's window names itself so: host/posix/display_sdl.c's HOS_APP_ID)
+APP_ID = "io.github.Sacrappy.HeyListen"   # (the game's window names itself so: host/posix/display_sdl.c's HOS_APP_ID)
 
 
 def add_to_menu(folder):
     """an entry in the applications menu that starts the game"""
     if any(ch in folder for ch in "\r\n\0"):   # (a line break would start another key of the entry)
         raise ValueError("the game folder's name has a line break")
-    icon = os.path.join(folder, "hookshot.png")
-    src = os.path.join(ROOT, "assets", "hookshot.png")
+    icon = os.path.join(folder, "heylisten.png")
+    src = os.path.join(ROOT, "assets", "heylisten.png")
     if os.path.exists(src):
         shutil.copyfile(src, icon)
     apps = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "applications")
     os.makedirs(apps, exist_ok=True)
-    with open(os.path.join(apps, "hookshot.desktop"), "w", encoding="utf-8") as f:
+    with open(os.path.join(apps, "heylisten.desktop"), "w", encoding="utf-8") as f:
         f.write("[Desktop Entry]\nType=Application\nName=HeyListen\nComment=The Legend of Zelda: Ocarina of Time, built from your copy\n"
                 "Exec=%s\nPath=%s\nIcon=%s\nCategories=Game;\nTerminal=false\nStartupWMClass=%s\n"
-                % (desktop_exec(os.path.join(folder, "hookshot")), folder, icon, APP_ID))
+                % (desktop_exec(os.path.join(folder, "HeyListen" if os.path.exists(os.path.join(folder, "HeyListen")) else "hookshot")), folder, icon, APP_ID))
 
 
 def free_gb(path):
-    path = os.path.expanduser(path or "")   # (the field takes ~/Games/Hookshot, as build() and apply_mode() read it)
+    path = os.path.expanduser(path or "")   # (the field takes ~/Games/HeyListen, as build() and apply_mode() read it)
     while path and not os.path.exists(path):
         path = os.path.dirname(path)
     try:

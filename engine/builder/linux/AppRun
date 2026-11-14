@@ -1,13 +1,13 @@
 #!/bin/sh
-# The Hookshot AppImage: the builder window (builder/linux/hookshot_builder.py) with everything it builds the game with -
+# The HeyListen AppImage: the builder window (builder/linux/hookshot_builder.py) with everything it builds the game with -
 # Python and the tools, clang and lld, a glibc 2.35 sysroot, FFmpeg, SDL2 and the Vulkan back end, built already.
-#   Hookshot.AppImage                  the builder window (Play is in the window, once a game is built)
-#   Hookshot.AppImage --play           start the game the builder saved, without opening the window
-#   Hookshot.AppImage --play <folder>  start the game in that folder
-#   Hookshot.AppImage <folder>         the same
-#   Hookshot.AppImage --cli <args>     nx2/make_game.py itself, e.g. --cli --nup game.nup --out ~/Games/Hookshot
-#   Hookshot.AppImage --launch <dir>  the game folder's launcher: Play, and Update when a newer release is out
-#   Hookshot.AppImage --update <dir>  download the new release (only the parts that changed) and build that folder again
+#   HeyListen.AppImage                 the builder window (Play is in the window, once a game is built)
+#   HeyListen.AppImage --play          start the game the builder saved, without opening the window
+#   HeyListen.AppImage --play <folder> start the game in that folder
+#   HeyListen.AppImage <folder>        the same
+#   HeyListen.AppImage --cli <args>    nx2/make_game.py itself, e.g. --cli --nup game.nup --out ~/Games/HeyListen
+#   HeyListen.AppImage --launch <dir> the game folder's launcher: Play, and Update when a newer release is out
+#   HeyListen.AppImage --update <dir> download the new release (only the parts that changed) and build that folder again
 HERE="$(dirname "$(readlink -f "$0")")"
 LIB="$HERE/usr/lib/hookshot"
 export HOOKSHOT_TOOLS="$HERE/usr/share/hookshot"
