@@ -166,6 +166,17 @@ void hos_gpu_track(uint64_t guest, uint64_t size, int on) {
     UNLOCK();
 }
 
+/* (HeyListen, 2026-11-14) The native NVN pools live now, {guest start, end} each (at most max; the count is returned): the
+   counted list above, which a pool made over an older one's memory does not lose at the older one's finalize, as the GPU
+   mappings' list does (hos_gpu_pools). The Vulkan back end's capture (RX_VK_CAP_ONLY_GPU) clips its imports to these */
+__declspec(dllexport) int hos_gpu_live_pools(uint64_t (*out)[2], int max) {
+    LOCK();
+    int n = 0;
+    for (int i = 0; i < ntracked && n < max; i++) out[n][0] = tracked[i].lo, out[n][1] = tracked[i].hi, n++;
+    UNLOCK();
+    return n;
+}
+
 /* (HeyListen, 2026-11-14) The Vulkan back end's release of a mirror holding left-out write-backs (gpu/vk/vk_memory.cpp,
    lazy_apply): n bytes of GPU results into guest memory at guest (within one page), only if the range lies in a native NVN
    pool that is live now and the soft write watch has no CPU write of the page since its last collection. Under the lock
