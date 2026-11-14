@@ -97,6 +97,7 @@ struct Pool {
     // (HeyListen, RX_VK_POOL_MIRROR: made with no import: its mirror filled and synced from guest memory through staging; false
     // once anything imported it after all (import_again, counted by why))
     bool never_imported = false;
+    bool held_told = false;   // (B4: the drop told its mirror holds it, hos_mirror_held)
 };
 void diff_gpu_wrote(uint64_t guest, uint64_t size);   // (TICK-048, below: the GPU may have written there)
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
@@ -118,6 +119,7 @@ bool import_again(Pool& p, int why);
 // (RX_VK_POOL_MIRROR: pools made with no import; see "a mirror per pool, never imported" below)
 bool pool_mirror_on();
 int64_t st_pm_made = 0, st_pm_fills = 0, st_pm_fill_bytes = 0, st_pm_live_bytes = 0, st_pm_again[kAgainKinds] = {};
+int64_t st_pm_held = 0, st_pm_held_bytes = 0;   // (B4: pools the drop was told about)
 int64_t st_pm_why[6] = {};   // (a binding imported: no recording, refused, parallel segment, deferred, written here, the mirror not made)
 bool staging_into_mirror(Pool& p, std::vector<VkBufferCopy>& runs, VkCommandBuffer cmd = VK_NULL_HANDLE);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
@@ -5685,6 +5687,19 @@ void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
     static uint64_t at;
     if (!pool_mirror_on()) return;
     pool_mirror_check_start();
+    {   // (B4, HL_MEM_DROP_POOLS, host/hl_drop.c: a never-imported pool whose mirror's fill is done and that the GPU never wrote is a
+        // candidate for the drop: its cold granules compared with the mirror read back, dropped into the spill if equal. Nothing pins
+        // them: no import. Told once a mirror; an exe without the export: nothing)
+        using Held = void (*)(uint64_t, uint64_t);
+        static const Held held = (Held)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_mirror_held");
+        if (held)
+            for (auto& [lo, p] : imported)
+                if (p.never_imported && !p.memory && p.mstate == Pool::MIRROR_ON && !p.gpu_written && !p.held_told &&
+                    p.fill_value <= mem_completed) {
+                    held(p.lo, p.hi);
+                    p.held_told = true, st_pm_held++, st_pm_held_bytes += (int64_t)(p.hi - p.lo);
+                }
+    }
     if (mirror_epoch - at < 1200) return;
     at = mirror_epoch;
     size_t never = 0, imported_n = 0;
@@ -5703,9 +5718,10 @@ void pool_mirror_log() {   // (pools_mu held; every 1200 mirror epochs)
          (unsigned long long)(imp_b >> 20), (long long)st_pm_why[0], (long long)st_pm_why[1], (long long)st_pm_why[2], (long long)st_pm_why[3],
          (long long)st_pm_why[4], (long long)st_pm_why[5]);
     logf("vk: write-backs of never-imported pools through staging (RX_VK_POOL_MIRROR): %lld runs, %lld MB; pages written into guest "
-         "memory %lld (left alone as already equal %lld), left as the CPU wrote them since %lld, no live pool there %lld; IMPORTS ASKED FOR %lld", (long long)st_sw_runs,
+         "memory %lld (left alone as already equal %lld), left as the CPU wrote them since %lld, no live pool there %lld; IMPORTS ASKED FOR %lld; "
+         "pools the drop was told a mirror holds (HL_MEM_DROP_POOLS) %lld (%lld MB)", (long long)st_sw_runs,
          (long long)(st_sw_bytes >> 20), (long long)st_sw_pages_written, (long long)st_sw_pages_same, (long long)st_sw_pages_cpu, (long long)st_sw_pages_dead,
-         (long long)st_imports_asked);
+         (long long)st_imports_asked, (long long)st_pm_held, (long long)(st_pm_held_bytes >> 20));
 }
 }  // namespace
 
