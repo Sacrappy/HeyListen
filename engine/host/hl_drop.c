@@ -166,6 +166,13 @@ static void cb_spill_free(void *ctx, int64_t slot) {
     spill_free_slots[spill_nfree++] = slot;
     ReleaseSRWLockExclusive(&spill_lock);
 }
+/* (RX_VK_LEDGER, gpu/vk/vk_ledger.cpp, finds it by name) the bytes the spill holds now: slots in use, on disk */
+__declspec(dllexport) uint64_t hos_drop_spill_bytes(void) {
+    AcquireSRWLockShared(&spill_lock);
+    const int64_t used = spill_next - spill_nfree;
+    ReleaseSRWLockShared(&spill_lock);
+    return used > 0 ? (uint64_t)used * granule : 0;
+}
 /* the file, HL_MEM_DROP_SPILL_MB of slots at most (default 4096; 0: no spill, every touch decodes its file) */
 static int spill_open(void) {
     const char *e = getenv("HL_MEM_DROP_SPILL_MB");

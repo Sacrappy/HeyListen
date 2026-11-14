@@ -29,16 +29,20 @@ enum { MAX_TAGS = 8192 };
 static Tag tags[MAX_TAGS];
 static int ntags, tags_dropped;
 static SRWLOCK tags_lock = SRWLOCK_INIT;
-static int hs_first = -1, hs_every;   /* (seconds of the first census, then between; -1: not read yet, 0: off) */
+static int hs_first = -1, hs_every, hs_ledger;   /* (seconds of the first census, then between; -1: not read yet, 0: off) */
 
+/* the tags are kept when either reads them: this census, or the back end's ledger (RX_VK_LEDGER), which asks for the census's
+   totals itself (hos_hostsplit_totals) */
 static int hs_enabled(void) {
     if (hs_first < 0) {
         const char *e = getenv("HOS_HOST_SPLIT");
         hs_first = e && atoi(e) > 0 ? atoi(e) : 0;
         const char *c = e ? strchr(e, ',') : NULL;
         hs_every = c ? atoi(c + 1) : 0;
+        const char *l = getenv("RX_VK_LEDGER");
+        hs_ledger = l && atoi(l) > 0;
     }
-    return hs_first > 0;
+    return hs_first > 0 || hs_ledger;
 }
 
 /* a range of this process's memory that this engine made, named for the census (the name is copied: 39 characters at most) */
@@ -266,8 +270,12 @@ static int by_resident_desc(const void *a, const void *b) {
 }
 #define MB(x) ((unsigned long long)((x) >> 20))
 
-static void census(const char *why) {
-    if (!TryAcquireSRWLockExclusive(&census_lock)) return;
+/* (the ledger's numbers out of a census: see hos_hostsplit_totals) */
+enum { T_WS, T_PRIVATE, T_RAM_COUNTED, T_WIN_RES, T_WIN_COM, T_BAR, T_GROUP_COM, T_GROUP_RES = T_GROUP_COM + G_N, T_BIG_RES = T_GROUP_RES + G_N,
+       T_BIG_COM, T_WALK_MS, T_N };
+static void census(const char *why, uint64_t *totals) {
+    if (totals) AcquireSRWLockExclusive(&census_lock);
+    else if (!TryAcquireSRWLockExclusive(&census_lock)) return;
     typedef BOOL(WINAPI * MappedFn)(HANDLE, LPVOID, LPSTR, DWORD);
     typedef BOOL(WINAPI * MemInfoFn)(HANDLE, MemCounters *, DWORD);
     HMODULE k = GetModuleHandleA("kernel32.dll");
@@ -364,6 +372,22 @@ static void census(const char *why) {
     MemCounters mc = {sizeof mc};
     if (mem_info) mem_info(GetCurrentProcess(), &mc, sizeof mc);
     const int64_t walk_ms = (hos_now_ns() - t0) / 1000000;
+    if (totals) {   /* (the ledger's census: the numbers, no report) */
+        memset(totals, 0, sizeof(uint64_t) * T_N);
+        for (int i = 0; i < nowners; i++) {
+            totals[T_GROUP_COM + owners[i].group] += owners[i].committed, totals[T_GROUP_RES + owners[i].group] += owners[i].resident;
+            if (!strcmp(owners[i].name, "private 512 MB and up") || !strcmp(owners[i].name, "private 128-512 MB"))
+                totals[T_BIG_RES] += owners[i].resident, totals[T_BIG_COM] += owners[i].committed;
+        }
+        totals[T_WS] = mc.WorkingSetSize, totals[T_PRIVATE] = mc.PrivateUsage;
+        totals[T_BAR] = totals[T_GROUP_RES + G_BAR];
+        totals[T_RAM_COUNTED] = total_resident - totals[T_BAR];
+        totals[T_WIN_RES] = owners[0].resident, totals[T_WIN_COM] = owners[0].committed;
+        totals[T_WALK_MS] = (uint64_t)walk_ms;
+        (void)why;
+        ReleaseSRWLockExclusive(&census_lock);
+        return;
+    }
     hos_log("hostsplit: --- %s, %.0f s after the start (%lld ms to walk: %d regions, %d allocations, %d host threads) ---", why,
             (double)(hos_now_ns() - start_ns) / 1e9, (long long)walk_ms, nregs, nallocs, nthreads);
     uint64_t gc[G_N] = {0}, gr[G_N] = {0}, gn[G_N] = {0};
@@ -446,17 +470,62 @@ static void census(const char *why) {
 static DWORD WINAPI hostsplit_main(void *unused) {
     (void)unused;
     Sleep((DWORD)hs_first * 1000);
-    census("census");
+    census("census", NULL);
     while (hs_every > 0) {
         Sleep((DWORD)hs_every * 1000);
-        census("census");
+        census("census", NULL);
     }
     return 0;
 }
-static void hostsplit_at_exit(void) { census("at exit"); }
+static void hostsplit_at_exit(void) { census("at exit", NULL); }
+
+/* (RX_VK_LEDGER, gpu/vk/vk_ledger.cpp, finds it by name) a census made now, quietly, its totals in out[0..n): the working set,
+   the private commit, the RAM counted, the guest window's RAM and commit, the VRAM mapped through the BAR, then each group's commit
+   and RAM (G_GUEST .. G_OTHER), the private allocations of 128 MB and up (the driver's arenas) in RAM and committed, the walk's
+   milliseconds. Bytes. The number of values written (0: not on Windows, or no QueryWorkingSetEx). */
+__declspec(dllexport) int hos_hostsplit_totals(uint64_t *out, int n) {
+    uint64_t t[T_N];
+    t[T_WALK_MS] = ~0ull;
+    if (!start_ns) start_ns = hos_now_ns();
+    census("ledger", t);
+    if (t[T_WALK_MS] == ~0ull) return 0;
+    const int m = n < T_N ? n : T_N;
+    memcpy(out, t, sizeof(uint64_t) * (size_t)m);
+    return m;
+}
+
+/* (RX_VK_LEDGER) the pages of guest [guest, guest + npages * 4 KB), one byte each in out: 1 committed, 2 in the working set.
+   VirtualQuery for the commit, QueryWorkingSetEx for the residency; nothing is touched. 1 when done */
+__declspec(dllexport) int hos_ledger_pages(uint64_t guest, uint64_t npages, uint8_t *out) {
+    static QueryWsFn query;
+    if (!query) query = (QueryWsFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32QueryWorkingSetEx");
+    if (!query) return 0;
+    memset(out, 0, (size_t)npages);
+    const uint64_t lo = (uint64_t)(uintptr_t)GP(guest), hi = lo + npages * 0x1000;
+    enum { BATCH = 1024 };
+    WsInfo info[BATCH];
+    for (uint64_t a = lo; a < hi;) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
+        const uint64_t rend = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize, end = rend < hi ? rend : hi;
+        if (mbi.State == MEM_COMMIT)
+            for (uint64_t q = a; q < end;) {
+                int m = 0;
+                for (; m < BATCH && q < end; m++, q += 0x1000) info[m].va = (void *)(uintptr_t)q, info[m].attr = 0;
+                const BOOL ok = query(GetCurrentProcess(), info, (DWORD)(m * sizeof(WsInfo)));
+                for (int p = 0; p < m; p++) {
+                    const uint64_t i = ((uint64_t)(uintptr_t)info[p].va - lo) >> 12;
+                    out[i] = (uint8_t)(1 | (ok && (info[p].attr & 1) ? 2 : 0));
+                }
+            }
+        if (rend <= a) break;
+        a = end;
+    }
+    return 1;
+}
 
 void hos_hostsplit_init(void) {
-    if (!hs_enabled()) return;
+    if (!hs_enabled() || hs_first <= 0) return;
     start_ns = hos_now_ns();
     hos_log("hostsplit: on, first census at %d s%s", hs_first, hs_every > 0 ? ", then every few seconds" : "");
     CloseHandle(CreateThread(NULL, 0, hostsplit_main, NULL, 0, NULL));

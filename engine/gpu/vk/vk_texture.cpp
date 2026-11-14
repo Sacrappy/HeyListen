@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "vk_texture.h"
+#include "vk_ledger.h"   // (RX_VK_LEDGER)
 #include "vk_menu.h"
 #include "vk_draw.h"
 #include "vk_gprof.h"
@@ -2543,6 +2544,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     }
     textures.emplace(key, std::move(tex));
     by_gpu.emplace(p->gpu, p);
+    ledger_mark(p->gpu, p->guest_size, kUseSampled);   // (RX_VK_LEDGER: this storage held a texture)
     watch_tex(p, "made");
     if (remade_log_on()) {   // (one evicted not long ago, made again)
         std::lock_guard lk(evicted_mu);
@@ -3713,6 +3715,7 @@ int texture_flush_to_guest(uint64_t lo, uint64_t size) {
 
 void texture_written(Texture* tex) {
     if (!tex) return;
+    ledger_mark(tex->gpu, tex->guest_size, kUseRendered);   // (RX_VK_LEDGER)
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {   // (a parallel replay's order broken: see dry_mark_written)
         static int64_t n;
         if (n++ < 40 || n % 500 == 0)
@@ -4050,7 +4053,33 @@ Texture* texture_for_present(const nvn_tex* t) {
     return best ? best : tex;
 }
 
+/// (RX_VK_LEDGER) the textures' part of a ledger snapshot (the replay's thread: the table is this thread's)
+void texture_ledger_snapshot(LedgerSnap& s) {
+    s.textures.reserve(textures.size());
+    for (auto& kv : textures) {
+        const Texture* t = kv.second.get();
+        LedgerTex l;
+        l.gpu = t->gpu, l.guest_size = t->guest_size, l.vk_bytes = t->bytes + t->pad, l.vk_format = (uint32_t)t->format;
+        l.width = t->width, l.height = t->height, l.depth = t->depth, l.layers = t->layers, l.levels = t->levels;
+        l.block_w = t->block_w, l.block_h = t->block_h;
+        l.astc = t->astc, l.gpu_written = t->gpu_written, l.released = t->released;
+        l.depth_aspect = (t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+        s.textures.push_back(l);
+    }
+    s.spare_bytes = spare_bytes;
+    {
+        std::lock_guard lk(pool_mu);
+        s.rt_pool_bytes = pool_bytes;
+    }
+    {
+        std::lock_guard lk(bcc_mu);
+        s.bcc_bytes = bcc_bytes, s.bcc_entries = bcc.size();
+    }
+    texture_stats(&s.uploads, &s.astc_gpu, &s.bytes_uploaded);
+}
+
 void texture_frame(uint64_t completed) {
+    ledger_frame();   // (RX_VK_LEDGER)
     upload_frame_report();
     if (bcc_cap()) {   // (TICK-051: the BC cache's entries let go, and every 600 frames what it did)
         bcc_free_done(completed);

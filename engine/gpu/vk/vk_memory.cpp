@@ -31,6 +31,7 @@
 
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
+#include "vk_ledger.h"    // (RX_VK_LEDGER)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
 #include "capture_merge.h"    // (TICK-043: the capture copied ahead)
@@ -5214,6 +5215,7 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
 void memory_pool_flags(uint64_t gpu, uint64_t size, uint32_t flags) {   // (TICK-015: the game's pools and their flags, for the write-backs left out)
     if (!size || gpu >= (1ull << 40)) return;
     cap_pool_born_now(gpu, size);   // (RX_VK_CAP_ONLY_GPU: a pool from the moment it is made)
+    if (ledger_on()) ledger_pool_made(gpu, size);
     std::lock_guard lk(nvn_pools_mu);
     auto it = nvn_pools.upper_bound(gpu);
     if (it != nvn_pools.begin() && std::prev(it)->second.hi > gpu) --it;
@@ -5360,6 +5362,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
         guest = host->gpu_guest(gpu);
     }
+    ledger_mark(guest, size, (uint16_t)(ledger_use | (written ? kUseGpuWrite : 0)));   // (RX_VK_LEDGER: what this memory is used for)
     // (the same read, while that stamp still stands: the buffer and the offset are the ones found before. a miss
     // runs the lookup below, including a mirror sync, and remembers what it returned. a write is not remembered)
     auto remember = [&](BufferRef ref) {
@@ -6835,6 +6838,20 @@ void memory_res_log() {
 void memory_trace_counts(int64_t* late_ns, int64_t* late_n, int64_t* scatter_bytes) {
     *late_ns = st_tr_late_ns.load(std::memory_order_relaxed), *late_n = st_tr_late_n.load(std::memory_order_relaxed);
     *scatter_bytes = st_scatter_bytes.load(std::memory_order_relaxed);
+}
+/// (RX_VK_LEDGER) the pools' part of a ledger snapshot: the game's pool flags, the live mirrors and imports, the retired mirrors
+void memory_ledger_snapshot(LedgerSnap& s) {
+    {
+        std::lock_guard lk(nvn_pools_mu);
+        s.pool_flags.reserve(nvn_pools.size());
+        for (const auto& [lo, np] : nvn_pools) s.pool_flags.push_back({lo, np.hi, np.flags});
+    }
+    std::lock_guard lk(pools_mu);
+    for (const auto& [lo, p] : imported) {
+        if (p.memory != VK_NULL_HANDLE) s.imports.push_back({p.lo, p.hi});
+        if (p.mstate == Pool::MIRROR_ON && p.mirror != VK_NULL_HANDLE) s.mirrors.push_back({p.lo, p.hi});
+    }
+    for (const DeadMirror& d : dead_mirrors) s.retired_mirror_bytes += allocation_size(d.alloc);
 }
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;

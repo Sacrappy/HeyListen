@@ -5,6 +5,7 @@
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include "vk_internal.h"
+#include "vk_ledger.h"
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
@@ -22,8 +23,8 @@ VmaAllocator vma;
 
 // ---- (TICK-038) allocations by kind and memory class, RX_VK_RES_LOG=1 ----
 thread_local MemKind mem_kind_tag = MemKind::Other;
-bool res_log_on() {
-    static const bool v = getenv("RX_VK_RES_LOG") && atoi(getenv("RX_VK_RES_LOG")) != 0;
+bool res_log_on() {   // (RX_VK_LEDGER counts the allocations by kind too: vk_ledger.cpp)
+    static const bool v = (getenv("RX_VK_RES_LOG") && atoi(getenv("RX_VK_RES_LOG")) != 0) || ledger_on();
     return v;
 }
 namespace {
@@ -80,6 +81,12 @@ void mem_kinds_log() {
     logf("%s", line);
 }
 
+void mem_kind_totals(uint64_t bytes[][4], uint64_t count[][4]) {
+    std::lock_guard lk(acct_mu);
+    for (int k = 0; k < (int)MemKind::Count; k++)
+        for (int j = 0; j < kClasses; j++) bytes[k][j] = acct_bytes[k][j], count[k][j] = acct_count[k][j];
+}
+
 // ---- (HOS_HOST_SPLIT, host/hos_hostsplit.c) the census of the process's memory outside the game's: host-visible buffers named ----
 // A buffer the back end maps (the captures, the BC cache, staging, readbacks) is a range of this process's address space that the
 // driver made: tagged with its kind and memory class, it is told apart there from the driver's own memory. Only an executable with
@@ -104,7 +111,7 @@ void host_untag(const void* ptr) {
 }
 namespace {
 void tag_mapped(const VmaAllocationInfo& info, MemKind kind) {
-    static const bool named = getenv("HOS_HOST_SPLIT") != nullptr;
+    static const bool named = getenv("HOS_HOST_SPLIT") != nullptr || ledger_on();
     if (!named || !info.pMappedData) return;
     static const char* const names[] = {"other", "textures", "render targets", "mirrors", "write-back shadows", "captures",
                                         "streams", "staging", "readback", "scratch", "BC cache"};
@@ -418,7 +425,7 @@ void invalidate_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaInvalidateAllocation(vma, allocation, 0, size);
 }
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
-    static const bool named = getenv("HOS_HOST_SPLIT") != nullptr;
+    static const bool named = getenv("HOS_HOST_SPLIT") != nullptr || ledger_on();
     if (named && allocation) {   // (HOS_HOST_SPLIT: its range is no longer named)
         VmaAllocationInfo info{};
         vmaGetAllocationInfo(vma, allocation, &info);
@@ -513,6 +520,30 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     *used = u, *budget = t;
     if (block_free) *block_free = f;
     return t != 0;
+}
+
+void vma_ledger_stats(uint64_t out[8]) {
+    for (int i = 0; i < 8; i++) out[i] = 0;
+    {
+        std::lock_guard lk(gen_mu);
+        for (const auto& [n, g] : gens[0]) {
+            VmaDetailedStatistics d{};
+            vmaCalculatePoolStatistics(vma, g.pool, &d);
+            out[0] += d.statistics.blockBytes, out[1] += d.statistics.allocationBytes;
+        }
+    }
+    for (int k = 0; k < 2; k++) {
+        const VmaPool pool = k ? target_image_pool : image_pool;
+        if (!pool) continue;
+        VmaDetailedStatistics d{};
+        vmaCalculatePoolStatistics(vma, pool, &d);
+        out[2 * k] += d.statistics.blockBytes, out[2 * k + 1] += d.statistics.allocationBytes;
+    }
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            out[4] += b[h].statistics.blockBytes, out[5] += b[h].statistics.allocationBytes, out[6] += b[h].usage, out[7] += b[h].budget;
 }
 
 /// The system-memory heaps the GPU reaches: what the process uses there (the imported guest memory too: pinned by the
