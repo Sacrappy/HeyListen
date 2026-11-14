@@ -138,3 +138,24 @@ some frames, which also mends their slowness at low frame rates. One accumulator
 the iteration and sees the step each frame), gives every such system the same ticks so that they stay in step with each
 other (a cutscene's sequencer and its voice lines). Each system is answered by an entry gate on its update function
 that lets the translated update run, or not, by that tick: the game's code is unchanged, its order too.
+
+**Finding the systems that count frames: `HL_STEP_SCAN`.** With `HL_TRACE=2` (the heaps' allocations recorded) and
+`HL_STEP_SCAN=<s>`, the recorder copies every live block of 16 KB or less at <s> seconds and compares it
+`HL_STEP_SCAN_SECS` (5) seconds later: a 32-bit word that went up by the number of frames presented counts frames, one
+that went up by 60 a second counts the game's time; the words are summed by the allocation site of their block (the
+log's `hl step scan` lines, and `hl_step_scan.txt`). It needs a frame rate at least 10% away from 60 during the window
+(`HL_FPS_LIMIT=120` on a quiet machine, or `HOS_FRAME_SLEEP_MS` to go below). First run, main PC, the market save
+(castle-move walk, 26 fps during the window with two other games running, 559,000 blocks): 78 frame-counting words
+against 146 time-counting ones. 72 of the 78 are in blocks made at `0x80ad3278` (in `0x80ad3230`, reached through a
+pointer) called from `0x8080b9bc` (`0x8080b990`, whose largest caller `0x80803ef0` is the chemistry system's object
+set-up: its strings are the `Chm_Object*` parameters): **the chemistry objects count frames**, so anything they time
+(burning, spreading, reactions) runs at the frame rate. The rest are single words in rendering objects (models,
+procedural eyes). The time-counting words are mostly floats in seconds. That walk had no cutscene, movie, voice line or
+boss: the three systems the owner reported are not in this sample, and finding them takes the same scan in those
+situations (below).
+
+**What to measure next, and what to play.** The scan in a cutscene with voice, in the Deku Tree boss fight and during
+the opening movie (a new game: a copy of the saves in a slot), each with the frame rate away from 60, names their
+frame-counting objects by maker; each maker's update function then gets the 60 Hz tick above. Owner's checks once a
+system has its tick, at 120 fps against 60: the opening movie (voice lines one after the other, picture to its end), a
+cutscene with voice-over (no overlap), the Deku Tree boss (the same pace as at 60).
