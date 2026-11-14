@@ -74,7 +74,7 @@ HeyListen's `engine/` is Hookshot's source imported with its history and kept in
 - Measurement tools: a bench harness (`tools/bench/`), frame job tracing and critical-path tools, GPU segment timestamps, a hot-function map and a hash-gated native-replacement framework.
 - A large set of measured performance switches (off by default unless adopted), each with its ticket and benchmark in `docs/tickets/` and `docs/benchmarks/`, plus static analyses of the remaining frame time in `docs/research/`.
 - Engine tests brought up to date with current code.
-- Linux: the engine builds again (the Win32 calls it gained since Hookshot, GCC fixes), and a Linux workflow (`.github/workflows/linux.yml`) runs the game-free checks on Ubuntu 24.04 and makes the AppImage on Ubuntu 22.04 for every pull request. Not yet tried with the game on Linux.
+- Linux: the engine builds again (the Win32 calls it gained since Hookshot, GCC fixes), and a Linux workflow (`.github/workflows/linux.yml`) runs the game-free checks on Ubuntu 24.04 and makes the AppImage on Ubuntu 22.04 for every pull request. Built from a 1.1.1 dump and played on Linux (CachyOS, Ryzen 5 5500X3D, Radeon RX 9070 XT with RADV): sound, an Xbox controller and the opening village work; a thread the engine lowers on Windows (OptimizeChangeBank) is now lowered on Linux too.
 
 ## Repository layout
 
