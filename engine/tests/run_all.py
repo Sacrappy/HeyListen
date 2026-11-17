@@ -36,6 +36,7 @@ ARGS = {
     "tests/test_sparse_bind_failure.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_dead_targets_sweep.py": ["--cxx", "{cxx}"],
     "tests/test_cold_gate.py": ["--cxx", "{cxx}"],
+    "tests/test_target_retention.py": ["--cxx", "{cxx}"],
     "tests/test_precompile_save.py": ["--cxx", "{cxx}"],
     "tests/test_prepare_speed.py": ["--cxx", "{cxx}"],
     "tests/test_state_report.py": ["--cxx", "{cxx}"],
