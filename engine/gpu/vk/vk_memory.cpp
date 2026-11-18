@@ -6925,14 +6925,31 @@ WbdTable* wbd_table_get(uint64_t bytes) {
     return &t;
 }
 
+/// (2026-11-19) the host's checked write of a GPU result into guest memory (host/nvdrv.c hos_gpu_write_live: only inside a live
+/// NVN pool, not over a page the CPU wrote since its last collection), found by name in the exe. The Linux exe exports it since
+/// nx2/build.py's HOST_EXPORTS lists it; before, it had none there: lazy_apply dropped every staged page of the lazy release as
+/// "no live pool" (kRelDead), and memory_staged_apply wrote the never-imported pools' write-backs unchecked (host->gpu_write).
+/// RX_VK_WRITE_LIVE=0: not looked up, as then (said once in the log either way)
+using WriteLive = int (*)(uint64_t, const void*, uint64_t);
+WriteLive write_live_fn() {
+    static const WriteLive f = [] {
+        const char* e = getenv("RX_VK_WRITE_LIVE");
+        const bool want = !e || atoi(e) != 0;
+        const WriteLive fn = want ? (WriteLive)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_write_live") : nullptr;
+        logf("vk: the host's checked write of left-out write-backs (hos_gpu_write_live): %s",
+             fn ? "found" : !want ? "not looked up (RX_VK_WRITE_LIVE=0)" : "not in the exe");
+        return fn;
+    }();
+    return f;
+}
+
 /// (2026-11-14) the staged left-out write-backs whose submission is done, into guest memory page by page: each one checked
 /// again here (its write generation against the mirror's sync, cpu_pages), then by the host under the lock pool Finalize takes
 /// (a live pool, no CPU write since the last collection). The pages written are stamped (a mirror or a read of them takes
 /// guest memory from now on); every piece leaves the left-out set. pools_mu held
 void lazy_apply() {
     if (lazy_stages.empty()) return;
-    using WriteLive = int (*)(uint64_t, const void*, uint64_t);
-    static const WriteLive write_live = (WriteLive)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_write_live");
+    const WriteLive write_live = write_live_fn();
     const uint64_t done = vk_timeline_completed();
     for (auto it = lazy_stages.begin(); it != lazy_stages.end();) {
         if (it->value > done) {
@@ -6989,8 +7006,7 @@ int64_t st_sw_runs = 0, st_sw_bytes = 0, st_sw_pages_written = 0, st_sw_pages_cp
 }  // namespace mkwvk
 void mkwvk::memory_staged_apply(uint64_t done) {
     if (staged_min.load(std::memory_order_acquire) > done) return;
-    using WriteLive = int (*)(uint64_t, const void*, uint64_t);
-    static const WriteLive write_live = (WriteLive)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_gpu_write_live");
+    const WriteLive write_live = write_live_fn();
     static uint8_t* const base = host->guest_base ? host->guest_base() : nullptr;
     std::lock_guard lk(staged_mu);
     while (!staged_wbs.empty() && staged_wbs.front().value <= done) {

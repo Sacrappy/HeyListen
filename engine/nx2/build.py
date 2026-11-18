@@ -147,6 +147,15 @@ def HOT_ORDER():
     return [toolchain.link_opt("/order:@" + p.replace("\\", "/")), toolchain.link_opt("/ignore:4037")]
 
 
+# (Linux) the exe's functions the Vulkan back end (hookshot_vk.so) finds by name: an executable's functions are in its dynamic
+# symbol table only when the link exports them (on Windows they are DLL exports, __declspec(dllexport)). Every name the back end
+# looks up in the exe (GetProcAddress(GetModuleHandleA(nullptr), ...), dlsym(RTLD_DEFAULT, ...)) is here:
+# tests/test_host_exports.py reads gpu/ for them. A name the Linux host does not define (hl_drop.c, hos_hostsplit.c,
+# hos_guestpages.c and hos_memsplit.c are Windows-only) is exported as nothing and still not found, as before
+HOST_EXPORTS = ("hos_posix_*", "hos_jt_mark_ext",
+                "hos_gpu_live_pools", "hos_gpu_write_live", "hos_gran_take", "hos_lag_sub", "hos_lag_frames", "hos_lag_counts",
+                "hos_mem_tag", "hos_mem_untag", "hos_gp_hold", "hos_gp_dropped_in", "hos_pool_trap_release", "hos_noaccess_import",
+                "hos_noaccess_unimport", "hos_mirror_held", "hos_drop_spill_bytes", "hos_hostsplit_totals", "hos_ledger_pages")
 HOST_LIBS = ["-lpthread", "-ldl", "-lm"] if LINUX else \
     ["-lwinhttp", "-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp"]
 GPU = os.path.join(kit.HERE, "..", "gpu")
@@ -1073,11 +1082,11 @@ def main():
     if a.standalone and not a.only and not vk_only and LINUX:
         exe = os.path.join(out, EXE)   # (+ hookshot.map: crash offsets -> f_<guest address>)
         t = time.time()
-        # (--export-dynamic-symbol: the window's state, which the Vulkan back end's own Win32 calls read by name, and the
-        # frame-timeline marks the renderer looks up, hos_jt_mark_ext: HOS_JOBTRACE, vk_replay.cpp jt_mark)
-        r = subprocess.run([cc] + target() + ["-fuse-ld=lld", "-o", exe, "-Wl,-Map=" + exe + ".map", "-Wl,--gc-sections",
-                                              "-Wl,--export-dynamic-symbol=hos_posix_*", "-Wl,--export-dynamic-symbol=hos_jt_mark_ext",
-                                              "@" + rsp] + HOT_ORDER() +
+        # (--export-dynamic-symbol: HOST_EXPORTS, the functions the Vulkan back end looks up in the exe by name: the window's
+        # state its own Win32 calls read, the frame-timeline marks (hos_jt_mark_ext: HOS_JOBTRACE, vk_replay.cpp jt_mark), the
+        # live pools and their checked write (hos_gpu_live_pools, hos_gpu_write_live: vk_memory.cpp) and the others)
+        r = subprocess.run([cc] + target() + ["-fuse-ld=lld", "-o", exe, "-Wl,-Map=" + exe + ".map", "-Wl,--gc-sections"] +
+                           ["-Wl,--export-dynamic-symbol=" + s for s in HOST_EXPORTS] + ["@" + rsp] + HOT_ORDER() +
                            (["-fprofile-instr-generate"] if PGO == "gen" else []) +
                            (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS + (["-l:libstdc++.a"] if SYSROOT else ["-lstdc++"]),   # (engine/native's C++: static with the
                            # AppImage's sysroot, so the player's system needs no particular libstdc++)

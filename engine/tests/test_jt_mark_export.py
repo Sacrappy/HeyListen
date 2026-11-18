@@ -9,6 +9,7 @@ a mark made in the library must reach the exe. It also fails when the export is 
 test sees the bug). Linux only (on Windows the mark is a DLL export).
 """
 import argparse
+import ast
 import os
 import re
 import shutil
@@ -84,7 +85,11 @@ def main():
     build = (ROOT / "nx2/build.py").read_text(encoding="utf-8")
     link = build[build.index("exe = os.path.join(out, EXE)"):]
     link = link[:link.index("capture_output=True")]
-    exports = re.findall(r'"(-Wl,--export-dynamic-symbol=[^"]+)"', link)
+    assert '"-Wl,--export-dynamic-symbol=" + s for s in HOST_EXPORTS' in link, "the exe's link exports HOST_EXPORTS"
+    tree = ast.parse(build)
+    names = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and
+                 any(isinstance(t, ast.Name) and t.id == "HOST_EXPORTS" for t in n.targets))
+    exports = ["-Wl,--export-dynamic-symbol=" + s for s in names]
     assert "-Wl,--export-dynamic-symbol=hos_jt_mark_ext" in exports, "the exe's link exports hos_jt_mark_ext"
     cc = shutil.which(a.cxx.replace("clang++", "clang").replace("g++", "gcc")) or a.cxx
     lld = ["-fuse-ld=lld"] if shutil.which("ld.lld") else []
