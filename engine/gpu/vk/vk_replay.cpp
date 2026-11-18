@@ -1232,6 +1232,24 @@ thread_local Mode rmode = Mode::Serial;
 thread_local size_t ub_limit = SIZE_MAX;   // (a worker: the uniform updates before its place in the stream)
 thread_local size_t cond_at = 0;           // (a worker: the next render condition's result)
 std::vector<uint8_t> par_conds;            // (the render conditions' results, in stream order: the dry pass's)
+// (HeyListen) how many of par_conds are written, for the workers' reads: the dry pass appends while early segments read
+// (RX_VK_SEG_EARLY), and a worker reads this count, never the vector's own size, which an append changes as it reads
+std::atomic<size_t> par_conds_n{0};
+// (HeyListen) RX_VK_GROW_LOCK_PLAIN=1: the dry pass's appends while segments are out as before: every render condition's
+// result takes ub_grow_mu, and an append waits for the lock among the workers' reads (UbGrowGuard). Off (the default): a
+// condition's result takes it only when it moves par_conds' buffer (par_conds_reset reserves room: never in play), and a
+// uniform update's append is let in ahead of the reads that come after it
+bool grow_lock_plain() {
+    static const bool v = getenv("RX_VK_GROW_LOCK_PLAIN") && atoi(getenv("RX_VK_GROW_LOCK_PLAIN")) != 0;
+    return v;
+}
+/// par_conds emptied for a dry pass, with room for kCondRoom results kept (no segment reads it now: none is out)
+constexpr size_t kCondRoom = 8192;
+void par_conds_reset() {
+    par_conds.clear();
+    if (par_conds.capacity() < kCondRoom) par_conds.reserve(kCondRoom);
+    par_conds_n.store(0, std::memory_order_release);
+}
 struct ParPoint {
     const uint8_t* p;
     NvnState s;
@@ -1277,11 +1295,19 @@ uint64_t par_seq = 0;   // (the segments' order, across submissions: a recording
 std::shared_mutex ub_grow_mu;
 std::atomic<bool> ub_growing{false};
 thread_local int ub_read_depth = 0;   // (a read inside a read holds the lock once)
+// (HeyListen) an append waiting for ub_grow_mu: reads not begun yet hold back until it has it (grow_lock_plain() off). The lock
+// lets new shared holders in while a writer waits (glibc's rwlock prefers readers), and four or more workers each read the list
+// at every draw, so an append waited until their reads happened to leave a gap: 7 us an update in Zora's Domain. Now it waits
+// only for the reads already under way
+std::atomic<bool> ub_grow_waiting{false};
 struct UbReadGuard {
     std::shared_lock<std::shared_mutex> lk;
     UbReadGuard() {
-        if (ub_read_depth++ == 0 && rmode == Mode::Worker && ub_growing.load(std::memory_order_acquire))
+        if (ub_read_depth++ == 0 && rmode == Mode::Worker && ub_growing.load(std::memory_order_acquire)) {
+            for (int spin = 0; ub_grow_waiting.load(std::memory_order_acquire); spin++)
+                if (spin >= 64) std::this_thread::yield();
             lk = std::shared_lock<std::shared_mutex>(ub_grow_mu);
+        }
     }
     ~UbReadGuard() { ub_read_depth--; }
     UbReadGuard(const UbReadGuard&) = delete;
@@ -1290,7 +1316,14 @@ struct UbReadGuard {
 struct UbGrowGuard {
     std::unique_lock<std::shared_mutex> lk;
     UbGrowGuard() {
-        if (ub_growing.load(std::memory_order_relaxed)) lk = std::unique_lock<std::shared_mutex>(ub_grow_mu);
+        if (!ub_growing.load(std::memory_order_relaxed)) return;
+        if (grow_lock_plain()) {
+            lk = std::unique_lock<std::shared_mutex>(ub_grow_mu);
+            return;
+        }
+        ub_grow_waiting.store(true, std::memory_order_release);
+        lk = std::unique_lock<std::shared_mutex>(ub_grow_mu);
+        ub_grow_waiting.store(false, std::memory_order_release);
     }
 };
 // (the dry pass calls on_point at each point it keeps while an early replay_handle runs; the replay thread's only)
@@ -2160,7 +2193,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_RENDER_COND: {   // (read on the CPU for now; VK_EXT_conditional_rendering later)
             if (worker) {   // (as the dry pass found it, with the reports before it written and none after)
                 UbReadGuard ug;   // (TICK-056: par_conds may grow meanwhile, RX_VK_SEG_EARLY)
-                s.render_enabled = cond_at < par_conds.size() ? par_conds[cond_at] != 0 : true;
+                s.render_enabled = cond_at < par_conds_n.load(std::memory_order_acquire) ? par_conds[cond_at] != 0 : true;
                 cond_at++;
                 break;
             }
@@ -2187,8 +2220,19 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 if (always) s.render_enabled = true;
             }
             if (dry) {
-                UbGrowGuard ug;   // (TICK-056: segments read it meanwhile, RX_VK_SEG_EARLY)
-                par_conds.push_back(s.render_enabled ? 1 : 0);
+                // (HeyListen) the append takes ub_grow_mu only when it moves the buffer (TICK-056: the segments out read it
+                // meanwhile, holding the lock shared, RX_VK_SEG_EARLY). Taken at every append, it waited for the workers' shared
+                // holds (their uniform buffer reads at every draw): 3.9 us a condition in the dry pass (0.1 us in Kokiri Forest's
+                // ~210), 3.1 ms of the replay thread's ~11 ms a frame in Zora's Domain (~790 conditions a frame). Without a move a
+                // worker's read of an earlier entry is not disturbed by it, and the count it reads (par_conds_n) is published after
+                // the entry
+                if (grow_lock_plain() || par_conds.size() == par_conds.capacity()) {
+                    UbGrowGuard ug;
+                    par_conds.push_back(s.render_enabled ? 1 : 0);
+                } else {
+                    par_conds.push_back(s.render_enabled ? 1 : 0);
+                }
+                par_conds_n.store(par_conds.size(), std::memory_order_release);
             }
             if (occ_mode()) occ_cond(r.addr, (int)r.mode, x, y, s.render_enabled, occ_serial);
             if (dump_on())
@@ -2850,7 +2894,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     EarlyWall early_wall;
     const auto t_dry0 = std::chrono::steady_clock::now();
     const size_t ub0 = ub_updates.size();
-    par_points.clear(), par_conds.clear(), dry_work = 0;
+    par_points.clear(), par_conds_reset(), dry_work = 0;
     const uint64_t serial0 = occ_serial;
     Recording& r = *rec_cur;
     end_pass(r.cmd);
@@ -3191,7 +3235,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     const auto t_dry0 = std::chrono::steady_clock::now();
     const NvnState start = state;
     const size_t ub0 = ub_updates.size();
-    par_points.clear(), par_conds.clear(), dry_work = 0;
+    par_points.clear(), par_conds_reset(), dry_work = 0;
     const uint64_t serial0 = occ_serial;   // (TICK-033: the segments' draws numbered from here)
     // (TICK-056, RX_VK_PRESYNC_EARLY) the mirrors' pre-sync on a worker while the dry pass runs (once the workers are started): see
     // PresyncEarly

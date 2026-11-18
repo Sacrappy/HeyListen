@@ -58,6 +58,7 @@ ARGS = {
     "tests/test_ssbo_binding_align.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
     "tests/test_msync_fast.py": ["--cxx", "{cxx}"],
+    "tests/test_grow_lock.py": ["--cxx", "{cxx}"],
     "tests/test_readback_ticket.py": ["--cxx", "{cxx}"],
     "tests/test_capture_claim.py": ["--cxx", "{cxx}"],
     "tests/test_pcie_link.py": ["--cxx", "{cxx}"],
