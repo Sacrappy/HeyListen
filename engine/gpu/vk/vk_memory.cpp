@@ -1771,6 +1771,7 @@ bool overlay_off() {
 }
 std::atomic<int64_t> st_overlaid{0}, st_differed{0};   // (pages read from the shadow; of them, ones guest memory had changed)
 std::atomic<int64_t> st_first_live{0};   // (pages a first upload read from guest memory: their copy was an older capture's)
+std::atomic<int64_t> st_again_live{0};   // (the same for re-uploads, RX_VK_REUPLOAD_OWN)
 
 // ---- (issue 66) a texture's first upload: only the copies its own submission's capture took ----
 // OoT reuses a texture's storage for a new one (the Market's lightmaps, BC6H/BC7 atlases, and its ASTC materials, streamed in
@@ -1781,8 +1782,8 @@ std::atomic<int64_t> st_first_live{0};   // (pages a first upload read from gues
 // or a roof, a timber frame or a banner in another material's colours (RX 9070 XT, RADV). A first upload now takes a page's
 // copy only when the submission being recorded took it (written before that submit and again since: what the copies are for,
 // MK World's terrain tiles, which the game rewrites right after the submit that draws them); a copy from an earlier capture
-// is the page as it was before the texture existed, and guest memory is read instead. A re-upload reads as before: its
-// pages are the ones written since the last upload, whose copies are that capture's. RX_VK_FIRST_UPLOAD_OWN=0: as before
+// is the page as it was before the texture existed, and guest memory is read instead. A re-upload: reupload_own_on, below.
+// RX_VK_FIRST_UPLOAD_OWN=0: as before
 bool first_upload_own_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_FIRST_UPLOAD_OWN");
@@ -1794,9 +1795,32 @@ bool first_upload_own_on() {
     return on;
 }
 
-const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n, std::vector<uint8_t>& scratch, bool first) {
+// ---- (issue 66) a texture's re-upload: the same, only the copies its own submission's capture took ----
+// With the first uploads fixed, the Market still flashed now and then: bursts of 10-15 one-frame flashes over ~10 s, 20-35 s
+// after an arrival (the picture blown out to white and magenta, a bloom, walls and ground in lighter colours, or both blue
+// banners white). OoT rewrites the scene's lightmaps (BC6H 1528x920x3 and 1120x1516x3, BC5 2240x3032) and ASTC materials in
+// place in that time, every ~9 frames, writing a page more than once. A re-upload in such a frame took 350-7,000 pages from
+// earlier captures' copies (none of them the recorded submission's) that differed from guest memory: a capture had taken
+// the page between two of those writes, and the next frame's re-upload, from copies equal to guest memory, put the right
+// bytes back. Of 28 flashes in two runs, 27 fell within two frames of such a re-upload; the other was a first upload. A
+// re-upload now takes a page's copy only when the submission being recorded took it, and guest memory for a page whose copy
+// is an earlier capture's, as a first upload does (a copy equal to guest memory gives the same bytes either way).
+// RX_VK_REUPLOAD_OWN=0: every copy, as before
+bool reupload_own_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_REUPLOAD_OWN");
+        const bool v = !e || atoi(e) != 0;
+        logf("vk: a texture's re-upload takes %s (RX_VK_REUPLOAD_OWN)",
+             v ? "only its own submission's copies of its storage" : "every copy of its storage, as before");
+        return v;
+    }();
+    return on;
+}
+
+const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n, std::vector<uint8_t>& scratch, bool first,
+                                   bool again) {
     if (!n || !shadow_n.load(std::memory_order_relaxed) || overlay_off()) return live;
-    const bool own_only = first && first_upload_own_on();
+    const bool own_only = first ? first_upload_own_on() : again && reupload_own_on();
     const uint64_t own = shadow_seq_own.load(std::memory_order_relaxed);
     std::lock_guard lk(shadow_mu);
     bool any = false;
@@ -1807,7 +1831,7 @@ const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t
             auto it = shadow.find((uint32_t)p);
             if (it == shadow.end()) continue;
             if (own_only && (!own || it->second.seq != own)) {   // (an earlier capture's copy: guest memory stands)
-                st_first_live.fetch_add(1, std::memory_order_relaxed);
+                (first ? st_first_live : st_again_live).fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (!any) {
@@ -1824,9 +1848,10 @@ const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t
     if (any && served.fetch_add(1) % 2000 == 0)
         logf("vk: texture storage read as submitted (%lld times; %lld pages from the copies, %lld of them rewritten in "
              "guest memory since their submit; %zu pages kept, %zu spans, %llu MB; %lld pages of first uploads read from guest "
-             "memory over an earlier capture's copy)", (long long)served.load(),
+             "memory over an earlier capture's copy, %lld of re-uploads)", (long long)served.load(),
              (long long)st_overlaid.load(), (long long)st_differed.load(), shadow.size(), tex_spans.size(),
-             (unsigned long long)(tex_merged_bytes >> 20), (long long)st_first_live.load());
+             (unsigned long long)(tex_merged_bytes >> 20), (long long)st_first_live.load(),
+             (long long)st_again_live.load());
     return any ? scratch.data() : live;
 }
 

@@ -1099,6 +1099,8 @@ LevelGeo level_geo(const Texture& tex, uint32_t level) {   // (level: the image'
 /// (issue 66) set by upload() around a texture's first upload: its storage as of the submit takes only the recorded
 /// submission's own copies (vk_memory.cpp, first_upload_own_on)
 thread_local bool tl_first_upload = false;
+/// (issue 66) and around a re-upload: the same, RX_VK_REUPLOAD_OWN (vk_memory.cpp, reupload_own_on)
+thread_local bool tl_reupload = false;
 /// The guest bytes [gpu, gpu + n) in host memory: in place when contiguous, else copied into scratch
 const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scratch) {
     uint64_t avail = 0;
@@ -1107,7 +1109,7 @@ const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scrat
     if (gpu < (1ull << 40)) memory_late_fix_wait_range(gpu, n);
     // (below 1 TB the GPU address is the guest's: the storage as it was at the submit being replayed, where the game has
     // rewritten it since (vk_memory.cpp, "texture storage in the capture"))
-    if (p && avail >= n) return gpu < (1ull << 40) ? memory_as_submitted(gpu, p, n, scratch, tl_first_upload) : p;
+    if (p && avail >= n) return gpu < (1ull << 40) ? memory_as_submitted(gpu, p, n, scratch, tl_first_upload, tl_reupload) : p;
     if (n >= (32u << 20)) {   // (a big sparse texture's pages, gathered on several threads: the course maps' 349 MB)
         scratch.resize(n);
         const uint32_t nt = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 6u);
@@ -1986,8 +1988,9 @@ bool upload(Texture& tex, const Ranges* dirty) {
     up_route = UP_CPU;
     const int kind = tex.uploaded ? UK_AGAIN : tex.astc ? UK_ASTC_NEW : UK_OTHER_NEW;
     tl_first_upload = !tex.uploaded;
+    tl_reupload = tex.uploaded;
     const bool ok = upload_inner(tex, dirty);
-    tl_first_upload = false;
+    tl_first_upload = tl_reupload = false;
     const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     frame_upload_ns.fetch_add(ns, std::memory_order_relaxed);
     frame_kind_ns[kind].fetch_add(ns, std::memory_order_relaxed);
