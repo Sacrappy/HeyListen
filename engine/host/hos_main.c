@@ -1530,6 +1530,33 @@ void hos_oot_free_view(Ctx *c, uint64_t view) {
 #endif
 }
 
+/* (nx2/oot_near.py) After the camera update loads its near distance (s0): while first person is on, the gameplay
+   camera's near plane at 5 cm at most, so his hands and what they hold are not cut off in front of the eye. Events keep the
+   game's; the camera's own field is never written. */
+void hos_oot_near(Ctx *c, uint64_t camera) {
+#if defined(_WIN32) || defined(__linux__)
+    int rx_option(int id, int otherwise);
+    if (!camera || !rx_option(HL_OPT_FIRST_PERSON, 0) || rx_option(HOS_OPT_CHEAT_CAMERA, 0)) return;
+    const uint64_t views = recomp_load64(c, camera + 0x18);
+    const uint64_t view = views ? recomp_load64(c, views + 8) : 0;
+    if (!view || view != oot_gameplay_view(c)) return;
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    if (events && recomp_load64(c, events + 104)) return;
+    float near_m;
+    memcpy(&near_m, c->vreg[0], sizeof near_m);
+    if (!isfinite(near_m) || near_m <= 0.05f) return;
+    static int told;
+    if (!told) told = 1, hos_log("first person: near plane %.3f -> 0.050 m", near_m);
+    const float want = 0.05f;
+    uint32_t bits;
+    memcpy(&bits, &want, sizeof bits);
+    a64_vset64(c->vreg[0], bits);
+#else
+    (void)c;
+    (void)camera;
+#endif
+}
+
 float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
 /* (nx2/oot_wide.py) read by the widescreen patches in the game's code; 0: the game's own 16:9 */
 volatile uint64_t hos_wide_out, hos_wide_scene;
