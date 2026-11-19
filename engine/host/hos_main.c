@@ -1124,6 +1124,7 @@ static int64_t process_start_ns;   /* (hos_now_ns when main began) */
    at the first hide). */
 static volatile float fp_link[3], fp_link_yaw, fp_eye_height = 1.15f;
 static volatile int fp_link_known;
+static volatile int fp_head_ready;   /* (the head hidden in this stretch of first person: the view waits for it) */
 
 static const char *const kHeadMaterials[] = {"Mt_Face", "Mt_Face_Eyelid", "Mt_Face_SoftEdge", "Mt_Eye_Inner", "Mt_Eye_Outer",
     "Mt_Eyebrow", "Mt_Eyelashes", "Mt_Eyelashes_01", "Mt_Eyelashes_02", "Mt_Eyelashes_03", "Mt_Eyeshadow", "Mt_EyeShadow_test",
@@ -1188,6 +1189,7 @@ static void oot_first_person_player(Ctx *c, uint64_t actor, uint64_t components,
     static int hidden, logs;
     static int64_t hidden_at, age_at;
     const int want = rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+    if (!want) fp_head_ready = 0;
     for (unsigned i = 0; i < 3; i++) fp_link[i] = oot_load_float(c, actor + 796 + i * 4);
     fp_link_yaw = atan2f(oot_load_float(c, actor + 816), oot_load_float(c, actor + 840));
     fp_link_known = 1;
@@ -1201,6 +1203,7 @@ static void oot_first_person_player(Ctx *c, uint64_t actor, uint64_t components,
         const int n = fp_set_head_visible(c, components, 0, logs < 2);
         if (logs < 2) logs++, hos_log("first person: %d head materials hidden", n);
         hidden = 1;
+        fp_head_ready = 1;
         hidden_at = now;
     } else if (!want && hidden) {
         hos_log("first person: %d head materials shown again", fp_set_head_visible(c, components, 1, 1));
@@ -1439,7 +1442,9 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out, int first) 
         return;
     }
     if (first != was_first) active_view = 0, was_first = first;   /* (switching between the two starts again) */
-    if (first && !fp_link_known) return;
+    /* (first person turned on, or back from the free camera: the game's own view until the player's update has hidden the head
+       again, so not one frame shows it from inside) */
+    if (first && (!fp_link_known || !fp_head_ready)) return;
     if (active_view != view || elapsed > 500000000) {
         double target[3];
         memcpy(eye, A64_PTR(view + 96), sizeof eye);
