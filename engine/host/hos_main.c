@@ -1462,6 +1462,11 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out, int first) 
     if (control) {
         yaw -= 1.6 * dt * (int16_t)(input >> 32) / 32767.0;
         pitch -= 1.2 * dt * (int16_t)(input >> 48) / 32767.0;
+        if (first) {   /* the native mouse, one to one (host/mouse_native.c); as the right stick it came in above */
+            int hos_mouse_first_person(double *yaw, double *pitch);
+            double my, mp;
+            if (hos_mouse_first_person(&my, &mp)) yaw += my, pitch += mp;
+        }
         pitch = first ? fmax(-1.1, fmin(1.3, pitch)) : fmax(-1.55, fmin(1.55, pitch));   /* (first: not straight down at his feet) */
     }
     const double sy = sin(yaw), cy = cos(yaw), sp = sin(pitch), cp = cos(pitch);

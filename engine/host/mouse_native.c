@@ -22,6 +22,8 @@
    The sensitivity is the mouse's (the menu's Mouse sensitivity, - and =): 0.1 degrees a count at 1. HOS_MOUSE_INVERT_Y=1
    or the menu's Invert mouse vertical flips up and down. */
 #include "hos.h"
+#include "../gpu/vk/vk_api.h"       /* (HOS_OPT_CHEAT_CAMERA) */
+#include "../gpu/vk/vk_opt_ids.h"   /* (HL_OPT_FIRST_PERSON) */
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -69,6 +71,12 @@ static int looks_like_camera(uint64_t cam) {
 /* f_80644c80's first line (nx2/oot_patches.py): cam is the player camera, the game's thread */
 void hos_mouse_camera(uint64_t cam) {
     if (!cam || !native_on() || !looks_like_camera(cam)) return;
+    /* First person: the view is ours (host/hos_main.c oot_build_free_view), so the mouse's motion is left for it to
+       take; the hook still counts as run, so the right stick is not given the motion either */
+    if (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) {
+        InterlockedExchange64(&last_hook_ns, hos_now_ns());
+        return;
+    }
     /* Only while it is the view: following Link (3) or turned by the player (4). Aiming the slingshot in first person
        leaves this camera updating with its state 0 while another one draws (traced at Hyrule Castle); shops are reported
        the same. In any other state the mouse is the right stick, which those views turn by (the hook counts as not
@@ -105,6 +113,21 @@ void hos_mouse_camera(uint64_t cam) {
     putf(cam + YAW_AT, y), putf(cam + PITCH_AT, p);
     if ((++applied & 4095) == 1)
         hos_log("mouse native: %lld moves applied; pitch %.2f yaw %.2f", applied, p, y);
+}
+
+/* First person's share of the native mouse (host/hos_main.c, once a frame of the view): the motion since the last
+   frame as a turn in radians, yaw falling as the view turns right and pitch rising as it tilts down, at the menu's
+   sensitivity and Invert mouse vertical. 0 when the native mouse is off or not captured (then the mouse is the right
+   stick, which turns the view too). */
+int hos_mouse_first_person(double *yaw, double *pitch) {
+    *yaw = *pitch = 0;
+    if (!native_on()) return 0;
+    int32_t dx, dy;
+    if (!hos_mouse_take(&dx, &dy)) return 0;
+    const double k = DEG_PER_COUNT * hos_mouse_sens * 3.14159265358979 / 180.0;
+    *yaw = -dx * k;
+    *pitch = (invert_y() ? -dy : dy) * k;
+    return 1;
 }
 
 /* With each read of the controller (nn_hid.c, the game's threads): 0 if the mouse is not captured, 1 if the camera takes
