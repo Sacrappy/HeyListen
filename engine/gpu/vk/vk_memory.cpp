@@ -54,6 +54,7 @@
 #endif
 #include "shaders/wb_diff_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+#include "linux_pressure.h"   // (Longshot f1b17d59: the idle imports under Linux memory pressure)
 
 namespace mkwvk {
 // (RX_VK_POOL_FINALIZE: the captures of the game's submits queued, and those the replay took: a finalize waits for the ones before it)
@@ -1179,6 +1180,18 @@ void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
     cap_used -= it->second.used;
     cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
     cap_bufs.erase(it);
+}
+// (Longshot f1b17d59) Under Linux memory pressure the spare capture buffers go back to the system, oldest first, keeping
+// keep_bytes: they are host-cached pages of the PC's RAM (276-400 MB left after a load on the RTX 5070), and a free chunk's
+// pages stay the process's until they are unmapped. Called once per /proc/meminfo sample (imports_give_back), not per frame
+void cap_free_trim(uint64_t keep_bytes) {
+    std::lock_guard lk(cap_free_mu);
+    while (!cap_free.empty() && cap_free_bytes > keep_bytes) {
+        const FreeBuf f = cap_free.back();
+        cap_free.pop_back();
+        cap_free_bytes -= std::min(cap_free_bytes, f.size);
+        destroy_buffer(f.buffer, f.alloc);
+    }
 }
 // (a capture's buffer by its size class: 2, 4, 8, then 16 MB and up to the MB. It was never under 16 MB, for captures of ~1 MB:
 // 25 kept ones were 413 MB of host-cached system memory, all resident, and three to a 64 MB block left 14 MB of each unused.
@@ -6299,18 +6312,42 @@ void imports_give_back() {   // (pools_mu held)
     static const int low = getenv("RX_VK_IMPORT_LOW") ? std::clamp(atoi(getenv("RX_VK_IMPORT_LOW")), 10, 95) : 75;
 #endif
     static uint64_t calls = 0;
-    if (high <= 0 || ++calls % 16) return;   // (the driver asked every 16 submissions)
+    // (Longshot f1b17d59) and under Linux memory pressure, once per /proc/meminfo sample (vk_texture.cpp texture_frame, every
+    // linux_pressure::kSampleEveryPresents presents): the shortfall less what is already on its way back, and over one episode of
+    // pressure no more in all than its deepest shortfall (linux_pressure.h episode_want), so a lasting episode does not unpin the
+    // same idle imports at every sample. vk_texture.h linux_pressure_shortfall: no file is read here, under pools_mu
+    uint64_t linux_want = 0, over_seq = 0, pending = 0;
+    static uint64_t last_over_seq = 0, episode_deepest = 0, episode_given = 0;
+    if (const uint64_t over = linux_pressure_shortfall(&over_seq)) {
+        if (over_seq != last_over_seq) {
+            last_over_seq = over_seq;
+            for (const DeadImport& d : dead_imports) pending += d.bytes;
+            for (const auto& nh : evicted_pools) pending += nh.mapped().hi - nh.mapped().lo;
+            cap_free_trim(32ull << 20);
+            episode_deepest = std::max(episode_deepest, over);
+            linux_want = linux_pressure::episode_want(linux_pressure::import_want(over, pending), episode_deepest, episode_given);
+        }
+    } else {
+        episode_deepest = episode_given = 0;   // (out of pressure: the next episode starts afresh)
+    }
+    if (!linux_want) {
+        if (high <= 0 || ++calls % 16) return;   // (the driver asked every 16 submissions)
+    }
     uint64_t used = 0, budget = 0;
-    if (!system_heap_usage(&used, &budget)) return;
-    static const bool small = [&] {   // (on by default where the budget is small: 16 GB of RAM and less)
-        const bool on = env_high || budget < (12ull << 30);
+    const bool heap_known = system_heap_usage(&used, &budget);
+    static bool small_known = false, small = false;
+    if (heap_known && !small_known) {   // (on by default where the budget is small: 16 GB of RAM and less)
+        small_known = true;
+        small = env_high || budget < (12ull << 30);
         logf("vk: imports given back past %d%% of a %llu MB system heap budget: %s", high, (unsigned long long)(budget >> 20),
-             on ? "on" : "off (RX_VK_IMPORT_HIGH=85 turns it on)");
-        return on;
-    }();
-    if (!small || used <= budget / 100 * (uint64_t)high) return;
-    const uint64_t target = budget / 100 * (uint64_t)low;
-    const uint64_t want = used > target ? used - target : 0;
+             small ? "on" : "off (RX_VK_IMPORT_HIGH=85 turns it on)");
+    }
+    uint64_t want = 0;
+    if (heap_known && small && used > budget / 100 * (uint64_t)high)
+        want = used - std::min(used, budget / 100 * (uint64_t)low);
+    const bool for_linux = linux_want > want;
+    const uint64_t want_bytes = std::max(want, linux_want);
+    if (!want_bytes) return;
     std::vector<std::map<uint64_t, Pool>::iterator> idle;
     for (auto it = imported.begin(); it != imported.end(); ++it) {
         const Pool& p = it->second;
@@ -6322,7 +6359,7 @@ void imports_give_back() {   // (pools_mu held)
     uint64_t freed = 0;
     int n = 0;
     for (auto it : idle) {
-        if (freed >= want) break;
+        if (freed >= want_bytes) break;
         Pool& p = it->second;
         guest_pages_set(p.lo, p.hi, 0);
         p.retired_value = mem_rec_value;   // (this submission's recording is being made: freed once it is done)
@@ -6330,11 +6367,17 @@ void imports_give_back() {   // (pools_mu held)
         n++;
         evicted_pools.push_back(imported_take(it));
     }
+    if (for_linux) episode_given += freed - std::min(freed, want);
     if (!n) {
         static int logged_none;
-        if (logged_none++ < 8)
-            logf("vk: system heap %llu of %llu MB: no idle import to give back (%zu imported)", (unsigned long long)(used >> 20),
-                 (unsigned long long)(budget >> 20), imported.size());
+        if (logged_none++ < 8) {
+            if (for_linux)
+                logf("vk: memory pressure on Linux: no idle import to give back for %llu MB (%zu imported)",
+                     (unsigned long long)(linux_want >> 20), imported.size());
+            else
+                logf("vk: system heap %llu of %llu MB: no idle import to give back (%zu imported)",
+                     (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), imported.size());
+        }
         return;
     }
     pools_gen++;
@@ -6342,11 +6385,21 @@ void imports_give_back() {   // (pools_mu held)
     std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
     if (mirror_on()) publish_cap_ranges();
     st_imports_evicted += n, st_import_bytes_evicted += freed;
-    static int logged;
-    if (logged++ < 40 || logged % 64 == 0)
-        logf("vk: system heap %llu of %llu MB: %d idle imports given back (%llu MB); %lld (%llu MB) in all",
-             (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), n, (unsigned long long)(freed >> 20),
-             (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
+    if (for_linux) {
+        static int logged_linux;
+        if (logged_linux++ < 8 || logged_linux % 16 == 0)
+            logf("vk: memory pressure on Linux: %d idle imports given back (%llu MB of %llu MB asked; %llu MB in this episode, "
+                 "deepest shortfall %llu MB); %lld (%llu MB) in all (RX_VK_AVAIL_RESERVE_MB, RX_VK_COMMIT_RESERVE_MB)",
+                 n, (unsigned long long)(freed >> 20), (unsigned long long)(linux_want >> 20),
+                 (unsigned long long)(episode_given >> 20), (unsigned long long)(episode_deepest >> 20),
+                 (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
+    } else {
+        static int logged;
+        if (logged++ < 40 || logged % 64 == 0)
+            logf("vk: system heap %llu of %llu MB: %d idle imports given back (%llu MB); %lld (%llu MB) in all",
+                 (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), n, (unsigned long long)(freed >> 20),
+                 (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
+    }
 }
 
 // ---- (HeyListen, 2026-11-14) RX_VK_POOL_FINALIZE=1 (default 0): a chunk of the pool table retires once no live game pool is left in it ----

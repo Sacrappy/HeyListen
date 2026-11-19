@@ -38,6 +38,7 @@
 #include "vk_ledger.h"   // (RX_VK_LEDGER)
 #include "vk_menu.h"
 #include "vk_draw.h"
+#include "linux_pressure.h"   // (Longshot f1b17d59: /proc/meminfo's reserves and the budget hold)
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
@@ -253,27 +254,39 @@ std::unordered_map<uint64_t, std::vector<Pooled>> target_pool;   // by pool_key_
 uint64_t pool_bytes, pool_n, st_pool_reused, st_pool_made, st_pool_destroyed;
 uint8_t pool_pressure = 0;   // (VRAM near what the driver allows: texture_frame's budget) 0 normal, 1 short (>90%: half the pool), 2 critical (>97%: all given back)
 // (Hookshot 2972 by NotRexed, Longshot 91a1ae8b; issue 55 and 62) the commit the textures leave free for the rest of the system:
-// texture_frame's commit rule. RX_VK_COMMIT_RESERVE_MB (default 2560, 0: off). Windows only: Linux overcommits, and its limit is
-// not one commit can reach
+// texture_frame's commit rule. RX_VK_COMMIT_RESERVE_MB (default 2560, 0: off). Windows: RAM plus the page file. Linux
+// (Longshot f1b17d59): MemAvailable plus SwapFree, the same value in the same field (host/posix/win32_posix.c
+// GlobalMemoryStatusEx), because a Linux PC that runs out of RAM and swap is killed the same way its commit limit refuses an
+// allocation, and issue 88's Arc run was killed with 31 GB. The physical reserve beside it (RX_VK_AVAIL_RESERVE_MB) is
+// linux_pressure.h's.
 static uint64_t commit_reserve() {
     static const uint64_t v = getenv("RX_VK_COMMIT_RESERVE_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_COMMIT_RESERVE_MB"))) << 20
                                                                 : 2560ull << 20;
     return v;
 }
-// (what Windows lets the process commit before its limit, RAM plus the page file: GlobalMemoryStatusEx's ullAvailPageFile, the
-// limit less the whole system's commit. false where it cannot be read)
+// (what the process may still commit before the system's limit: Windows' RAM plus the page file in ullAvailPageFile; Linux'
+// MemAvailable plus SwapFree in the same field. false where it cannot be read)
 static bool commit_headroom(uint64_t* free_bytes) {
-#if defined(_WIN32)
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof m;
     if (!GlobalMemoryStatusEx(&m)) return false;
     *free_bytes = m.ullAvailPageFile;
     return true;
+}
+// (Longshot f1b17d59) Linux's physical reserve (RX_VK_AVAIL_RESERVE_MB, 1536 MB by default, 0: off) and the sample that
+// texture_frame takes of /proc/meminfo. The latest shortfall (bytes) and its sample number are published here for
+// vk_memory.cpp's imports_give_back, which must not read a file under pools_mu: linux_pressure_shortfall below. Nothing off
+// Linux: the reserve is 0 there, so none of it runs (and a Windows run behaves exactly as it did)
+static uint64_t linux_avail_reserve() {
+#if defined(__linux__)
+    static const uint64_t v = linux_pressure::avail_reserve(getenv("RX_VK_AVAIL_RESERVE_MB"));
+    return v;
 #else
-    (void)free_bytes;
-    return false;
+    return 0;
 #endif
 }
+std::atomic<uint64_t> linux_shortfall_bytes{0};
+std::atomic<uint64_t> linux_shortfall_seq{0};
 uint64_t pool_cap() {
     // (Longshot 1db4c290, #994) RX_VK_TARGET_POOL_MB=<MB>, else a twelfth of what the driver allows, 256 to 768 MB (target_pool.h)
     static const uint64_t mb = [] {
@@ -470,6 +483,12 @@ struct InitRedirect {
     InitRedirect& operator=(const InitRedirect&) = delete;
 };
 }  // namespace
+// (Longshot f1b17d59) the latest Linux memory-pressure shortfall and its sample's number (vk_memory.cpp: the idle imports are
+// given back under it). 0: none, or not Linux
+uint64_t linux_pressure_shortfall(uint64_t* seq) {
+    if (seq) *seq = linux_shortfall_seq.load(std::memory_order_acquire);
+    return linux_shortfall_bytes.load(std::memory_order_relaxed);
+}
 // (RX_VK_POOL_MIRROR, vk_memory.cpp) a never-imported pool's mirror made by a segment's worker goes the same way
 void* upload_to_earliest_begin() { return new InitRedirect(true); }
 void upload_to_earliest_end(void* h) { delete static_cast<InitRedirect*>(h); }
@@ -5087,6 +5106,61 @@ void texture_frame(uint64_t completed) {
             }
         }
     }
+#if defined(__linux__)
+    // (Longshot f1b17d59) and Linux's memory pressure (MemAvailable and SwapFree in /proc/meminfo, linux_pressure.h): the device
+    // heap can report room while the PC has none left, because every VMA block, staging arena, spare capture buffer and imported
+    // pool is kernel-pinned in physical RAM and cannot be swapped out. Sampled every 30 presents (and once at the start). Below
+    // RX_VK_AVAIL_RESERVE_MB (1536) of MemAvailable or RX_VK_COMMIT_RESERVE_MB (2560) of MemAvailable + SwapFree, PressureHold
+    // cuts the texture budget on an integrated GPU (where VRAM is system RAM) from the texture total at entry, with a 512 MB
+    // floor, and steps it back up once both reserves clear by 256 MB. On a discrete card VRAM and RAM are different memories and
+    // the budget is not cut (the RAM-side valves run on every GPU: malloc_trim, the staging arenas, the idle imports in
+    // vk_memory.cpp, which read linux_pressure_shortfall). Issue 88's Arc B580 is one, with 31 GB: nothing here would have been
+    // the death, and the driver's compiles are compile_gate.h's).
+    {
+        static linux_pressure::PressureHold hold;
+        static uint64_t cached_avail = 0, cached_swap = 0, held_cached = UINT64_MAX;
+        static bool cached_has_swap = true, have_meminfo = false;
+        static const bool igpu = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        const uint64_t avail_res = linux_avail_reserve(), commit_res = commit_reserve();
+        if (!avail_res && !commit_res) {
+            hold = linux_pressure::PressureHold{};
+            held_cached = UINT64_MAX;
+            have_meminfo = false;
+            linux_shortfall_bytes.store(0, std::memory_order_relaxed);
+        } else if (frame_no % linux_pressure::kSampleEveryPresents == 0) {   // (a file read: not every present)
+            have_meminfo = linux_pressure::read_meminfo(&cached_avail, &cached_swap, nullptr, nullptr, &cached_has_swap);
+            if (have_meminfo) {
+                const bool was_active = hold.active;
+                const uint64_t over = linux_pressure::shortfall(cached_avail, cached_swap, avail_res, commit_res, cached_has_swap);
+                linux_shortfall_bytes.store(over, std::memory_order_relaxed);
+                linux_shortfall_seq.fetch_add(1, std::memory_order_release);
+                held_cached = hold.step(total_bytes, cached_avail, cached_swap, avail_res, commit_res,
+                                        linux_pressure::kClearMargin, linux_pressure::kBudgetFloor, cached_has_swap);
+                if (hold.active) {
+                    if (igpu) budget = std::min(budget, held_cached);
+                    static uint64_t said_at;
+                    if (hold.active != was_active || !said_at || frame_no - said_at >= 600) {
+                        said_at = frame_no;
+                        if (igpu)
+                            logf("vk: memory pressure on Linux: %llu MB available, %llu MB swap free (reserves %llu / %llu MB); the "
+                                 "textures' budget %s %llu MB of their %llu MB (RX_VK_AVAIL_RESERVE_MB, RX_VK_COMMIT_RESERVE_MB)",
+                                 (unsigned long long)(cached_avail >> 20), (unsigned long long)(cached_swap >> 20),
+                                 (unsigned long long)(avail_res >> 20), (unsigned long long)(commit_res >> 20),
+                                 budget < total_bytes ? "down to" : "held at", (unsigned long long)(budget >> 20),
+                                 (unsigned long long)(total_bytes >> 20));
+                        else
+                            logf("vk: memory pressure on Linux: %llu MB available, %llu MB swap free (reserves %llu / %llu MB); the "
+                                 "textures' budget is not cut on a discrete GPU (%llu MB, %llu MB in use) (RX_VK_AVAIL_RESERVE_MB, "
+                                 "RX_VK_COMMIT_RESERVE_MB)", (unsigned long long)(cached_avail >> 20),
+                                 (unsigned long long)(cached_swap >> 20), (unsigned long long)(avail_res >> 20),
+                                 (unsigned long long)(commit_res >> 20), (unsigned long long)(budget >> 20),
+                                 (unsigned long long)(total_bytes >> 20));
+                    }
+                }
+            }
+        }
+    }
+#endif
     // (TICK-023) from what the driver allows (VK_EXT_memory_budget), less a margin: the whole process held to
     // RX_VK_VRAM_TARGET_PCT of it (80), the textures getting what the rest (mirrors, pools, pipelines, streams, swapchain and the
     // free space VMA's blocks hold) leaves. A 12 GB card ran at 9.8 of 10.9 GB allowed with the textures at 5.6 GB under the
