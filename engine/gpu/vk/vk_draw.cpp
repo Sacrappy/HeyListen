@@ -29,6 +29,9 @@
 #include <thread>
 #include <setjmp.h>
 #include <signal.h>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>   // (compile_gate.h trims: a long compile's freed memory handed back)
+#endif
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
@@ -48,6 +51,7 @@
 #include "vk_ledger.h"   // (RX_VK_LEDGER)
 #include "ubo_memo.h"    // (HL_UBO_MEMO)
 #include "predict_limits.h"   // (what the prediction of pipelines holds itself to)
+#include "compile_gate.h"     // (Longshot c392df3a: how many of the driver's compiles run at once)
 #include "movie_upscale_policy.h"
 #include "skip_code.h"
 
@@ -8834,6 +8838,181 @@ struct CommitGate {
     CommitGate& operator=(const CommitGate&) = delete;
 };
 }  // namespace
+// ---- (Longshot c392df3a, Tomiss, PR #426: compute_gate.h, widened here to the start-up graphics pipelines: issue 88) how many of
+// the GPU driver's compiles run at once. A driver's compile takes the PC's RAM, not the GPU's: Mesa's Intel compiler spent
+// gigabytes on the game's large programs, and the start-up build ran twelve at once on twelve threads on a 31 GB PC until the
+// kernel killed the process at 1,360 of 16,358 (the reporter's log, issue 88, with the shader preparation finished). The same
+// shape upstream measured on an Iris Xe. The gate weighs each compile (gpu/vk/compile_gate.h) and starts one beside the others
+// only while their weights fit in what was available past the gate's reserve, and the memory is still there now.
+namespace {
+/// (Linux) What the process's cgroup v2 limits leave, in MB: the least of memory.max less memory.current over its cgroup and
+/// those above it (a limit on a parent slice binds too); kUnknownMB with none set, or no cgroup v2 (compile_gate.h
+/// cgroup_room_mb). MemAvailable does not see them, and a cgroup's OOM killer ends the game whatever the system has
+uint64_t cgroup_available_mb() {
+#if defined(__linux__)
+    FILE* f = std::fopen("/proc/self/cgroup", "r");
+    if (!f) return compile_gate::kUnknownMB;
+    char line[512] = "";
+    std::string path;
+    while (std::fgets(line, sizeof line, f))
+        if (const char* at = std::strstr(line, "::")) {   // (v2's one line: "0::/user.slice/...")
+            path = at + 2;
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+            break;
+        }
+    std::fclose(f);
+    if (path.empty()) return compile_gate::kUnknownMB;
+    uint64_t room = compile_gate::kUnknownMB;
+    for (;;) {   // (its own cgroup and each above it: a slice's MemoryMax binds what its children do)
+        const std::string dir = "/sys/fs/cgroup" + (path == "/" ? std::string() : path);
+        auto read1 = [&](const char* name) {
+            std::string v;
+            if (FILE* g = std::fopen((dir + "/" + name).c_str(), "rb")) {
+                char b[64] = "";
+                if (std::fgets(b, sizeof b, g)) v = b;
+                std::fclose(g);
+            }
+            return v;
+        };
+        const std::string max = read1("memory.max"), current = read1("memory.current");
+        if (!current.empty()) {
+            unsigned long long cur = 0;
+            if (std::sscanf(current.c_str(), "%llu", &cur) == 1) room = std::min(room, compile_gate::cgroup_room_mb(max.c_str(), cur));
+        }
+        if (path == "/" || path.empty()) break;
+        const size_t slash = path.find_last_of('/');
+        path = slash == std::string::npos || slash == 0 ? "/" : path.substr(0, slash);
+    }
+    return room;
+#else
+    return compile_gate::kUnknownMB;
+#endif
+}
+}  // namespace
+/// MB the system has for the process now: MemAvailable on Linux (the POSIX shim's GlobalMemoryStatusEx ullAvailPhys reads it
+/// from /proc/meminfo), ullAvailPhys on Windows, and the least of that and the cgroup's. kUnknownMB when it cannot be read
+uint64_t memory_available_mb() {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    const uint64_t avail = GlobalMemoryStatusEx(&m) ? (uint64_t)(m.ullAvailPhys >> 20) : compile_gate::kUnknownMB;
+    // (the least of the system's and the cgroup's: kUnknownMB is the largest, so either one alone stands when the other is not known)
+    return std::min(avail, cgroup_available_mb());
+}
+namespace {
+/// Whether the gate is on by itself: Linux with Mesa's Intel driver (ANV; the reporter's Arc B580 and upstream's Iris Xe), and
+/// Linux with RADV on an integrated GPU on a PC with under 13 GB of RAM (upstream's rule, #1398's 12 GB Radeon 760M). Nothing
+/// on Windows: IntelDriverGate and the commit rule already hold its compiles and its allocations, and a Windows run must behave
+/// as it did. RX_VK_COMPILE_AT_ONCE=<n> or 0 says otherwise on any GPU
+bool compile_gate_by_memory() {
+#if defined(__linux__)
+    if (dev.props.vendorID == 0x8086) return true;
+    if (dev.props.vendorID == 0x1002 && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        MEMORYSTATUSEX m{};
+        m.dwLength = sizeof m;
+        return compile_gate::radv_by_memory(true, GlobalMemoryStatusEx(&m) ? (uint64_t)(m.ullTotalPhys >> 20) : 0);
+    }
+#endif
+    return false;
+}
+/// The gate, set once: RX_VK_COMPILE_AT_ONCE=<n> (at most n at once, whatever the memory; 0: no limit, as before), or by
+/// memory with the budget of what is available now
+compile_gate::Gate& compile_compiles() {
+    static compile_gate::Gate gate;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* e = getenv("RX_VK_COMPILE_AT_ONCE");
+        if (e && *e) {
+            const unsigned n = (unsigned)std::max(0, atoi(e));
+            if (n) {
+                gate.set(n, false);
+                logf("vk: the driver's compiles: at most %u at once (RX_VK_COMPILE_AT_ONCE)", n);
+            } else {
+                logf("vk: the driver's compiles: no gate (RX_VK_COMPILE_AT_ONCE=0)");
+            }
+        } else if (compile_gate_by_memory()) {
+            gate.set(0, true, compile_gate::budget_for(memory_available_mb()));
+            logf("vk: the driver's compiles: as many at once as the memory holds (RX_VK_COMPILE_AT_ONCE=<n> or 0 says otherwise)");
+        }
+    });
+    return gate;
+}
+/// What the memory past the reserve leaves for the compiles, and whether it is the memory that decides (compile_gate_begin)
+std::atomic<bool> compile_gate_memory_rule{false};
+std::atomic<uint64_t> compile_gate_budget_mb{0};
+/// The budget is what is available when a phase starts (the preparation's own step may be long enough for it to change). Returns
+/// the budget in MB (0: no memory rule, or not known), which the start-up build reads to keep out a compile that could not fit
+/// beside anything, or at all
+uint64_t compile_gate_begin() {
+    compile_gate::Gate& gate = compile_compiles();
+    if (!gate.on()) {
+        compile_gate_memory_rule.store(false, std::memory_order_relaxed);
+        return 0;
+    }
+    // (only the memory rule has a budget to refresh: an asked count stands)
+    const char* e = getenv("RX_VK_COMPILE_AT_ONCE");
+    if (e && *e) {
+        compile_gate_memory_rule.store(false, std::memory_order_relaxed);
+        return 0;
+    }
+    const uint64_t avail = memory_available_mb();
+    const uint64_t budget = compile_gate::budget_for(avail);
+    gate.set(0, true, budget);
+    compile_gate_budget_mb.store(budget, std::memory_order_relaxed);
+    compile_gate_memory_rule.store(true, std::memory_order_relaxed);
+    logf("vk: the compiles: as many at once as %llu MB hold (%llu MB available now, %llu left to the PC), at most %u; one of "
+         "%llu MB at the least (gpu/vk/compile_gate.h)", (unsigned long long)budget,
+         (unsigned long long)(avail == compile_gate::kUnknownMB ? 0 : avail), (unsigned long long)compile_gate::kReserveMB,
+         compile_gate::kMost, (unsigned long long)compile_gate::kWordsSmallMB);
+    return budget;
+}
+/// What a compile weighs at the gate: a program's SPIR-V (all its stages, in 32-bit words, as the start-up build's pipelines are
+/// weighed); a compute program's size is not known before it is read, so a pinned one (every compute stage, where the device
+/// runs 32 lanes) weighs kPinnedMB and another kFreeMB, as upstream's
+uint64_t compile_weight(const Program& p) {
+    uint64_t words = 0;
+    for (const Stage& st : p.stages) words += st.spirv_words;
+    if (words) return compile_gate::weight_words(words);
+    const bool pinned = (dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+    return compile_gate::weight(pinned, 0, p.fallback);
+}
+/// (the start-up build, the prediction) Whether this program's compile is too heavy to run at all: the driver was never given what
+/// its compiler cannot finish, and a compile heavier than everything past the reserve would be the process's death (issue 88:
+/// a 66-151k-word program takes ~1 GB, the two of 502k and 1014k took 11 and 29 GB on the PC 3050, and RX_VK_PREDICT_MAX_KWORDS
+/// already leaves those two to the draw that needs them). Only where the memory rule is on: a Windows run is unchanged
+bool compile_too_heavy(const Program& p) {
+    if (!compile_gate_memory_rule.load(std::memory_order_relaxed)) return false;
+    return !compile_gate::fits_alone(compile_weight(p), true, compile_gate_budget_mb.load(std::memory_order_relaxed));
+}
+/// A turn at the gate around one driver compile. None taken when the gate is off (a Windows run, or any GPU it is not on for):
+/// every call returns at once. A compile that held its turn for a long time hands the memory it freed back to the system as it
+/// leaves (compile_gate.h trims: glibc's malloc_trim, nothing on other C libraries)
+struct CompileTurn {
+    compile_gate::Gate* gate;
+    uint64_t weight_mb;
+    std::chrono::steady_clock::time_point t0;
+    bool stopped = false;
+    explicit CompileTurn(uint64_t weight) : gate(compile_compiles().on() ? &compile_compiles() : nullptr), weight_mb(weight) {
+        if (!gate) return;
+        t0 = std::chrono::steady_clock::now();
+        if (!gate->enter(weight_mb, memory_available_mb, [] { return prepare_stopped(); })) gate = nullptr, stopped = true;
+    }
+    ~CompileTurn() {
+        if (!gate) return;
+        const int64_t held_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        gate->leave(weight_mb);
+#if defined(__linux__) && defined(__GLIBC__)
+        if (compile_gate::trims(true, held_ms)) malloc_trim(0);
+#else
+        (void)held_ms;
+#endif
+    }
+    CompileTurn(const CompileTurn&) = delete;
+    CompileTurn& operator=(const CompileTurn&) = delete;
+};
+}  // namespace
+
+>>>>>>> 24b82c261a85 (fix(vk): the driver's compiles run as many at once as the memory holds)
 /// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator. True: prepared now.
 /// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
 /// its compiler crashing in here would take the game with it)
@@ -8965,11 +9144,17 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         VkPipeline pl = VK_NULL_HANDLE;
         // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
         // where the driver's own cache missed them, AMD's 15 s culling compiles each time)
-        if (gated_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
-            vkDestroyPipeline(dev.device, pl, nullptr);
-            libs++;
-            pcache_built_since_save++;
-            if (id) ledger_add(id);
+        {
+            // (Longshot c392df3a: the preparation's warm compiles are as many at once as the memory holds: on an Iris Xe this is
+            // the step that was killed at 24 GB, upstream's measurement)
+            const CompileTurn turn(compile_weight(p));
+            if (turn.stopped) return;
+            if (gated_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
+                vkDestroyPipeline(dev.device, pl, nullptr);
+                libs++;
+                pcache_built_since_save++;
+                if (id) ledger_add(id);
+            }
         }
         if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
         if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
@@ -9181,6 +9366,9 @@ void precompile_finished(Pre* pre) {
 
 void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
     const auto t0 = std::chrono::steady_clock::now();
+    // (Longshot c392df3a, widened here to these graphics pipelines: how many of the driver's compiles run at once, gpu/vk/
+    // compile_gate.h. Nothing when the gate is off, as on Windows)
+    compile_gate_begin();
     // (a start that dies in here would die in here every time, the notes being what it builds from: a player saw the console reach
     // 542 of 543 and the game close. The file says this step began and did not end: the next start lets the notes go and plays)
     // (two starts in a row, not one: closing the window while it ran counted as a crash, and the next start then skipped the
@@ -9225,8 +9413,15 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
     // the pipeline cache when first dispatched (on a worker, the dispatch waiting up to 50 ms as for any compute pipeline), a few ms
     // each, at the scene's load. A new driver's start (the cache's data refused) precompiles them all as before.
     // RX_VK_LAZY_COMPUTE=0: precompiled always, as before; 2: lazy even without the cache's data
+    // (Longshot c392df3a, adapted: on Mesa's Intel driver the preparation and a first start build only the listed compute
+    // programs (`RX_VK_PRECOMPILE_COMPUTES=listed`), because every program read in is a VkShaderModule the driver holds, and
+    // on an Arc B580 14,676 of them were read before the start-up build's 16,358 pipelines (issue 88). Here the same saving is
+    // the switch this tree already has: under the compile gate's memory rule (Linux, Mesa's Intel driver by default) the
+    // compute programs stay on disk until their first dispatch, exactly as TICK-038 already does once the pipeline cache began
+    // with this driver's data. Windows and every GPU without the rule keep the old choice)
     const int lazy_mode = getenv("RX_VK_LAZY_COMPUTE") ? atoi(getenv("RX_VK_LAZY_COMPUTE")) : 1;
-    const bool lazy_compute = lazy_mode == 2 || (lazy_mode == 1 && pcache_loaded);
+    const bool gated_memory = compile_gate_memory_rule.load(std::memory_order_relaxed);
+    const bool lazy_compute = lazy_mode == 2 || (lazy_mode == 1 && (pcache_loaded || gated_memory));
     // (upstream, Sync 11: without the lazy start, the compute programs play dispatched (hookshot_computes.bin), or every kept one
     // when there is no list yet. RX_VK_PRECOMPILE_COMPUTES=all / none)
     const char* which = getenv("RX_VK_PRECOMPILE_COMPUTES");
@@ -9247,10 +9442,20 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
         else if (p.fallback) pre->fallbacks.push_back(&p);   // (hookshot: the mesh fallback's compute pipelines too, before play)
     }, all_computes, !fallbacks_noted_only());
     if (variants_left) logf("vk: precompile: %zu texture variants of compute programs are left to their first dispatch (RX_VK_WARM_VARIANTS=all: built)", variants_left);
-    if (lazy_compute) logf("vk: precompile: the compute programs stay on disk until dispatched (RX_VK_LAZY_COMPUTE)");
+    if (lazy_compute)
+        logf("vk: precompile: the compute programs stay on disk until dispatched (%s)", gated_memory && !pcache_loaded
+                                                                                            ? "gpu/vk/compile_gate.h: the memory "
+                                                                                              "rule's driver (RX_VK_LAZY_COMPUTE=0: "
+                                                                                              "precompiled)"
+                                                                                            : "RX_VK_LAZY_COMPUTE");
     else logf("vk: precompile: compute programs: %s (%zu keys listed as dispatched in play)",
               all_computes ? "every kept one" : (which && !strcmp(which, "none")) ? "none" : "those play dispatched", used.size());
     // The entries are made here, before the game draws: a draw that asks for one finds it (not ready) and does not make another
+    // (RX_VK_PREDICT_MAX_KWORDS, as the prediction reads it: the start-up build leaves the same programs to their first draw)
+    static const unsigned long long predict_max_kwords =
+        getenv("RX_VK_PREDICT_MAX_KWORDS") ? strtoull(getenv("RX_VK_PREDICT_MAX_KWORDS"), nullptr, 10)
+                                           : predictlimits::kDefaultMaxKWords;
+    size_t too_heavy = 0, pipelines_too_heavy = 0;
     {
         ParLock lk;
         for (auto& n : notes) {
@@ -9258,6 +9463,25 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
             if (!p) {
                 pre->missing++;
                 continue;
+            }
+            // (Longshot c392df3a's rule, for the start-up build: the driver is not given what its compiler cannot finish. A
+            // program over RX_VK_PREDICT_MAX_KWORDS is left to the draw that needs it, as the prediction leaves it; one whose
+            // compile does not fit the memory past the reserve at all is too. No entry is made, so the draw that first needs it
+            // builds it as it would have without a note; only where the memory rule is on, so a Windows run is unchanged)
+            if (compile_gate_memory_rule.load(std::memory_order_relaxed)) {
+                uint64_t words = 0;
+                for (const Stage& st : p->stages) words += st.spirv_words;
+                const bool big = predictlimits::too_big(words, predict_max_kwords);
+                if (big || compile_too_heavy(*p)) {
+                    too_heavy++;
+                    pipelines_too_heavy++;   // (one note, one pipeline: the notes name each pipeline they need)
+                    if (too_heavy <= 20)
+                        logf("vk: precompile: %016llx left out, %llu k words of SPIR-V%s: its driver compile %s; a draw that needs "
+                             "it builds it", (unsigned long long)p->key, (unsigned long long)(words / 1000),
+                             big ? (" (RX_VK_PREDICT_MAX_KWORDS " + std::to_string(predict_max_kwords) + ")").c_str() : "",
+                             big ? "takes minutes and gigabytes" : "does not fit the memory (gpu/vk/compile_gate.h)");
+                    continue;
+                }
             }
             Targets at = note_targets(*n);
             const uint64_t key = pipeline_key(*p, n->s, at, (VkPrimitiveTopology)n->topo);   // (not the note's own: it is made again)
@@ -9277,6 +9501,10 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
         p->compute_state.compare_exchange_strong(none, 1);   // (being built: a dispatch that meets it before it is ready is left out)
     }
     pre->total = pre->computes.size() + pre->fallbacks.size() + pre->items.size();
+    if (too_heavy)
+        logf("vk: precompile: %zu of %zu noted pipelines left out for their size (%zu more than the notes' own programs leave for "
+             "play): the driver is not given what its compiler could never finish (RX_VK_PREDICT_MAX_KWORDS, gpu/vk/compile_gate.h)",
+             pipelines_too_heavy, notes_n, too_heavy);
     const size_t total = pre->total;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     // (below normal, half the CPUs, in the background: the game's own threads come first. Waited for: all of them, as before)
@@ -9292,39 +9520,59 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
             if (i >= total) break;
             if (i < pre->computes.size()) {
                 Program& p = *pre->computes[i];
-                VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-                ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                ci.stage.module = p.stages[0].module;
-                ci.stage.pName = "main";
-                pin_subgroup(ci.stage, p.workgroup[0]);
-                ci.layout = p.layout;
-                VkPipeline made = VK_NULL_HANDLE;
-                const bool quick = precompile_compute_quick(ci);
-                if (gated_compute(pcache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
-                if (made) {
-                    std::atomic_ref<VkPipeline>(p.compute_pipeline).store(made, std::memory_order_release);
-                    if (quick) p.optimize_owed.store(true, std::memory_order_release);   // (its module stays for compute_optimize)
-                    else cs_module_release(p);   // (TICK-038)
-                    p.compute_state.store(2, std::memory_order_release);
+                if (compile_too_heavy(p)) {   // (the driver is not given what it could never finish: a dispatch makes its own)
+                    p.compute_state.store(0, std::memory_order_release);
+                    static std::atomic<int> told{0};
+                    if (told++ < 20)
+                        logf("vk: precompile: compute %016llx is not built: its compile does not fit the memory (gpu/vk/"
+                             "compile_gate.h); a dispatch that needs it makes it", (unsigned long long)p.key);
                 } else {
-                    p.compute_state.store(0, std::memory_order_release);   // (a dispatch makes its own, and says why it fails)
+                    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                    ci.stage.module = p.stages[0].module;
+                    ci.stage.pName = "main";
+                    pin_subgroup(ci.stage, p.workgroup[0]);
+                    ci.layout = p.layout;
+                    VkPipeline made = VK_NULL_HANDLE;
+                    const bool quick = precompile_compute_quick(ci);
+                    {
+                        // (as many of the driver's compiles at once as the memory holds; a stopped preparation takes no turn)
+                        const CompileTurn turn(compile_weight(p));
+                        if (!turn.stopped && gated_compute(pcache, &ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
+                    }
+                    if (made) {
+                        std::atomic_ref<VkPipeline>(p.compute_pipeline).store(made, std::memory_order_release);
+                        if (quick) p.optimize_owed.store(true, std::memory_order_release);   // (its module stays for compute_optimize)
+                        else cs_module_release(p);   // (TICK-038)
+                        p.compute_state.store(2, std::memory_order_release);
+                    } else {
+                        p.compute_state.store(0, std::memory_order_release);   // (a dispatch makes its own, and says why it fails)
+                    }
                 }
             } else if (i < pre->computes.size() + pre->fallbacks.size()) {
                 // (a program a draw is already building is left to it: compute_state, as in fallback_pipelines_ready)
                 Program& p = *pre->fallbacks[i - pre->computes.size()];
                 int none = 0;
                 if (p.compute_state.compare_exchange_strong(none, 1)) {
-                    fallback_compute_pipelines(p);
-                    p.compute_state.store(2, std::memory_order_release);
+                    // (a fallback stage is large: its weight says how much; a stopped preparation leaves it to play)
+                    const CompileTurn turn(compile_weight(p));
+                    if (turn.stopped) p.compute_state.store(0, std::memory_order_release);
+                    else {
+                        fallback_compute_pipelines(p);
+                        p.compute_state.store(2, std::memory_order_release);
+                    }
                 }
             } else {
                 Pre::Item& it = pre->items[i - pre->computes.size() - pre->fallbacks.size()];
-                const VkPipeline made = build_graphics(*it.program, it.note->s, it.at, (VkPrimitiveTopology)it.note->topo);
-                if (made) pre->made++;
-                else pre->failed++;
-                if (made) it.entry->pipeline.store(made);
-                it.entry->ready.store(true, std::memory_order_release);   // (a draw leaves out a pipeline that failed, as any)
+                const CompileTurn turn(compile_weight(*it.program));
+                if (!turn.stopped) {   // (a stopped preparation leaves it for play: the entry stays not-ready, a draw builds it)
+                    VkPipeline made = build_graphics(*it.program, it.note->s, it.at, (VkPrimitiveTopology)it.note->topo);
+                    if (made) pre->made++;
+                    else pre->failed++;
+                    if (made) it.entry->pipeline.store(made);
+                    it.entry->ready.store(true, std::memory_order_release);   // (a draw leaves out a pipeline that failed, as any)
+                }
                 it.note.reset();
             }
             pre->done++;
@@ -9435,9 +9683,11 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
         std::atomic<unsigned> worker_n{0};
     };
     const std::shared_ptr<Shared> shared = std::make_shared<Shared>();
-    shared->notes = pipe_notes_read();
-    if (shared->notes.empty() || (!noted && getenv("RX_VK_NO_PREDICT"))) return;
-    const std::vector<std::unique_ptr<PipeNote>>& notes = shared->notes;
+    // (Longshot c392df3a, widened here to these graphics pipelines: the prediction's builds are the same driver compiles as the
+    // start-up build's, and issue 88's run spent 142 s of them before the game; gpu/vk/compile_gate.h)
+    compile_gate_begin();
+    const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
+    if (notes.empty() || (!noted && getenv("RX_VK_NO_PREDICT"))) return;
     size_t programs = 0;
     if (!noted) shared->made_up = predict_pipelines(notes, &programs);
     const std::vector<std::unique_ptr<PipeNote>>& predicted = noted ? notes : shared->made_up;
@@ -9557,10 +9807,19 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
                             continue;
                         }
                         const auto t_build = std::chrono::steady_clock::now();
+                        const auto t_build = std::chrono::steady_clock::now();
                         if (test_slow.first && test_slow.first == p.key) Sleep((DWORD)test_slow.second * 1000);
-                        const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo);
-                        if (S.abandoned.load()) return;   // (let go while it built: nothing is waiting for it, and what it used may be gone: no more work)
-                        if (pl) vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                        {
+                            // (Longshot c392df3a: the same driver compiles, before the game: a turn at the gate, weighed by
+                            // this program's SPIR-V. The 502k- and 1014k-word programs are left out above, so what takes a
+                            // turn here is what the driver builds in 25 s and a few hundred MB to a couple of gigabytes)
+                            const CompileTurn turn(compile_weight(p));
+                            if (!turn.stopped) {
+                                const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo);
+                                if (S.abandoned.load()) return;   // (let go while it built: nothing is waiting for it, and what it used may be gone: no more work)
+                                if (pl) vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                            }
+                        }
                         const double build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_build).count();
                         static std::atomic<int> slow_logged{0};
                         if (build_ms > 3000 && slow_logged.fetch_add(1, std::memory_order_relaxed) < 40) {

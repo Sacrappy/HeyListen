@@ -181,6 +181,11 @@ bool create_instance() {
     }
     ci.enabledExtensionCount = (uint32_t)ext_list.size();
     ci.ppEnabledExtensionNames = ext_list.data();
+    // (Longshot c392df3a sets Mesa's Intel driconf shader_spilling_rate to 2 here, before the driver loads. Not ported: the
+    // renderer sets no environment variable from here, because a `setenv` while another thread may be in `getenv` is undefined,
+    // and the switches that need it are decided in the host before its first thread. A player can still set
+    // shader_spilling_rate=2 themselves; create_device logs it, and the README's fixes line says what it is worth on Mesa's
+    // Intel compiler)
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
     if (getenv("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
@@ -351,6 +356,11 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
     }
     const bool fadd_wanted = native_fadd_wanted(fadd_env, fadd_driver.driverID, dev.props.deviceID, dev.props.driverVersion);
+    // (Longshot c392df3a: says the spilling rate Mesa's Intel compiler (ANV) will use. The renderer does not set it here: see
+    // create_instance's note. The driverID alone tells the driver, so no platform guard is needed)
+    if (fadd_driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && getenv("shader_spilling_rate"))
+        logf("vk: Mesa's Intel compiler spills at rate %s (driconf shader_spilling_rate: set by the player; 2 was measured as "
+             "the best on an Iris Xe, Longshot c392df3a)", getenv("shader_spilling_rate"));
     bool atomic_float = false;
     if (fadd_wanted) optional(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME, atomic_float);
     optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)

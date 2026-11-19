@@ -45,8 +45,14 @@ struct VkComputePipelineCreateInfo {
 };
 struct {uintptr_t device=0x1234;}dev;
 VkPipelineCache pcache=0x5678;
-struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;std::atomic<int>compute_state{1};std::atomic<bool>optimize_owed{false};};
-struct Pre {std::vector<Program*>computes;};
+struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;std::atomic<int>compute_state{1};std::atomic<bool>optimize_owed{false};uint64_t key=0x99;};
+struct Pre {std::vector<Program*>computes;size_t done=0;};
+// (the compile gate's own pieces, not under test here: test_compile_gate.py compiles the header and its rules)
+struct CompileTurn {bool stopped=false;explicit CompileTurn(uint64_t){}~CompileTurn(){}};
+uint64_t compile_weight(const Program&){return 0;}
+bool compile_too_heavy(const Program&){return false;}
+void logf(const char*,...){}
+bool prepare_stopped(){return false;}
 int mode=0,calls=0,destroys=0,released=0; bool completed=false,quick_mode=false;
 void cs_module_release(Program&){++released;}
 bool precompile_compute_quick(VkComputePipelineCreateInfo&){return quick_mode;}   // (Intel serial builds: its own check, test_intel_quick_compute)
