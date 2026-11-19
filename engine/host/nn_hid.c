@@ -802,7 +802,9 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     static const char *native_env;
     static int native_looked;
     if (!native_looked) native_looked = 1, native_env = getenv("HOS_MOUSE_NATIVE");
-    const int native = native_env ? atoi(native_env) != 0 : rx_option(6, 0);
+    /* first person: always the native path, the view taking the mouse one to one (host/mouse_native.c) */
+    const int native = (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) ||
+                       (native_env ? atoi(native_env) != 0 : rx_option(6, 0));
     int hos_mouse_native(void);
     int captured = 0, as_stick = !native;
     if (native) {

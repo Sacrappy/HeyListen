@@ -52,6 +52,8 @@ static int native_on(void) {
     static const char *env;
     static int looked;
     if (!looked) looked = 1, env = getenv("HOS_MOUSE_NATIVE");
+    /* first person always takes the mouse one to one, whatever the Mouse camera row says */
+    if (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) return 1;
     return env ? atoi(env) != 0 : rx_option(6, 0);
 }
 
