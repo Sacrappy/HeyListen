@@ -1125,6 +1125,7 @@ static int64_t process_start_ns;   /* (hos_now_ns when main began) */
 static volatile float fp_link[3], fp_link_yaw, fp_eye_height = 1.15f;
 static volatile int fp_link_known;
 static volatile int fp_head_ready;   /* (the head hidden in this stretch of first person: the view waits for it) */
+static volatile int fp_head_scaled;   /* (the head bone is at scale 0 now: the eye can sit at his eyes) */
 
 static const char *const kHeadMaterials[] = {"Mt_Face", "Mt_Face_Eyelid", "Mt_Face_SoftEdge", "Mt_Eye_Inner", "Mt_Eye_Outer",
     "Mt_Eyebrow", "Mt_Eyelashes", "Mt_Eyelashes_01", "Mt_Eyelashes_02", "Mt_Eyelashes_03", "Mt_Eyeshadow", "Mt_EyeShadow_test",
@@ -1184,9 +1185,72 @@ static int fp_set_head_visible(Ctx *c, uint64_t components, int visible, int log
     return set;
 }
 
+/* Link's head through its bone: its local scale 0 while first person is on, so the head, hair and hat (the hat is
+   the tunic's mesh, skinned to the head's bones) go with it, and the eye can sit at his eyes.
+   The model's skeleton is nn::g3d's (model +0xf8): its local matrices at [skel+0x18], 0x60 bytes a bone (flags, scale at
+   +0x10, the 3x4 matrix at +0x20), the resource's bone dictionary at [[skel]+8] (a count at +4, a bone's name at
+   [dict + 0x20 + 16 * index] + 2). The model's vtable +0x48 gives a bone's name by index and +0x60 (model, &scale,
+   index) sets its local scale (main+0x3596360: it clears the bone's identity flags and marks the skeleton dirty), as the
+   game's own animation does. The animation writes the bones every frame, so this runs every player update.
+   HL_FP_HEAD_BONE=0 leaves the bone alone (the materials are hidden as before). */
+static int fp_head_bone(Ctx *c, uint64_t components, int log) {
+    static int env = -1;
+    if (env < 0) {
+        const char *e = getenv("HL_FP_HEAD_BONE");
+        env = e ? atoi(e) != 0 : 1;
+    }
+    if (!env) return 0;
+    const uint64_t comp = recomp_load64(c, components + 8);
+    if (!comp || !fp_in_main(recomp_load64(c, comp))) return 0;
+    const uint64_t getter = recomp_load64(c, recomp_load64(c, comp) + 248);
+    const uint64_t scratch = (c->x[31] - 256) & ~15ULL;
+    uint64_t holder = 0;
+    if (getter == recomp_load64(c, 0x84cd9d58ULL)) holder = recomp_load64(c, comp + 24);
+    else if (!fp_guest_call(c, getter, scratch - 16, comp, 0, 0, &holder)) return 0;
+    const uint64_t slots = holder ? recomp_load64(c, holder + 40) : 0;
+    if (!slots) return 0;
+    recomp_store32_sp(c, scratch, 0), recomp_store32_sp(c, scratch + 4, 0), recomp_store32_sp(c, scratch + 8, 0);
+    int set = 0;
+    uint64_t done[16];
+    int ndone = 0;
+    for (int i = 0; i < 16; i++) {
+        const uint64_t slot = recomp_load64(c, slots + i * 8);
+        const uint64_t model = slot ? recomp_load64(c, slot) : 0;
+        if (!model) break;
+        const uint64_t vt = recomp_load64(c, model);
+        if (!fp_in_main(vt)) break;
+        int seen = 0;
+        for (int k = 0; k < ndone; k++) seen |= done[k] == model;
+        if (seen) continue;
+        done[ndone++] = model;
+        const uint64_t skel = recomp_load64(c, model + 0xf8);
+        const uint64_t res = skel ? recomp_load64(c, skel) : 0;
+        const uint64_t dict = res ? recomp_load64(c, res + 8) : 0;
+        if (!dict) continue;
+        const uint32_t count = recomp_load32(c, dict + 4);
+        int head = -1;
+        for (uint32_t b = 0; b < count && b < 1024; b++) {
+            const uint64_t key = recomp_load64(c, dict + 0x20 + 16 * (uint64_t)b);
+            if (key && !strcmp((const char *)A64_PTR(key + 2), "Head")) { head = (int)b; break; }
+        }
+        if (log) hos_log("first person: model %d: %u bones, Head %d", i, count, head);
+        if (head < 0) continue;
+        fp_guest_call(c, recomp_load64(c, vt + 0x60), scratch - 16, model, scratch, (uint64_t)head, NULL);
+        set++;
+    }
+    return set;
+}
+
 static void oot_first_person_player(Ctx *c, uint64_t actor, uint64_t components, int64_t now) {
     int rx_option(int id, int otherwise);
-    static int hidden, logs;
+    static int hidden, logs, bone_logs;
+    if (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) {
+        const int n = fp_head_bone(c, components, bone_logs < 2);
+        if (bone_logs < 2) bone_logs++, hos_log("first person: the head bone scaled to 0 on %d models", n);
+        fp_head_scaled = n > 0;
+    } else {
+        fp_head_scaled = 0;
+    }
     static int64_t hidden_at, age_at;
     const int want = rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0);
     if (!want) fp_head_ready = 0;
@@ -1489,7 +1553,13 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out, int first) 
             if (in_air && !air_told) air_told = 1, hos_log("first person: in the air (%.1f m/s up): the eye eased out", vy);
         }
         last_y = fp_link[1];
-        const double out_m = 0.35 + 0.35 * air;
+        /* (with the head bone at scale 0 nothing of his head is left in front of the eye: HL_FP_EYE_OUT metres, 0.10 if unset) */
+        static double head_out = -1;
+        if (head_out < 0) {
+            const char *e = getenv("HL_FP_EYE_OUT");
+            head_out = e ? atof(e) : 0.10;
+        }
+        const double out_m = fp_head_scaled ? head_out : 0.35 + 0.35 * air;
         eye[0] = fp_link[0] - out_m * axes[2][0];
         eye[1] = fp_link[1] + fp_eye_height - out_m * axes[2][1];
         eye[2] = fp_link[2] - out_m * axes[2][2];
