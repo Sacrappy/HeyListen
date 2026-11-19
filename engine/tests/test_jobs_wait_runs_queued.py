@@ -6,6 +6,7 @@ python -I -B tests/test_jobs_wait_runs_queued.py
 """
 import argparse
 import shutil
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -37,15 +38,20 @@ inline void pipeline_cache_between_builds() {}
 
 
 def check_source():
-    """The pipeline job a draw waits for is pushed with its flag, and jobs_wait still looks for it in the queue"""
+    """The pipeline and translation jobs a draw waits for are pushed with their flags, and jobs_wait still looks for them in the queue"""
     draw = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
     if "}, false, &e->ready);" not in draw:
         raise SystemExit("graphics_pipeline's build job is pushed without its ready flag")
+    shader = (ROOT / "gpu/vk/vk_shader.cpp").read_text(encoding="utf-8")
+    if shader.count("&raw->ready);") < 2:
+        raise SystemExit("a graphics or mesh translation job is pushed without its ready flag")
     jobs = (ROOT / "gpu/vk/vk_jobs.cpp").read_text(encoding="utf-8")
-    wait = jobs[jobs.index("void jobs_wait("):]
+    wait = jobs[jobs.index("bool jobs_wait("):]
     wait = wait[:wait.index("\n}\n")]
     if "it->flag == &flag" not in wait or 'getenv("RX_VK_JOB_STEAL")' not in wait:
         raise SystemExit("jobs_wait no longer runs a queued job it waits for")
+    if "return fresh" not in wait:
+        raise SystemExit("jobs_wait no longer tells whether the job ran during the wait")
 
 
 def main():
@@ -63,7 +69,8 @@ def main():
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-pthread", "-I", str(tmp),
                         str(tmp / "vk_jobs.cpp"), str(ROOT / "tests/test_jobs_wait_runs_queued.cpp"), "-o", str(exe)],
                        check=True)
-        subprocess.run([str(exe)], check=True, timeout=60)
+        # (the steal is off by default since v0.4.3: this checks it when turned on)
+        subprocess.run([str(exe)], check=True, timeout=60, env={**os.environ, "RX_VK_JOB_STEAL": "1"})
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ def block(text, marker):
 
 def main():
     src = (ROOT / "gpu" / "vk" / "vk_shader.cpp").read_text(encoding="utf-8")
-    profile = block(src, "Shader::Profile make_profile()")
+    profile = block(src, "Shader::Profile make_profile(bool wide)")
     if "p.support_int8 = dev.vk12.shaderInt8 != VK_FALSE;" not in profile:
         raise SystemExit("FAIL: the profile's 8-bit integers do not follow the device's shaderInt8")
     if "p.support_int16 = dev.features.shaderInt16 != VK_FALSE;" not in profile:

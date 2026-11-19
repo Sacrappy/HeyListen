@@ -185,9 +185,9 @@ void perf_picture(uint32_t w, uint32_t h, const ImVec4& c) {
     // (the present's filter, game image to window; an upscaler that makes the game image from the 3D scene named before it:
     // the row said "bilinear" alone while DLSS drew)
     static const char* const scaling[] = {"bilinear", "Catmull-Rom", "Lanczos"};
-    static const char* const engines[] = {"", "DLSS", "DLAA", "FSR 3.1", "FSR 4", "FSR 4 AA"};
+    static const char* const engines[] = {"", "DLSS", "DLAA", "FSR 3.1", "FSR 4", "FSR 4 AA", ""};
     const int mode = temporal_mode();
-    const char* engine = fsr3_wanted() ? "FSR 3.1" : (mode > 0 && mode < upscaler_rows::kUpscalers ? engines[mode] : "");
+    const char* engine = upscaler_off() ? "no upscaler" : fsr3_wanted() ? "FSR 3.1" : (mode > 0 && mode < upscaler_rows::kUpscalers ? engines[mode] : "");
     snprintf(v[3], sizeof v[3], "%s%s%s", engine, *engine ? " + " : "", scaling[opts.upscale < 0 || opts.upscale > 2 ? 0 : opts.upscale]);
     {   // (HeyListen) the game's frame rate limit (option 9 / HOS_FPS_LIMIT, what host/nn_vi.c paces at), and frame generation on top
         static const int lim[] = {60, 90, 120, 144, 165, 240};

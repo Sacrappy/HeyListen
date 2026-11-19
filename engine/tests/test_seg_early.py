@@ -2,8 +2,9 @@
 
 By the text of gpu/vk/vk_replay.cpp and vk_draw.cpp:
 - off by default (seg_early_on reads RX_VK_SEG_EARLY);
-- the dry pass's appends to ub_updates and par_conds hold ub_grow_mu (UbGrowGuard), the workers' reads of them hold it shared
-  (UbReadGuard in ub_overlay, ub_read and a worker's render condition), and only a worker's read takes it, only while growing;
+- the dry pass's appends to ub_updates hold ub_grow_mu (UbGrowGuard), and those to par_conds where they move its buffer (with
+  RX_VK_GROW_LOCK_PLAIN=1 all of them: tests/test_grow_lock.py), the workers' reads of them hold it shared (UbReadGuard in
+  ub_overlay, ub_read and a worker's render condition), and only a worker's read takes it, only while growing;
 - the dry pass calls the hook right after it keeps a point, and the hook copies the point's state into the next segment (the
   points' vector moves as it grows) and hands a segment out only once its end is passed;
 - before the dry pass, in rec_cur: the pre-sync and the part's readback refresh; par_active on before the dry pass, the growth
@@ -51,8 +52,9 @@ def main():
     i = rep.index("ub_updates.push_back(std::move(up));")
     need("UbGrowGuard ug;" in rep[i - 200:i], "the dry pass appends a uniform update unguarded")
     i = rep.index("par_conds.push_back(s.render_enabled ? 1 : 0);")
-    need("UbGrowGuard ug;" in rep[i - 200:i], "the dry pass appends a render condition unguarded")
-    i = rep.index("s.render_enabled = cond_at < par_conds.size() ? par_conds[cond_at] != 0 : true;")
+    need("UbGrowGuard ug;" in rep[i - 200:i] and "par_conds.size() == par_conds.capacity()" in rep[i - 200:i],
+         "the dry pass moves par_conds' buffer unguarded")
+    i = rep.index("s.render_enabled = cond_at < par_conds_n.load(std::memory_order_acquire) ? par_conds[cond_at] != 0 : true;")
     need("UbReadGuard ug;" in rep[i - 200:i], "a worker reads a render condition unguarded")
     i = rep.index("par_points.push_back({p + h.size, s, ub_updates.size(), par_conds.size(), dry_work});")
     need("if (seg_early_hook) seg_early_hook->on_point(par_points.back());" in rep[i:i + 300], "the hook is not called after a point")

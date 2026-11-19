@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QFileDialog, QFram
                                QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedLayout,
                                QVBoxLayout, QWidget)
 
-from . import core, paths, setup_parts, strings, updater
+from . import core, paths, setup_parts, shader_time, strings, updater
 from .theme import (C, MONO, W_BOLD, W_MEDIUM, W_SEMIBOLD, Bar, Button, Card, Chip, Choice, PathEdit, Ring, Tick, argb, css,
                     faint, font, glow, heading, label, note, rounded, section, set_color, sub, tick_path)
 
@@ -563,6 +563,7 @@ class Window(QWidget):
         self.launch_folder = ""
         self.problem_is_tools = False
         self.elapsed0 = self.compile0 = None
+        self.shaders0, self.shaders_frac = None, None   # (the shaders' step: when it began and how far its @@progress says it is)
         self.prepare_now, self.shaders_began, self.shaders_later, self.built_in = True, False, None, None
         self.weight = WITHOUT_SHADERS
         self.setWindowTitle("Hookshot")
@@ -1384,6 +1385,7 @@ class Window(QWidget):
         self.files_changed, self.files_compiled, self.compile_eta = -1, 0, -1.0
         self.this_compile, self.previous_total = 0, -1
         self.shaders_began, self.shaders_later, self.built_in = False, None, None
+        self.shaders0, self.shaders_frac = None, None
         self.show_page(self.build_page)
         self.cancel_button.show()
         self.set_progress(self.weight["read"][0] if self.updating else 0)
@@ -1413,6 +1415,7 @@ class Window(QWidget):
                 self.compile0 = time.monotonic()
             if sid == "shaders":
                 self.shaders_began = True
+                self.shaders0, self.shaders_frac = time.monotonic(), None
             if sid in self.weight:
                 self.set_progress(self.weight[sid][0])
         elif line.startswith("@@progress "):
@@ -1423,6 +1426,8 @@ class Window(QWidget):
             if self.current in self.weight:
                 if self.current == "compile":
                     self.compiled = f
+                elif self.current == "shaders":
+                    self.shaders_frac = f
                 w = self.weight[self.current]
                 self.set_progress(w[0] + w[1] * max(0.0, min(1.0, f)))
             return
@@ -1491,6 +1496,9 @@ class Window(QWidget):
             left = (time_left(self.compile_eta) if self.compile_eta >= 0 else
                     time_left(el / self.compiled * (1 - self.compiled) + 60) if self.compiled > 0.03 else "Estimating…")
             self.build_note.setText("Compiling %s · %s%s" % (clock(el), left, tail))
+            return
+        if self.current == "shaders" and self.shaders0:   # (the shaders' step: its own time, not the whole build's "usually")
+            self.build_note.setText(shader_time.shaders_note(time.monotonic() - self.shaders0, self.shaders_frac, tail))
             return
         self.build_note.setText(("Working…" if self.updating else "Usually about 45 minutes") + tail)
 

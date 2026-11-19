@@ -13,7 +13,15 @@ Solver: the game cuts frame step * n + 0.001 to its solver steps (n a 60 fps fra
 wanders; with n = 4, 0 above 240). With the frames' own time and a step under 1 it is rounded up (10% leeway for the frame
 time's jitter) and at least 1, never under the game's; a step of 1 or more, or no frame time (a cap of 60), keeps the game's.
 
-The hooks: host/hl_high_fps.c asks nx2/hl_gates.py for them (HL_SOUND_HOOK, HL_SOLVER_HOOK). The sound job's gate goes at its
+Music manager (after Longshot eb5ba6e2, Hookshot bf802502 by CraftyCorvid; HL_BGM_HOOK): its update (f_83373400, game::Bgm) runs inside
+the gated job but reads the step (+16) and the seconds (+24) from the game's time object itself: its clock runs at 60 / fps of the
+real one unless a whole step and that step's seconds are handed to it (120 and 240 fps; 60 fps, a slow frame and a cap of 60 read the
+game's own). The battle manager sets a byte of change flags ([[0x84c9dda0]]+0x4898: bit 5 the battle music's name, bit 1 its distance
+volume, 2, 6) for one game frame, and the update syncs a property for each bit set: held to 60 Hz it saw a frame's flags only on the
+frames it ran, so half the fight ends were lost at 120 fps (the battle music played on). The hooked update, with the host's code, handles a
+bit set for one frame exactly once, whether the gate ran the job on that frame or held it (72 cases: 3 rates, 8 offsets, 3 bits).
+
+The hooks: host/hl_high_fps.c asks nx2/hl_gates.py for them (HL_SOUND_HOOK, HL_SOLVER_HOOK, HL_BGM_HOOK). The sound job's gate goes at its
 head and its step after the job's own load of it, the solver's count after its cut; each function's hash is unchanged, a
 second run changes nothing, another text, a function an exeFS mod patches and a tree that does not ask leave the lift as it
 was. The hooked made-up functions, compiled with the host's code, run the job at 60 Hz and round the count up at 120 fps, as
@@ -35,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "nx2"))
 import hl_gates  # noqa: E402
 
-SOUND, SOLVERS = "80435300", ("838ceb80", "838cfc10")
+SOUND, SOLVERS, BGM = "80435300", ("838ceb80", "838cfc10"), "83373400"
 HEAD = hl_gates.HEAD
 # (the job: phase 0 alone loads the step; what it hands the engine is kept, with how many times it ran. The next function
 #  has the same load, and stays as it is)
@@ -46,6 +54,12 @@ LIFTED_SOUND = ('#include "a64.h"\n' + HEAD % SOUND + "    /* nop/hint */\n"
                 HEAD % "80435360" + hl_gates.SOUND_LOAD + "}\n")
 SOLVER_CUT = hl_gates.CUT % 1 + hl_gates.SOLVER_STORE
 LIFTED_SOLVER = '#include "a64.h"\n' + "".join(HEAD % a + "    c->x[8]=1;\n" + SOLVER_CUT + "}\n" for a in SOLVERS)
+# (the music manager's update as the lift writes it: the time object in x8, its step into s8 and seconds into s9, then the four reads
+#  of the change flags, each followed by a handler call the stand-in counts by bit; the next function has the same loads and stays)
+LIFTED_BGM = (HEAD % BGM + "    c->x[8]=BASE + 0x2000;\n" + hl_gates.BGM_TIME + "    c->x[26]=BASE + 0x1000;\n" +
+              "".join(hl_gates.BGM_FLAGS + "    if ((c->x[8] >> %d) & 1) { handled[%d]++; }\n" % (b, b) for b in (5, 1, 2, 6)) +
+              "    clock_steps += oot_bits_float((uint32_t)c->vreg[8][0]);\n    clock_secs += oot_bits_float((uint32_t)c->vreg[9][0]);\n}\n" +
+              HEAD % "83373460" + hl_gates.BGM_TIME + "}\n")
 HOST_ANCHOR = "extern volatile uint32_t hos_frame_seconds_bits;"
 
 
@@ -168,6 +182,7 @@ volatile uint32_t hos_frame_seconds_bits;
 static const uint64_t g_module_base = BASE - 0x80435000ULL - 75927552ULL;   /* (the job's slot at guest + 0) */
 static uint64_t recomp_load64(Ctx *c, uint64_t a) { (void)c; return G64(a); }
 static uint64_t recomp_load32(Ctx *c, uint64_t a) { (void)c; return G32(a); }
+static uint64_t recomp_load8(Ctx *c, uint64_t a) { (void)c; return *(uint8_t *)GP(a); }
 static void recomp_store32(Ctx *c, uint64_t a, uint64_t v) { (void)c; G32(a) = (uint32_t)v; }
 static void a64_vset64(uint64_t *v, uint64_t x) { v[0] = x, v[1] = 0; }
 static uint64_t recomp_fp_to_int(uint64_t b, int iw, int ow, int s, int mode, uint32_t fpcr, uint32_t *fpsr) {
@@ -175,8 +190,8 @@ static uint64_t recomp_fp_to_int(uint64_t b, int iw, int ow, int s, int mode, ui
     const float f = oot_bits_float((uint32_t)b);
     return (uint32_t)(f != f ? 0 : (int32_t)f);
 }
-static double fed;
-static int ran[3];
+static double fed, clock_steps, clock_secs;
+static int ran[3], handled[8];
 @LIFTED@
 static void seconds(double s) { hos_frame_seconds_bits = s > 0 ? oot_float_bits((float)s) : 0; }
 /* (a frame of the job: phases 0, 1 and 2, the game step at 60 x the frame's seconds; the job's slot at guest + 2192 points to
@@ -191,6 +206,43 @@ static void frames(int n, float step) {
             f_80435300(&ctx);
         }
 }
+/* the music manager: a frame of step (60 / fps; no frame time given at a cap of 60) with the flag byte, the job's phases as the game
+   calls them (the update on phase 1 when the gate runs it); the flag byte is cleared after the frame, as the battle manager does */
+static Ctx bctx;
+static void bgm_frame(float step, int timed, uint8_t flags) {
+    const float secs = step / 60.0f;
+    hos_frame_seconds_bits = timed ? oot_float_bits(secs) : 0;
+    G64(BASE + 2192) = BASE + 0x1000, G64(BASE + 0x1000) = BASE + 0x2000;
+    G32(BASE + 0x2010) = oot_float_bits(step), G32(BASE + 0x2018) = oot_float_bits(secs);
+    *(uint8_t *)GP(BASE + 0x1000 + 2200) = flags;
+    for (uint64_t phase = 0; phase < 3; phase++)
+        if (hos_oot_sound_gate(&bctx, (uint32_t)phase, BASE + 2192) && phase == 1) f_83373400(&bctx);
+    *(uint8_t *)GP(BASE + 0x1000 + 2200) = 0;
+}
+static void bgm_checks(void) {
+    const float steps[] = {0.5f, 0.25f, 1.0f, 1.5f};
+    const int timed[] = {1, 1, 0, 0};
+    int lost = 0;
+    for (int i = 0; i < 4; i++) {   /* (the update's clock against the real one; a step of 0.5 at a cap of 60 runs every frame with it) */
+        clock_steps = clock_secs = 0;
+        for (int f = 0; f < 2400; f++) bgm_frame(steps[i], timed[i], 0);
+        CHECK(fabs(clock_steps / (steps[i] * 2400) - 1.0) < 0.01 && fabs(clock_secs / (steps[i] / 60.0f * 2400) - 1.0) < 0.01);
+    }
+    const int bits[] = {5, 1, 6};
+    for (int i = 0; i < 3; i++)
+        for (int w = 0; w < 8; w++)
+            for (int k = 0; k < 3; k++) {
+                const float step = i == 2 ? 1.0f : i == 1 ? 0.25f : 0.5f;
+                const int t = i != 2;
+                for (int f = 0; f < 4; f++) bgm_frame(step, t, 0);
+                memset(handled, 0, sizeof handled);
+                for (int f = 0; f < w; f++) bgm_frame(step, t, 0);
+                bgm_frame(step, t, (uint8_t)(1u << bits[k]));
+                for (int f = 0; f < 8; f++) bgm_frame(step, t, 0);
+                lost += handled[bits[k]] != 1;
+            }
+    CHECK(lost == 0);
+}
 static int32_t solver(void (*f)(Ctx *), float step, float n) {
     Ctx ctx;
     memset(&ctx, 0, sizeof ctx);
@@ -201,9 +253,15 @@ static int32_t solver(void (*f)(Ctx *), float step, float n) {
 }
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "on";
+    if (!strcmp(mode, "bgm")) {
+        bgm_checks();
+        printf("PASS: %s\n", mode);
+        return 0;
+    }
     const int sound_on = !strcmp(mode, "on") || !strcmp(mode, "solver-off");
     const int solver_on = !strcmp(mode, "on") || !strcmp(mode, "sound-off");
     logic();
+    if (sound_on) bgm_checks();
     /* a cap of 60: every phase of every frame with the game's step, the game's solver count */
     seconds(0);
     frames(60, 1.0f);
@@ -243,14 +301,15 @@ def host_asks():
     asked = hl_gates.wanted_lifts()
     check(asked.get(SOUND, (None, None))[1] == "sound", "host/hl_high_fps.c does not ask for the sound hook")
     check(all(asked.get(a, (None, None))[1] == "solver" for a in SOLVERS), "host/hl_high_fps.c does not ask for both solver hooks")
+    check(asked.get(BGM, (None, None))[1] == "bgm", "host/hl_high_fps.c does not ask for the music manager hook")
     return asked
 
 
 def hook_text():
     """The hooks in a made-up lift: put in after their anchors, once, with the hashes unchanged; idempotent; left out for
     another text, a function an exeFS mod patches, or a tree that does not ask; an older tree's stale-gate rule takes them out."""
-    lifted = LIFTED_SOUND + LIFTED_SOLVER.replace('#include "a64.h"\n', "")
-    hashes = {a: hl_gates.text_hash(lifted, a) for a in (SOUND,) + SOLVERS}
+    lifted = LIFTED_SOUND + LIFTED_SOLVER.replace('#include "a64.h"\n', "") + LIFTED_BGM
+    hashes = {a: hl_gates.text_hash(lifted, a) for a in (SOUND, BGM) + SOLVERS}
     gate, step = hl_gates.lift_lines("sound", SOUND, ())
     with tempfile.TemporaryDirectory(prefix="high-fps-hook-") as tmp:
         gen, host = Path(tmp) / "gen", Path(tmp) / "host"
@@ -259,7 +318,7 @@ def hook_text():
         code = gen / "code_000.c"
         code.write_text(lifted, encoding="utf-8", newline="")
         asks = 'HL_SOUND_HOOK(%s, "%s");\n' % (SOUND, hashes[SOUND]) + \
-            "".join('HL_SOLVER_HOOK(%s, "%s");\n' % (a, hashes[a]) for a in SOLVERS)
+            "".join('HL_SOLVER_HOOK(%s, "%s");\n' % (a, hashes[a]) for a in SOLVERS) + 'HL_BGM_HOOK(%s, "%s");\n' % (BGM, hashes[BGM])
         (host / "hl_f.c").write_text(asks, encoding="utf-8")
         hl_gates.apply(str(gen), str(host), quiet=True)
         s = code.read_text(encoding="utf-8")
@@ -272,6 +331,12 @@ def hook_text():
               "/* hl gate 838cfc11 */" in s, "the solver hooks not once each")
         check(s.count(hl_gates.CUT % 1 + hl_gates.lift_lines("solver", SOLVERS[0], ())[0] + hl_gates.SOLVER_STORE) == 1,
               "the solver hook is not between the cut and the store")
+        bgm = hl_gates.lift_lines("bgm", BGM, ())
+        body = s[s.index(HEAD % BGM):s.index(HEAD % "83373460")]
+        check(body.startswith(HEAD % BGM + bgm[0]) and body.count(bgm[1]) == 1 and body.count(bgm[2]) == 4, "the music manager hooks are not once each")
+        check(body.count(hl_gates.BGM_TIME + bgm[1]) == 1 and body.count(hl_gates.BGM_FLAGS + bgm[2]) == 4,
+              "the music manager hooks are not right after their loads")
+        check(bgm[1] not in s[s.index(HEAD % "83373460"):], "the next function's loads hooked too")
         check(all(hl_gates.text_hash(s, a) == h for a, h in hashes.items()), "a hook changed its function's hash")
         old = re.compile(r"^.*/\* hl gate ([0-9a-f]{8}) \*/\n", re.M).sub("", s)
         check(old == lifted, "an older tree's gates script does not restore the lift")
@@ -286,10 +351,15 @@ def hook_text():
         # (an exeFS mod patches the sound job: its hook out, the solver's stay)
         hl_gates.apply(str(gen), str(host), quiet=True, skip={SOUND: "some_mod"})
         t = code.read_text(encoding="utf-8")
-        check(gate not in t and step not in t and t.count("hos_oot_solver_steps((uint32_t)") == 2, "a patched function was hooked")
+        check(gate not in t and step not in t and t.count("hos_oot_solver_steps((uint32_t)") == 2 and "hos_oot_bgm" in t,
+              "a patched function was hooked")
+        hl_gates.apply(str(gen), str(host), quiet=True, skip={BGM: "some_mod"})
+        check("hos_oot_bgm" not in code.read_text(encoding="utf-8"), "a patched music manager was hooked")
         # (another game version: the functions' text differs, they are left alone)
-        for what, other, line in (("another slot", lifted.replace("+ 2192);", "+ 2200);", 1), "hos_oot_sound_"),
-                                  ("another field", lifted.replace("+ 712,", "+ 716,"), "hos_oot_solver_steps(")):
+        for what, other, line in (("another slot", lifted.replace("+ 2192);", "+ 2200);", 1), "hos_oot_sound_gate("),
+                                  ("another field", lifted.replace("+ 712,", "+ 716,"), "hos_oot_solver_steps("),
+                                  ("another flag byte", lifted.replace("c->x[26] + 2200", "c->x[26] + 2208", 1), "hos_oot_bgm"),
+                                  ("another time field", lifted.replace("(c->x[8]+24ULL)", "(c->x[8]+28ULL)", 1), "hos_oot_bgm")):
             code.write_text(other, encoding="utf-8", newline="")
             hl_gates.apply(str(gen), str(host), quiet=True)
             check(line not in code.read_text(encoding="utf-8"), "a function with %s was hooked" % what)
@@ -309,7 +379,7 @@ def main():
     a = p.parse_args()
     host_asks()
     hooked = hook_text().replace('#include "a64.h"\n', "")
-    plain = (LIFTED_SOUND + LIFTED_SOLVER).replace('#include "a64.h"\n', "")
+    plain = (LIFTED_SOUND + LIFTED_SOLVER).replace('#include "a64.h"\n', "") + LIFTED_BGM
     fixture = FIXTURE.replace("@HOST@", host_part()).replace("@LOGIC@", LOGIC)
     with tempfile.TemporaryDirectory(prefix="high-fps-") as tmp:
         c, exe = Path(tmp) / "fixture.c", Path(tmp) / "fixture.exe"
@@ -322,6 +392,7 @@ def main():
         subprocess.run([str(exe)], env=dict(env, HOS_FPS_SOUND="1", HOS_FPS_SOLVER="1"), check=True)   # (read by value: 1 is on)
         subprocess.run([str(exe), "sound-off"], env=dict(env, HOS_FPS_SOUND="0"), check=True)
         subprocess.run([str(exe), "solver-off"], env=dict(env, HOS_FPS_SOLVER="0"), check=True)
+        subprocess.run([str(exe), "bgm"], env=env, check=True)
         r = subprocess.run([str(exe), "sound-off"], env=env, capture_output=True, text=True)
         check(r.returncode != 0 and "FAIL:" in r.stderr, "the sound job is the game's own without HOS_FPS_SOUND=0")
         # (the negative control: the game's own job and count fail the same checks at 120 fps)
@@ -331,6 +402,8 @@ def main():
         check(r.returncode != 0 and "FAIL:" in r.stderr, "the unhooked job passes the checks: they prove nothing")
         r = subprocess.run([str(exe), "sound-off"], env=env, capture_output=True, text=True)
         check(r.returncode != 0 and "FAIL:" in r.stderr, "the unhooked solver count passes the checks: they prove nothing")
+        r = subprocess.run([str(exe), "bgm"], env=env, capture_output=True, text=True)
+        check(r.returncode != 0 and "FAIL:" in r.stderr, "the unhooked music manager passes the checks: they prove nothing")
     print("high fps fixes: ok")
 
 

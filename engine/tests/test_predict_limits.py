@@ -21,6 +21,9 @@ def check_wiring():
         # (the stop reaches the main loop, and the builds in hand are waited for with the memory still looked at)
         "!out_of_time.load() && !out_of_memory.load()",
         "the builds in hand are let finish",
+        # (the wait for them is bounded, and what the workers use outlives the function)
+        "RX_VK_PREDICT_WAIT_S", "shared->abandoned = true;", "t.detach()", "predict_slow_add(", "predict_slow_has(", "RX_VK_TEST_SLOW_PIPELINE",
+        "std::make_shared<Shared>()", "if (S.abandoned.load()) return;",
     ):
         if needle not in body:
             raise SystemExit("predict_run no longer has: " + needle)

@@ -35,6 +35,8 @@
    (they cannot leave the working set).
      HL_MEM_COLD=1  on (the default)    HL_MEM_COLD=0  off: nothing here runs, as before
      HL_MEM_COLD_HEAPS=1  the heaps too (the default)    HL_MEM_COLD_HEAPS=0  the pools only
+     HL_MEM_COLD_PRESSURE=0  without the back-off: a pass of 500 ms or more stops all trimming for 60 s, and the pools wait out
+       the quiet rule too (the default: the system is paging then, and what comes back is read from the page file)
      HL_MEM_COLD_FLAGS=<hex,...>  the pool flags (default 24,64)    HL_MEM_COLD_AGE=<seconds>  the pools' age (default 10)
    Every 10 s two lines "hl mem: cold pages (pools): ..." and "(heaps): ..." give the counters (MB out now, taken out, came
    back and how often, the most that came back in 10 s). */
@@ -299,7 +301,13 @@ static void heaps_pass(void) {
     }
 }
 
+static int pressure_on = 1;
+static int64_t pressure_until;
 static DWORD WINAPI cold_main(void *unused) {
+    {
+        const char *pe = getenv("HL_MEM_COLD_PRESSURE");
+        pressure_on = pe && pe[0] ? atoi(pe) != 0 : 1;
+    }
     (void)unused;
     double worst_ms[2] = {0, 0};
     int64_t next_report = hos_now_ns() + 10000000000LL;
@@ -308,20 +316,33 @@ static DWORD WINAPI cold_main(void *unused) {
     for (;;) {
         Sleep(COLD_PASS_MS);
         if (hos_pool_trap_active()) continue;
+        /* (STUT1, HL_MEM_COLD_PRESSURE=0: as before) A pass that took 500 ms or more, or memory coming back fast, stops the
+           trimming for a while, the pools' too: the v0.4.2 log of issue 67 (16 GB, 10.3 GB used, an RX 580) took 8.7 GB of pool
+           pages out and 6.8 GB came back, 113,504 units, and one working-set query took 6.8 s with game threads 2-11 s without a
+           core: the system was paging, and each page taken out was one more to read back */
+        if (pressure_on && hos_now_ns() < pressure_until) continue;
         const int64_t t0 = hos_now_ns();
         const int64_t unlocks0 = cold_unlocks, queries0 = cold_queries;
         cold_max_ws = cold_max_unlock = cold_max_query = 0;
-        pools_pass();
-        const int64_t t1 = hos_now_ns(), unlocks1 = cold_unlocks;
-        if (heaps_on) {
+        {
             const uint64_t back = hl_mem_cold_back_pages(HL_MEM_COLD_POOLS) + hl_mem_cold_back_pages(HL_MEM_COLD_HEAPS);
             if (++passes > 2 && back - back_before[1] >= COLD_QUIET_PAGES) quiet_left = COLD_QUIET_PASSES;
             back_before[1] = back_before[0], back_before[0] = back;
+        }
+        if (pressure_on && quiet_left > 0) hl_mem_cold_pass(HL_MEM_COLD_POOLS);   /* (the pools wait too, holds count on) */
+        else pools_pass();
+        const int64_t t1 = hos_now_ns(), unlocks1 = cold_unlocks;
+        if (heaps_on) {
             if (quiet_left > 0) quiet_left--, quiet_passes++, hl_mem_cold_pass(HL_MEM_COLD_HEAPS);   /* (holds count on) */
             else if (heaps_listed_on) heaps_pass_listed();
             else heaps_pass();
-        }
+        } else if (quiet_left > 0) quiet_left--;
         const int64_t t2 = hos_now_ns();
+        if (pressure_on && t2 - t0 >= 500000000LL) {
+            pressure_until = t2 + 60000000000LL;
+            static int told;
+            if (told++ < 8) hos_log("hl mem: cold pages: a pass took %.0f ms (working-set query %.0f ms): no trimming for 60 s (HL_MEM_COLD_PRESSURE=0: not)", (t2 - t0) / 1e6, cold_max_ws / 1e6);
+        }
         /* (a pass of 100 ms or more, alone, with its calls: such passes came with the 250 ms frames of the v0.4.0
            benchmark, the game's Resource Memory thread holding its core meanwhile) */
         if (t2 - t0 >= 100000000LL)

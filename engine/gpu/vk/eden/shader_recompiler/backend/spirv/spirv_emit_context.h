@@ -20,8 +20,6 @@
 
 namespace Shader::Backend::SPIRV {
 
-static std::bitset<8> clip_distance_written;
-
 using Sirit::Id;
 
 class VectorTypes {
@@ -48,6 +46,7 @@ struct TextureDefinition {
 
 struct TextureBufferDefinition {
     Id id;
+    Id pointer_type;
     u32 count;
 };
 
@@ -372,6 +371,8 @@ public:
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
     Id write_global_cas_loop_func{};
+    Id write_global_u8_func{};    // (hookshot) (address, value): the byte written directly
+    Id write_global_u16_func{};   // (hookshot) (address, value): the half written directly
     Id atomic_global_add_f32_func{};   // (hookshot) (address, value) -> the old value
 
     bool need_input_position_indirect{};

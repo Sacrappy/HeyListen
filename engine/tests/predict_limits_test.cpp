@@ -15,9 +15,10 @@ int main() {
     // (the two programs that took the PC's memory are over the default limit, and every other program of the game is under it)
     CHECK(too_big(1014000, kDefaultMaxKWords));
     CHECK(too_big(502000, kDefaultMaxKWords));
-    CHECK(!too_big(133000, kDefaultMaxKWords));
-    CHECK(!too_big(300999, kDefaultMaxKWords));   // (300k words and some: still 300 thousand)
-    CHECK(too_big(301000, kDefaultMaxKWords));
+    CHECK(too_big(144000, kDefaultMaxKWords));   // (the program that hung a Turing driver for 2 hours)
+    CHECK(!too_big(40000, kDefaultMaxKWords));
+    CHECK(!too_big(100999, kDefaultMaxKWords));   // (100k words and some: still 100 thousand)
+    CHECK(too_big(101000, kDefaultMaxKWords));
     CHECK(!too_big(0, kDefaultMaxKWords));
     // (0: no limit)
     CHECK(!too_big(5000000, 0));

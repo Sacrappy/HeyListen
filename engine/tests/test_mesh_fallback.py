@@ -209,7 +209,7 @@ def main():
     if "else if (p.fallback) pre->fallbacks.push_back(&p);" not in precompile or "fallback_compute_pipelines(p);" not in precompile:
         raise SystemExit("the precompile leaves the mesh fallback's compute pipelines to play")
     shader = (ROOT / "gpu" / "vk" / "vk_shader.cpp").read_text(encoding="utf-8")
-    if "(fallbacks && (it->second[0].kind & 4))" not in block(shader, "size_t program_cache_load_some(") or             "}, all_computes, true);" not in precompile:
+    if "(fallbacks && (it->second[0].kind & 4))" not in block(shader, "size_t program_cache_load_some(") or             "}, all_computes, !fallbacks_noted_only());" not in precompile:
         raise SystemExit("the precompile loads only the mesh fallback programs play has drawn (white until compiled)")
     print("mesh shader fallback (compute records and a vertex stage) ok")
 

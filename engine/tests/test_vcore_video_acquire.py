@@ -54,6 +54,9 @@ typedef struct AVPacket AVPacket;
 typedef struct AVFrame AVFrame;
 struct SwsContext;
 typedef long long LONG64;
+typedef void *HANDLE;
+typedef unsigned long DWORD;
+typedef struct { int x; } CONDITION_VARIABLE;
 typedef struct { int locked; } SRWLOCK;
 typedef struct { uint64_t x[32]; } Ctx;
 #define ARG(n) (c->x[n])
@@ -64,6 +67,7 @@ typedef struct { uint64_t x[32]; } Ctx;
 #define HOS_WRITTEN(p, n) ((void)0)
 static LONG64 InterlockedCompareExchange64(volatile LONG64 *p, LONG64 x, LONG64 cmp) { (void)x, (void)cmp; return *p; }
 static int video_log(void) { return 0; }
+static int video_trace(void) { return 0; }
 static void hos_log(const char *f, ...) { (void)f; }
 static int64_t clock_ns = 1000000000;
 static int64_t hos_now_ns(void) { return clock_ns; }
@@ -90,6 +94,8 @@ static void hos_sleep_ns(int64_t ns) {
     clock_ns += ns;
     if (away) hos_vcore_back();
 }
+static void worker_kick(Dec *d) { (void)d; }   /* (no decoder thread here: the way without one, dec_acquire decoding) */
+static int SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, unsigned long fl) { (void)cv, (void)l, (void)ms, (void)fl; return 1; }
 static Pool pool;
 static void *host_of(uint64_t obj, uint32_t magic) {
     if (magic == DEC_MAGIC) return obj == 1 ? &dec : NULL;
@@ -177,6 +183,34 @@ int main(void) {
     check(r == 0 && held == 0 && takes == 0, "a thread that held no core takes none");
     r = acquire(0, 1, 1, 1);
     check(r == 0 && dec.held == 1 && held == 0 && takes == 0, "nor through the hold");
+    /* with a decoder thread (HeyListen): catch-up skips pictures already decoded, never decodes on this thread, and shows the
+       only picture there is, late as it is */
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < dec.qn; i++) picture_free(&dec.queue[(dec.qhead + i) % MAX_QUEUE]);
+        memset(&dec, 0, sizeof dec);
+        pool.read_by_api = 0;
+        dec.worker = (HANDLE)1;
+        dec.slots[0] = 2;
+        dec.clock_set = 1, dec.clock_ns = clock_ns - 1000000000, dec.clock_pts = 0;
+        dec.phead = dec.ptail = &one;   /* (a submission waiting: the thread's, not decoded here) */
+        const int64_t pts[3] = {100000000, 117000000, 950000000};
+        dec.qn = k ? 1 : 3;
+        for (int i = 0; i < dec.qn; i++) {
+            Picture *p = &dec.queue[i];
+            p->w = p->h = 4, p->pts = pts[k ? 2 : i];
+            p->nv12 = (uint8_t *)calloc(1, 4 * 4 * 3 / 2);
+        }
+        Ctx c;
+        memset(&c, 0, sizeof c);
+        static uint32_t index;
+        static uint64_t sync;
+        c.x[0] = (uint64_t)(uintptr_t)&index, c.x[1] = (uint64_t)(uintptr_t)&sync, c.x[2] = 1;
+        held = 1, decodes = 0;
+        dec_acquire(&c);
+        check(c.x[0] == 0 && dec.qn == 0 && dec.last_pts == 950000000, k ? "the one late picture is shown" : "late pictures skipped, the newest shown");
+        check(decodes == 0, "no decoding on the acquiring thread when a decoder thread exists");
+        check(k || movie_totals[1] >= 2, "the skips are counted");
+    }
     if (!bad) puts("ok");
     return bad;
 }
@@ -189,7 +223,7 @@ def main():
     parser.add_argument("--source", type=Path, default=ROOT / "host/nn_video.c")
     args = parser.parse_args()
     src = args.source.read_text(encoding="utf-8")
-    defines = "\n".join(re.findall(r"^#define (?:RESULT_NO_OUTPUT|POOL_MAGIC|DEC_MAGIC|MAX_SLOTS|MAX_QUEUE|SYNC_IDLE_TAG|"
+    defines = "\n".join(re.findall(r"^#define (?:RESULT_NO_OUTPUT|POOL_MAGIC|DEC_MAGIC|MAX_SLOTS|MAX_QUEUE|MAX_OUT|SYNC_IDLE_TAG|"
                                    r"SYNC_IDLE_MASK)\b.*$", src, re.M))
     types = "\n".join((defines,
                        through(src, "typedef struct {\n    int w, h, format, count;", "} Pool;"),

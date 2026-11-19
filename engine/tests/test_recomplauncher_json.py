@@ -255,7 +255,7 @@ class RecompLauncherJsonTests(unittest.TestCase):
         by_key = {k: s for s in self.doc["settings"] for k in s["choices"][0]["set"]}
         up = {c["set"]["dlss"]: c["label"] for c in by_key["dlss"]["choices"]}
         self.assertEqual(up, {"0": "The game's own", "1": "NVIDIA DLSS", "2": "NVIDIA DLAA", "3": "AMD FSR 3.1", "4": "AMD FSR 4",
-                              "5": "AMD FSR 4 Native AA"})   # (gpu/vk/upscaler_rows.h: GAME DLSS DLAA FSR3 FSR4 FSR4_AA)
+                              "5": "AMD FSR 4 Native AA", "6": "Off"})   # (gpu/vk/upscaler_rows.h: GAME DLSS DLAA FSR3 FSR4 FSR4_AA OFF)
         fps = [c["label"].split()[0] for c in by_key["frame_rate_limit"]["choices"]]
         self.assertEqual(fps, ["60", "90", "120", "144", "165", "240"])   # (vk_menu.cpp tx_fps_limit)
         gen = [c["set"]["frame_generation"] for c in by_key["frame_generation"]["choices"]]

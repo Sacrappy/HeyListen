@@ -8,8 +8,9 @@
    pictures by buffer index (AcquireXDecoderOutputBuffer, GetXDecoderOutputBufferProperties), reads them back to
    its own memory as RGBA or NV12 (ReadDecoderOutputImageRgba / Nv12) and gives the buffer back (Release).
 
-   Here a submission is decoded at once; a finished picture waits in a queue until an Acquire puts it in the first
-   free registered buffer (host memory: the pool's guest memory is not used). The video service itself (nn::gsv) is
+   Submissions are decoded ahead on the decoder's own thread (HOS_VIDEO_NO_AHEAD=1: on the game's Acquire, as before); a
+   finished picture waits in a queue until an Acquire puts it in the first free registered buffer (host memory: the pool's
+   guest memory is not used). The video service itself (nn::gsv) is
    not emulated: nn::codec::video::Initialize does nothing. */
 #include "hos.h"
 #include <limits.h>
@@ -28,8 +29,15 @@
 #define DEC_MAGIC 0x43454456u      /* 'VDEC' */
 #define PREF_MAGIC 0x46455250u     /* 'PREF' */
 #define MAX_SLOTS 16
-#define MAX_QUEUE 8
+#define MAX_QUEUE 12
+#define AHEAD_DEFAULT 8            /* (HeyListen) pictures the decoder thread keeps decoded ahead (HOS_VIDEO_AHEAD=n) */
+#define MAX_OUT 16                 /* pictures one submission can bring out (the end drains a few) */
 
+static int video_trace(void) {   /* (HeyListen) HOS_VIDEO_TRACE=1: every acquisition and every read, one short line each ("vt ...") */
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_VIDEO_TRACE") != NULL;
+    return on;
+}
 static int video_log(void) {   /* HOS_VIDEO_LOG=1: submissions and acquisitions */
     static int on = -1;
     if (on < 0) on = getenv("HOS_VIDEO_LOG") != NULL;
@@ -47,6 +55,7 @@ typedef struct {
     int rgba_stale;           /* (hookshot) its NV12 picture not converted to RGBA yet (pool_rgba, when it is asked for) */
     int read_by_api;          /* (hookshot) read through ReadDecoderOutputImage*: no copy into its memory (dec_acquire) */
     struct SwsContext *sws;   /* (that conversion's) */
+    int64_t pts;              /* (HeyListen, HOS_VIDEO_TRACE) the pts of the picture last put in it */
 } Pool;
 /* the preference MakeDecodeImagePreference returns (the caller's buffer is larger: only these fields are ours) */
 typedef struct { uint32_t magic; uint16_t w, h; uint32_t format, tiling; } Pref;
@@ -104,6 +113,18 @@ typedef struct {
     int64_t held;                    /* (HeyListen) acquisitions answered with that picture again (ahead of the clock) */
     int64_t log_submits;             /* (HOS_VIDEO_LOG) submissions still to log, after a flush or the end */
     SRWLOCK lock;
+    /* (HeyListen) decode ahead: a thread decodes the submissions into the queue while fewer than `ahead` pictures wait
+       there, so Acquire finds a picture ready instead of decoding on the game's thread (a 1080p AV1 picture takes more
+       than its 16 ms when the CPU is busy). worker NULL: no thread, Acquire decodes as it did (HOS_VIDEO_NO_AHEAD=1).
+       All of it under `lock`, except the decoding itself (the decoder is the thread's alone) */
+    HANDLE worker;
+    CONDITION_VARIABLE cv_work;      /* the thread: a submission, room in the queue, a flush done, the end */
+    CONDITION_VARIABLE cv_pic;       /* Acquire and flush: a picture published, the thread idle */
+    int ahead, stop, flushing, decoding;
+    unsigned gen;                    /* (a flush makes what the thread is decoding stale) */
+    Picture out[MAX_OUT];            /* decoded, not published yet (the decoding thread's) */
+    int nout;
+    int64_t decoded, decode_ns, decode_max_ns;
 } Dec;
 
 /* (hookshot) the host objects of the game's pool and decoder objects, by the guest object's address: kept here, not in
@@ -264,6 +285,7 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEj
     }
     if (!o || i >= (uint32_t)o->count || x >= (uint32_t)o->w) { RET(0); return; }
     o->read_by_api = 1;
+    if (video_trace()) hos_log("vt R %.1f pts %.1f", (double)hos_now_ns() / 1e6, (double)o->pts / 1e6);
     const uint8_t *yp = o->nv12 + (size_t)i * o->w * o->h * 3 / 2, *uvp = yp + (size_t)o->w * o->h;
     const uint32_t cw = x + w <= (uint32_t)o->w ? w : o->w - x;
     for (uint32_t r = 0; ydst && r < h && y + r < (uint32_t)o->h; r++) {
@@ -281,6 +303,7 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEj
 
 /* ---- decoders ---- */
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h);
+static DWORD WINAPI decode_ahead(LPVOID arg);
 static void dec_init(Ctx *c, enum AVCodecID id, const char *what) { dec_init_sized(c, id, what, 0, 0); }
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h) {
     const AVCodec *codec = NULL;
@@ -310,11 +333,20 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
 #endif
     d->pkt = av_packet_alloc();
     d->frame = av_frame_alloc();
+    InitializeConditionVariable(&d->cv_work);
+    InitializeConditionVariable(&d->cv_pic);
+    if ((d->ctx || d->mf) && !getenv("HOS_VIDEO_NO_AHEAD")) {   /* (HeyListen) decode ahead, on a thread of its own */
+        const char *n = getenv("HOS_VIDEO_AHEAD");
+        d->ahead = n && atoi(n) > 0 ? (atoi(n) < MAX_QUEUE - 2 ? atoi(n) : MAX_QUEUE - 2) : AHEAD_DEFAULT;
+        d->worker = CreateThread(NULL, 0, decode_ahead, d, 0, NULL);
+        if (d->worker) SetThreadPriority(d->worker, THREAD_PRIORITY_ABOVE_NORMAL);
+        else hos_log("video: no decoder thread: decoding on the game's thread");
+    }
     set_host(ARG(0), DEC_MAGIC, d);
     static int logged;
     if (logged++ < 4)
-        hos_log("video: %s decoder %s (%dx%d)", what, d->ctx ? "ready" : d->mf ? "ready on Media Foundation" :
-                "not available in this FFmpeg", w, h);
+        hos_log("video: %s decoder %s (%dx%d)%s", what, d->ctx ? "ready" : d->mf ? "ready on Media Foundation" :
+                "not available in this FFmpeg", w, h, d->worker ? ", decoding ahead on its own thread" : "");
     RET(0);
 }
 static void picture_free(Picture *p) {
@@ -333,8 +365,18 @@ static void pending_free(Dec *d) {
 static void dec_finalize(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (!d) return;
+    if (d->worker) {   /* (the thread out before anything it uses is freed) */
+        AcquireSRWLockExclusive(&d->lock);
+        d->stop = 1;
+        WakeAllConditionVariable(&d->cv_work);
+        ReleaseSRWLockExclusive(&d->lock);
+        WaitForSingleObject(d->worker, INFINITE);
+        CloseHandle(d->worker);
+        d->worker = NULL;
+    }
     pending_free(d);
     for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
+    for (int i = 0; i < d->nout; i++) picture_free(&d->out[i]);
     if (d->sws) sws_freeContext(d->sws);
     avcodec_free_context(&d->ctx);
     mf_av1_close(d->mf);
@@ -343,7 +385,7 @@ static void dec_finalize(Ctx *c) {
     free(d);
     set_host(ARG(0), DEC_MAGIC, NULL);
 }
-/* a decoded frame into the queue, as RGBA and NV12 (the oldest dropped when the reader falls behind) */
+/* a decoded frame, as RGBA and NV12, into d->out (publish puts it in the queue) */
 static void queue_frame(Dec *d, const AVFrame *f) {
     const int w = f->width, h = f->height;
     if (w <= 0 || h <= 0) return;
@@ -379,12 +421,12 @@ static void queue_frame(Dec *d, const AVFrame *f) {
                 uv[(size_t)y * w + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
             }
     }
-    if (d->qn == MAX_QUEUE) {
-        picture_free(&d->queue[d->qhead]);
-        d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
+    if (d->nout == MAX_OUT) {   /* (never in practice) */
+        picture_free(&d->out[0]);
+        memmove(&d->out[0], &d->out[1], (MAX_OUT - 1) * sizeof d->out[0]);
+        d->nout--;
     }
-    d->queue[(d->qhead + d->qn) % MAX_QUEUE] = p;
-    d->qn++;
+    d->out[d->nout++] = p;
 }
 static void mf_picture(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts) {
     AVFrame f;
@@ -400,10 +442,65 @@ static void drain(Dec *d) {
         av_frame_unref(d->frame);
     }
 }
-/* the oldest submissions decoded until a picture comes out (or none are left). The stream's end is taken as soon as
-   it is next, pictures queued or not: the last picture decoded must carry the last flag, as the hardware's does. Media
-   Foundation's decoder holds nothing back, so waiting for an empty queue gave the flag only to a buffer handed out
-   again, with an older picture's pts, after the real last one went out unmarked */
+/* The decoding of one submission (pkt NULL: the stream's end) into d->out. Needs no lock: the decoder belongs to the one
+   thread that decodes (the decode-ahead thread, or Acquire when there is none). Returns 1 for the end */
+static int decode_packet(Dec *d, AVPacket *pkt) {
+    const int64_t t0 = hos_now_ns();
+    int end = 0;
+    if (d->mf) {   /* (hookshot) */
+        if (pkt) {
+            mf_av1_decode(d->mf, pkt->data, (size_t)pkt->size, pkt->pts, mf_picture, d);
+        } else {
+            mf_av1_decode(d->mf, NULL, 0, 0, mf_picture, d);
+            end = 1;
+        }
+    } else if (pkt) {
+        if (avcodec_send_packet(d->ctx, pkt) == AVERROR(EAGAIN)) {   /* (full: its pictures out first) */
+            drain(d);
+            avcodec_send_packet(d->ctx, pkt);
+        }
+        drain(d);
+    } else {   /* (the end: the rest out, the last picture marked) */
+        avcodec_send_packet(d->ctx, NULL);
+        drain(d);
+        avcodec_flush_buffers(d->ctx);   /* (a stream after it starts again) */
+        end = 1;
+    }
+    const int64_t ns = hos_now_ns() - t0;
+    d->decode_ns += ns;
+    if (ns > d->decode_max_ns) d->decode_max_ns = ns;
+    if (pkt && ++d->decoded % 120 == 0 && video_log()) {
+        hos_log("video: decode %lld pictures: %.1f ms each on average, %.1f ms at most (%s)", (long long)d->decoded,
+                (double)d->decode_ns / 1e6 / (double)d->decoded, (double)d->decode_max_ns / 1e6,
+                d->worker ? "on the decoder's thread" : "on the game's thread");
+        d->decode_max_ns = 0;
+    }
+    return end;
+}
+/* (lock held) what a decoding brought out into the queue (the oldest dropped when the reader falls behind), and the end:
+   the last picture carries the last flag, as the hardware's does */
+static void publish(Dec *d, int end) {
+    for (int i = 0; i < d->nout; i++) {
+        if (d->qn == MAX_QUEUE) {
+            picture_free(&d->queue[d->qhead]);
+            d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
+        }
+        d->queue[(d->qhead + d->qn) % MAX_QUEUE] = d->out[i];
+        d->qn++;
+    }
+    memset(d->out, 0, (size_t)d->nout * sizeof d->out[0]);
+    d->nout = 0;
+    if (end) {
+        d->eos = 1;
+        d->log_submits = 8;   /* (data after the end: a restart, worth seeing) */
+        if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
+    }
+}
+/* The oldest submissions decoded until a picture comes out (or none are left), on the calling thread: the way without
+   a decode-ahead thread. The stream's end is taken as soon as it is next, pictures queued or not: the last picture decoded
+   must carry the last flag, as the hardware's does. Media Foundation's decoder holds nothing back, so waiting for an empty
+   queue gave the flag only to a buffer handed out again, with an older picture's pts, after the real last one went out
+   unmarked */
 static void decode_next(Dec *d);
 static void decode_pending(Dec *d) {
     while (d->phead && (!d->qn || !d->phead->pkt)) decode_next(d);
@@ -414,35 +511,52 @@ static void decode_next(Dec *d) {
         Pending *n = d->phead;
         d->phead = n->next;
         if (!d->phead) d->ptail = NULL;
-        if (d->mf) {   /* (hookshot) */
-            if (n->pkt) {
-                d->eos = 0;
-                mf_av1_decode(d->mf, n->pkt->data, (size_t)n->pkt->size, n->pkt->pts, mf_picture, d);
-                av_packet_free(&n->pkt);
-            } else {
-                mf_av1_decode(d->mf, NULL, 0, 0, mf_picture, d);
-                d->eos = 1;
-                d->log_submits = 8;   /* (data after the end: a restart, worth seeing) */
-                if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
-            }
-        } else if (n->pkt) {
-            d->eos = 0;
-            if (avcodec_send_packet(d->ctx, n->pkt) == AVERROR(EAGAIN)) {   /* (full: its pictures out first) */
-                drain(d);
-                avcodec_send_packet(d->ctx, n->pkt);
-            }
-            drain(d);
-            av_packet_free(&n->pkt);
-        } else {   /* (the end: the rest out, the last picture marked) */
-            avcodec_send_packet(d->ctx, NULL);
-            drain(d);
-            d->eos = 1;
-            d->log_submits = 8;
-            if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
-            avcodec_flush_buffers(d->ctx);   /* (a stream after it starts again) */
-        }
+        if (n->pkt) d->eos = 0;
+        const int end = decode_packet(d, n->pkt);
+        publish(d, end);
+        av_packet_free(&n->pkt);
         free(n);
     }
+}
+/* (lock held) the decode-ahead thread has something to do: a submission, and room in the queue for its pictures (the
+   stream's end needs none: it only marks the last picture) */
+static int worker_wants(const Dec *d) {
+    return !d->stop && !d->flushing && !d->decoding && d->phead && (d->qn < d->ahead || !d->phead->pkt);
+}
+static DWORD WINAPI decode_ahead(LPVOID arg) {
+    Dec *d = (Dec *)arg;
+    AcquireSRWLockExclusive(&d->lock);
+    while (!d->stop) {
+        if (!worker_wants(d)) {
+            SleepConditionVariableSRW(&d->cv_work, &d->lock, INFINITE, 0);
+            continue;
+        }
+        Pending *n = d->phead;
+        d->phead = n->next;
+        if (!d->phead) d->ptail = NULL;
+        if (n->pkt) d->eos = 0;
+        const unsigned gen = d->gen;
+        d->decoding = 1;
+        ReleaseSRWLockExclusive(&d->lock);
+        const int end = decode_packet(d, n->pkt);
+        AcquireSRWLockExclusive(&d->lock);
+        d->decoding = 0;
+        if (gen == d->gen) {
+            publish(d, end);
+        } else {   /* (a flush came meanwhile: these pictures belong to the movie that was flushed) */
+            for (int i = 0; i < d->nout; i++) picture_free(&d->out[i]);
+            d->nout = 0;
+        }
+        WakeAllConditionVariable(&d->cv_pic);
+        av_packet_free(&n->pkt);
+        free(n);
+    }
+    ReleaseSRWLockExclusive(&d->lock);
+    return 0;
+}
+/* (lock held) the thread told: a submission, room in the queue, a flush done */
+static void worker_kick(Dec *d) {
+    if (d->worker) WakeConditionVariable(&d->cv_work);
 }
 static void pending_push(Dec *d, AVPacket *pkt) {
     Pending *n = (Pending *)calloc(1, sizeof *n);
@@ -546,6 +660,7 @@ static void dec_submit(Ctx *c) {
     if (video_log() && (d->submits <= 8 || (ARG(5) & 1) || logged_one))
         hos_log("video: submit %lld (%llu bytes, pts %lld%s)", (long long)d->submits, (unsigned long long)ARG(3),
                 (long long)ARG(4), (ARG(5) & 1) ? ", last" : "");
+    worker_kick(d);
     ReleaseSRWLockExclusive(&d->lock);
     RET(0);
 }
@@ -558,6 +673,10 @@ static void dec_flush(Ctx *c, const char *what) {
                     (long long)d->acquires, d->qn, d->eos ? "at the end" : d->phead ? "submissions left" : "none left",
                     (unsigned long long)c->x[30]);
         d->log_submits = 8;
+        if (d->worker) {   /* (what the thread is decoding is stale from now on; wait for it before the decoder is flushed) */
+            d->flushing = 1, d->gen++;
+            while (d->decoding) SleepConditionVariableSRW(&d->cv_pic, &d->lock, INFINITE, 0);
+        }
         if (d->ctx) avcodec_flush_buffers(d->ctx);
         else mf_av1_flush(d->mf);
         pending_free(d);
@@ -566,6 +685,8 @@ static void dec_flush(Ctx *c, const char *what) {
         d->eos = 0;
         d->clock_set = 0;
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
+        d->flushing = 0;
+        worker_kick(d);
         ReleaseSRWLockExclusive(&d->lock);
     }
     RET(0);
@@ -595,12 +716,21 @@ static void dec_acquire(Ctx *c) {
        lock (dec_submit). Every way out below gives it back, the HeyListen hold's too */
     const int away = hos_vcore_away();
     AcquireSRWLockExclusive(&d->lock);
-    decode_pending(d);
-    for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
-        ReleaseSRWLockExclusive(&d->lock);
-        hos_sleep_ns(2000000);
-        AcquireSRWLockExclusive(&d->lock);
+    if (d->worker) {   /* (HeyListen) decoded ahead by the decoder's thread: a picture is ready; if not, wait for it, up to ~100 ms */
+        const int64_t until = hos_now_ns() + 100000000;
+        while (!d->qn && !d->eos) {
+            const int64_t left = until - hos_now_ns();
+            if (left <= 0) break;
+            SleepConditionVariableSRW(&d->cv_pic, &d->lock, (DWORD)(left / 1000000 + 1), 0);
+        }
+    } else {
         decode_pending(d);
+        for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
+            ReleaseSRWLockExclusive(&d->lock);
+            hos_sleep_ns(2000000);
+            AcquireSRWLockExclusive(&d->lock);
+            decode_pending(d);
+        }
     }
     int slot = -1;
     for (int i = 0; i < MAX_SLOTS && slot < 0; i++)
@@ -615,9 +745,10 @@ static void dec_acquire(Ctx *c) {
     if (!d->qn) {   /* (nothing decoded: the buffer's last picture again; after the last submission, as the last) */
         d->busy[slot] = 1;
         if (d->eos) d->slot_last[slot] = 1, d->slot_pts[slot] = d->last_pts;   /* (the end at the last picture's time) */
-        const int idle = !d->eos && !d->phead;   /* (nothing will come into this buffer: its sync is not reached) */
+        const int idle = !d->eos && !d->phead && !d->decoding;   /* (nothing will come into this buffer: its sync is not reached) */
         if (idle && ARG(1))
             G64(ARG(1)) = SYNC_IDLE_TAG | ((uint64_t)InterlockedCompareExchange64(&submissions, 0, 0) & SYNC_IDLE_MASK);
+        if (video_trace()) hos_log("vt A %.1f none pts %.1f slot %d skipped 0 ahead 0", (double)hos_now_ns() / 1e6, (double)d->last_pts / 1e6, slot);
         if (video_log()) hos_log("video: acquire %lld: nothing decoded%s, buffer %d again", (long long)d->acquires,
                                  d->eos ? " (the end)" : idle ? " (idle: its sync not reached)" : "", slot);
         else if (d->acquires == 1 && !d->eos)   /* (the start: the frame shows the buffer as it was, black since the pool's fill) */
@@ -628,6 +759,7 @@ static void dec_acquire(Ctx *c) {
         RET(0);
         return;
     }
+    int skipped_now = 0;   /* (HOS_VIDEO_TRACE) */
     {   /* (hookshot) The game takes one picture a frame, and the sound plays on: under 60 fps the movie fell behind its
            sound (the intro "slow motion, audio ahead", issues 146 and 179). Pictures behind the movie's clock are skipped:
            the next ones decoded, as the whole movie is submitted at once. HOS_VIDEO_NO_CATCHUP=1: as before */
@@ -641,7 +773,9 @@ static void dec_acquire(Ctx *c) {
             const int64_t due = d->clock_pts + (now - d->clock_ns);
             if (d->queue[d->qhead].pts + late >= due) break;
             if (d->qn < 2) {
-                if (!d->phead) break;
+                /* (the last picture there is, late as it is: with a decoder thread the next is not waited for here, and
+                   the thread skips nothing; without one it is decoded now, then the late one is skipped) */
+                if (d->worker || !d->phead) break;
                 decode_next(d);
                 continue;
             }
@@ -649,6 +783,8 @@ static void dec_acquire(Ctx *c) {
             d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
             skipped++;
         }
+        skipped_now = skipped;
+        if (skipped) worker_kick(d);
         __atomic_add_fetch(&movie_totals[1], skipped, __ATOMIC_RELAXED);
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
     }
@@ -674,6 +810,8 @@ static void dec_acquire(Ctx *c) {
             d->busy[slot] = 1;
             d->last_slot = slot + 1;
             d->held++;
+            to->pts = d->last_pts;
+            if (video_trace()) hos_log("vt A %.1f held pts %.1f slot %d skipped 0 ahead %d", (double)hos_now_ns() / 1e6, (double)d->last_pts / 1e6, slot, d->qn);
             if (video_log() && d->held % 120 == 1)
                 hos_log("video: acquire %lld: the last picture again (the next is %.1f ms ahead of the movie's clock; %lld so far)",
                         (long long)d->acquires, (double)(d->queue[d->qhead].pts - due) / 1e6, (long long)d->held);
@@ -738,8 +876,11 @@ static void dec_acquire(Ctx *c) {
                 (unsigned long long)(n ? sum / n : 0), (unsigned long long)(n ? rgb[0] / n : 0),
                 (unsigned long long)(n ? rgb[1] / n : 0), (unsigned long long)(n ? rgb[2] / n : 0));
     }
+    o->pts = p->pts;
+    if (video_trace()) hos_log("vt A %.1f shown pts %.1f slot %d skipped %d ahead %d", (double)hos_now_ns() / 1e6, (double)p->pts / 1e6, slot, skipped_now, d->qn - 1);
     picture_free(p);
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
+    worker_kick(d);
     ReleaseSRWLockExclusive(&d->lock);
     if (away) hos_vcore_back();
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;

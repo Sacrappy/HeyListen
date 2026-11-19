@@ -33,6 +33,7 @@ ARGS = {
     "tests/test_sparse_bind_failure.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_dead_targets_sweep.py": ["--cxx", "{cxx}"],
     "tests/test_precompile_save.py": ["--cxx", "{cxx}"],
+    "tests/test_prepare_speed.py": ["--cxx", "{cxx}"],
     "tests/test_settings_atomic.py": ["--cc", "gcc"],
     "tests/test_host_alloc_wait.py": ["--cc", "gcc"],
     "tests/test_audio_speaker_layout.py": ["--cxx", "{cxx}"],
@@ -55,9 +56,11 @@ ARGS = {
     "tests/test_present_aspect.py": ["--cxx", "{cxx}"],
     "tests/test_present_aspect_vulkan.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
+    "tests/test_predict_limits.py": ["--cxx", "{cxx}"],
     "tests/test_ssbo_binding_align.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
     "tests/test_msync_fast.py": ["--cxx", "{cxx}"],
+    "tests/test_grow_lock.py": ["--cxx", "{cxx}"],
     "tests/test_readback_ticket.py": ["--cxx", "{cxx}"],
     "tests/test_capture_claim.py": ["--cxx", "{cxx}"],
     "tests/test_pcie_link.py": ["--cxx", "{cxx}"],
@@ -95,6 +98,7 @@ ARGS = {
     "tests/test_guestpages.py": ["--cc", "gcc"],
     "tests/test_hl_trace.py": ["--cc", "gcc"],
     "tests/test_windows_display_startup.py": ["--cc", "gcc"],
+    "tests/test_texture_handle_banks.py": ["--cxx", "{cxx}"],
     "tests/test_system_header_cache.py": ["--cc", "clang"],
     "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
     "tests/test_vulkan_clear_mip.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
@@ -115,6 +119,7 @@ ARGS = {
     "tests/test_frame_whole.py": ["--cc", "gcc"],
     "tests/test_web_floor_steps.py": ["--cc", "gcc"],
     "tests/test_scarecrow_timing.py": ["--cc", "gcc"],
+    "tests/test_above60_gameplay.py": ["--cc", "gcc"],
     "tests/test_vcore_held_flush.py": ["--cxx", "{cxx}"],
     "tests/test_audio_in.py": ["--cc", "gcc", "--cxx", "g++"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
@@ -128,6 +133,7 @@ ARGS = {
     "tests/test_fg_scale_sharpen.py": ["--cxx", "g++"],
     "tests/test_astc_bc_encode.py": ["--cxx", "{cxx}"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
+    "tests/test_upscaler_off.py": ["--cxx", "{cxx}"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],
     "tests/test_segment_plan.py": ["--cxx", "g++"],
     "tests/test_desc_counts.py": ["--cxx", "{cxx}"],
@@ -140,6 +146,7 @@ ARGS = {
     "tests/test_menu_utf8.py": ["--cxx", "{cxx}"],
     "tests/test_menu_keys.py": ["--cxx", "{cxx}"],
     "tests/test_menu_touchpad.py": [],
+    "tests/test_warp_wide.py": [],
     "tests/test_prompt_font_bind.py": ["--cc", "gcc"],
     "tests/test_hl_gates.py": ["--cc", "gcc"],
     "tests/test_stick_dead_zone.py": ["--cc", "gcc", "--cxx", "g++"],
@@ -165,6 +172,14 @@ ARGS = {
     "tests/test_seed_kept_loaded.py": ["--cxx", "g++"],
     "tests/test_prepare_seed_stamp.py": ["--cxx", "g++"],
     "tests/test_lower_atomg_cas.py": ["--cxx", "g++"],
+    "tests/test_lower_isberd_output.py": ["--cxx", "g++"],
+    "tests/test_lower_ldg_uniform_order.py": ["--cxx", "g++"],
+    "tests/test_lower_tld_ms.py": ["--cxx", "g++"],
+    "tests/test_lower_end_at_closing_branch.py": ["--cxx", "g++"],
+    "tests/test_lower_immediate_not_register.py": ["--cxx", "g++"],
+    "tests/test_lower_r2ur_one_register.py": ["--cxx", "g++"],
+    "tests/test_lower_lds_after_sts.py": ["--cxx", "clang++"],
+    "nx2/test_image_arrays.py": ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "tests/test_lower_lea_hi_constant.py": ["--cxx", "g++"],
     "tests/test_wb_diff_split.py": ["--cxx", "g++"],
     "tests/test_native_suatom.py": ["--cxx", "clang++"],
@@ -319,6 +334,8 @@ def cpp_checks(tools, timeout):
     out.append((lower, build_and_run(lower, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], ["{tmp}"])))
     regmap = "gpu/vk/tests/regmap_marker_test.cpp"   # (the lowering's renamed-register markers: no number mapped twice)
     out.append((regmap, build_and_run(regmap, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
+    ldsm = "gpu/vk/tests/ldsm_address_test.cpp"   # (LDSM's row addresses kept apart from its shuffles' registers)
+    out.append((ldsm, build_and_run(ldsm, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 

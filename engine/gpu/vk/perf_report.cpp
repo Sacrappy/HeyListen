@@ -115,7 +115,7 @@ double vram_total_gb() {
 }
 
 const char* upscaler_name(int v) {
-    static const char* const t[] = {"Game network", "DLSS", "DLAA", "FSR 3.1", "FSR 4", "FSR 4 AA"};
+    static const char* const t[] = {"Game network", "DLSS", "DLAA", "FSR 3.1", "FSR 4", "FSR 4 AA", "Off"};
     static_assert(sizeof t / sizeof t[0] == upscaler_rows::kUpscalers, "a name for each upscaler");
     return v >= 0 && v < upscaler_rows::kUpscalers ? t[v] : "other";
 }

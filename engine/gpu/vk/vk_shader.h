@@ -123,6 +123,7 @@ void seed_close();
 /// Program i of the seed, translated and kept for the default state (null: kept already, or it does not translate); its modules are yours
 std::unique_ptr<Program> seed_program(size_t i, int inputs = 0);
 bool seed_is_compute(size_t i);
+uint64_t seed_compute_key(size_t i);   // (the key of seed program i's compute stage, as the program cache and hookshot_computes.bin know it; 0: none)
 /// (hookshot) Seed program i, a compute program, kept in hookshot_programs.bin with every texture variant its questions can make (up
 /// to cap variants); made is given each variant not kept before
 struct SeedVariants {
@@ -157,6 +158,7 @@ Shader::AttributeType attribute_type_of(uint32_t vattr);
 Shader::TextureType handle_texture_type(uint32_t handle);
 void shader_stats(int64_t* translated, int64_t* failed);
 double shader_translate_ms();
+void shader_profile(double out[6]);   // (the preparation's profile: vk_shader.cpp)
 void program_released(const nvn_prog* p);
 
 } // namespace mkwvk

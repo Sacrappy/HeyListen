@@ -58,7 +58,7 @@ def main():
     draw = (VK / "vk_draw.cpp").read_text(encoding="utf-8")
     fn = section(internal, "inline uint64_t storage_binding_align()", "\n}\n") + "\n}\n"
 
-    profile = section(shader, "Shader::Profile make_profile()", "\n}\n")
+    profile = section(shader, "Shader::Profile make_profile(bool wide)", "\n}\n")
     host = section(shader, "Shader::HostTranslateInfo host_info()", "\n}\n")
     stamp = section(shader, "uint64_t disk_stamp()", "\n}\n")
     for name, body, want in (("make_profile", profile, "p.min_ssbo_alignment = storage_binding_align();"),

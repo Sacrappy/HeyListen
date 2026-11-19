@@ -263,7 +263,7 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{
                 MarkNonUniform(ctx, idx, index, NonUniformKind::UniformTexelBuffer)};
-            const Id ptr{ctx.OpAccessChain(ctx.image_buffer_type, def.id, idx)};
+            const Id ptr{ctx.OpAccessChain(def.pointer_type, def.id, idx)};
             const Id object{ctx.OpLoad(ctx.image_buffer_type, ptr)};
             if (non_uniform) {
                 DecorateNonUniform(ctx, ptr);

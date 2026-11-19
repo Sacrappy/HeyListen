@@ -18,7 +18,7 @@ Rules of this tree:
 | Module | Headers | State |
 |---|---|---|
 | Job system: workers, dependencies, lanes for gameplay jobs | `hl/jobs/JobSystem.h`, `hl/jobs/GuestLanes.h` | first version, tested; runs the game's stages behind `HL_JOBS` |
-| Main loop: phases, frame step, pacing | `hl/app/MainLoop.h`, `hl/bridge/FrameLoop.h` | in the game behind `HL_MAINLOOP` (on by default; `=0` is the translated loop): the game's frame steps are its phases |
+| Main loop: phases, frame step, pacing | `hl/app/MainLoop.h`, `hl/bridge/FrameLoop.h` | in the game behind `HL_MAINLOOP` (off by default from 0.4.3, on in 0.4.2; `=1` turns it on): the game's frame steps are its phases |
 | Job bridge: the game's job entry points and the structures read in place | `hl/bridge/JobBridge.h` | in the game behind `HL_JOBS`: 1 entry point of 18 answered (`hl::bridge::ready()` lists what is left) |
 | Memory: which cold pages of static GPU data and of the game's heaps leave the working set | `hl/mem/ColdPages.h` | in the game behind `HL_MEM_COLD` (on) and `HL_MEM_COLD_HEAPS`, through `engine/host/hl_mem.c` (`docs/native-engine/memory-boundary.md`, sections 8 and 11) |
 | Memory: a decoded resource's granules given back for good (no RAM, no commit) and made again from its file on touch | `hl/mem/Drop.h` | in the game behind `HL_MEM_DROP` (off) over the substrate `HOS_GUEST_PAGES`, through `engine/host/hl_drop.c` (`memory-boundary.md` section 14) |

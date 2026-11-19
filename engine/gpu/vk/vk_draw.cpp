@@ -59,6 +59,7 @@
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "precompile_save.h"   // (the pipeline cache written before the title after a long precompile)
+#include "prepare_work.h"   // (what a program of the seed costs a preparation: its progress bar)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -634,7 +635,7 @@ constexpr uint32_t kPushSize = Shader::Backend::SPIRV::MESH_FALLBACK_PUSH_END;
 void ensure_layout(Program& p) {
     if (p.layout) return;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
-    uint32_t total = 0;
+    uint64_t total = 0;   // (64-bit: a sum of 32-bit counts)
     auto add = [&](VkDescriptorType type, VkShaderStageFlags stage, const auto& descriptors) {
         for (const auto& d : descriptors) {
             bindings.push_back({(uint32_t)bindings.size(), type, d.count, stage, nullptr});
@@ -800,6 +801,7 @@ void skip_report_impl(double frames) {
 }
 std::atomic<int64_t> st_pipelines, st_links, st_link_us, st_lib_hits, st_lib_cold, st_lib_built, st_lib_build_us;
 std::atomic<int64_t> st_pipe_fresh_skips;   // (TICK-008) draws left out for a pipeline in the building, into targets made this frame
+std::atomic<int64_t> st_stolen_skips;   // (hookshot) draws left out for the frame in which their own wait ran their translation
 std::atomic<int64_t> st_pipeline_us;
 double st_wait_ms;
 double st_shader_wait_ms;   // (st_wait_ms's waits for a program's translation; the rest are for its pipeline)
@@ -1137,10 +1139,27 @@ NoteFile note_file_state(FILE* f, long* first) {
 bool targets_ok(uint32_t n, uint32_t samples, uint32_t topo) {
     return n <= 8 && samples >= 1 && samples <= 64 && !(samples & (samples - 1)) && topo <= VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
 }
+/// (hookshot) Formats a pipeline can be made with: each colour target's none or one this device draws to, the depth target's
+/// one it uses as depth. They come from the notes and the shareable state list, and any number reached the driver as a
+/// VkFormat (a crash in the shader preparation, at every start, until the file was deleted)
+bool formats_ok(uint32_t n, const uint32_t color[8], uint32_t has_depth, uint32_t depth) {
+    if (!dev.physical) return true;   // (no device to ask: the pipeline is not made either)
+    auto supports = [](uint32_t f, VkFormatFeatureFlags need) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, (VkFormat)f, &fp);
+        return (fp.optimalTilingFeatures & need) == need;
+    };
+    for (uint32_t i = 0; i < n && i < 8; i++)
+        if (color[i] != VK_FORMAT_UNDEFINED && !supports(color[i], VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return false;
+    return !has_depth || depth == VK_FORMAT_UNDEFINED ||
+           (is_depth_format((VkFormat)depth) && supports(depth, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT));
+}
 /// (hookshot) a note read from hookshot_pipelines.bin: its counts in range, its booleans 0 or 1, and no host pointers (the
 /// render targets' objects of the run that wrote it mean nothing here)
 bool note_sane(PipeNote& n) {
-    if (!targets_ok(n.n, n.samples, n.topo) || n.s.nvattr < 0 || n.s.nvattr > 16) return false;
+    if (!targets_ok(n.n, n.samples, n.topo) || n.s.nvattr < 0 || n.s.nvattr > 16 ||
+        !formats_ok(n.n, n.color_format, n.has_depth, n.depth_format))
+        return false;
     n.s.rt = nvn_p_set_rt{};
     for (bool* b : {&n.s.has_prog, &n.s.restart, &n.s.depth_clamp, &n.s.raster_discard, &n.s.render_enabled}) {
         unsigned char v;
@@ -1335,7 +1354,7 @@ std::vector<StateRec> state_list_read(const std::string& path) {
         StateRec r;
         while (fread(&r, sizeof r, 1, f) == 1) {
             if (r.nanswers > std::size(r.answers) || r.nquestions > std::size(r.questions) || r.nvattr > 16 ||
-                !targets_ok(r.n, r.samples, r.topo))
+                !targets_ok(r.n, r.samples, r.topo) || !formats_ok(r.n, r.color_format, r.has_depth, r.depth_format))
                 continue;   // (hookshot: a pipeline is made from the rest: its counts must be ones it can have)
             out.push_back(r);
         }
@@ -2565,13 +2584,12 @@ uint32_t handle_of(const NvnState& s, const Stage& st, const D& d, uint32_t k) {
     if constexpr (requires { d.handle_program; }) {   // (read from a storage buffer: its handle program's; of a table, element k's)
         if (d.handle_program != ~0U) return stage_handle(s, st, d.handle_program, k);
     }
-    const int nvn_stage = st.nvn_stage;
     const uint32_t step = 1u << d.size_shift;
-    uint32_t h = driver_bank_word(s, (int)d.cbuf_index, nvn_stage, d.cbuf_offset + k * step);
+    uint32_t h = stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset + k * step);
     if constexpr (requires { d.has_secondary; }) {
         if (d.has_secondary) {
             const uint32_t a = h << d.shift_left;
-            const uint32_t b = driver_bank_word(s, (int)d.secondary_cbuf_index, nvn_stage, d.secondary_cbuf_offset + k * step)
+            const uint32_t b = stage_cbuf_word(s, st, d.secondary_cbuf_index, d.secondary_cbuf_offset + k * step)
                                << d.secondary_shift_left;
             h = a | b;
         }
@@ -7249,15 +7267,60 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     auto wait_for = [&](const std::atomic<bool>& ready, bool shader) {
         PROF_EXACT();
         const auto t0 = std::chrono::steady_clock::now();
-        jobs_wait(ready);
+        const bool fresh = jobs_wait(ready);
         st_waits++;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         st_wait_ms += ms;
         if (shader) st_shader_wait_ms += ms;
+        return fresh;
     };
+    // (hookshot) The storm hold: while the translation queue is still hundreds deep — a cold area's arrival, its fade
+    // rewriting the texture handles every game frame, each frame's state its own variant — this thread's draws are
+    // left out, and the frames show the area's earlier picture, as a draw left out always does. The frames the storm
+    // itself drew sampled the fade's transient words (white/cyan blowouts, green bands — the picture regression that
+    // 9c42f5e7's render-instead-of-stall unmasked); the queue's depth is the churn's own clock, so the first presents
+    // past the hold sample the state by then settled. The waits below still run, and still steal: it is what drains
+    // the queue at the pace the storm always had. Engaged above RX_VK_STORM_HOLD jobs (200), released below half of
+    // that: the queue saws with each frame's pushes, and a hold that flickered with it drew the churn's transient
+    // frames anyway. 0: off, drawn as before
+    static const int hold_deep = getenv("RX_VK_STORM_HOLD") ? atoi(getenv("RX_VK_STORM_HOLD")) : 0;   // (off by default since v0.4.3: the steal it covers for is off; RX_VK_STORM_HOLD=200 with RX_VK_JOB_STEAL=1)
+    static const int64_t hold_off = (int64_t)std::max(1, hold_deep / 2);
+    thread_local bool hold_on = false;
+    const int64_t pending_jobs = jobs_pending();
+    if (hold_deep <= 0) hold_on = false;
+    else if (hold_on) {
+        if (pending_jobs < hold_off) hold_on = false;
+    } else if (pending_jobs >= (int64_t)hold_deep) hold_on = true;
+    static std::atomic<int64_t> st_storm_holds{0};
+    if (hold_on && cp->ready.load(std::memory_order_acquire)) {
+        st_pending_skips++;
+        st_storm_holds.fetch_add(1, std::memory_order_relaxed);
+        if (st_storm_holds.load(std::memory_order_relaxed) < 8 ||
+            st_storm_holds.load(std::memory_order_relaxed) % 2000 == 0)
+            logf("vk: a translation storm: %d jobs queued, the frame's draws left out until it drains",
+                 jobs_pending());
+        return;
+    }
     if (!cp->ready.load(std::memory_order_acquire)) {
         if (may_skip) return void(st_pending_skips++);
-        wait_for(cp->ready, true);
+        // (hookshot) The translation finished in this draw's own wait: stolen to run here (9c42f5e7) or a worker seen
+        // finishing it just then. Its variant's answers were read mid-storm — a cold area's arrival fades textures in and
+        // out and rewrites the handles every frame — and what the frames of the storm drew from them showed as white/cyan
+        // blowouts and green bands, the picture regression of #1714's unmasked race. The draw is left out of this frame, as
+        // a draw whose program was not ready always was; the frame itself keeps the steal's win (the translation ran, the
+        // queue advanced, no 6-12 s stall), and the next frame's pick re-validates the variant against the state by then.
+        // RX_VK_STOLEN_SKIP=0: drawn at once, as 9c42f5e7 alone
+        static const bool stolen_skip = !getenv("RX_VK_STOLEN_SKIP") || atoi(getenv("RX_VK_STOLEN_SKIP")) != 0;
+        const bool fresh = wait_for(cp->ready, true);
+        if (stolen_skip && fresh) {
+            st_pending_skips++;
+            st_stolen_skips.fetch_add(1, std::memory_order_relaxed);
+            if (st_stolen_skips.load(std::memory_order_relaxed) < 12 ||
+                st_stolen_skips.load(std::memory_order_relaxed) % 1000 == 0)
+                logf("vk: a draw waited out its own translation (program %016llx): left out for this frame",
+                     (unsigned long long)cp->key);
+            return;
+        }
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
     if (cp->failed) SKIP_HERE();
@@ -8068,7 +8131,8 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
             const VkImageView output_view = texture_view(dst, &out, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage,
                                                          &output_format, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
             if (input_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && output_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
-                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", gameplay_network(key))) {
+                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback",
+                              gameplay_network(key) && !upscaler_off())) {   // (Upscaler Off: no edge smoothing either)
                 full_barrier(cmd);
                 texture_written(dst);
                 return true;
@@ -8324,6 +8388,45 @@ static bool temporal_rejected_network(VkCommandBuffer cmd, uint64_t key, Texture
     if (seen.size() < 32 && seen.insert(key).second)
         logf("vk: network %016llx does not translate here: the temporal upscaler draws its upscale (%ux%u -> %ux%u)",
              (unsigned long long)key, src->width, src->height, dst->width, dst->height);
+    return true;
+}
+/// (hookshot) The Upscaler row's Off: the gameplay upscale networks (the keyed ones, and the Render resolution's fixed shares by
+/// their shape and formats, as temporal_upscale takes them) are not run: their dispatch draws the plain linear upscale of the
+/// 3D input, the typed path the stub has (shaders/taau_upscale.comp) with no FXAA and no history bound. At 100% (the same-size
+/// pass 9dc98871) that is the scene's colour decoded into the picture, a copy. No temporal state is touched. After fsr3_stand_in
+/// (frame generation's inputs are still made) and temporal_stand_in (not drawing when Off), before the TAAU stand-in
+static bool off_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
+    if (p.stages.empty() || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
+    const Stage& st = p.stages[0];
+    const bool known = gameplay_network(p.key);
+    if (!known && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
+                    st.info.image_descriptors.size() == 1))
+        return false;
+    if (st.info.texture_descriptors.empty() || st.info.image_descriptors.empty() || !upscaler_off()) return false;
+    size_t ntex = 0;   // (build_descriptors' image infos: the textures', then the images')
+    for (const auto& d : st.info.texture_descriptors) ntex += d.count;
+    if (dw().imgs.size() <= ntex || !dw().imgs[0].imageView || !dw().imgs[ntex].imageView) return false;
+    const auto& od = st.info.image_descriptors[0];
+    const uint32_t out_handle = handle_of(s, st, od, 0);
+    if (!out_handle) return false;
+    Texture* out = nullptr;
+    uint32_t level = 0;
+    texture_view_of(out_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
+    if (!out || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return false;
+    if (!known) {   // (another network of the upscale's shape: only the scene into the picture, the rest runs)
+        Texture* in = nullptr;
+        const uint32_t in_handle = handle_of(s, st, st.info.texture_descriptors[0], 0);
+        if (in_handle) texture_view_of(in_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &in);
+        if (!in || in->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || (out->width >> level) <= in->width) return false;
+    }
+    if (!typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, "Upscaler Off", false))
+        return false;
+    static std::mutex mu;
+    static std::unordered_set<uint64_t> seen;
+    std::lock_guard lk(mu);
+    if (seen.size() < 32 && seen.insert(p.key).second)
+        logf("vk: Upscaler Off: network %016llx not run, its dispatch draws the plain upscale into %ux%u",
+             (unsigned long long)p.key, out->width >> level, out->height >> level);
     return true;
 }
 bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
@@ -8649,6 +8752,88 @@ unsigned long long commit_left_mb() {
     return GlobalMemoryStatusEx(&m) ? (unsigned long long)(m.ullAvailPageFile >> 20) : ~0ull;
 }
 }  // namespace
+std::atomic<double> prepare_cost_fraction{-1.0};   // (-1: no preparation runs here; see prepare_work.h)
+double prepare_progress_by_cost() { return prepare_cost_fraction.load(); }
+namespace {
+/// (hookshot) Where a preparation's time goes, by kind of work: how many, the thread time in them and the longest one. A graphics
+/// program, a native mesh program, a mesh fallback program (the three: the program's translation and what it keeps), a compute
+/// program (its texture variants' translations; the driver's builds of them are the next) and the driver's builds (a compute pipeline
+/// of each variant, a graphics program's stage libraries)
+struct PrepKind {
+    std::atomic<int64_t> n{0}, us{0}, max_us{0};
+    void add(std::chrono::steady_clock::time_point since) {
+        const int64_t d = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count();
+        n++, us += d;
+        int64_t m = max_us.load();
+        while (d > m && !max_us.compare_exchange_weak(m, d)) {}
+    }
+    void log(const char* what) const {
+        if (n.load()) logf("vk: prepare profile: %-24s %7lld x, %8.1f s thread time, %6.0f ms each, longest %.1f s", what, (long long)n.load(),
+                           us.load() / 1e6, us.load() / 1e3 / (double)n.load(), max_us.load() / 1e6);
+    }
+};
+/// (hookshot) The preparation's workers. A worker is one thread working through the seed's programs; the driver's compiles are most of
+/// a worker's time (80% on an RTX 3050), and a thread inside one is the CPU's, not ours, so as many as the machine has threads is
+/// right: half of them, as it was, left the other half of the CPU idle for the whole of a first start's wait. What the driver's
+/// compiles hold in memory bounds it instead (prepare_commit_gate). RX_VK_PREPARE_WORKERS=<n>: that many (1 to 64); the old count
+/// (half the CPUs) is RX_VK_PREPARE_WORKERS=old
+unsigned prepare_worker_count(bool background, unsigned cpus) {
+    return prepare_work::workers(background, cpus, getenv("RX_VK_PREPARE_WORKERS"));
+}
+/// (hookshot) Which texture variants of a compute program the driver builds before the game. A compute program is translated for the
+/// texture types its questions can get (up to 64 variants, seed_compute), the plain answers (every texture a 2D colour image: what the
+/// game binds to nearly all of them) first. RX_VK_WARM_VARIANTS=all: every variant is built, as before (10330 compute pipelines for 6306
+/// programs: on an RTX 3050 the variants were half of the pipelines and 78% of the driver's time, 3054 s of 3893); base (the default): only the plain one is, here and in the precompile, and a variant the game does bind is built when its
+/// first dispatch asks (a worker, the dispatch left out meanwhile as for any compute pipeline) and kept for the next start
+bool warm_base_only() {
+    static const bool base = [] {
+        const char* e = getenv("RX_VK_WARM_VARIANTS");
+        return !(e && !strcmp(e, "all"));
+    }();
+    return base;
+}
+/// (hookshot) Which compute programs the driver builds before the game: with a list of the ones play dispatched (hookshot_computes.bin:
+/// a start that has played, or a list that came with the build) only those, the rest when first dispatched as on any later start
+/// (RX_VK_LAZY_COMPUTE); without one, every kept one, as there was nothing to go by. RX_VK_WARM_COMPUTES=all: every one whatever the
+/// list says; used: those of the list (a list of fewer than 32 keys is no list)
+bool warm_used_only(const std::unordered_set<uint64_t>& used) {
+    const char* e = getenv("RX_VK_WARM_COMPUTES");
+    if (e && !strcmp(e, "all")) return false;
+    return used.size() >= 32 || (e && !strcmp(e, "used") && !used.empty());
+}
+/// (hookshot) A GPU without mesh shaders: the precompile builds the compute pipelines of every program translated for the fallback
+/// (1286 here), not only those the notes name. On an RTX 3050 that is 3 minutes; AMD's compiler took 3 to 12 s on each. RX_VK_PRECOMPILE_FALLBACKS=noted:
+/// only those the notes (and the state list) name; the rest are built at their first draw, as the others are
+bool fallbacks_noted_only() {
+    const char* e = getenv("RX_VK_PRECOMPILE_FALLBACKS");
+    return e && !strcmp(e, "noted");
+}
+thread_local unsigned warm_seen = 0;   // (the variants of the program this worker is on that were asked for so far: the first is the plain one)
+/// (hookshot) A driver compile asks for memory (a program of a million SPIR-V words took gigabytes, and several of them at once
+/// are what the commit limit refuses): before one begins, while the system's commit left is under a reserve and another worker is
+/// in the driver, it waits, so that more workers than before cannot be what runs the PC out. Alone it goes on, as before
+struct CommitGate {
+    static std::atomic<int>& inside() {
+        static std::atomic<int> n{0};
+        return n;
+    }
+    static std::atomic<int64_t>& waited_ms() {
+        static std::atomic<int64_t> ms{0};
+        return ms;
+    }
+    CommitGate() {
+        static const unsigned long long reserve = getenv("RX_VK_PREPARE_COMMIT_MB") ? strtoull(getenv("RX_VK_PREPARE_COMMIT_MB"), nullptr, 10) : 3072;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (reserve && inside().load() > 0 && commit_left_mb() < reserve && !prepare_stopped()) Sleep(100);
+        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (ms > 50) waited_ms() += ms;
+        inside()++;
+    }
+    ~CommitGate() { inside()--; }
+    CommitGate(const CommitGate&) = delete;
+    CommitGate& operator=(const CommitGate&) = delete;
+};
+}  // namespace
 /// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator. True: prepared now.
 /// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
 /// its compiler crashing in here would take the game with it)
@@ -8728,6 +8913,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     // (hookshot) compute pipelines too, for the driver's own cache: built in play they stopped the game while the driver compiled
     // them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
     std::atomic<int64_t> warm_us{0};   // (the driver's part, the workers' time added up)
+    PrepKind k_graphics, k_mesh, k_fallback, k_compute, k_warm_compute, k_warm_variant, k_warm_graphics;   // (the profile: where the time went)
     struct WarmClock {
         std::atomic<int64_t>& sum;
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -8741,8 +8927,17 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         explicit DriverTurn(bool lift) : on(lift) { if (on) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); }
         ~DriverTurn() { if (on) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE); }
     };
+    const std::unordered_set<uint64_t> used_computes = computes_read();
+    const bool used_only = warm_used_only(used_computes);
+    std::atomic<size_t> left_to_play{0};
     const auto warm_compute = [&](Program& p) {
         if (!warm_cs || taau_key(p.key)) return;
+        if (used_only && !used_computes.count(p.key)) {   // (not one play dispatched: its first dispatch builds it)
+            left_to_play++;
+            return;
+        }
+        const bool variant = warm_seen++ != 0;
+        if (variant && warm_base_only()) return;   // (a variant: left to its first dispatch)
         WarmClock wc{warm_us};
         const uint64_t id = shader_key_on() ? ledger_id_compute(p) : 0;
         if (id && ledger_has(id)) {   // (RX_VK_SHADER_KEY: the driver has this very compute shader and layout already)
@@ -8750,6 +8945,8 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
             return;
         }
         const DriverTurn turn{background};
+        const auto t_warm = std::chrono::steady_clock::now();
+        const CommitGate commit;
         ensure_layout(p);
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -8758,6 +8955,11 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         ci.stage.pName = "main";
         pin_subgroup(ci.stage, p.workgroup[0]);
         ci.layout = p.layout;
+        struct Timed {
+            PrepKind& k;
+            std::chrono::steady_clock::time_point t;
+            ~Timed() { k.add(t); }
+        } timed{variant ? k_warm_variant : k_warm_compute, t_warm};
         if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         precompile_compute_quick(ci);   // (Intel's one-at-a-time builds: without the optimizer, as a dispatch's first)
         VkPipeline pl = VK_NULL_HANDLE;
@@ -8772,6 +8974,17 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
         if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
     };
+    // (the bar counts work by what it costs, not programs: 3000 programs of the seed are compute programs whose driver builds take
+    // 0.3 s to tens of seconds each, 30000 are graphics programs of a few ms. By programs the bar sat at 7% for the first 8 minutes
+    // of a 9 minute preparation on an RTX 3050, and the builder's time left, which goes by it, said hours; prepare_work.h)
+    std::vector<uint32_t> cost(programs);
+    uint64_t cost_total = 0;
+    for (size_t k = 0; k < programs; k++) {
+        cost[k] = prepare_work::cost(seed_is_compute(k), seed_is_compute(k) && used_only && !used_computes.count(seed_compute_key(k)));
+        cost_total += cost[k];
+    }
+    std::atomic<uint64_t> cost_done{0};
+    prepare_cost_fraction.store(0.0);
     const auto worker = [&] {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
@@ -8783,14 +8996,19 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
             const size_t k = order[i / 3];
             if (seed_is_compute(k)) {   // (hookshot) a compute program with each of its texture variants, each warmed
                 if (i % 3 == 0) {
+                    const auto t_seed = std::chrono::steady_clock::now();
+                    warm_seen = 0;
                     const SeedVariants v = seed_compute(k, 64, warm_compute);
+                    k_compute.add(t_seed);
                     made += v.variants != 0, variants += v.variants, asking += v.variants > 1, capped += v.capped && v.variants;
+                    cost_done += cost[k];
                 }
                 done++;
                 continue;
             }
             const auto t_prog = std::chrono::steady_clock::now();
             std::unique_ptr<Program> seeded = seed_program(k, (int)(i % 3));
+            if (seeded) (seeded->fallback ? k_fallback : seeded->mesh ? k_mesh : k_graphics).add(t_prog);
             {   // (hookshot: a program that took over a second to prepare is named, a few dozen times: the no-mesh fallback's first
                 // start ran about 100 times slower than a mesh GPU's)
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_prog).count();
@@ -8808,6 +9026,8 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
                 } else if (!p->failed && warm && !p->compute) {
                     WarmClock wc{warm_us};
                     const DriverTurn turn{background};
+                    const auto t_libs = std::chrono::steady_clock::now();
+                    const CommitGate commit;
                     ensure_layout(*p);
                     Targets at{};
                     int built = 0;
@@ -8817,19 +9037,20 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
                             libs++, built++;
                         }
                     if (lib_id && built == 2) ledger_add(lib_id);
+                    k_warm_graphics.add(t_libs);
                 }
                 for (Stage& st : p->stages)
                     if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
                 if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
                 if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
             }
+            if (i % 3 == 0) cost_done += cost[k];
             done++;
         }
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    // (in play: a quarter of the CPUs, two to four, the game's own threads before them)
-    const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : std::clamp(cpus / 2, 1u, 32u);
+    const unsigned workers = prepare_worker_count(background, cpus);
     // (a lazy update: first the programs the pipeline state lists name, the ones the game draws with, and the pipelines the notes name
     // for them, the driver's only for those whose ledger id is missing, then the rest of the seed)
     if (lazy) state_list_prepare(nullptr, true);
@@ -8838,6 +9059,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     auto stat_at = std::chrono::steady_clock::now();
     while (done.load() < total && !prepare_stopped()) {
         if (progress) progress(done.load() / 3, programs);   // (in programs, as the log counts them, not programs times variants)
+        if (!background && cost_total) prepare_cost_fraction.store((double)std::min<uint64_t>(cost_done.load(), cost_total) / (double)cost_total);
         Sleep(100);
         if ((!background || lazy) && std::chrono::steady_clock::now() - stat_at > std::chrono::seconds(background ? 30 : 10)) {
             // (every 10 s: what a run cut short by its time limit still says, and what the driver built so far is listed already)
@@ -8870,6 +9092,21 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     logf("vk: shader key %s: %lld driver builds left out (the same SPIR-V and layout were built before), %lld built and listed; "
              "translation %.1f s and the driver's part %.1f s of work, on %u workers",
              shader_key_on() ? "on" : "off", (long long)ledger_reused.load(), (long long)ledger_built.load(), shader_translate_ms() / 1000.0, warm_us.load() / 1e6, workers);
+    {   // (where the time went; one line a kind, thread time)
+        double prof[6];
+        shader_profile(prof);
+        logf("vk: prepare profile: %u workers on %u CPUs, wall %.1f s; translation %.1f s of thread time, of which the driver's shader modules "
+             "%.1f s, the cache's fingerprints %.1f s, packing %.1f s, waiting for the cache file %.1f s and writing it %.1f s; the driver's "
+             "builds waited %.1f s for memory", workers, cpus, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+             prof[0], prof[1], prof[2], prof[3], prof[4], prof[5], CommitGate::waited_ms().load() / 1e3);
+        k_graphics.log("graphics programs");
+        k_mesh.log("native mesh programs");
+        k_fallback.log("mesh fallback programs");
+        k_compute.log("compute (all variants)");
+        k_warm_compute.log("compute pipelines, plain (drv)");
+        k_warm_variant.log("compute pipelines, variants");
+        k_warm_graphics.log("stage libraries (driver)");
+    }
     if (driver_part) remove(warming.c_str());
     if (const size_t kept = program_cache_kept(); kept != SIZE_MAX) prepared_for.kept = kept;
     prepared_write(path, prepared_for);
@@ -8993,14 +9230,23 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
     // (upstream, Sync 11: without the lazy start, the compute programs play dispatched (hookshot_computes.bin), or every kept one
     // when there is no list yet. RX_VK_PRECOMPILE_COMPUTES=all / none)
     const char* which = getenv("RX_VK_PRECOMPILE_COMPUTES");
-    const std::unordered_set<uint64_t> used = lazy_compute ? std::unordered_set<uint64_t>{} : computes_read();
+    // (STUT1, RX_VK_LAZY_COMPUTE_WARM=1, off by default: 4 interleaved rounds on the PC 3050 showed no gain, dispatch time in slow submits 1.4-1.9 s against 1.0-1.8 s) The lazy start also builds, on the precompile's workers behind the start, the compute
+    // programs the plays before dispatched (hookshot_computes.bin: a few hundred, from the pipeline cache): an area's load
+    // dispatched ~10 of them in one submit, each waiting up to 50 ms, "slow submit: 888 ms: dispatch 267" (PC 3050, 0.9-1.3 s of the
+    // slow submits of a Market to Hyrule Field load)
+    static const bool warm = getenv("RX_VK_LAZY_COMPUTE_WARM") && atoi(getenv("RX_VK_LAZY_COMPUTE_WARM")) != 0;
+    const std::unordered_set<uint64_t> used = lazy_compute && !warm ? std::unordered_set<uint64_t>{} : computes_read();
     const bool all_computes = !lazy_compute && (which ? !strcmp(which, "all") : used.empty());
-    if (!lazy_compute && !all_computes && !(which && !strcmp(which, "none"))) wanted.insert(used.begin(), used.end());
+    if ((lazy_compute ? warm : !all_computes) && !(which && !strcmp(which, "none"))) wanted.insert(used.begin(), used.end());
+    std::unordered_map<uint64_t, unsigned> variants_seen;   // (RX_VK_WARM_VARIANTS=base: the first variant a key has is the plain one)
+    size_t variants_left = 0;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
-        if (p.compute) pre->computes.push_back(&p);
+        if (p.compute && warm_base_only() && variants_seen[p.key]++ && !p.fallback) variants_left++;   // (not built before the game)
+        else if (p.compute) pre->computes.push_back(&p);
         else if (p.fallback) pre->fallbacks.push_back(&p);   // (hookshot: the mesh fallback's compute pipelines too, before play)
-    }, all_computes, true);
+    }, all_computes, !fallbacks_noted_only());
+    if (variants_left) logf("vk: precompile: %zu texture variants of compute programs are left to their first dispatch (RX_VK_WARM_VARIANTS=all: built)", variants_left);
     if (lazy_compute) logf("vk: precompile: the compute programs stay on disk until dispatched (RX_VK_LAZY_COMPUTE)");
     else logf("vk: precompile: compute programs: %s (%zu keys listed as dispatched in play)",
               all_computes ? "every kept one" : (which && !strcmp(which, "none")) ? "none" : "those play dispatched", used.size());
@@ -9119,38 +9365,145 @@ void precompile_run(void (*progress)(size_t done, size_t total), bool wait) {
 /// noted (a lazy update, in play): the pipelines the notes name themselves, not those they predict, built into our pipeline cache too:
 /// what precompile_run would have built before the game, for the programs the state list has made by now, so that the draws that
 /// meet a changed shader find the driver's compile done
+/// (hookshot) The programs whose prediction was given up (a driver compile that outlasted the wait, see predict_run), in
+/// hookshot_predict_slow.txt beside the game: a line "device <vendor>:<device>:<driver>" and a line "<key> <k words> <seconds>" each.
+/// Read for the same device and driver only (a new driver may do better); the next prediction leaves them to the draw that needs them
+namespace {
+std::string predict_slow_path() {
+    std::string p = prepared_path();
+    return p.substr(0, p.size() - strlen("hookshot_prepared.bin")) + "hookshot_predict_slow.txt";
+}
+std::string predict_slow_device() {
+    char b[96];
+    snprintf(b, sizeof b, "device %x:%x:%x", (unsigned)dev.props.vendorID, (unsigned)dev.props.deviceID, (unsigned)dev.props.driverVersion);
+    return b;
+}
+std::mutex predict_slow_mu;
+std::unordered_set<uint64_t>& predict_slow_set() {   // (under predict_slow_mu)
+    static std::unordered_set<uint64_t> keys;
+    static bool read = false;
+    if (!read) {
+        read = true;
+        if (FILE* f = fopen(predict_slow_path().c_str(), "rb")) {
+            char line[256];
+            bool same = false;
+            if (fgets(line, sizeof line, f)) same = predict_slow_device() == std::string(line).substr(0, std::string(line).find_first_of("\r\n"));
+            while (same && fgets(line, sizeof line, f)) {
+                unsigned long long k = 0;
+                if (sscanf(line, "%llx", &k) == 1 && k) keys.insert(k);
+            }
+            fclose(f);
+        }
+    }
+    return keys;
+}
+bool predict_slow_has(uint64_t key) {
+    std::lock_guard lk(predict_slow_mu);
+    return predict_slow_set().count(key) != 0;
+}
+void predict_slow_add(uint64_t key, uint64_t kwords, long long seconds) {
+    std::lock_guard lk(predict_slow_mu);
+    auto& keys = predict_slow_set();
+    if (!keys.insert(key).second) return;
+    const std::string path = predict_slow_path();
+    FILE* f = fopen(path.c_str(), "rb");
+    const bool fresh = !f;
+    if (f) fclose(f);
+    if (fresh) {
+        f = fopen(path.c_str(), "wb");
+        if (f) fprintf(f, "%s\n", predict_slow_device().c_str());
+    } else if (!(f = fopen(path.c_str(), "ab")))
+        return;
+    if (f) fprintf(f, "%016llx %llu %lld\n", (unsigned long long)key, (unsigned long long)kwords, seconds), fclose(f);
+}
+}  // namespace
+
 void predict_run(void (*progress)(size_t done, size_t total), bool background, bool noted) {
     const auto t0 = std::chrono::steady_clock::now();
-    const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
-    if (notes.empty() || (!noted && getenv("RX_VK_NO_PREDICT"))) return;
+    // (hookshot) What the workers use lives on the heap, held by each of them: a worker whose driver compile outlasts the wait
+    // (RX_VK_PREDICT_WAIT_S) is detached and may run on after this function has returned
+    struct Shared {
+        std::vector<std::unique_ptr<PipeNote>> notes, made_up;
+        std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
+        std::vector<uint64_t> keys;
+        std::atomic<size_t> next{0}, done{0}, made{0}, read_in{0}, matched{0}, too_big{0}, pipelines_too_big{0}, slow_skipped{0};
+        std::atomic<bool> out_of_time{false}, out_of_memory{false}, abandoned{false};
+        std::atomic<uint64_t> in_flight[32]{};   // (each worker's program now: the progress line names them)
+        std::atomic<uint32_t> in_note[32]{};     // (and the pipeline of it the worker builds: its index among that program's)
+        std::atomic<int64_t> in_since[32]{};     // (and since when, ms)
+        std::atomic<uint32_t> in_words[32]{};    // (and its SPIR-V's size, 1000 words)
+        std::atomic<unsigned> worker_n{0};
+    };
+    const std::shared_ptr<Shared> shared = std::make_shared<Shared>();
+    shared->notes = pipe_notes_read();
+    if (shared->notes.empty() || (!noted && getenv("RX_VK_NO_PREDICT"))) return;
+    const std::vector<std::unique_ptr<PipeNote>>& notes = shared->notes;
     size_t programs = 0;
-    const std::vector<std::unique_ptr<PipeNote>> made_up = noted ? std::vector<std::unique_ptr<PipeNote>>{} : predict_pipelines(notes, &programs);
-    const std::vector<std::unique_ptr<PipeNote>>& predicted = noted ? notes : made_up;
-    std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
+    if (!noted) shared->made_up = predict_pipelines(notes, &programs);
+    const std::vector<std::unique_ptr<PipeNote>>& predicted = noted ? notes : shared->made_up;
+    auto& by_program = shared->by_program;
     for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
-    std::vector<uint64_t> keys;
+    auto& keys = shared->keys;
     for (const auto& kv : by_program) keys.push_back(kv.first);
-    std::atomic<size_t> next{0}, done{0}, made{0}, read_in{0}, matched{0};
+    auto& next = shared->next;
+    auto& done = shared->done;
+    auto& made = shared->made;
+    auto& read_in = shared->read_in;
+    auto& matched = shared->matched;
     // (hookshot) A time budget, RX_VK_PREDICT_S (90 s by default; 0: none): once #1051 let the prediction find its programs again it
     // predicted ~28000 pipelines, and a first start after an update spent many minutes on them before the game's first frame (20 with
     // the CPU busy). Those not built by then are built in play when first drawn, as before the prediction worked
     static const int budget_s = getenv("RX_VK_PREDICT_S") ? atoi(getenv("RX_VK_PREDICT_S")) : 90;
-    std::atomic<bool> out_of_time{false}, out_of_memory{false};
+    auto& out_of_time = shared->out_of_time;
+    auto& out_of_memory = shared->out_of_memory;
     // (The pipelines are made for the driver's own cache and let go; a program of 502k SPIR-V words and one of 1014k (the game's
     // two largest) each took the driver's compiler over three minutes and, still growing at 11 GB of the process's commit, all the
     // PC had: C++ allocations were refused at the commit limit (0 MB of commit left), the compile failed (-13) and the memory stayed
-    // taken. The others, up to 133k words, take 25 s and a few hundred MB. Over RX_VK_PREDICT_MAX_KWORDS (300: 300k words; 0: no
+    // taken. The others, up to 133k words, take 25 s and a few hundred MB. Over RX_VK_PREDICT_MAX_KWORDS (100: 100k words, v0.4.3; 0: no
     // limit) a program is left to the draw that needs it, as it was before the prediction. And the prediction stops, the rest left
     // to play, when the system has less than RX_VK_PREDICT_RESERVE_MB (3072) of commit left)
     static const unsigned long long max_kwords = getenv("RX_VK_PREDICT_MAX_KWORDS") ? strtoull(getenv("RX_VK_PREDICT_MAX_KWORDS"), nullptr, 10) : predictlimits::kDefaultMaxKWords;
     static const unsigned long long reserve_mb = getenv("RX_VK_PREDICT_RESERVE_MB") ? strtoull(getenv("RX_VK_PREDICT_RESERVE_MB"), nullptr, 10) : predictlimits::kDefaultReserveMB;
-    std::atomic<size_t> too_big{0}, pipelines_too_big{0};
-    std::atomic<uint64_t> in_flight[32]{};   // (each worker's program now: the progress line names them)
-    std::atomic<uint32_t> in_note[32]{};     // (and the pipeline of it the worker builds: its index among that program's)
-    std::atomic<int64_t> in_since[32]{};     // (and since when, ms)
-    std::atomic<uint32_t> in_words[32]{};    // (and its SPIR-V's size, 1000 words)
-    std::atomic<unsigned> worker_n{0};
-    const auto worker = [&] {
+    auto& too_big = shared->too_big;
+    auto& pipelines_too_big = shared->pipelines_too_big;
+    auto& slow_skipped = shared->slow_skipped;
+    auto& in_flight = shared->in_flight;
+    auto& in_note = shared->in_note;
+    auto& in_since = shared->in_since;
+    auto& in_words = shared->in_words;
+    auto& worker_n = shared->worker_n;
+    // (RX_VK_PREDICT_WAIT_S, 60 by default; 0: wait for ever, as before: once the budget has run out (or the work is done) the
+    // builds in hand are given this long. A driver's compile cannot be taken back, and one on a GTX 1660 SUPER (Turing) sat in
+    // vkCreateGraphicsPipelines for 2 hours on a 144k-word program (the same takes ~25 s on Ampere): the builder, which sees the
+    // status line, never ended the step. After the wait the program is left to play, noted in hookshot_predict_slow.txt so the
+    // next prediction leaves it out, and its worker is let go on its own)
+    static const int wait_s = getenv("RX_VK_PREDICT_WAIT_S") ? atoi(getenv("RX_VK_PREDICT_WAIT_S")) : 60;
+    // (test only, RX_VK_TEST_SLOW_PIPELINE=<program key in hex>:<seconds>: that program's predicted builds sleep, as a hung driver would)
+    static const std::pair<uint64_t, int> test_slow = [] {
+        const char* e = getenv("RX_VK_TEST_SLOW_PIPELINE");
+        unsigned long long k = 0;
+        int s = 0;
+        return e && sscanf(e, "%llx:%d", &k, &s) == 2 ? std::make_pair((uint64_t)k, s) : std::make_pair((uint64_t)0, 0);
+    }();
+    const auto worker = [shared, t0, noted, background] {
+        Shared& S = *shared;
+        auto& next = S.next;
+        auto& done = S.done;
+        auto& made = S.made;
+        auto& read_in = S.read_in;
+        auto& matched = S.matched;
+        auto& out_of_time = S.out_of_time;
+        auto& out_of_memory = S.out_of_memory;
+        auto& too_big = S.too_big;
+        auto& pipelines_too_big = S.pipelines_too_big;
+        auto& slow_skipped = S.slow_skipped;
+        auto& in_flight = S.in_flight;
+        auto& in_note = S.in_note;
+        auto& in_since = S.in_since;
+        auto& in_words = S.in_words;
+        auto& worker_n = S.worker_n;
+        auto& by_program = S.by_program;
+        auto& keys = S.keys;
         ub_thread_off();   // (a background thread: see ub_thread_off)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's: these are the driver's compiles, see DriverTurn)
         driver_cache_only = !noted;
@@ -9158,7 +9511,7 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
         std::atomic<uint64_t>& mine = in_flight[me];
         for (;;) {
             mine = 0;
-            if (prepare_stopped()) return;
+            if (prepare_stopped() || S.abandoned.load()) return;
             if (!background && budget_s > 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(budget_s)) {
                 out_of_time = true;
                 return;
@@ -9172,6 +9525,11 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
             const size_t i = next++;
             if (i >= keys.size()) return;
             const auto& list = by_program[keys[i]];
+            if (!noted && predict_slow_has(keys[i])) {   // (a program whose driver compile once outlasted the wait: left to the draw)
+                slow_skipped++;
+                done += list.size();
+                continue;
+            }
             mine = keys[i];
             program_cache_borrow(keys[i], [&](Program& p) {
                 ensure_layout(p);
@@ -9199,8 +9557,10 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
                             continue;
                         }
                         const auto t_build = std::chrono::steady_clock::now();
-                        if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
-                            vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                        if (test_slow.first && test_slow.first == p.key) Sleep((DWORD)test_slow.second * 1000);
+                        const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo);
+                        if (S.abandoned.load()) return;   // (let go while it built: nothing is waiting for it, and what it used may be gone: no more work)
+                        if (pl) vkDestroyPipeline(dev.device, pl, nullptr), made++;
                         const double build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_build).count();
                         static std::atomic<int> slow_logged{0};
                         if (build_ms > 3000 && slow_logged.fetch_add(1, std::memory_order_relaxed) < 40) {
@@ -9254,11 +9614,31 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
         Sleep(100);
         watch();
     }
-    while (!prepare_stopped() && std::count_if(std::begin(in_flight), std::end(in_flight), [](const auto& k) { return k.load() != 0; })) {
-        Sleep(100);   // (the builds in hand are let finish: a driver's compile cannot be taken back)
+    const auto building = [&] { return std::count_if(std::begin(in_flight), std::end(in_flight), [](const auto& k) { return k.load() != 0; }); };
+    const auto grace_from = std::chrono::steady_clock::now();
+    while (!prepare_stopped() && building()) {
+        // (the builds in hand are let finish: a driver's compile cannot be taken back. But not for ever, RX_VK_PREDICT_WAIT_S)
+        if (!background && wait_s > 0 && std::chrono::steady_clock::now() - grace_from > std::chrono::seconds(wait_s)) break;
+        Sleep(100);
         watch();
     }
-    for (std::thread& t : threads) t.join();
+    if (building()) {
+        // (still in the driver: told, written down so that the next prediction leaves each out, and the threads let go. Their
+        // state is on the heap (shared), and once `abandoned` they do nothing more when the driver returns. In the prepare run
+        // the process's exit ends the compile; the pipeline cache's save does not wait for it (the builds here use no cache)
+        shared->abandoned = true;
+        const auto now = std::chrono::steady_clock::now();
+        for (unsigned k = 0; k < std::min<unsigned>(worker_n.load(), 32); k++)
+            if (const uint64_t key = in_flight[k].load()) {
+                const long long secs = (std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() - in_since[k].load()) / 1000;
+                logf("vk: predict: program %016llx (%uk words of SPIR-V) is still in the driver after %lld s (RX_VK_PREDICT_WAIT_S %d): "
+                     "given up, left out of the next predictions; a draw that needs it builds it in play",
+                     (unsigned long long)key, in_words[k].load(), secs, wait_s);
+                predict_slow_add(key, in_words[k].load(), secs);
+            }
+        for (std::thread& t : threads) t.detach();
+    } else
+        for (std::thread& t : threads) t.join();
     if (shader_key_on()) ledger_commit();
     logf("vk: %s%s %zu pipelines from %zu notes for %zu program variants no note names (%zu of %zu programs read, %zu pipelines had their variant): "
          "%zu made, %lld left out (listed as built, all steps so far), in %.1f s on %u workers%s",
@@ -9266,6 +9646,7 @@ void predict_run(void (*progress)(size_t done, size_t total), bool background, b
          keys.size(), matched.load(), made.load(), (long long)ledger_reused.load(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), workers,
          out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "");
+    if (slow_skipped.load()) logf("vk: predict: %zu programs left out: their driver compile once outlasted the wait (hookshot_predict_slow.txt)", slow_skipped.load());
     if (too_big.load() || out_of_memory.load())
         logf("vk: predict: %zu programs (%zu pipelines) left out for their size, %s", too_big.load(), pipelines_too_big.load(),
              out_of_memory.load() ? "and the prediction stopped for want of commit" : "the others as they were asked for");
@@ -9591,6 +9972,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     if (fsr3_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
+    if (off_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
     const VkPipeline pipe = cpipe();
     if (!pipe) SKIP_HERE();

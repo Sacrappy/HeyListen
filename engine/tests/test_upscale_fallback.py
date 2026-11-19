@@ -126,6 +126,8 @@ void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat format, VkFo
 void end_pass(VkCommandBuffer) {}
 // (the temporal upscaler, off here: upscale_stub offers it the frame first, vk_draw.cpp temporal_rejected_network)
 bool temporal_wanted() { return false; }
+bool upscaler_off_now = false;   // (the Upscaler row's Off, vk_temporal.cpp upscaler_off)
+bool upscaler_off() { return upscaler_off_now; }
 static bool temporal_rejected_network(VkCommandBuffer, uint64_t, Texture *, const nvn_tex *, Texture *, const nvn_tex *) {
     return false;
 }
@@ -203,11 +205,13 @@ int main(int argc, char **argv) {
         src.levels = 2;
     if (mode == "swizzle")
         source.d.swizzle_r = 4;
-    if (mode == "fd")
+    if (mode == "fd" || mode == "off-fd")
         key = 0xfd029a317a9a4b94ull;
-    if (mode == "9dc" || mode == "9dc-same")
+    if (mode == "9dc" || mode == "9dc-same" || mode == "off-9dc-same")
         key = 0x9dc98871eb7fc101ull;
-    if (mode == "9dc-same" || mode == "same") {   // (the full-size pass: Render resolution 100%)
+    if (mode == "off-fd" || mode == "off-9dc-same")
+        upscaler_off_now = true;   // (Upscaler Off: the same typed upscale, with no edge smoothing)
+    if (mode == "9dc-same" || mode == "off-9dc-same" || mode == "same") {   // (the full-size pass: Render resolution 100%)
         source.d.width = 128, source.d.height = 64;
         src.width = 128, src.height = 64;
     }
@@ -228,7 +232,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     assert(upscale_stub((VkCommandBuffer)5, state, key));
-    if (mode == "captured" || mode == "fd" || mode == "9dc" || mode == "9dc-same") {
+    if (mode == "captured" || mode == "fd" || mode == "9dc" || mode == "9dc-same" || mode == "off-fd" || mode == "off-9dc-same") {
         // (the gameplay networks reach this only when left out (no f16 shaders): their RGB9E5 input read as B10G11R11 by the
         // blit was the full-screen noise of RX_VK_NO_F16, and the full-size pass was skipped, the 3D black. Both as the TAAU
         // network's stand-in draws (taau_stand_in: temporal, edges smoothed); the other networks' as before)
@@ -236,7 +240,7 @@ int main(int argc, char **argv) {
             puts("RED: captured RGB9E5 input still used physical-format blit");
             return 7;
         }
-        assert(writes == 1 && typed_temporal == (mode != "captured"));
+        assert(writes == 1 && typed_temporal == (mode != "captured" && mode.rfind("off-", 0) != 0));
     } else if (mode == "movie") {
         assert(movie_calls == 1 && typed_calls == 0 && blits == 0 && writes == 1);
     } else if (mode == "pipeline-failure") {
@@ -262,7 +266,7 @@ def main():
         exe = tmp / ('check.exe' if os.name == 'nt' else 'check')
         source.write_text(PREFIX + body + SUFFIX, encoding='utf-8')
         subprocess.run([args.cxx, '-std=c++20', '-UNDEBUG', str(source), '-o', str(exe)], env=env, check=True)
-        cases = ('captured', 'r11', 'movie', 'view', 'skip', 'mip', 'swizzle', 'fd', '9dc', '9dc-same', 'same',
+        cases = ('captured', 'r11', 'movie', 'view', 'skip', 'mip', 'swizzle', 'fd', '9dc', '9dc-same', 'off-fd', 'off-9dc-same', 'same',
                  'pipeline-failure', 'no-storage', 'no-e5-sample', 'no-e5-linear')
         for case in cases:
             subprocess.run([str(exe), case], env=env, check=True)

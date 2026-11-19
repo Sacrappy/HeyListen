@@ -44,6 +44,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -99,6 +100,10 @@ int temporal_mode() {
     if (ur::is_dlss(v) && dlss_why() != DLSS_OK) return ur::GAME;
     if (ur::is_fsr4(v) && fsr4_why() != FSR_OK) return ur::GAME;
     return v;
+}
+bool upscaler_off() {
+    // (the row's Off. RX_VK_DLSS / RX_VK_FSR4 for an engine that runs here, and RX_VK_FSR=1, go over it as over the row's FSR 3.1)
+    return opts.dlss == ur::OFF && !temporal_env_chosen() && !fsr3_wanted();
 }
 bool temporal_wanted() { return temporal_mode() != ur::GAME; }
 bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
@@ -733,7 +738,31 @@ int temporal_status(char* b, size_t n) {
     return mode;
 }
 
+/// (HeyListen, STUT1) NVIDIA's NGX started at the first present with DLSS chosen, on a thread of its own, not at the first
+/// gameplay upscale: there it took 1.8 s of the replay thread (an RTX 4090, a warm session: "slow submit: 1870 ms: dispatch 1866"
+/// with NGX started and the feature made, 45 ms of CPU, in it), at the moment the game's first frame of play was due. dlss_probe is
+/// the menu's own call of the same start, taken under the engine's own lock: the upscale's start() finds it done, or waits for the
+/// part that is left. RX_VK_DLSS_PREWARM=0: at the first upscale, as before
+static void dlss_prewarm() {
+    static std::atomic<bool> done{false};
+    if (done.load(std::memory_order_relaxed)) return;
+    static const bool on = !getenv("RX_VK_DLSS_PREWARM") || atoi(getenv("RX_VK_DLSS_PREWARM")) != 0;
+    if (!on) {
+        done.store(true, std::memory_order_relaxed);
+        return;
+    }
+    if (!dev.device || !ur::is_dlss(temporal_mode())) return;   // (the row may be chosen later: asked again each present)
+    if (done.exchange(true)) return;
+    std::thread([] {
+        const auto t0 = std::chrono::steady_clock::now();
+        dlss_probe();
+        logf("vk: NVIDIA DLSS: started ahead of the first upscale (frame %llu, %.1f ms on its own thread; RX_VK_DLSS_PREWARM=0: at the first upscale)",
+             (unsigned long long)texture_frame_no(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }).detach();
+}
+
 void temporal_idle() {
+    dlss_prewarm();
     State& s = st();
     if (!s.holding.load(std::memory_order_relaxed)) return;
     std::lock_guard lk(s.mu);

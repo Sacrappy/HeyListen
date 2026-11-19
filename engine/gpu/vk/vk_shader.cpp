@@ -604,7 +604,7 @@ bool handle_tables_on() {
     return on;
 }
 
-Shader::Profile make_profile() {
+Shader::Profile make_profile(bool wide) {
     Shader::Profile p{};
     p.supported_spirv = 0x00010600;
     p.unified_descriptor_binding = true;
@@ -630,15 +630,18 @@ Shader::Profile make_profile() {
     p.support_demote_to_helper_invocation = true;
     p.support_int64_atomics = true;
     p.support_float32_atomic_add = dev.float_atomic_add;   // (one OpAtomicFAddEXT for a float add, not a compare-exchange loop: vk_main.cpp)
+    // (8/16-bit global stores written as bytes/halves through narrow views, RX_VK_NATIVE_NARROW=0: the compare-exchange loop on the
+    // word as before; an RX_VK_NATIVE* switch, so the program cache stamp follows it)
+    p.support_native_narrow_global_store = !(getenv("RX_VK_NATIVE_NARROW") && atoi(getenv("RX_VK_NATIVE_NARROW")) == 0);
     p.support_derivative_control = true;
     p.support_native_ndc = false;   // (the vertex stage converts NVN's -1..1 depth: RuntimeInfo::convert_depth_mode)
     p.support_scaled_attributes = false;   // (*_UI2F / *_I2F read as integers, converted in the shader: R32 has no scaled format)
     p.support_multi_viewport = true;
     p.support_sampled_image_array_nonuniform_indexing = true;
-    p.warp_size_potentially_larger_than_guest = false;
+    p.warp_size_potentially_larger_than_guest = wide;   // (issue 67: subgroups wider than 32 lanes: the translator keeps the guest's warp of 32)
     p.lower_left_origin_mode = false;
     p.need_declared_frag_colors = false;
-    p.max_subgroup_size = 32;
+    p.max_subgroup_size = wide ? dev.warp_lanes : 32;
     p.min_ssbo_alignment = storage_binding_align();   // (at least 16: vk_internal.h)
     return p;
 }
@@ -710,6 +713,8 @@ std::vector<uint32_t> strip_float_controls(const std::vector<uint32_t>& spirv, u
     return out;
 }
 
+// (the preparation's profile, shader_profile: the driver's shader modules, the cache's fingerprint, packing, the wait for the file and its writes; inside the translation time)
+std::atomic<int64_t> st_module_ns, st_finger_ns, st_pack_ns, st_lockwait_ns, st_write_ns;
 VkShaderModule make_module(const std::vector<uint32_t>& spirv_in) {
     // (RX_VK_KEEP_DENORM=1: the modules as translated, to compare a picture or a number with and without the strip)
     static const bool keep = getenv("RX_VK_KEEP_DENORM") != nullptr;
@@ -723,8 +728,11 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv_in) {
     VkShaderModule m = VK_NULL_HANDLE;
     // (longshot #252: one thread at a time in Intel's compiler on Windows, and a fault in the driver leaves this program out: no
     // module, and the translation of the program fails as it does when the driver refuses one)
+    const auto t_module = std::chrono::steady_clock::now();
     IntelDriverGate gate;
-    if (extern_guarded_shader_module(&ci, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const bool made = extern_guarded_shader_module(&ci, &m) == VK_SUCCESS;
+    st_module_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_module).count();
+    if (!made) return VK_NULL_HANDLE;
     return m;
 }
 
@@ -819,17 +827,16 @@ namespace {
 /// a handle the shader reads from a storage buffer, its handle program's)
 uint32_t descriptor_handle(const NvnState& s, const Stage& st, const Shader::TextureDescriptor& d) {
     if (d.handle_program != ~0U) return stage_handle(s, st, d.handle_program);
-    const int stage = st.nvn_stage;
-    uint32_t h = driver_bank_word(s, (int)d.cbuf_index, stage, d.cbuf_offset);
+    uint32_t h = stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset);
     if (d.has_secondary)
-        h = h << d.shift_left | driver_bank_word(s, (int)d.secondary_cbuf_index, stage, d.secondary_cbuf_offset)
+        h = h << d.shift_left | stage_cbuf_word(s, st, d.secondary_cbuf_index, d.secondary_cbuf_offset)
                                     << d.secondary_shift_left;
     return h;
 }
 /// (hookshot) a storage image descriptor's handle word (its handle program's, read from a storage buffer)
 uint32_t descriptor_handle(const NvnState& s, const Stage& st, const Shader::ImageDescriptor& d) {
     if (d.handle_program != ~0U) return stage_handle(s, st, d.handle_program);
-    return driver_bank_word(s, (int)d.cbuf_index, st.nvn_stage, d.cbuf_offset);
+    return stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset);
 }
 uint8_t texture_answer(uint32_t handle) {
     if (!handle) return 0xFF;
@@ -948,9 +955,12 @@ bool still_valid(const NvnState& s, const Program& p) {
 std::mutex shader_mu;
 std::unordered_map<uint64_t, std::vector<std::unique_ptr<Program>>> programs;   // by the stages' code keys
 std::unordered_map<uint64_t, std::vector<Code>> codes;                          // by program serial
-const Shader::Profile& profile() {
-    static const Shader::Profile p = make_profile();
-    return p;
+/// The profile of a stage's translation: the 32-lane one, or (warp_wide_stages: vk_main.cpp, issue 67) the one that emulates the
+/// guest's 32-lane warps on a wider subgroup. The stage is the one the program runs as (a fallback mesh program is a compute one).
+const Shader::Profile& profile(VkShaderStageFlagBits stage) {
+    static const Shader::Profile narrow = make_profile(false);
+    static const Shader::Profile wide = make_profile(true);
+    return (dev.warp_wide_stages & stage) ? wide : narrow;
 }
 
 const std::vector<Code>& codes_of(const NvnState& s) {
@@ -1360,8 +1370,16 @@ uint64_t disk_stamp() {
         const uint32_t half = 0x16f0u | (float16_shaders() ? 1u : 0u);
         add(&half, sizeof half);
     }
+    // (issue 67: and the stages translated for subgroups wider than the guest's 32 lanes (vk_main.cpp), with their width. Added only then:
+    // a GPU that runs 32 lanes keeps its programs and its stamp)
+    if (dev.warp_wide_stages) {
+        const uint32_t wide[2] = {0x77617270u, dev.warp_lanes};   // ("warp")
+        add(wide, sizeof wide);
+        const uint32_t stages = (uint32_t)dev.warp_wide_stages;
+        add(&stages, sizeof stages);
+    }
     for (char** e = _environ; e && *e; e++)
-        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_FOLD", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "EDEN_"})
+        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_LOCAL", "RX_VK_FOLD", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
 }
@@ -1740,6 +1758,18 @@ void put_info(std::vector<uint8_t>& o, const Shader::Info& i) {
     put(o, (uint64_t)i.handle_programs.size());
     for (const auto& h : i.handle_programs) put_list(o, h);
 }
+/// (hookshot) every descriptor array within kMaxDescriptorCount: the counts come from hookshot_programs.bin, and two of 2^31
+/// wrapped the layout's sum to 0 (a push layout with billions of descriptors), and one made the binds loop that often
+constexpr uint32_t kMaxDescriptorCount = 4096;
+template <class Info> bool descriptor_counts_fit(const Info& i) {
+    auto fit = [](const auto& list) {
+        for (const auto& d : list)
+            if (d.count > kMaxDescriptorCount) return false;
+        return true;
+    };
+    return fit(i.constant_buffer_descriptors) && fit(i.storage_buffers_descriptors) && fit(i.texture_buffer_descriptors) &&
+           fit(i.image_buffer_descriptors) && fit(i.texture_descriptors) && fit(i.image_descriptors);
+}
 void get_info(Reader& r, Shader::Info& i) {
     if (!r.has(sizeof i)) return;   // (left as constructed: the record is bad, and left out)
     alignas(Shader::Info) static thread_local uint8_t fresh[sizeof(Shader::Info)];
@@ -1768,6 +1798,7 @@ void get_info(Reader& r, Shader::Info& i) {
     }
     i.handle_programs.resize((size_t)r.count(sizeof(uint64_t)));   // (each at least its own count)
     for (auto& h : i.handle_programs) r.list(h);
+    if (!descriptor_counts_fit(i)) r.bad = true;   // (left out, and translated again)
 }
 
 /// The record d of key as translation made it (to), from the file in (under mu when given): all of it, or its first limit bytes when
@@ -1803,7 +1834,9 @@ bool disk_read_record(FILE* in, std::mutex* mu, uint64_t key, const DiskRecord& 
 }
 
 void program_cache_save(Program& p, const std::vector<std::vector<uint32_t>>& spirv) {
+    const auto t_fp = std::chrono::steady_clock::now();
     if (shader_key_on()) p.fp = program_fingerprint(p, spirv), program_fingerprinted(p.fp);
+    st_finger_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_fp).count();
     disk_init();
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
@@ -1819,7 +1852,9 @@ void program_cache_save(Program& p, const std::vector<std::vector<uint32_t>>& sp
         put_info(o, st.info);
     }
     std::vector<uint8_t> stored;   // (packed here, outside the lock)
+    const auto t_pack = std::chrono::steady_clock::now();
     record_pack(o.data(), o.size(), stored);
+    st_pack_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_pack).count();
     uint32_t kind;
     std::memcpy(&kind, stored.data(), 4);
     if (kind & kKindZstd) {
@@ -1830,7 +1865,17 @@ void program_cache_save(Program& p, const std::vector<std::vector<uint32_t>>& sp
                  (long long)(st_pack_raw.load() >> 20), (long long)(st_pack_stored.load() >> 20));
     }
     const uint64_t head[2] = {p.key, stored.size()};
+    const auto t_lock = std::chrono::steady_clock::now();
     std::lock_guard lk(disk_mu);
+    const auto t_got = std::chrono::steady_clock::now();
+    struct Wrote {
+        std::chrono::steady_clock::time_point from, asked;
+        ~Wrote() {
+            const auto now = std::chrono::steady_clock::now();
+            st_lockwait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(from - asked).count();
+            st_write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - from).count();
+        }
+    } wrote{t_got, t_lock};
     _fseeki64(disk_out, 0, SEEK_END);
     const int64_t at = _ftelli64(disk_out);
     fwrite(head, 8, 2, disk_out);
@@ -1991,7 +2036,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 if ((!kept_one && (Shader::Backend::SPIRV::mma_software || dev.props.vendorID != 0x10DE)) || !float16_shaders())
                     throw std::runtime_error("a network left out on this card");
             }
-            const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), rt, t->program, bindings);
+            const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile(VK_SHADER_STAGE_COMPUTE_BIT), rt, t->program, bindings);
             // (EvilOOT) RX_VK_DUMP_SPV=<folder>: the SPIR-V of the programs RX_VK_MISS_LOG_PROG names (all: unset), for spirv-val
             if (const char* dir = getenv("RX_VK_DUMP_SPV"); dir && Shader::Optimization::g_nvn2_miss_log_this) {
                 char path[512];
@@ -2032,7 +2077,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             vrt.inline_global_128_loads = dev.props.vendorID == 0x10DE && vsc->key == kDekuWebVertexCode;
             Stage v;
             v.nvn_stage = 0;
-            const std::vector<uint32_t> vspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), vrt, vs->program, bindings);
+            const std::vector<uint32_t> vspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(VK_SHADER_STAGE_VERTEX_BIT), vrt, vs->program, bindings);
             dump_ir(p, "vertex", vs->program);
             {   // (the programs that read the draw's parameters from the driver bank, each once)
                 const auto& ld = vs->program.info.loads;
@@ -2064,7 +2109,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                         if (frt.color_output_types[i] == Shader::AttributeType::Float) float_targets |= 1u << i;
                     Shader::Optimization::GuardFragmentOutputs(fs->program, float_targets);
                 }
-                const std::vector<uint32_t> fspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), frt, fs->program, bindings);
+                const std::vector<uint32_t> fspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(VK_SHADER_STAGE_FRAGMENT_BIT), frt, fs->program, bindings);
                 dump_ir(p, "fragment", fs->program);
                 Stage f;
                 f.nvn_stage = 1;
@@ -2163,7 +2208,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             rt.previous_stage_stores.mask.set();
             rt.mesh_fallback = fallback;
             rt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
-            const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), rt, task_t->program, bindings);
+            const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile(fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_TASK_BIT_EXT), rt, task_t->program, bindings);
             kept.push_back(spirv);
             Stage st;
             st.nvn_stage = bank_stage(*task);
@@ -2199,7 +2244,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         mrt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
         mrt.mesh_fallback_task = task_t != nullptr;
         mrt.mesh_fallback_task_threads = task_t ? task_t->program.workgroup_size[0] : 0;
-        const std::vector<uint32_t> mspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), mrt, mesh_t->program, bindings);
+        const std::vector<uint32_t> mspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_MESH_BIT_EXT), mrt, mesh_t->program, bindings);
         if (getenv("RX_VK_MESH_NOINLINE_ABOVE")) {   // (stream P5: the IR size the threshold is read against, with the SPIR-V's)
             size_t ir_n = 0;
             for (const Shader::IR::Block* b : mesh_t->program.blocks) ir_n += b->size();
@@ -2233,7 +2278,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
                     vrt.per_primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
             }
             const std::vector<uint32_t> vspirv =
-                Shader::Backend::SPIRV::EmitSPIRV(profile(), vrt, mesh_t->program, bindings);
+                Shader::Backend::SPIRV::EmitSPIRV(profile(VK_SHADER_STAGE_VERTEX_BIT), vrt, mesh_t->program, bindings);
             mesh_t->program.info = std::move(saved_info);
             mesh_t->program.stage = saved_stage;
             kept.push_back(vspirv);
@@ -2279,7 +2324,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
                     if (fs->program.info.loads.Generic(i) && !mesh_t->program.info.stores.Generic(i))
                         frt.point_coord_generics.set(i);
             for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
-            const std::vector<uint32_t> fspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), frt, fs->program, bindings);
+            const std::vector<uint32_t> fspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(VK_SHADER_STAGE_FRAGMENT_BIT), frt, fs->program, bindings);
             kept.push_back(fspirv);
             Stage f;
             f.nvn_stage = 1;
@@ -2386,7 +2431,7 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     jobs_push([job] {
         translate_mesh_into(*job->p, job->s, job->has_task ? &job->task : nullptr, job->mesh,
                             job->has_prim ? &job->prim : nullptr, job->has_fs ? &job->fs : nullptr, job->ct);
-    });
+    }, false, &raw->ready);   // (a draw that waits for it runs it at once if it is still queued: jobs_wait)
     return raw;
 }
 
@@ -2710,7 +2755,8 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     job->p = raw, job->s = s, job->vs = *stage_code[0], job->has_fs = stage_code[1] != nullptr;
     if (job->has_fs) job->fs = *stage_code[1];
     std::memcpy(job->ct, color_types, 8);
-    jobs_push([job] { translate_into(*job->p, job->s, &job->vs, job->has_fs ? &job->fs : nullptr, nullptr, job->ct); });
+    jobs_push([job] { translate_into(*job->p, job->s, &job->vs, job->has_fs ? &job->fs : nullptr, nullptr, job->ct); }, false,
+              &raw->ready);   // (as the mesh one: a waiting draw runs it, not every job queued before it)
     return raw;
 }
 
@@ -3043,6 +3089,12 @@ bool seed_is_compute(size_t i) {
     return false;
 }
 
+uint64_t seed_compute_key(size_t i) {
+    for (const uint32_t k : seed.programs[i])
+        if ((seed.stages[k].stage & 7) == 5) return seed.stages[k].end ? seed.stages[k].key : 0;
+    return 0;
+}
+
 // (hookshot) The seed's compute programs, each with its texture variants. A program's texture questions are answered in play by the
 // textures bound (Program::answers), which nothing before the game knows; the questions themselves are few, so each is tried with every
 // answer it can get, and an answer that changes the SPIR-V makes a variant. Variants of two answers and more are taken fewest first, up
@@ -3275,6 +3327,11 @@ void shader_stats(int64_t* translated, int64_t* failed) {
 }
 double shader_translate_ms() {
     return st_translate_ns.load() / 1e6;
+}
+/// (the preparation's profile, in seconds of thread time: the translation as a whole, then what it holds of the driver's shader modules, the cache's fingerprints, packing, the wait for the program cache's file and the writes to it)
+void shader_profile(double out[6]) {
+    out[0] = st_translate_ns.load() / 1e9, out[1] = st_module_ns.load() / 1e9, out[2] = st_finger_ns.load() / 1e9;
+    out[3] = st_pack_ns.load() / 1e9, out[4] = st_lockwait_ns.load() / 1e9, out[5] = st_write_ns.load() / 1e9;
 }
 
 void program_released(const nvn_prog* p) {

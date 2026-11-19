@@ -17,6 +17,8 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,6 +26,13 @@
 DEFINE_GUID(MFVideoFormat_AV1_local, 0x31305641, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
 #define MFVideoFormat_AV1 MFVideoFormat_AV1_local
 #endif
+
+#ifndef MF_LOW_LATENCY
+DEFINE_GUID(MF_LOW_LATENCY_local, 0x9c27891a, 0xed7a, 0x40e1, 0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee);
+#define MF_LOW_LATENCY MF_LOW_LATENCY_local
+#endif
+/* the AV1 profile 0 decoder profile of DXVA (D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0) */
+DEFINE_GUID(HL_DECODER_AV1_PROFILE0, 0xb8be4ccb, 0xcf53, 0x46ba, 0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a);
 
 /* a picture: luma rows and the interleaved chroma rows, both `stride` bytes apart */
 typedef void (*mf_av1_picture_fn)(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts);
@@ -34,6 +43,15 @@ typedef struct {
     int want_w, want_h;   /* (the stream's size: the decoder's frames may be padded, 1088 rows for 1080) */
     int provides_samples;
     DWORD out_size;
+    /* (HeyListen) hardware decoding: the AV1 Video Extension's decoder runs on the GPU (DXVA) once it is given a D3D11 device;
+       its pictures are then textures, read back to system memory through a staging texture */
+    ID3D11Device *dev;
+    ID3D11DeviceContext *dctx;
+    IMFDXGIDeviceManager *mgr;
+    ID3D11Texture2D *staging;
+    UINT stg_w, stg_h;
+    int hw;                       /* the decoder was given the device */
+    int hw_pictures;              /* pictures read back from a texture (the first one is logged) */
 } MfAv1;
 
 static int com_ready(void) {
@@ -88,6 +106,72 @@ static void av1_missing(void) {
     CreateThread(NULL, 0, av1_missing_notice, NULL, 0, NULL);
 }
 
+/* (HeyListen) A D3D11 device on the first adapter whose video decoder does AV1 (DXVA profile 0), for the decoder to run on. 0 when
+   there is none (the decoder then decodes in software, as it always did). HOS_AV1_NO_HW=1: none, on purpose. */
+static int hw_device(MfAv1 *m) {
+    typedef HRESULT(WINAPI * create_fn)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
+                                         ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+    typedef HRESULT(WINAPI * factory_fn)(REFIID, void **);
+    typedef HRESULT(WINAPI * manager_fn)(UINT *, IMFDXGIDeviceManager **);
+    if (getenv("HOS_AV1_NO_HW")) return 0;
+    HMODULE d3d = LoadLibraryA("d3d11.dll"), dxgi = LoadLibraryA("dxgi.dll"), mfp = GetModuleHandleA("mfplat.dll");
+    if (!d3d || !dxgi || !mfp) return 0;
+    const create_fn create = (create_fn)(void *)GetProcAddress(d3d, "D3D11CreateDevice");
+    const factory_fn make_factory = (factory_fn)(void *)GetProcAddress(dxgi, "CreateDXGIFactory1");
+    const manager_fn make_manager = (manager_fn)(void *)GetProcAddress(mfp, "MFCreateDXGIDeviceManager");
+    if (!create || !make_factory || !make_manager) return 0;
+    IDXGIFactory1 *fac = NULL;
+    if (FAILED(make_factory(&IID_IDXGIFactory1, (void **)&fac))) return 0;
+    const D3D_FEATURE_LEVEL levels[2] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    for (UINT i = 0; !m->dev; i++) {
+        IDXGIAdapter1 *ad = NULL;
+        if (IDXGIFactory1_EnumAdapters1(fac, i, &ad) != S_OK) break;
+        DXGI_ADAPTER_DESC1 desc;
+        IDXGIAdapter1_GetDesc1(ad, &desc);
+        ID3D11Device *dev = NULL;
+        ID3D11DeviceContext *dc = NULL;
+        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(create((IDXGIAdapter *)ad, D3D_DRIVER_TYPE_UNKNOWN, NULL, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, 2,
+                             D3D11_SDK_VERSION, &dev, NULL, &dc))) {
+            int av1 = 0;
+            ID3D11VideoDevice *vd = NULL;
+            if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D11VideoDevice, (void **)&vd))) {
+                const UINT n = ID3D11VideoDevice_GetVideoDecoderProfileCount(vd);
+                for (UINT k = 0; k < n && !av1; k++) {
+                    GUID g;
+                    if (SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderProfile(vd, k, &g)) && IsEqualGUID(&g, &HL_DECODER_AV1_PROFILE0)) av1 = 1;
+                }
+                ID3D11VideoDevice_Release(vd);
+            }
+            if (av1) {
+                ID3D10Multithread *mt = NULL;
+                if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D10Multithread, (void **)&mt))) {
+                    ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
+                    ID3D10Multithread_Release(mt);
+                }
+                m->dev = dev, m->dctx = dc;
+                hos_log("video: AV1 decoding on the GPU: %ls", desc.Description);
+            } else {
+                ID3D11DeviceContext_Release(dc);
+                ID3D11Device_Release(dev);
+            }
+        }
+        IDXGIAdapter1_Release(ad);
+    }
+    IDXGIFactory1_Release(fac);
+    if (!m->dev) { hos_log("video: no GPU with an AV1 decoder: decoding in software"); return 0; }
+    UINT token = 0;
+    if (FAILED(make_manager(&token, &m->mgr)) || FAILED(IMFDXGIDeviceManager_ResetDevice(m->mgr, (IUnknown *)m->dev, token))) return 0;
+    return 1;
+}
+static void hw_release(MfAv1 *m) {
+    if (m->staging) ID3D11Texture2D_Release(m->staging), m->staging = NULL;
+    if (m->mgr) IMFDXGIDeviceManager_Release(m->mgr), m->mgr = NULL;
+    if (m->dctx) ID3D11DeviceContext_Release(m->dctx), m->dctx = NULL;
+    if (m->dev) ID3D11Device_Release(m->dev), m->dev = NULL;
+    m->hw = 0;
+}
+
 void *mf_av1_open(int w, int h) {
     if (!com_ready()) return NULL;
     if (getenv("HOS_AV1_MISSING")) { av1_missing(); return NULL; }
@@ -132,6 +216,17 @@ void *mf_av1_open(int w, int h) {
     m->mft = mft;
     m->w = w, m->h = h, m->stride = w;
     m->want_w = w, m->want_h = h;
+    {   /* (HeyListen) pictures out as they are decoded, not after some more input; and on the GPU where it decodes AV1 */
+        IMFAttributes *a = NULL;
+        if (SUCCEEDED(IMFTransform_GetAttributes(mft, &a)) && a) {
+            IMFAttributes_SetUINT32(a, &MF_LOW_LATENCY, TRUE);
+            IMFAttributes_Release(a);
+        }
+        if (hw_device(m)) {
+            if (SUCCEEDED(IMFTransform_ProcessMessage(mft, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)m->mgr))) m->hw = 1;
+            else { hos_log("video: the AV1 decoder did not take the GPU: decoding in software"); hw_release(m); }
+        }
+    }
     set_output_nv12(m);
     IMFTransform_ProcessMessage(mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     IMFTransform_ProcessMessage(mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
@@ -168,6 +263,44 @@ static void pull(MfAv1 *m, mf_av1_picture_fn fn, void *user) {
         LONGLONG t100 = 0;
         IMFSample_GetSampleTime(s, &t100);
         IMFMediaBuffer *b = NULL;
+        IMFDXGIBuffer *db = NULL;
+        if (m->hw && SUCCEEDED(IMFSample_GetBufferByIndex(s, 0, &b)) &&
+            SUCCEEDED(IMFMediaBuffer_QueryInterface(b, &IID_IMFDXGIBuffer, (void **)&db))) {
+            /* (HeyListen) a texture the GPU decoded into: copied to a staging texture and read from there */
+            ID3D11Texture2D *tex = NULL;
+            UINT sub = 0;
+            if (SUCCEEDED(IMFDXGIBuffer_GetResource(db, &IID_ID3D11Texture2D, (void **)&tex)) &&
+                SUCCEEDED(IMFDXGIBuffer_GetSubresourceIndex(db, &sub))) {
+                D3D11_TEXTURE2D_DESC desc;
+                ID3D11Texture2D_GetDesc(tex, &desc);
+                if (!m->staging || m->stg_w != desc.Width || m->stg_h != desc.Height) {
+                    if (m->staging) ID3D11Texture2D_Release(m->staging), m->staging = NULL;
+                    D3D11_TEXTURE2D_DESC sd = desc;
+                    sd.ArraySize = 1, sd.MipLevels = 1, sd.BindFlags = 0, sd.MiscFlags = 0;
+                    sd.Usage = D3D11_USAGE_STAGING, sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    if (SUCCEEDED(ID3D11Device_CreateTexture2D(m->dev, &sd, NULL, &m->staging))) m->stg_w = desc.Width, m->stg_h = desc.Height;
+                }
+                D3D11_MAPPED_SUBRESOURCE mp;
+                if (m->staging) {
+                    ID3D11DeviceContext_CopySubresourceRegion(m->dctx, (ID3D11Resource *)m->staging, 0, 0, 0, 0, (ID3D11Resource *)tex, sub, NULL);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(m->dctx, (ID3D11Resource *)m->staging, 0, D3D11_MAP_READ, 0, &mp))) {
+                        const int ow = m->want_w > 0 && m->want_w < (int)desc.Width ? m->want_w : (int)desc.Width;
+                        const int oh = m->want_h > 0 && m->want_h < (int)desc.Height ? m->want_h : (int)desc.Height;
+                        const BYTE *y = (const BYTE *)mp.pData;
+                        fn(user, y, y + (size_t)mp.RowPitch * desc.Height, ow, oh, (int)mp.RowPitch, (int64_t)t100 * 100);
+                        ID3D11DeviceContext_Unmap(m->dctx, (ID3D11Resource *)m->staging, 0);
+                        if (!m->hw_pictures++) hos_log("video: the first AV1 picture read back from the GPU (%ux%u texture)", desc.Width, desc.Height);
+                    }
+                }
+            }
+            if (tex) ID3D11Texture2D_Release(tex);
+            IMFDXGIBuffer_Release(db);
+            IMFMediaBuffer_Release(b);
+            if (ob.pEvents) IMFCollection_Release(ob.pEvents);
+            IMFSample_Release(s);
+            continue;
+        }
+        if (b) IMFMediaBuffer_Release(b), b = NULL;
         if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(s, &b))) {
             BYTE *p = NULL;
             DWORD len = 0;
@@ -245,5 +378,6 @@ void mf_av1_close(void *h) {
     if (!m) return;
     IMFTransform_ProcessMessage(m->mft, MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     IMFTransform_Release(m->mft);
+    hw_release(m);
     free(m);
 }

@@ -52,9 +52,11 @@ int main() {
     std::atomic<bool> ready{false};
     std::thread::id ran_on{};
     jobs_push([&] { ran_on = std::this_thread::get_id(); ready.store(true, std::memory_order_release); }, false, &ready);
-    jobs_wait(ready);   // (every worker is held: before, this waited until release(), which nobody calls)
+    const bool ran_during = jobs_wait(ready);   // (every worker is held: before, this waited until release(), which nobody calls)
     expect(ready.load(), "the waited-for job ran");
     expect(ran_on == std::this_thread::get_id(), "it ran on the waiting thread");
+    expect(ran_during, "the wait reports the job as run during it");
+    expect(!jobs_wait(ready), "a wait on a job already done reports that nothing ran during it");
 
     std::atomic<bool> unflagged{false};
     jobs_push([&] { unflagged.store(true, std::memory_order_release); jobs_notify(); });   // (no flag: left in the queue)

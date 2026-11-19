@@ -137,6 +137,13 @@ class UploadBudget(unittest.TestCase):
         doc = DOC.read_text(encoding="utf-8")
         self.assertIn("RX_VK_UPLOAD_BUDGET_MS", doc)
         self.assertIn("RX_VK_UPLOAD_BUDGET_SUM=1", doc)
+        self.assertIn("RX_VK_UPLOAD_BUDGET_FRAME_MS", doc)
+
+    def test_the_frame_budget_is_off_by_default(self):
+        # (STUT1) every thread's summed uploads cap a present too, but only with RX_VK_UPLOAD_BUDGET_FRAME_MS set
+        body = block(self.tex, "bool upload_defer(Texture& tex)")
+        self.assertIn('getenv("RX_VK_UPLOAD_BUDGET_FRAME_MS") ? atof(getenv("RX_VK_UPLOAD_BUDGET_FRAME_MS")) : 0.0', body)
+        self.assertIn("if (spent < budget_ns && (!frame_ns || frame_upload_ns.load(std::memory_order_relaxed) < frame_ns)) return false;", body)
 
     def test_the_rule_runs(self):
         cxx = shutil.which("g++") or shutil.which("clang++")

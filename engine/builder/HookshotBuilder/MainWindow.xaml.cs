@@ -24,6 +24,8 @@ public partial class MainWindow : Window
     readonly DispatcherTimer clock = new() { Interval = TimeSpan.FromSeconds(1) };
     readonly Stopwatch elapsed = new();
     readonly Stopwatch compileClock = new();
+    readonly Stopwatch shadersClock = new();   // (the shaders' step: its own time and its @@progress, ShaderStep.Note)
+    double shadersFraction = -1;
     readonly Dictionary<string, StepRow> rows = new();
     readonly Dictionary<string, (bool Ok, string Text)?> checks = new(StringComparer.OrdinalIgnoreCase);
     readonly List<Dump> dumps = new();
@@ -846,6 +848,8 @@ public partial class MainWindow : Window
         SetProgress(updating ? Weight["read"].From : 0);
         elapsed.Restart();
         compileClock.Reset();
+        shadersClock.Reset();
+        shadersFraction = -1;
         clock.Start();
         Tick();
         if (!args.Contains("--work")) args.AddRange(new[] { "--work", Storage.Work });   // (HeyListen: always, so make_game.py never falls back to its default, the Hookshot Builder folder)
@@ -867,7 +871,7 @@ public partial class MainWindow : Window
             current = id;
             if (rows.TryGetValue(id, out var row)) row.Begin();
             if (id == "compile") compileClock.Restart();
-            if (id == ShaderStep.Id) shadersBegan = true;
+            if (id == ShaderStep.Id) { shadersBegan = true; shadersClock.Restart(); shadersFraction = -1; }
             if (Weight.TryGetValue(id, out var w)) SetProgress(w.From);
         }
         else if (line.StartsWith("@@progress "))
@@ -876,6 +880,7 @@ public partial class MainWindow : Window
                 && Weight.TryGetValue(current, out var w))
             {
                 if (current == "compile") compiled = f;
+                else if (current == ShaderStep.Id) shadersFraction = f;
                 SetProgress(w.From + w.Size * Math.Clamp(f, 0, 1));
             }
             return;
@@ -969,6 +974,11 @@ public partial class MainWindow : Window
                 : compiled > 0.03 ? TimeLeft(compileClock.Elapsed.TotalSeconds / compiled * (1 - compiled) + 60)
                 : "Estimating…";
             BuildNote.Text = $"Compiling {Clock(compileClock.Elapsed)} · {left}{tail}";
+            return;
+        }
+        if (current == ShaderStep.Id && shadersClock.IsRunning)
+        {
+            BuildNote.Text = ShaderStep.Note(shadersClock.Elapsed.TotalSeconds, shadersFraction, tail);
             return;
         }
         BuildNote.Text = (updating ? "Working…" : "Usually about 45 minutes") + tail;

@@ -101,6 +101,9 @@ inline u32 FieldSpan(u32 opcode, u32 field) {
     const u32 family = opcode & 0x1ff, form = (opcode >> 9) & 7;
     if (opcode == 0x805) return field == 0 ? 2 : 0;
     if (opcode == 0x308) return 1;
+    // (hookshot) R2UR URd, Ra: one 32-bit register. Taken for a pair by its alignment, R2UR UR6, R238 counted R239, the
+    // lowering's own scratch, and one of OoT's vertex programs was refused
+    if (opcode == 0x3c2) return field == 1 ? 1 : 0;
     if (opcode == 0x387 || opcode == 0x987 || opcode == 0x983) return field == 1 ? 1 : 0;   // (the address register)
     if (form < 1 || form > 7) return 0;
     if (family == 0x025) return field == 0 || field == 3 ? 2 : 1;
@@ -181,6 +184,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         return result;
     };
     if (code.empty() || code.size() > MaximumNativeInstructions) return fail(0, "invalid native program size");
+    // (hookshot) A shared memory store (STS) not yet followed by a barrier: an LDS after it may read what another lane of the
+    // warp stored (see LDS below)
+    bool shared_store_pending = false;
     for (u32 index = 0; index < code.size(); ++index) {
         auto insn = code[index];
         result.source_instruction_offsets.push_back(static_cast<u32>(result.instructions.size()));
@@ -222,6 +228,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             constexpr u32 bits[4]{16, 24, 32, 64};
             // (a pair or quad starts at an even or a 4-aligned register: an odd one is one register, R4n+2 at most two)
             const auto span_of = [](u32 reg) { return (reg & 1) ? 1U : (reg & 2) ? 2U : 4U; };
+            // (ISBEWR's data too: not counted, a mesh program's output held in a high GPR was read from the plain register,
+            // never written, while what computes it wrote the extended one: vertices past the first 32 came out undefined.
+            // SUST and SURED's data as well, the same field. (amd-fix, Lichii #149) RED's too: a reduction's data in a high GPR
+            // read the plain register, never written. (Lichii #588) TXD's four gradients (0xb6c) and the global atomic's
+            // data (0x9a8) too: both are registers at bit 32)
+            const auto register_field = [&](u32 f) {
+                return bits[f] != 32 || insn.Bits(9, 3) == 1 || opcode == 0xb60 || opcode == 0xb66 || opcode == 0x927 ||
+                       opcode == 0xb9b || opcode == 0x59f || opcode == 0x983 || opcode == 0x98e || opcode == 0xb6c ||
+                       opcode == 0x9a8 || (renameable & (1U << f));
+            };
             for (u32 f = 0; f < 4; ++f) {   // what may be native high GPRs, and which are to be renamed
                 const u32 bit = bits[f], reg = insn.Bits(bit, 8);
                 // Survey all original operands before rewriting any of them. A marker chosen for
@@ -229,19 +245,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // Keep the same conservative pair/quad spans used for high-register accesses.
                 for (u32 k = 0; k < span_of(reg) && reg + k < 255; ++k)
                     native_occupied[reg + k] = true;
-                // (ISBEWR's data too: not counted, a mesh program's output held in a high GPR was read from the plain register,
-                // never written, while what computes it wrote the extended one: vertices past the first 32 came out undefined.
-                // SUST and SURED's data as well, the same field. (amd-fix, Lichii #149) RED's too: a reduction's data in a high GPR
-                // read the plain register, never written. (Lichii #588) TXD's four gradients (0xb6c) and the global atomic's
-                // data (0x9a8) too: both are registers at bit 32)
-                const bool register_field = bit != 32 || insn.Bits(9, 3) == 1 || opcode == 0xb60 || opcode == 0xb66 ||
-                                            opcode == 0x927 || opcode == 0xb9b || opcode == 0x59f || opcode == 0x983 ||
-                                            opcode == 0x98e || opcode == 0xb6c || opcode == 0x9a8 || (renameable & (1U << f));
                 if (reg >= 255 || reg + 3 < reserved_base) continue;   // (a quad below may reach up)
-                if (register_field && reg >= reserved_base) any_high = true;
+                if (register_field(f) && reg >= reserved_base) any_high = true;
             }
             for (u32 f = 0; f < 4 && any_high; ++f) {
                 const u32 bit = bits[f], reg = insn.Bits(bit, 8);
+                // (hookshot) only the fields that hold registers: an immediate's low byte at bit 32 (LOP3 R231, R231,
+                // 0xfffffffe) was taken for R254 in the scratch registers, and two of OoT's compute programs were refused
+                if (!register_field(f)) continue;
                 if (reg >= 255 || reg + 3 < reserved_base) continue;
                 const u32 exact = FieldSpan(opcode, f);
                 const u32 span = exact ? exact : span_of(reg);
@@ -1595,6 +1606,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0xb1d: // BAR.SYNC 0 (bit 80: .DEFER_BLOCKING), full workgroup.
             if (insn.words[1] || (insn.words[2] & ~0x10000U) || native_predicate != 7)
                 return fail(index, "native workgroup barrier mode");
+            shared_store_pending = false;
             emit(0xf0a8000000000000ULL | predicate | (u64{1} << 43) |
                 (u64{1} << 44) | (u64{1} << 39) | (u64{7} << 39));
             break;
@@ -1617,6 +1629,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 address = 250;
             }
             const u32 data = opcode == 0x388 ? insn.Bits(32, 8) : static_cast<u32>(dest);
+            // (hookshot) A warp stores to shared memory (STS) and reads it back (LDS) with no barrier between: the Switch runs a
+            // warp's shared memory accesses in order, Vulkan orders another lane's store and this lane's load only through a
+            // barrier, and the driver's compiler may move them past each other (OoT's 4/3 gameplay network on NVIDIA's cooperative
+            // matrix path: 16x2 bright bars, Hookshot issue 2455). As for LDSM: a subgroup barrier before the first LDS after an
+            // STS, only where the LDS is not predicated (every lane of the warp reaches it). RX_VK_SHARED_NO_LDS_BARRIER=1: none, as before
+            static const bool lds_barrier = std::getenv("RX_VK_SHARED_NO_LDS_BARRIER") == nullptr;
+            if (opcode == 0x388) {
+                shared_store_pending = true;
+            } else if (shared_store_pending && lds_barrier && native_predicate == 7) {
+                emit(0xef98000000000000ULL | predicate | (u64{1} << 20));   // (MEMBAR, bit 20: barrier_operations.cpp)
+                shared_store_pending = false;
+            }
             emit((opcode == 0x388 ? 0xef58000000000000ULL : 0xef48000000000000ULL) |
                 predicate | data | (u64{address} << 8) | (u64{insn.Bits(40, 24)} << 20) |
                 (u64{width} << 48));
@@ -1729,9 +1753,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native matrix load mode");
             u32 address = insn.Bits(24, 8);
             const u64 offset = insn.Bits(40, 24);
+            // (Fritchii f130f0c50) An address the results overwrite is copied first, to R254: the paths below use R246-R253,
+            // and R253 (the copy's old place) is where each matrix's row address is shuffled to, so matrices 1-3 of an .x2/.x4
+            // shuffled matrix 0's address and read the wrong rows (OoT has one such LDSM.x4, gpu/vk/tests/ldsm_address_test.cpp)
             if (address != 255 && address >= dest && address < dest + count) {
-                emit(0x5c10000000000000ULL | predicate | 253 | (u64{address} << 8) | (u64{255} << 20));
-                address = 253;
+                emit(0x5c10000000000000ULL | predicate | 254 | (u64{address} << 8) | (u64{255} << 20));
+                address = 254;
             }
             // (hookshot) A warp stores its tiles (STS) and reads them back with LDSM, often with no BAR between: the Switch runs a
             // warp's shared memory accesses in order, Vulkan orders another lane's store and this lane's load only through a
@@ -1913,8 +1940,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // desc[URn][Ra.64]: the uniform pair is a memory (cache policy) descriptor and
                 // Ra the whole address.
                 const bool descriptor_address = (insn.words[2] & ~(0x3fU | 0xe00U)) == 0x0c1e1100;
+                // (hookshot) bits 77-78, the load's memory ordering, as the register form's bit 77: nothing for a Maxwell
+                // LDG. Two of OoT's compute programs load [URn+imm] with both set and stopped here
                 if ((!descriptor_address &&
-                     (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U | 0x2000U)) != 0x081e8100) ||
+                     (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U | 0x6000U)) != 0x081e8100) ||
                     uniform_address == ~0U || (uniform_address & 1))
                     return fail(index, "native global load uniform addressing mode");
                 if (descriptor_address) {
@@ -1956,7 +1985,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // desc[URn][Ra.64]: the uniform pair is a memory (cache policy) descriptor and
                 // Ra the whole address.
                 const bool descriptor_address = (insn.words[2] & ~(0x3fU | 0xe00U)) == 0x0c101100;
-                if ((!descriptor_address && (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U)) != 0x0810a100) ||
+                // (hookshot) bit 78 beside 77, the store's memory ordering, as for LDG: nothing for a Maxwell STG (the
+                // second of those compute programs stores [URn+imm] so)
+                if ((!descriptor_address && (insn.words[2] & ~(0x04000000U | 0x3fU | 0xe00U | 0x4000U)) != 0x0810a100) ||
                     uniform_address == ~0U || (uniform_address & 1) || !extended)
                     return fail(index, "native global store uniform addressing mode");
                 if (descriptor_address) {
@@ -2089,6 +2120,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Bit 76: a texel offset after the coordinates and level. 2D only, as Maxwell TLDS
             // 2D.LZ.AOFFI (x, y in Ra, Ra+1, offsets in Rb) or 2D.LL.AOFFI (level, offsets in Rb, Rb+1).
             const bool offsets = insn.Bits(76, 1) != 0;
+            // (hookshot) Bit 78: a multisampled texture's texel (.MS), the sample index in Rb. 2D at level zero only, as
+            // Maxwell TLDS 2D.LZ.MS (x, y in Ra, Ra+1, the sample in Rb): three of OoT's fragment programs stopped here
+            const bool multisample = insn.Bits(78, 1) != 0;
             const u32 dimension = insn.Bits(61, 3);
             const bool array = dimension == 5;
             const bool volume = dimension == 2;
@@ -2104,7 +2138,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 for (u32 i = 0; i < rg_masks.size(); ++i) if (rg_masks[i] == mask) swizzle = i;
             }
             if (!insn.Bits(60, 1) || (dimension != 0 && dimension != 1 && !array && !volume) ||
-                swizzle == ~0U || (insn.Bits(76, 5) & ~1U) ||
+                swizzle == ~0U || (insn.Bits(76, 5) & ~5U) ||
+                (multisample && (dimension != 1 || level || offsets || (source_a & 1) || source_a >= 254 ||
+                                 source_b == 255)) ||
                 (offsets && (dimension != 1 || (source_a & 1) || source_a >= 254 || source_b == 255 ||
                              (level && ((source_b & 1) || source_b >= 254)))) ||
                 insn.Bits(81, 3) != 7 || (insn.Bits(87, 3) != 1 && !level) || (level && volume) ||
@@ -2120,7 +2156,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             const u32 binding = insn.Bits(54, 5);
             if (!bind_texture_buffer(binding)) {
-                if (level || offsets)
+                if (level || offsets || multisample)
                     return fail(index, "native texture descriptor buffer conflict");
                 // A second descriptor buffer: TLD.B (LZ) with the coordinates in R250.. (array
                 // index or Z after Ra) and the handle, loaded from that buffer, in R253.
@@ -2168,7 +2204,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{source_b} << 20) | (u64{insn.Bits(64, 8)} << 28) |
                  (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) |
                  (u64{swizzle} << 50) |
-                 (u64{offsets ? (level ? 12U : 4U)
+                 (u64{offsets ? (level ? 12U : 4U) : multisample ? 6U
                       : array ? 8U : volume ? 7U : dimension == 0 ? (level ? 1U : 0U) : (level ? 5U : 2U)} << 53));
             break;
         }
@@ -3411,7 +3447,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (target < 0 || target % 16) return fail(index, "native branch destination alignment");
             relocations.push_back({static_cast<u32>(result.instructions.size()), target / 16});
             emit(0xe24000000000000fULL | branch_predicate);
-            if (computed_branch && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
+            // (hookshot) a loop that leaves only by predicated EXITs: the program ends at the closing self-branch after the
+            // loop's unconditional jump back, which nothing falls into (one of OoT's compute programs, its EXITs all @P0)
+            const auto unconditional_jump = [&](const Instruction& before) {
+                const u32 op = before.Bits(0, 12);
+                return before.Bits(12, 4) == 7 && ((op == 0x947 && before.Bits(87, 4) == 7) || op == 0x94d);
+            };
+            const bool after_jump = index > 0 && call_targets.empty() && unconditional_jump(code[index - 1]);
+            if ((computed_branch || after_jump) && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
                 return finish(index); // the closing self-branch
             break;
         }
@@ -3424,7 +3467,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool write = opcode == 0x927;
             const u32 region = insn.Bits(76, 2);
             const bool output = insn.Bits(79, 1) != 0;
-            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || write != output ||
+            // (hookshot) a read may be of the output region (.O): the program reading back what it wrote (one of OoT's
+            // task programs reads its payload so); a write is always to it
+            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || (write && !output) ||
                 (!write && region != 3) || (!write && dest == 255))
                 return fail(index, "native stage buffer access mode");
             emit(0xefc0000000000000ULL | predicate | (write ? u64{insn.Bits(32, 8)} : dest) |

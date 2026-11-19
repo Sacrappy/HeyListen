@@ -46,7 +46,8 @@ class CacheModuleCleanupTests(unittest.TestCase):
         header = (ROOT / 'gpu/vk/vk_shader.h').read_text(encoding='utf-8')
         structs = '\n'.join(block(header, marker) + ';' for marker in ('struct Stage {', 'struct Program {'))
         structs += '\n' + block(source, 'struct DiskRecord {') + ';'
-        functions = '\n'.join(block(source, marker) for marker in (
+        functions = line(source, 'std::atomic<int64_t> st_module_ns') + '\n'   # (the preparation's profile counters, which make_module and program_cache_save add to)
+        functions += '\n'.join(block(source, marker) for marker in (
             'VkShaderModule make_module(', 'uint64_t answers_hash(', 'bool answers_fit(', 'void idx_put('))
         # (the records' packing: kKindZstd and what record_pack and record_unpack use. zstd is stubbed in the test: it packs nothing)
         functions += '\n' + line(source, 'constexpr uint32_t kKindZstd')

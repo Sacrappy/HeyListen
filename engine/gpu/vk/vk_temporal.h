@@ -21,6 +21,10 @@ int temporal_mode();
 /// RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 set for this run, and that engine runs here: over the row, its FSR 3.1 too
 /// (vk_fsr3.cpp fsr3_wanted). Where it cannot run, a saved FSR 3.1 stays
 bool temporal_env_chosen();
+/// The Upscaler row says Off (upscaler_rows.h OFF) and no switch goes over it: the gameplay upscale networks are not run, their
+/// dispatches draw the plain upscale of the 3D (vk_draw.cpp off_stand_in). temporal_mode() is GAME then, so DLSS's and FSR 4's
+/// state is let go as on any switch to the game's own (temporal_idle)
+bool upscaler_off();
 bool temporal_wanted();       // (temporal_mode() != GAME)
 /// DLAA or FSR's native anti-aliasing: the 3D drawn at full scale, whatever the Render resolution row says
 bool temporal_full_scale();

@@ -237,7 +237,7 @@ choices and starts the game again, so progress since your last save is lost.
 | | Frame pacing | Off, On | Off |
 | | NVIDIA Reflex | Off, On, On + Boost (NVIDIA GPUs with `VK_NV_low_latency2`) | Off |
 | | Output resolution | 1920x1080, 2048x1152, 2560x1440, 3840x2160, 5120x1440 (after a restart) | 2048x1152 |
-| | Upscaler | Game's own, NVIDIA DLSS, NVIDIA DLAA (only in builds with NVIDIA's DLSS SDK, below; DLSS and DLAA on RTX GPUs), AMD FSR 3.1 (every build, on GPUs it runs on, below), AMD FSR 4, AMD FSR 4 Native AA (only in builds with FSR 4, below) | Game's own |
+| | Upscaler | Game's own, NVIDIA DLSS, NVIDIA DLAA (only in builds with NVIDIA's DLSS SDK, below; DLSS and DLAA on RTX GPUs), AMD FSR 3.1 (every build, on GPUs it runs on, below), AMD FSR 4, AMD FSR 4 Native AA (only in builds with FSR 4, below), Off (every build and GPU, `dlss=6`: no upscaling network, the 3D at the Render resolution stretched to the output, no anti-aliasing; Render resolution steps as for the game's own, Sharpness applies) | Game's own |
 | | DLSS model | Transformer (K), Transformer 2 (M), Transformer 2 (L), NVIDIA default (builds with DLSS; used by DLSS and DLAA) | Transformer (K) |
 | | Render resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size). With DLSS, FSR 3.1 or FSR 4: Auto, Quality (67%), Balanced (58%), Performance (50%), Ultra Performance (33%). With DLAA or FSR 4 Native AA: Native | Auto |
 | | Window scaling filter | Off, Catmull-Rom, Lanczos | Off |

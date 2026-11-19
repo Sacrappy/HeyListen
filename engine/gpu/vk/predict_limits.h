@@ -7,13 +7,15 @@
 //  * a program over kDefaultMaxKWords thousand words is left to the draw that needs it (RX_VK_PREDICT_MAX_KWORDS, 0: no limit);
 //  * the prediction stops, the rest left to play, when the system has less than kDefaultReserveMB of commit left
 //    (RX_VK_PREDICT_RESERVE_MB, 0: no limit).
+// (v0.4.3: the default is 100: on a GTX 1660 SUPER (Turing) one program of 144k words stayed in the driver for 2 hours, the same
+// takes ~25 s on Ampere; the programs measured cheap and safe are 40k words or fewer, and a prediction is speculative anyway.)
 // No Vulkan: tests/predict_limits_test.cpp.
 #pragma once
 #include <cstdint>
 
 namespace mkwvk::predictlimits {
 
-constexpr unsigned long long kDefaultMaxKWords = 300;
+constexpr unsigned long long kDefaultMaxKWords = 100;   // (was 300: a 144k-word program sat 2 hours in a GTX 1660 SUPER's driver, v0.4.2; the cheap ones measured are <= 40k)
 constexpr unsigned long long kDefaultReserveMB = 3072;
 
 /// A program of `words` 32-bit words of SPIR-V (all its stages) is too big to be predicted when max_kwords is not 0 and it is over it

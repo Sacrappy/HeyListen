@@ -50,6 +50,16 @@ the **Open menu** row takes one gamepad button, or two pressed together (L3 + R3
 the ways above keep working. A combination held does not reach the game. When a controller is opened the game's log
 (`hookshot_log.txt`) says what it is and which buttons open the menu. Frame generation is off by default.
 
+### Upscaler
+
+The menu's Graphics tab has an **Upscaler** row: what scales the 3D picture up to the output. **Game's own** (the default) is
+the game's own upscaling network. **NVIDIA DLSS**, **NVIDIA DLAA**, **AMD FSR 3.1**, **AMD FSR 4** and **AMD FSR 4 Native AA** are
+offered where they run. **Off** is on every GPU: the game's upscaling network is not run at all, and the 3D is drawn at the
+**Render resolution** and stretched to the output, with no anti-aliasing. Try it if the game's own network shows glitches on your
+GPU (some older AMD cards, handhelds), or to save its GPU time. Render resolution works as with the game's own upscaler (at 100% the
+picture is the 3D as drawn), **Sharpness** still applies (it works on the picture after the upscaler), and frame generation is
+unaffected. In `hookshot_options.ini` it is `dlss=6`; the launcher's Upscaler setting has it as **Off**.
+
 ## Install with RecompLauncher
 
 [RecompLauncher](https://recomplauncher.com) installs HeyListen for you, like a PC game, and keeps it up to date. It does

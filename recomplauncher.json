@@ -429,7 +429,7 @@
     {
       "id": "upscaler",
       "label": "Upscaler",
-      "help": "What scales the 3D picture up to the output. DLSS needs an NVIDIA RTX card and its tick at setup; FSR 4 needs an AMD card with FSR 4 and its tick at setup; FSR 3.1 works on any card.",
+      "help": "What scales the 3D picture up to the output. DLSS needs an NVIDIA RTX card and its tick at setup; FSR 4 needs an AMD card with FSR 4 and its tick at setup; FSR 3.1 works on any card. Off runs no upscaling network at all (the 3D stretched to the output, no anti-aliasing), for a GPU where the game's own network shows glitches.",
       "group": "Upscaling",
       "choices": [
         {
@@ -466,6 +466,12 @@
           "label": "AMD FSR 4 Native AA",
           "set": {
             "dlss": "5"
+          }
+        },
+        {
+          "label": "Off",
+          "set": {
+            "dlss": "6"
           }
         }
       ],

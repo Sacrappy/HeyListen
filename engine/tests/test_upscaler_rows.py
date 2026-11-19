@@ -47,8 +47,8 @@ def main():
             raise SystemExit("ini_key: %s is not saved as %s (an options file from before would lose it)" % (value, name))
     # the menu's rules are upscaler_rows.h's, checked by behaviour in test_upscaler_rows.cpp: here only that the menu uses them
     uses = {
-        "row_fixed": ("ur::upscaler_fixed(", "ur::resolution_fixed(", "reflex_available()", "ur::model_fixed("),
-        "row_shown": ("ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported())", "ur::model_shown(dlss_built())"),
+        "row_fixed": ("ur::resolution_fixed(", "reflex_available()", "ur::model_fixed("),
+        "row_shown": ("ur::model_shown(dlss_built())",),
         "set_row": ("ur::step_upscaler(", "ur::step(", "ur::snap(", "row_fixed("),
     }
     for name, calls in uses.items():
@@ -122,8 +122,8 @@ def main():
         raise SystemExit("upscalers_available does not ask vk_fsr3.cpp whether FSR 3.1 runs here")
     if "fsr4_why() == FSR_OK" not in available:
         raise SystemExit("upscalers_available does not ask vk_fsr4.cpp whether FSR 4 runs here")
-    if "upscalers_available()" not in function(menu, "void set_row(") or "upscalers_available()" not in function(menu, "bool row_fixed("):
-        raise SystemExit("the Upscaler row does not step over (or fix on) what runs here")
+    if "upscalers_available()" not in function(menu, "void set_row("):
+        raise SystemExit("the Upscaler row does not step over what runs here")
     # the saved Render resolution is the player's: another Upscaler does not overwrite it with its nearest step (Balanced 58%
     # came back from the game's own as Performance 50%); what draws and what the row shows is that nearest step
     if "opts.resolution = ur::snap(" in function(menu, "void set_row("):

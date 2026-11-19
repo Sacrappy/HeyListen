@@ -2,12 +2,14 @@
    docs/native-engine/main-loop.md).
 
    The game's main thread ends in the framework's main loop (guest 0x809667b0), which calls the framework's frame function
-   forever. HL_MAINLOOP (on by default; =0 is the translated loop): an entry gate on that loop hands the main thread to the native main loop (hl::app::MainLoop
+   forever. HL_MAINLOOP=1 (off by default: the translated loop): an entry gate on that loop hands the main thread to the native main loop (hl::app::MainLoop
    through hl::bridge::FrameLoop): the iteration and the order of the frame's steps are native, each step calls the
    game's own functions, the frame's time step stays the game's and the pacing the OS layer's (nn_vi.c, nvn_native.c).
    It needs the job bridge on (HL_JOBS, the default), whose native job system the loop is given. HL_MAINLOOP=0: the translated loop, as before
-   (the default was 0 until the PC 3050 runs of 2026-11-17: the three scenes and a zone change, no crash or hang,
-   game speed 60 by the median of the speed lines).
+   (on by default in 0.4.2 after the PC 3050 runs of 2026-11-17; off again from 0.4.3: three 0.4.2 crash reports, RX 580
+   twice and RTX 5070, read [null+0x150] on a ModuleSystemWorker, a handle resolver (f_80cb38d0) given an index past its
+   table's count, which no 0.4.1 log of the same player shows; the native loop's step order is the first suspect, until
+   HL_MAINLOOP_CHECK runs on those scenes say otherwise).
    HL_MAINLOOP_CHECK=1: the loop's invariants are counted (each phase once a frame in the game's order; the module
    system's frame 0x80706be0, observed through a second entry gate that runs it translated, run at most once a frame and
    its frame counter counted up by one) and logged every 10 s with the phases' functions. HL_MAINLOOP_LOG=1: the
@@ -18,7 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#define HL_MAINLOOP_DEFAULT 1
+#define HL_MAINLOOP_DEFAULT 0
 #define HL_JOBS_WORKER_MESSAGE 0x8004aae0ULL   /* (hl_jobs.c: answered when the job bridge is on) */
 
 A64Fn a64_lookup_replaced(uint64_t addr);   /* hl_host.c */

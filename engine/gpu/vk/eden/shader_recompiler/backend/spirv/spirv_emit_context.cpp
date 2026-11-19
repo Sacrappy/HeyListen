@@ -19,6 +19,7 @@
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/global_helper_policy.h"
+#include "shader_recompiler/backend/spirv/local_memory_pad.h"   // (hookshot SH1)
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -488,6 +489,10 @@ std::string NameOf(Stage stage, const Desc& desc, std::string_view prefix) {
     }
 }
 
+// (hookshot) Textures, texture buffers, image buffers and images alike: a descriptor of count above 1 is an array of count,
+// the descriptors the renderer writes to its binding (vk_draw.cpp, ensure_layout), indexed with an OpAccessChain to an element
+// (pointer_type). Texture buffers were refused ("Array of texture buffers") and image buffers and images declared one image,
+// which that OpAccessChain cannot index (invalid SPIR-V). With a count of 1 the declaration is what it was.
 Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
     if (count > 1) {
         const Id array_type{ctx.TypeArray(sampled_type, ctx.Const(count))};
@@ -694,7 +699,14 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
     if (program.local_memory_size == 0) {
         return;
     }
-    const u32 num_elements{Common::DivCeil(program.local_memory_size, 4U)};
+    // (stream SH1, RX_VK_LOCAL_PAD=<words>, off by default: local_memory_pad.h, the driver's compile of the game's two largest mesh programs)
+    static const u32 pad_to{LocalPadNumber(std::getenv("RX_VK_LOCAL_PAD"), kLocalPadDefault)};
+    static const u32 pad_from{LocalPadNumber(std::getenv("RX_VK_LOCAL_PAD_FROM"), kLocalPadFromDefault)};
+    const u32 used_elements{Common::DivCeil(program.local_memory_size, 4U)};
+    const u32 num_elements{PaddedLocalWords(used_elements, pad_to, pad_from)};
+    if (num_elements != used_elements) {
+        LOG_WARNING(Shader_SPIRV, "local memory of {} words declared with {} (RX_VK_LOCAL_PAD)", used_elements, num_elements);
+    }
     const Id element_type{TypeStruct(U32[1])};
     const Id type{TypeArray(element_type, Const(num_elements))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
@@ -1174,6 +1186,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         if (m == &StorageDefinitions::F32) return storage_types.F32.array;   // (hookshot: the native float add's, as U32's)
         if (m == &StorageDefinitions::U32x2) return storage_types.U32x2.array;
         if (m == &StorageDefinitions::U32x4) return storage_types.U32x4.array;
+        if (m == &StorageDefinitions::U8) return storage_types.U8.array;     // (hookshot: the direct narrow stores)
+        if (m == &StorageDefinitions::U16) return storage_types.U16.array;
         return Id{};
     }};
     // (EvilOOT, RX_VK_MISS_LOG) the miss log's descriptor (translate_program.cpp: c0+0xff0), -1 none. It is a single storage
@@ -1289,6 +1303,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback, bool add_label = true) {
         if (add_label) AddLabel();
+        // A helper may have only the page-table path, with no bound view of this type.
+        if (!Sirit::ValidId(element_pointer)) return;
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         // (from Fritchii) Info::native_global_bounds: the candidate pointers the storage buffer pass bound for accesses it
         // left global (any single descriptor not in the driver bank) carry no NVN size word: the address goes to the
@@ -1343,7 +1359,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             // nvn_buffer_used[index], took a descriptor's place in the list for an NVN slot number: with the tracked
             // buffers first, the slots' own descriptors past them were skipped and their reads gave 0. A match is exact,
             // so searching a buffer the access never falls in costs a comparison and nothing else.
-            if (info.storage_buffers_descriptors[index].count > 1) {
+            if (info.storage_buffers_descriptors[index].count > 1 ||
+                !Sirit::ValidId(ssbos[index].*ssbo_member)) {
                 continue;
             }
             if (const auto hit{ranges.find({index, 0})}; hit != ranges.end() && Sirit::ValidId(ssbos[index].*ssbo_member)) {
@@ -1600,7 +1617,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         }};
         define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
                     [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
-        guest_lookup(addr, 4U, [&](Id target) {
+        const Id word_address{OpBitwiseAnd(U64, addr, Constant(U64, ~u64{3}))};
+        guest_lookup(word_address, 4U, [&](Id target) {
             if (gp_level >= 3) {
                 cas_loop(psb_member(U32[1], target));
             } else {
@@ -1610,6 +1628,82 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         OpReturn();
         OpFunctionEnd();
         write_global_cas_loop_func = func;
+    }
+    // (hookshot) Where 8/16-bit storage is there (the profile's narrow views): the narrow global store writes its byte or half
+    // directly, at the exact address, instead of a compare-exchange loop on the 32-bit word around it (which retried under
+    // contention in OoT's table-walking passes, and took the lookup's exact address as the word's). Bytes and halves stored
+    // this way do not disturb their neighbours
+    if (info.stores_global_memory && profile.support_native_narrow_global_store) {
+        const auto make_narrow{[&](u32 bits, Id type, DefPtr member, Id element) -> Id {
+            if (!Sirit::ValidId(type)) return Id{};
+            // (the narrow views need these declared: the device has both features on, vk_main.cpp enables what it reports)
+            if (bits == 8) {
+                AddExtension("SPV_KHR_8bit_storage");
+                AddCapability(spv::Capability::StorageBuffer8BitAccess);
+            } else {
+                AddExtension("SPV_KHR_16bit_storage");
+                AddCapability(spv::Capability::StorageBuffer16BitAccess);
+            }
+            const Id func_type{TypeFunction(void_id, U64, U32[1])};
+            const Id func{OpFunction(void_id, spv::FunctionControlMask::DontInline, func_type)};
+            const Id addr{OpFunctionParameter(U64)};
+            const Id value{OpFunctionParameter(U32[1])};
+            AddLabel();
+            const Id narrow{OpUConvert(type, value)};
+            define_body(member, addr, element, bits == 8 ? 0U : 1U,
+                        [&](Id ssbo_pointer) {
+                            OpStore(ssbo_pointer, narrow);
+                            OpReturn();
+                        }, false);
+            guest_lookup(addr, bits / 8, [&](Id target) {
+                if (gp_level >= 3) {
+                    OpStore(psb_member(type, target), narrow, spv::MemoryAccessMask::Aligned, bits / 8);
+                }
+                OpReturn();
+            });
+            OpReturn();
+            OpFunctionEnd();
+            return func;
+        }};
+        if (profile.support_storage_buffer_8bit && True(info.used_storage_buffer_types & IR::Type::U8))
+            write_global_u8_func = make_narrow(8, U8, &StorageDefinitions::U8, storage_types.U8.element);
+        if (profile.support_storage_buffer_16bit && True(info.used_storage_buffer_types & IR::Type::U16))
+            write_global_u16_func = make_narrow(16, U16, &StorageDefinitions::U16, storage_types.U16.element);
+    }
+    if (info.stores_global_memory && profile.support_native_narrow_global_store &&
+        True(info.used_storage_buffer_types & IR::Type::U16)) {
+        const Id native_half{write_global_u16_func};
+        const Id func_type{TypeFunction(void_id, U64, U32[1])};
+        const Id func{OpFunction(void_id, spv::FunctionControlMask::DontInline, func_type)};
+        const Id addr{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(U32[1])};
+        AddLabel();
+        const auto store{[&](Id target, Id data, u32 bits, Id direct) {
+            if (Sirit::ValidId(direct)) {
+                OpFunctionCall(void_id, direct, target, data);
+                return;
+            }
+            const Id low{OpBitwiseAnd(U32[1], OpUConvert(U32[1], target), Const(3U))};
+            const Id offset{OpShiftLeftLogical(U32[1], low, Const(3U))};
+            OpFunctionCall(void_id, write_global_cas_loop_func, target, data, offset, Const(bits));
+        }};
+        // Keep control flow inside the helper so the guest block labels used by OpPhi remain valid.
+        const Id one{Constant(U64, u64{1})};
+        const Id odd{OpINotEqual(U1, OpBitwiseAnd(U64, addr, one), Constant(U64, u64{0}))};
+        const Id split{OpLabel()}, done{OpLabel()};
+        OpSelectionMerge(done, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(odd, split, done);
+        AddLabel(split);
+        // An odd halfword can straddle both a 32-bit word and a guest page.
+        store(addr, value, 8, write_global_u8_func);
+        store(OpIAdd(U64, addr, one), OpShiftRightLogical(U32[1], value, Const(8U)), 8,
+              write_global_u8_func);
+        OpReturn();
+        AddLabel(done);
+        store(addr, value, 16, native_half);
+        OpReturn();
+        OpFunctionEnd();
+        write_global_u16_func = func;
     }
     // (hookshot) RED/ATOM.E.ADD.F32 at an address no buffer was tracked to: the 32-bit atomics' fallback, with the float
     // sum made in a compare-exchange loop as the storage buffers' f32_add_cas does, or the GPU's own float add where
@@ -1947,6 +2041,8 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     }
     if (profile.support_int8 && profile.support_storage_buffer_8bit &&
         True(used_types & IR::Type::U8)) {
+        AddExtension("SPV_KHR_8bit_storage");   // (hookshot: the 8-bit views need it declared)
+        AddCapability(spv::Capability::StorageBuffer8BitAccess);
         DefineSsbos(*this, storage_types.U8, &StorageDefinitions::U8, info, binding, U8,
                     sizeof(u8));
         DefineSsbos(*this, storage_types.S8, &StorageDefinitions::S8, info, binding, S8,
@@ -1954,6 +2050,8 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     }
     if (profile.support_int16 && profile.support_storage_buffer_16bit &&
         True(used_types & IR::Type::U16)) {
+        AddExtension("SPV_KHR_16bit_storage");   // (hookshot: the 16-bit views need it declared)
+        AddCapability(spv::Capability::StorageBuffer16BitAccess);
         DefineSsbos(*this, storage_types.U16, &StorageDefinitions::U16, info, binding, U16,
                     sizeof(u16));
         DefineSsbos(*this, storage_types.S16, &StorageDefinitions::S16, info, binding, S16,
@@ -2037,15 +2135,14 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
     const Id type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
     texture_buffers.reserve(info.texture_buffer_descriptors.size());
     for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
-        if (desc.count != 1) {
-            throw NotImplementedException("Array of texture buffers");
-        }
-        const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
+        const Id desc_type{DescType(*this, image_buffer_type, type, desc.count)};
+        const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
+            .pointer_type = type,
             .count = desc.count,
         });
         if (profile.supported_spirv >= 0x00010400) {
@@ -2063,7 +2160,8 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id image_type{
             TypeImage(sampled_type, spv::Dim::Buffer, false, false, false, 2, format)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
-        const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+        const Id desc_type{DescType(*this, image_type, pointer_type, desc.count)};
+        const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "imgbuf"));
@@ -2118,7 +2216,8 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
         const Id image_type{ImageType(*this, desc, sampled_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
-        const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+        const Id desc_type{DescType(*this, image_type, pointer_type, desc.count)};
+        const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "img"));
@@ -2379,7 +2478,11 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + mesh_info.Corners() * mesh_info.max_primitives;
+    // Whole blocks of 32 primitives, as the attributes: the program writes the index bytes of every primitive block, lanes past
+    // max_primitives too (a count of 0 wraps its min(count - 1, lane) to every lane). Sized to max_primitives, those writes were
+    // clamped onto the last byte, the last primitive's last corner: with 126 primitives (most of OoT's) a stray vertex, flashing
+    // triangles over Kokiri's foliage and ground (as nxnative found: "primitive index bytes for every primitive block")
+    mesh_map_bytes = 4 + mesh_info.Corners() * Common::DivCeil(mesh_info.max_primitives, 32U) * 32;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);

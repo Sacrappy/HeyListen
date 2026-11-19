@@ -143,6 +143,21 @@ def movie_site(s, addr, off):
 # - HL_SOUND_HOOK(80435300, "<hash>"): the sound manager's job. At its head: return at once while hos_oot_sound_gate
 #   (host/hl_high_fps.c) says so (the job at 60 Hz above a 60 cap); after its load of the game step: that step through
 #   hos_oot_sound_step (a whole one while the gate holds the job to whole steps).
+# - HL_BGM_HOOK(83373400, "<hash>"): (Longshot eb5ba6e2 / Hookshot bf802502, CraftyCorvid) the music manager's update, run inside
+#   the sound job, so at 60 Hz too: at its head hos_oot_bgm_begin (takes the change flags the sound gate held back); after its
+#   two loads of the time object's step (+16) and seconds (+24) both through hos_oot_sound_step / hos_oot_sound_seconds (a
+#   whole step while the gate holds the job); after each of its four reads of the battle manager's change flags (x26 + 2200)
+#   that byte with the held ones, hos_oot_bgm_flags (the battle music stopped after a fight above 60 fps).
+# - HL_TURN_HOOK(8263e8e0, "<hash>"): (Longshot 3ab8cae6 / Hookshot 93a8bff3, PirateKingIsh; Gohma) the steering update's two
+#   clamps of the saved rate (+36), vreg 1 = turn x rate and vreg 0 = turn x step (vreg 8): above 60 fps, 0 < step < 1, each is
+#   the division instead (the turn was already scaled by the step, so the saved rate kept rate x step squared). Each multiply
+#   is jumped over by a line before it that does the division when the step is under 1, and a label after it.
+# - HL_HORSE_HOOK(82c59eb0, "<hash>"): (Longshot 8e8a06db, CraftyCorvid; Epona's fences) between the jump state machine's test of
+#   its step (vreg 10) against 1 and its branch past the slow-motion branch: a step that is the whole frame's (the time
+#   object's, hos_oot_horse_whole_step) takes that branch too.
+# - HL_FLOOR_HOOK(80159dc0, "<hash>", "L_8015a39c"): (Longshot 4f755527, CraftyCorvid; the Shadow Temple's barge) a character
+#   module's test of the physics' 1/dt (+40) against 100 and its branch to the tenth of a moving floor's velocity (the label
+#   given): that branch is skipped above a 60 cap on a frame under a 60 fps one unless hos_oot_floor_carry_slow says time is slow.
 # - HL_SOLVER_HOOK(838ceb80, "<hash>"): after the cut of frame step x the solver's steps a 60 fps frame + 0.001, stored to
 #   the solver's +712: the count through hos_oot_solver_steps (rounded up while the step is under 1).
 # - HL_WHOLE_HOOK(80a87e50, "<hash>", <reg>, "<key>"): after the function's cut of an amount of the frame step (vreg 0's
@@ -159,7 +174,7 @@ def movie_site(s, addr, off):
 #   after it ("}" and the retry), so that taking the hook out leaves the lift as it was.
 # Each goes in only where its function's text hashes as recorded, both lines of a kind or none. The marker is the address
 # plus one, as a step hook's (one hook a function), so a tree that does not ask for it takes it out as a stale gate.
-WANT_LIFT = re.compile(r'^HL_(SOUND|SOLVER|WHOLE|HEAP)_HOOK\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f]*)"((?:\s*,\s*(?:\d+|"[^"\n]*"))*)\s*\)',
+WANT_LIFT = re.compile(r'^HL_(SOUND|SOLVER|WHOLE|HEAP|BGM|TURN|HORSE|FLOOR)_HOOK\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f]*)"((?:\s*,\s*(?:\d+|"[^"\n]*"))*)\s*\)',
                        re.M)
 CUT = "    c->x[%d]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);\n"
 SOUND_SLOT = "g_module_base + 0x80435000ULL + (int64_t)75927552"   # (the page of the step's pointer, whose +2192 holds it)
@@ -168,6 +183,23 @@ SOUND_LOAD = ("    c->x[8]=" + SOUND_SLOT + ";\n"
               "    c->x[8]=recomp_load64(c,c->x[8] + 2192);\n"
               "    c->x[8]=recomp_load64(c,c->x[8] + 0);\n"
               "    { { uint64_t _v=recomp_load32(c,(c->x[8]+16ULL)); a64_vset64(c->vreg[0],_v); } }\n")
+BGM_TIME = ("    { { uint64_t _v=recomp_load32(c,(c->x[8]+16ULL)); a64_vset64(c->vreg[8],_v); } }\n"
+            "    { { uint64_t _v=recomp_load32(c,(c->x[8]+24ULL)); a64_vset64(c->vreg[9],_v); } }\n")
+BGM_FLAGS = "    c->x[8]=recomp_load8(c,c->x[26] + 2200);\n"   # (the update's four reads of the change flags)
+TURN_MULS = ("    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[0],4);memcpy(&_b,c->vreg[1],4);_z=(_a^_b)&0x80000000ULL;\n"
+             "    _v=a64_fpx_mul32_fma32(c,_a,_b,_z);\n"
+             "    a64_vset64(c->vreg[1],_v);}\n")
+TURN_MULS2 = ("    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[0],4);memcpy(&_b,c->vreg[8],4);_z=(_a^_b)&0x80000000ULL;\n"
+              "    _v=a64_fpx_mul32_fma32(c,_a,_b,_z);\n"
+              "    a64_vset64(c->vreg[0],_v);}\n")
+HORSE_TEST = "    a64_vset64(c->vreg[9],0x3f800000ULL);\n    { if (!a64_fcmp32(c,c->vreg[10],c->vreg[9])) "   # (its line goes on)
+HORSE_BRANCH = "if (!c->n) { goto L_82c5ae48; }\n"
+FLOOR_TEST = ("    { { uint64_t _v=recomp_load32(c,(c->x[8]+40ULL)); a64_vset64(c->vreg[0],_v); } }\n"
+              "    c->x[8] = 0x42c80000ULL;\n"
+              "    c->x[8] &= 0xFFFFFFFFULL;\n"
+              "    { a64_vset64(c->vreg[1],0); memcpy(&c->vreg[1][0],&c->x[8],4); }\n")
+FLOOR_FCMP = "    { if (!a64_fcmp32(c,c->vreg[0],c->vreg[1])) "   # (its line goes on, then the branch)
+FLOOR_BRANCH = "if ((c->n == c->v) && !c->z) { goto %s; }\n"
 SOLVER_STORE = "    recomp_store32(c,c->x[0] + 712,c->x[1]);\n"
 WHOLE_STORE = "    recomp_store32(c,%s,c->x[%d]);\n"
 # (the unsigned cut's addition of the elapsed counter: "u<N>" anchors on the cut followed by the addition to x<N>)
@@ -189,6 +221,28 @@ def lift_lines(kind, addr, args):
                 "if (!hos_oot_sound_gate(c, (uint32_t)c->x[2], " + SOUND_SLOT + " + 2192)) return; }" + mark,
                 "    { extern uint32_t hos_oot_sound_step(uint32_t); "
                 "a64_vset64(c->vreg[0], hos_oot_sound_step((uint32_t)c->vreg[0][0])); }" + mark]
+    if kind == "bgm":
+        return (["    { extern void hos_oot_bgm_begin(void); hos_oot_bgm_begin(); }" + mark,
+                 "    { extern uint32_t hos_oot_sound_step(uint32_t); extern uint32_t hos_oot_sound_seconds(uint32_t, uint32_t); "
+                 "const uint32_t _st = (uint32_t)c->vreg[8][0]; a64_vset64(c->vreg[9], hos_oot_sound_seconds((uint32_t)c->vreg[9][0], _st)); "
+                 "a64_vset64(c->vreg[8], hos_oot_sound_step(_st)); }" + mark] +
+                ["    { extern uint64_t hos_oot_bgm_flags(uint64_t, uint64_t); "
+                 "c->x[8] = hos_oot_bgm_flags(c->x[26] + 2200, c->x[8]); }" + mark] * 4)
+    if kind == "turn":
+        cond = "(uint32_t)c->vreg[8][0] > 0 && (uint32_t)c->vreg[8][0] < 0x3f800000u"   # (0 < step < 1, by its bits: no host compare)
+        out = []
+        for tag, src, dst in (("a", 1, 1), ("b", 8, 0)):
+            out += ["    if (" + cond + ") { {uint64_t _a=0,_b=0,_v;memcpy(&_a,c->vreg[0],4);memcpy(&_b,c->vreg[%d],4);"
+                    "_v=a64_fpx_div32_div32(c,_a,_b);a64_vset64(c->vreg[%d],_v);} goto L_hl_%s_%s; }" % (src, dst, step_id(addr), tag) + mark,
+                    "L_hl_%s_%s:;" % (step_id(addr), tag) + mark]
+        return out
+    if kind == "horse":
+        return ["    { extern int hos_oot_horse_whole_step(uint32_t, uint64_t); "
+                "if (hos_oot_horse_whole_step((uint32_t)c->vreg[10][0], " + SOUND_SLOT + " + 2192)) { goto L_82c5ae48; } }" + mark]
+    if kind == "floor":
+        return ["    { extern int hos_oot_floor_carry_slow(uint32_t, uint64_t); if ((c->n == c->v) && !c->z && "
+                "!hos_oot_floor_carry_slow((uint32_t)c->vreg[0][0], " + SOUND_SLOT + " + 2192)) goto L_hl_%s; }" % step_id(addr) + mark,
+                "L_hl_%s:;" % step_id(addr) + mark]
     if kind == "solver":
         return ["    { extern uint32_t hos_oot_solver_steps(uint32_t, uint32_t, uint32_t); c->x[1] = "
                 "hos_oot_solver_steps((uint32_t)c->x[1], (uint32_t)c->vreg[0][0], (uint32_t)c->vreg[1][0]); }" + mark]
@@ -217,6 +271,36 @@ def lift_places(body, addr, kind, args):
         if body.count(SOUND_LOAD) != 1:
             return None
         return [len(HEAD % addr), body.index(SOUND_LOAD) + len(SOUND_LOAD)]
+    if kind == "bgm":
+        if body.count(BGM_TIME) != 1 or body.count(BGM_FLAGS) != 4:
+            return None
+        places, at = [len(HEAD % addr), body.index(BGM_TIME) + len(BGM_TIME)], 0
+        for _ in range(4):
+            at = body.index(BGM_FLAGS, at) + len(BGM_FLAGS)
+            places.append(at)
+        return places if places == sorted(places) else None
+    if kind == "turn":
+        if body.count(TURN_MULS + TURN_MULS2) != 1:
+            return None
+        at = body.index(TURN_MULS + TURN_MULS2)
+        mid, end = at + len(TURN_MULS), at + len(TURN_MULS + TURN_MULS2)
+        return [at, mid, mid, end]
+    if kind == "horse":
+        if body.count(HORSE_TEST) != 1 or "L_82c5ae48:;" not in body:
+            return None
+        line_end = body.find("\n", body.index(HORSE_TEST) + len(HORSE_TEST))
+        if line_end < 0 or not body.startswith(HORSE_BRANCH, line_end + 1):
+            return None
+        return [line_end + 1]
+    if kind == "floor":
+        branch = FLOOR_BRANCH % args[0]
+        if body.count(FLOOR_TEST) != 1 or body.count(branch) != 1:
+            return None
+        fcmp = body.index(FLOOR_TEST) + len(FLOOR_TEST)
+        line_end = body.find("\n", fcmp)
+        if not body.startswith(FLOOR_FCMP, fcmp) or line_end < 0 or not body.startswith(branch, line_end + 1):
+            return None
+        return [line_end + 1, line_end + 1 + len(branch)]
     if kind == "solver":
         anchor = CUT % 1 + SOLVER_STORE
         if body.count(anchor) != 1:
@@ -272,7 +356,9 @@ def apply_lift(s, addr, kind, args):
     places = lift_places(body, addr, kind, args)
     if places is None:
         return None
-    for at, line in sorted(zip(places, lift_lines(kind, addr, args)), reverse=True):
+    # (the lines in reverse order of place, those of one place the last first, so that they end up in their order)
+    for _, at, line in sorted(((i, at, line) for i, (at, line) in enumerate(zip(places, lift_lines(kind, addr, args)))),
+                              key=lambda t: (t[1], t[0]), reverse=True):
         body = body[:at] + line + body[at:]
     return s[:span[0]] + body + s[span[1]:]
 

@@ -71,7 +71,23 @@ class PrepareShadersTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 30)
         self.assertIsNone(code)
         self.assertEqual(lines[0], "@@stage shaders Preparing shaders")
-        self.assertIn("printed nothing for 1 seconds and was stopped", not_prepared(lines)[0])
+        self.assertIn("printed nothing for 1 seconds", not_prepared(lines)[0])
+
+    def test_a_run_that_talks_but_makes_no_progress_is_stopped(self):
+        # (the prediction's status line every 10 s kept a stuck driver compile "talking" for two hours: the @@ lines are the progress)
+        started = time.monotonic()
+        code, lines = prepared(stub("import time;print('@@stage shaders Preparing shaders', flush=True);print('@@progress 0.970', flush=True);"
+                                    "[(print('vk: predict: status', flush=True), time.sleep(0.3)) for i in range(600)]"), stall=1)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIsNone(code)
+        self.assertIn("made no progress for 1 seconds", not_prepared(lines)[0])
+
+    def test_progress_that_moves_is_not_a_stall(self):
+        code, lines = prepared(stub("import time;"
+                                    "[(print('@@progress %.3f' % (i / 8), flush=True), print('status', flush=True), time.sleep(0.4)) for i in range(8)]"),
+                               stall=1)
+        self.assertEqual(code, 0)
+        self.assertEqual(not_prepared(lines), [])
 
     def test_steady_output_is_not_silence(self):
         code, lines = prepared(stub("import time\nfor i in range(6):\n    print('@@progress %.3f' % (i / 6), flush=True); "

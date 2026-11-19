@@ -202,7 +202,7 @@ def check_source():
     if not device.index("*tail = &afloat") < query < reset < device.index("vkCreateDevice("):
         raise SystemExit("FAIL: create_device: the features are not queried, then cut to the one used, before vkCreateDevice")
     shader = (VK / "vk_shader.cpp").read_text(encoding="utf-8")
-    profile = shader[shader.index("Shader::Profile make_profile()"):shader.index("Shader::HostTranslateInfo host_info()")]
+    profile = shader[shader.index("Shader::Profile make_profile(bool wide)"):shader.index("Shader::HostTranslateInfo host_info()")]
     if "p.support_float32_atomic_add = dev.float_atomic_add;" not in profile:
         raise SystemExit("FAIL: the translator is not told the device's float add (make_profile)")
     # (the program cache's stamp: disk_stamp says what the translator is told; the add is in it only when it is native, so that

@@ -8,10 +8,11 @@ namespace mkwvk::upscaler_rows {
 
 /// The Upscaler row (opts.dlss, RX_VK_DLSS): the game's own network, NVIDIA DLSS, NVIDIA DLAA, AMD FSR 3.1 (built from AMD's
 /// shader sources: gpu/vk/vk_fsr3.cpp), AMD FSR 4 and its native anti-aliasing (AMD's library, a build with FSR 4:
-/// gpu/vk/vk_fsr4.cpp). The saved values keep their meaning: each came after the ones before, so a saved 1 or 2 is still DLSS
-/// or DLAA and a saved 3 FSR 3.1
-enum { GAME = 0, DLSS = 1, DLAA = 2, FSR3 = 3, FSR4 = 4, FSR4_AA = 5, kUpscalers = 6 };
-/// One bit per upscaler that can run here (1 << GAME always): what the row steps through
+/// gpu/vk/vk_fsr4.cpp), and Off: no upscaling network at all, the 3D stretched to the output (vk_draw.cpp off_stand_in). The
+/// saved values keep their meaning: each came after the ones before, so a saved 1 or 2 is still DLSS or DLAA, a saved 3
+/// FSR 3.1 and a saved 6 Off. The row steps in this order: Off comes last, then the game's own again
+enum { GAME = 0, DLSS = 1, DLAA = 2, FSR3 = 3, FSR4 = 4, FSR4_AA = 5, OFF = 6, kUpscalers = 7 };
+/// One bit per upscaler that can run here (1 << GAME and 1 << OFF always: Off runs on every GPU): what the row steps through
 inline unsigned bit(int upscaler) { return 1u << upscaler; }
 /// The DLSS and DLAA bits, for a caller that knows only whether DLSS runs
 inline unsigned dlss_bits(bool dlss_ok) { return dlss_ok ? bit(DLSS) | bit(DLAA) : 0u; }
@@ -19,6 +20,9 @@ inline unsigned dlss_bits(bool dlss_ok) { return dlss_ok ? bit(DLSS) | bit(DLAA)
 inline unsigned fsr4_bits(bool fsr4_ok) { return fsr4_ok ? bit(FSR4) | bit(FSR4_AA) : 0u; }
 inline bool is_dlss(int upscaler) { return upscaler == DLSS || upscaler == DLAA; }
 inline bool is_fsr4(int upscaler) { return upscaler == FSR4 || upscaler == FSR4_AA; }
+/// No upscaling network. The Render resolution row applies as with the game's own (the 3D is drawn at that share), and so does
+/// Sharpness (it works on the present, whatever made the picture)
+inline bool is_off(int upscaler) { return upscaler == OFF; }
 /// The 3D drawn at full size, the upscaler anti-aliasing alone (DLAA, FSR 4's native AA): the Render resolution row does not
 /// apply
 inline bool full_scale(int upscaler) { return upscaler == DLAA || upscaler == FSR4_AA; }
@@ -87,9 +91,9 @@ inline int snap(int upscaler, int v) {
 }
 
 /// The Upscaler row's next value from v (dir +1 / -1), wrapping over the choices there are (available: bit() of each that
-/// runs here). A value that cannot run here steps as the game's own does
+/// runs here; the game's own and Off always do). A value that cannot run here steps as the game's own does
 inline int step_upscaler(int v, int dir, unsigned available) {
-    available |= bit(GAME);
+    available |= bit(GAME) | bit(OFF);
     int at = v < 0 || v >= kUpscalers || !(available & bit(v)) ? GAME : v;
     for (int i = 0; i < kUpscalers; i++) {
         at = (at + (dir > 0 ? 1 : kUpscalers - 1)) % kUpscalers;
@@ -134,17 +138,9 @@ inline unsigned dlss_preset(int model, const char* env, uint64_t vram = 0) {
 /// A preset's letter for the log ('A' + preset - 1), or '0' for NVIDIA's default
 inline char preset_letter(unsigned preset) { return preset ? (char)('A' + preset - 1) : '0'; }
 
-/// The Upscaler row is there only in a build with DLSS or FSR 4 (built: dlss_built() || fsr4_built()): elsewhere the game's own is all there is, and
-/// the Render resolution row is the game's own's
-inline bool upscaler_shown(bool built) { return built; }
-/// ...and in any build where FSR 3.1 runs (fsr: vk_fsr3.cpp answered that it runs on this GPU)
-inline bool upscaler_shown(bool built, bool fsr) { return built || fsr; }
-/// Rows with nothing else to choose here (shown without arrows; Left and Right leave the saved value alone): the Upscaler
-/// where DLSS cannot run (dlss_ok: dlss_why() == DLSS_OK), the Render resolution with DLAA or FSR 4's native AA (the 3D at
-/// full size), the DLSS model while DLSS and DLAA are not drawing
-inline bool upscaler_fixed(bool dlss_ok) { return !dlss_ok; }
-/// The same, from the mask of what can run: fixed when only the game's own can
-inline bool upscaler_fixed(unsigned available) { return (available & ~bit(GAME)) == 0; }
+/// The Upscaler row is in every build and on every GPU (it always has the game's own and Off): no shown or fixed rule for it.
+/// Rows with nothing else to choose here (shown without arrows; Left and Right leave the saved value alone): the Render
+/// resolution with DLAA or FSR 4's native AA (the 3D at full size), the DLSS model while DLSS and DLAA are not drawing
 inline bool resolution_fixed(int upscaler) { return full_scale(upscaler); }
 /// The DLSS model row: shown where the Upscaler is (a build with DLSS), with nothing to choose while the game's own upscales
 inline bool model_shown(bool built) { return built; }

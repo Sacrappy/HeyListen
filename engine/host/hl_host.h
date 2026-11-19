@@ -48,6 +48,23 @@ void hl_answer(uint64_t guest, A64Fn fn, HlOn on, const char *what);
     __attribute__((constructor)) static void hl_solver_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); } \
     extern const int hl_solver_hook_##addr
 
+/* HL_BGM_HOOK(83373400, "<hash>"): a lift hook (nx2/hl_gates.py) in the music manager's update (inside the sound job): its clock
+   counts whole 60 Hz steps and the change flags the sound gate held back reach it (host/hl_high_fps.c). Nothing in C. */
+#define HL_BGM_HOOK(addr, hash)     __attribute__((constructor)) static void hl_bgm_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); }     extern const int hl_bgm_hook_##addr
+
+/* HL_TURN_HOOK(8263e8e0, "<hash>"); HL_HORSE_HOOK(82c59eb0, "<hash>"); HL_FLOOR_HOOK(80159dc0, "<hash>", "<label>"): lift hooks
+   (nx2/hl_gates.py) for three places that break above a 60 cap: Gohma's steering rate (Longshot 3ab8cae6), Epona's jump blend
+   (8e8a06db) and a moving floor's carry, the Shadow Temple's barge (4f755527). host/hl_high_fps.c has the host side. Nothing in C. */
+#define HL_TURN_HOOK(addr, hash) \
+    __attribute__((constructor)) static void hl_turn_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); } \
+    extern const int hl_turn_hook_##addr
+#define HL_HORSE_HOOK(addr, hash) \
+    __attribute__((constructor)) static void hl_horse_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); } \
+    extern const int hl_horse_hook_##addr
+#define HL_FLOOR_HOOK(addr, hash, label) \
+    __attribute__((constructor)) static void hl_floor_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); } \
+    extern const int hl_floor_hook_##addr
+
 /* HL_HEAP_HOOK(804566e0, "<hash>"): a lift hook (nx2/hl_gates.py) around f_804566e0's four allocations that are not checked
    (two CPU buffers, two GPU-memory calls): a failed one is tried again in the heap's parents (host/hl_heap_retry.c). Both
    pairs of lines or none. Nothing in C. */

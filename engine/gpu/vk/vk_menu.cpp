@@ -167,14 +167,15 @@ const char* hn_reflex(int v, int variant) {
 namespace ur = upscaler_rows;
 /// One bit per upscaler that runs here (upscaler_rows.h bit). Each backend caches its own answer, so this costs nothing
 unsigned upscalers_available() {
-    return ur::bit(ur::GAME) | ur::dlss_bits(dlss_why() == DLSS_OK) | (fsr3::supported() ? ur::bit(ur::FSR3) : 0u) |
-           ur::fsr4_bits(fsr4_why() == FSR_OK);
+    return ur::bit(ur::GAME) | ur::bit(ur::OFF) | ur::dlss_bits(dlss_why() == DLSS_OK) |
+           (fsr3::supported() ? ur::bit(ur::FSR3) : 0u) | ur::fsr4_bits(fsr4_why() == FSR_OK);
 }
-/// (FSR 3.1 has inputs of its own; DLSS and FSR 4 run on the frame chain they share, temporal_mode)
-int upscaler() { return fsr3_wanted() ? (int)ur::FSR3 : temporal_mode(); }
+/// (FSR 3.1 has inputs of its own; DLSS and FSR 4 run on the frame chain they share, temporal_mode; Off draws no network,
+/// vk_draw.cpp off_stand_in)
+int upscaler() { return upscaler_off() ? (int)ur::OFF : fsr3_wanted() ? (int)ur::FSR3 : temporal_mode(); }
 const char* tx_upscaler(int) {
     static const char* t[ur::kUpscalers] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4",
-                                            "AMD FSR 4 Native AA"};
+                                            "AMD FSR 4 Native AA", "Off"};
     return t[std::clamp(upscaler(), 0, ur::kUpscalers - 1)];
 }
 /// The Upscaler: the one shown (what runs, upscaler()), and with the game's own, why DLSS and FSR are not offered. Variants
@@ -191,6 +192,8 @@ const char* hn_upscaler(int v, int variant) {
         "AMD's machine-learned upscaler, from a smaller 3D, with AMD's files beside the game. Things that move by themselves "
         "can trail for now.",
         "AMD's machine-learned upscaler, the 3D at full size with its edges smoothed; the slowest.",
+        "No upscaling network: the 3D drawn at the Render resolution and stretched to the output, no anti-aliasing. For GPUs "
+        "where the game's own network shows glitches.",
     };
     static const char* const dlss_no[DLSS_WHY_COUNT] = {
         nullptr,
@@ -362,7 +365,7 @@ const char* hn_resolution(int v, int variant) {
 }
 /// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
 bool row_fixed(const int* value) {
-    return ((value == &opts.send_perf || value == &opts.send_crash) && !telemetry_available()) || (value == &opts.reflex && !reflex_available()) || (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
+    return ((value == &opts.send_perf || value == &opts.send_crash) && !telemetry_available()) || (value == &opts.reflex && !reflex_available()) ||
            (value == &opts.resolution && ur::resolution_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr));
 }
@@ -612,7 +615,7 @@ MENU_HINTS(hn_prompts, 0,
            "Those of the first controller, from its name (SDL's). The Switch's when it has none, as with XInput alone.")
 
 Row rows[] = {
-    // Graphics (the Upscaler only in a build with DLSS, or where AMD FSR 3.1 runs: row_shown)
+    // Graphics (the Upscaler in every build: it always has the game's own and Off)
     {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
      "Sets the scaling rows and memory limits for a GPU with that much memory. The Upscaler and Frame generation stay yours.",
      hn_preset},
@@ -948,8 +951,7 @@ std::string restart_list(const char* last) {
 }
 int ask_sel = 0;   // (the restart question's choice: 0 Later, 1 Restart now)
 
-/// A row on its tab: the debug tools only with them on, the Upscaler only in a build with DLSS or FSR 4, or where AMD
-/// FSR 3.1 runs
+/// A row on its tab: the debug tools only with them on, the DLSS model only in a build with DLSS
 bool row_shown(int i) {
     // (the Intel shader compiles row: Intel graphics on Windows, the only place IntelDriverGate holds the compiler)
     if (rows[i].value == &opts.intel_compiles) {
@@ -960,7 +962,6 @@ bool row_shown(int i) {
 #endif
     }
     return (rows[i].cheat < 0 || cheats_on()) &&
-           (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported())) &&
            (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built()));
 }
 int tab_row_count(int t) {

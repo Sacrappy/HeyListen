@@ -46,33 +46,34 @@ int main() {
     CHECK("DLAA keeps the value", ur::snap(DLAA, 5) == 5 && ur::snap(DLAA, 1) == 1);
     CHECK("a value past the row snaps to Auto", ur::snap(GAME, 9) == 0 && ur::snap(DLSS, -3) == 0);
 
-    // the Upscaler row: all three where DLSS runs, the game's own alone elsewhere
+    // the Upscaler row: the game's own, DLSS and DLAA where DLSS runs, then Off (always there: every GPU)
     CHECK("upscaler with DLSS", ur::step_upscaler(0, 1, true) == 1 && ur::step_upscaler(1, 1, true) == 2 &&
-                                    ur::step_upscaler(2, 1, true) == 0 && ur::step_upscaler(0, -1, true) == 2);
-    CHECK("upscaler without DLSS", ur::step_upscaler(0, 1, false) == 0 && ur::step_upscaler(2, -1, false) == 0);
-    CHECK("upscaler from a bad value", ur::step_upscaler(7, 1, true) == 1);
+                                    ur::step_upscaler(2, 1, true) == ur::OFF && ur::step_upscaler(ur::OFF, 1, true) == 0 &&
+                                    ur::step_upscaler(0, -1, true) == ur::OFF && ur::step_upscaler(ur::OFF, -1, true) == 2);
+    CHECK("upscaler without DLSS: the game's own and Off", ur::step_upscaler(0, 1, false) == ur::OFF &&
+                                                               ur::step_upscaler(ur::OFF, 1, false) == 0 &&
+                                                               ur::step_upscaler(0, -1, false) == ur::OFF &&
+                                                               ur::step_upscaler(2, -1, false) == ur::OFF);
+    CHECK("upscaler from a bad value", ur::step_upscaler(ur::kUpscalers, 1, true) == 1 && ur::step_upscaler(-1, 1, true) == 1);
 
-    // the Upscaler row only in a build with DLSS; the rows with nothing to choose
-    CHECK("upscaler row shown", ur::upscaler_shown(true) && !ur::upscaler_shown(false));
     // AMD FSR 3.1 on the same row, after DLAA: stepping visits only what runs here, and wraps
     {
         const unsigned all = ur::bit(GAME) | ur::dlss_bits(true) | ur::bit(ur::FSR3);
         const unsigned fsr3 = ur::bit(GAME) | ur::bit(ur::FSR3);
         CHECK("FSR 3.1 after DLAA", ur::FSR3 == 3);
-        CHECK("upscaler steps through all four", ur::step_upscaler(DLAA, 1, all) == ur::FSR3 &&
-                                                   ur::step_upscaler(ur::FSR3, 1, all) == GAME &&
-                                                   ur::step_upscaler(GAME, -1, all) == ur::FSR3 &&
-                                                   ur::step_upscaler(ur::FSR3, -1, all) == DLAA);
+        CHECK("upscaler steps through all four, then Off", ur::step_upscaler(DLAA, 1, all) == ur::FSR3 &&
+                                                               ur::step_upscaler(ur::FSR3, 1, all) == ur::OFF &&
+                                                               ur::step_upscaler(ur::OFF, 1, all) == GAME &&
+                                                               ur::step_upscaler(GAME, -1, all) == ur::OFF &&
+                                                               ur::step_upscaler(ur::OFF, -1, all) == ur::FSR3 &&
+                                                               ur::step_upscaler(ur::FSR3, -1, all) == DLAA);
         CHECK("upscaler without DLSS skips it", ur::step_upscaler(GAME, 1, fsr3) == ur::FSR3 &&
-                                                  ur::step_upscaler(ur::FSR3, 1, fsr3) == GAME &&
-                                                  ur::step_upscaler(GAME, -1, fsr3) == ur::FSR3);
+                                                  ur::step_upscaler(ur::FSR3, 1, fsr3) == ur::OFF &&
+                                                  ur::step_upscaler(ur::OFF, 1, fsr3) == GAME &&
+                                                  ur::step_upscaler(GAME, -1, fsr3) == ur::OFF);
         CHECK("an upscaler that cannot run here steps as the game's own", ur::step_upscaler(DLSS, 1, fsr3) == ur::FSR3 &&
-                                                                            ur::step_upscaler(ur::FSR3, 1, ur::bit(GAME)) == GAME);
-        CHECK("the DLSS-only form is the mask's", ur::step_upscaler(DLAA, 1, true) == GAME && ur::step_upscaler(GAME, -1, true) == DLAA);
-        CHECK("upscaler fixed only with nothing but the game's own",
-              ur::upscaler_fixed(ur::bit(GAME)) && !ur::upscaler_fixed(fsr3) && !ur::upscaler_fixed(all));
-        CHECK("upscaler row shown with FSR 3.1 alone", ur::upscaler_shown(false, true) && !ur::upscaler_shown(false, false) &&
-                                                          ur::upscaler_shown(true, false));
+                                                                            ur::step_upscaler(ur::FSR3, 1, ur::bit(GAME)) == ur::OFF);
+        CHECK("the DLSS-only form is the mask's", ur::step_upscaler(DLAA, 1, true) == ur::OFF && ur::step_upscaler(GAME, -1, true) == ur::OFF);
         CHECK("FSR 3.1's modes are DLSS's shares", ur::scales_by_mode(ur::FSR3) && ur::scales_by_mode(DLSS) &&
                                                      !ur::scales_by_mode(DLAA) && !ur::scales_by_mode(GAME));
         CHECK("FSR 3.1 steps as DLSS does", ur::step(ur::FSR3, 0, 1) == 3 && ur::step(ur::FSR3, 3, 1) == 5 &&
@@ -88,17 +89,20 @@ int main() {
         using ur::FSR4_AA;
         const unsigned every = ur::bit(GAME) | ur::dlss_bits(true) | ur::bit(FSR3) | ur::fsr4_bits(true);
         const unsigned fsr4 = ur::bit(GAME) | ur::fsr4_bits(true);
-        CHECK("FSR 4 after FSR 3.1", FSR4 == 4 && FSR4_AA == 5 && ur::kUpscalers == 6);
-        CHECK("upscaler steps through all six", ur::step_upscaler(FSR3, 1, every) == FSR4 &&
-                                                  ur::step_upscaler(FSR4, 1, every) == FSR4_AA &&
-                                                  ur::step_upscaler(FSR4_AA, 1, every) == GAME &&
-                                                  ur::step_upscaler(GAME, -1, every) == FSR4_AA &&
-                                                  ur::step_upscaler(FSR4, -1, every) == FSR3);
-        CHECK("upscaler with FSR 4 alone", ur::step_upscaler(GAME, 1, fsr4) == FSR4 && ur::step_upscaler(FSR4_AA, 1, fsr4) == GAME &&
-                                               ur::step_upscaler(GAME, -1, fsr4) == FSR4_AA && !ur::upscaler_fixed(fsr4));
+        CHECK("FSR 4 after FSR 3.1", FSR4 == 4 && FSR4_AA == 5);
+        CHECK("upscaler steps through all six, then Off", ur::step_upscaler(FSR3, 1, every) == FSR4 &&
+                                                              ur::step_upscaler(FSR4, 1, every) == FSR4_AA &&
+                                                              ur::step_upscaler(FSR4_AA, 1, every) == ur::OFF &&
+                                                              ur::step_upscaler(ur::OFF, 1, every) == GAME &&
+                                                              ur::step_upscaler(GAME, -1, every) == ur::OFF &&
+                                                              ur::step_upscaler(ur::OFF, -1, every) == FSR4_AA &&
+                                                              ur::step_upscaler(FSR4, -1, every) == FSR3);
+        CHECK("upscaler with FSR 4 alone", ur::step_upscaler(GAME, 1, fsr4) == FSR4 && ur::step_upscaler(FSR4_AA, 1, fsr4) == ur::OFF &&
+                                               ur::step_upscaler(ur::OFF, 1, fsr4) == GAME && ur::step_upscaler(GAME, -1, fsr4) == ur::OFF);
         CHECK("a saved FSR 4 where it cannot run steps as the game's own",
               ur::step_upscaler(FSR4, 1, ur::bit(GAME) | ur::dlss_bits(true)) == DLSS &&
-              ur::step_upscaler(FSR4_AA, -1, ur::bit(GAME) | ur::bit(FSR3)) == FSR3);
+              ur::step_upscaler(FSR4_AA, -1, ur::bit(GAME) | ur::bit(FSR3)) == ur::OFF &&
+              ur::step_upscaler(ur::OFF, -1, ur::bit(GAME) | ur::bit(FSR3)) == FSR3);
         CHECK("engines", ur::is_dlss(DLSS) && ur::is_dlss(DLAA) && !ur::is_dlss(FSR3) && !ur::is_dlss(FSR4) &&
                              ur::is_fsr4(FSR4) && ur::is_fsr4(FSR4_AA) && !ur::is_fsr4(FSR3) && !ur::is_fsr4(DLAA) &&
                              !ur::is_fsr4(GAME));
@@ -122,7 +126,6 @@ int main() {
         CHECK("back on an Upscaler with the step, the choice is whole", shown == saved);
         CHECK("a step from the shown value", ur::step(ur::GAME, ur::snap(ur::GAME, saved), 1) == 0 && ur::step(ur::GAME, ur::snap(ur::GAME, saved), -1) == 3);
     }
-    CHECK("upscaler fixed where DLSS cannot run", ur::upscaler_fixed(false) && !ur::upscaler_fixed(true));
     CHECK("render resolution fixed at full scale only", ur::resolution_fixed(DLAA) && ur::resolution_fixed(ur::FSR4_AA) &&
                                                              !ur::resolution_fixed(DLSS) && !ur::resolution_fixed(ur::FSR4) &&
                                                              !ur::resolution_fixed(GAME));
@@ -164,5 +167,28 @@ int main() {
     CHECK("model row shown with DLSS built", ur::model_shown(true) && !ur::model_shown(false));
     CHECK("model row fixed with the game's own or the switch", ur::model_fixed(GAME, false) && !ur::model_fixed(DLSS, false) &&
                                                                !ur::model_fixed(DLAA, false) && ur::model_fixed(DLSS, true));
+    {   // Off: a new value after the saved ones (no renumbering), on every GPU, last in the row's order
+        using ur::OFF;
+        CHECK("saved values keep their numbers", GAME == 0 && DLSS == 1 && DLAA == 2 && ur::FSR3 == 3 && ur::FSR4 == 4 &&
+                                                     ur::FSR4_AA == 5);
+        CHECK("Off is 6, the last", OFF == 6 && ur::kUpscalers == 7);
+        CHECK("Off is no engine", ur::is_off(OFF) && !ur::is_off(GAME) && !ur::is_off(ur::FSR4_AA) && !ur::is_dlss(OFF) &&
+                                      !ur::is_fsr4(OFF) && !ur::scales_by_mode(OFF) && !ur::full_scale(OFF));
+        CHECK("Off is there with nothing else available", ur::step_upscaler(GAME, 1, 0u) == OFF && ur::step_upscaler(OFF, 1, 0u) == GAME &&
+                                                               ur::step_upscaler(GAME, -1, ur::bit(GAME)) == OFF);
+        // (Render resolution applies to Off as to the game's own: its steps, and a saved Balanced or Ultra Performance snaps)
+        for (int v = 0; v < ur::kValues; v++)
+            for (int dir : {1, -1})
+                CHECK("Off steps as the game's own", ur::step(OFF, v, dir) == ur::step(GAME, v, dir) && ur::snap(OFF, v) == ur::snap(GAME, v));
+        CHECK("Off has a Render resolution", !ur::resolution_fixed(OFF) && ur::snap(OFF, 5) == 4 && ur::snap(OFF, 1) == 1);
+        CHECK("the model row waits with Off", ur::model_fixed(OFF, false));
+        // (a saved 0 to 5 steps exactly as before, round the whole row)
+        int at = GAME;
+        const int order[] = {1, 2, 3, 4, 5, 6, 0};
+        for (int want : order) {
+            at = ur::step_upscaler(at, 1, ur::bit(GAME) | ur::dlss_bits(true) | ur::bit(ur::FSR3) | ur::fsr4_bits(true));
+            CHECK("the row visits every value in number order", at == want);
+        }
+    }
     std::puts("upscaler rows: all checks passed");
 }

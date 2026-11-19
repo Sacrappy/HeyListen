@@ -323,19 +323,26 @@ def output_lines(p, silence):
         yield line
 
 
-def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROOT, base=None, silence=None):
+def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROOT, base=None, silence=None, stall=None):
     """A step, its output printed as it comes. show: what of each line is printed (its None: nothing; on_line and a failure's
     reason still get the line itself). base: the environment it starts from (os.environ). silence: seconds without a line after
-    which the step is stopped; it returns None then (with check, the build fails)"""
+    which the step is stopped; it returns None then (with check, the build fails). stall: seconds without one of its @@stage or
+    @@progress lines (it may print other lines all the while: a status line every 10 s kept a stuck driver compile "talking" for
+    two hours) after which it is stopped the same way"""
     e = dict(os.environ if base is None else base, PYTHONIOENCODING="utf-8")
     e.update(env or {})
     p = subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                          errors="replace", bufsize=1)
     no_throttle(getattr(p, "_handle", None))
     lines = []
+    moved = time.monotonic()
     try:
         for line in output_lines(p, silence):
             line = line.rstrip()
+            if line.startswith(("@@stage ", "@@progress ")):
+                moved = time.monotonic()
+            elif stall and time.monotonic() - moved > stall:
+                raise Silent()
             shown = show(line) if show else line
             if PROGRESS_LINES and shown is not None and shown.startswith("@@"):
                 shown = None   # (a step's @@ lines are the window's: on_line has read them)
@@ -348,7 +355,7 @@ def run(cmd, env=None, on_line=None, check=True, output=None, show=None, cwd=ROO
         p.kill()
         p.wait()
         if check:
-            fail("%s printed nothing for %s and was stopped" % (os.path.basename(cmd[0]), span(silence)))
+            fail("%s printed nothing for %s and was stopped" % (os.path.basename(cmd[0]), span(silence or stall)))
         return None
     p.stdout.close()
     code = p.wait()
@@ -970,6 +977,7 @@ NOT_PREPARED = "the shaders were not prepared now"
 # (a run that prints nothing this long is stopped. Not its whole length: that is 25 minutes on some AMD GPUs, and the driver's own
 # step near the end can sit at 99% for minutes)
 PREPARE_SILENCE = 15 * 60
+PREPARE_STALL = 10 * 60   # (a prepare whose progress does not move for this long is stopped even if it keeps printing)
 GAME_ENV_DROP = ("HOOKSHOT_", "PYTHON", "APPDIR", "APPIMAGE", "ARGV0", "OWD")
 
 
@@ -1008,10 +1016,10 @@ def show_prepared(line):
     return line if line.startswith(("@@stage ", "@@progress ")) or not line.startswith("@@") else line[2:]
 
 
-def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE):
+def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE, stall=PREPARE_STALL):
     """The shaders prepared now, under the builder's progress bar, not at the game's first start behind a black window (minutes on
     some GPUs, issue 711): hookshot --prepare-shaders (host/hos_main.c, gpu/vk/vk_main.cpp), the same work as that first start, in
-    the game's folder and environment, as the builders' Play starts it. A PC whose Vulkan can't (exit 3), a run silent for `silence` seconds (then stopped), or
+    the game's folder and environment, as the builders' Play starts it. A PC whose Vulkan can't (exit 3), a run silent for `silence` seconds or making no progress for `stall` (then stopped), or
     any other failure leaves the work to the first start, as before: never a failed build. Returns its exit code (None: stopped)"""
     def on_line(line):   # (--prepare: the game's @@stage and @@progress lines become the launcher's progress lines)
         if PROGRESS_LINES and line.startswith(("@@stage ", "@@progress ")):
@@ -1019,12 +1027,12 @@ def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE):
             say(*words)
     try:
         code = run(cmd, check=False, show=show_prepared, cwd=folder or os.path.dirname(cmd[0]) or None,
-                   base=game_env(), silence=silence, on_line=on_line)
+                   base=game_env(), silence=silence, stall=stall, on_line=on_line)
     except OSError as e:
         not_prepared(str(e))
         return 1
     if code is None:
-        not_prepared("the game printed nothing for %s and was stopped" % span(silence))
+        not_prepared("the game printed nothing for %s or made no progress for %s, and was stopped" % (span(silence), span(stall)))
     elif code == 3:
         not_prepared("no usable Vulkan here")
     elif code:

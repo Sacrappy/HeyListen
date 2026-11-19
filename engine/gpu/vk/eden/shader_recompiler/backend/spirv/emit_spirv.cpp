@@ -20,6 +20,7 @@
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"   // (hookshot)
+#include "shader_recompiler/backend/spirv/empty_if_select.h"   // (hookshot SH1)
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -711,6 +712,16 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     std::vector<u32> code{ctx.Assemble()};
     RewriteOpcodes(code, ctx.opcode_rewrites);
     PatchMeshInstructions(code, ctx);
+    // (stream SH1, RX_VK_FOLD_EMPTY_IF=<words>, off by default: a selection with an empty body becomes the selects of its phis)
+    static const u32 empty_if_min_words{EmptyIfMinWords(std::getenv("RX_VK_FOLD_EMPTY_IF"))};
+    if (empty_if_min_words != 0 && code.size() >= empty_if_min_words) {
+        const std::size_t before{code.size()};
+        const std::size_t rewritten{SelectEmptyIfs(code)};
+        if (rewritten != 0) {
+            LOG_WARNING(Shader_SPIRV, "{} empty selections became selects: {} -> {} SPIR-V words (RX_VK_FOLD_EMPTY_IF {})", rewritten,
+                        before, code.size(), empty_if_min_words);
+        }
+    }
     return code;
 }
 
