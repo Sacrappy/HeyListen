@@ -1467,7 +1467,19 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out, int first) 
     const double sy = sin(yaw), cy = cos(yaw), sp = sin(pitch), cp = cos(pitch);
     const double axes[3][3] = {{cy, 0, -sy}, {-sp * sy, cp, -sp * cy}, {cp * sy, sp, cp * cy}};
     if (first) {
-        const double out_m = 0.35;
+        /* In the air (a leap off a ledge, a fall) his jump pose leans the head forward and his hair flies up past 0.35 m: while his
+           height changes faster than a walk on a slope does, the eye eases out to 0.7 m (80 ms), and back after he lands (400 ms).
+           Read from his height over time, so it needs no game state. */
+        static double last_y, air;
+        static int air_told;
+        if (dt > 0) {
+            const double vy = (fp_link[1] - last_y) / dt;
+            const int in_air = fabs(vy) > 2.5;   /* (m/s: walking and running on slopes stay well below) */
+            air = in_air ? fmin(1.0, air + dt / 0.08) : fmax(0.0, air - dt / 0.4);
+            if (in_air && !air_told) air_told = 1, hos_log("first person: in the air (%.1f m/s up): the eye eased out", vy);
+        }
+        last_y = fp_link[1];
+        const double out_m = 0.35 + 0.35 * air;
         eye[0] = fp_link[0] - out_m * axes[2][0];
         eye[1] = fp_link[1] + fp_eye_height - out_m * axes[2][1];
         eye[2] = fp_link[2] - out_m * axes[2][2];
