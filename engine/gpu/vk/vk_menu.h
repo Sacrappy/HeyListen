@@ -59,6 +59,7 @@ struct Options {
     int vram_mb = 0;      // dynamic texture cache budget limit in MB
     int mirror_mb = 0;    // staging mirror limit in MB
     int audio_output = 0; // (hookshot) the speakers the game mixes for: 0 Auto (the default output's), 1 Stereo, 2 5.1; read once, at the start (host/nn_audio.c; HOS_AUDIO_CHANNELS)
+    int first_person = 0;   // the view from Link's eyes, his head hidden (host/hos_main.c; HL_OPT_FIRST_PERSON)
     int skip_title = 0;   // (longshot) start with the most recent save, pressing through the title and its file list (host/oot_autoload.c); read at the start
     int discord = 1;   // (hookshot) the Discord status (host/discord_rpc.c): 1 on, shown while a Discord client runs on this PC
     int update_check = 1;   // (heylisten) "Check for updates" (host/hos_update.c): 1 the offer at the start (the default), 0 off; saved as update_check=

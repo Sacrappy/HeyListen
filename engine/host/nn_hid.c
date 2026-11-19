@@ -34,6 +34,7 @@
 #include <windows.h>
 #include <xinput.h>
 #include "../gpu/vk/vk_api.h"   /* (the controls' names: HOS_SW_*, HOS_PAD_*) */
+#include "../gpu/vk/vk_opt_ids.h"   /* (HL_OPT_FIRST_PERSON) */
 #include "hos_motion.h"
 #include "hos_atomic_file.h"   /* (the sensitivity is written whole or not at all) */
 
@@ -862,8 +863,12 @@ static void npad_states(Ctx *c) {
         int height = 0;
         const int menu_open = rx_option(1, 0);
         const int free_camera = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+        const int first_person = !free_camera && rx_option(HL_OPT_FIRST_PERSON, 0);
         const int flying = flight_jump_shortcut(&buttons, rx_option(HOS_OPT_CHEAT_FLIGHT, -1), menu_open, free_camera);
-        if (free_camera && !menu_open) {
+        if (first_person && !menu_open) {   /* (first person: the right stick turns the view, host/hos_main.c; Link walks as ever) */
+            for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
+            stick[2] = stick[3] = 0;
+        } else if (free_camera && !menu_open) {
             for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
             height = (int)(buttons >> B_R & 1) - (int)(buttons >> B_L & 1);
             memset(stick, 0, sizeof stick);

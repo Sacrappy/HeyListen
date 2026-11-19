@@ -62,6 +62,9 @@ def main():
     constants = block(hid, "enum { B_A") + ";\n" + block(api, "enum { HOS_SW_A") + ";\n"
     constants += block(api, "enum { HOS_KEY_MOVE_UP") + ";\n"   # (the keys-only controls)
     constants += block(api, "enum { HOS_OPT_CHEAT_HEARTS") + ";\n"
+    # (the option ids of rows that are HeyListen's alone, gpu/vk/vk_opt_ids.h: First person's, which the input reads)
+    ids = (ROOT / "gpu/vk/vk_opt_ids.h").read_text(encoding="utf-8")
+    constants += "".join(m + "\n" for m in re.findall(r"^#define HL_OPT_\w+\s+\d+", ids, re.M))
     for name in ("STATE_SIZE", "NPAD_NO1", "ATTR_CONNECTED"):
         matches = re.findall(r"^#define " + name + r"\s+[^\n]+", hid, re.M)
         assert len(matches) == 1, name

@@ -13,6 +13,7 @@
 #include "hos_run_logs.h"
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
+#include "../gpu/vk/vk_opt_ids.h"   /* (HL_OPT_FIRST_PERSON) */
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1111,6 +1112,103 @@ static int64_t flight_player_seen;
 static int64_t play_began;   /* (the first time the player ran, hos_now_ns clock; 0 before) */
 static int64_t process_start_ns;   /* (hos_now_ns when main began) */
 
+/* First person, the Gameplay page's First person row (HL_OPT_FIRST_PERSON). The player's update keeps Link's place, facing
+   and eye height for the view (oot_build_free_view, which puts the eye there) and hides his head while it is on.
+
+   The head is hidden the way the game's own AI node OneshotModelSetMaterialVisible does it (its execute at main+0x29637f0):
+   components (actor+624) +8 is a component whose getter (vtable +248) gives the model holder (the default getter, the GOT slot
+   0x84cd9d58, returns component+24); the holder's +40 is an array of model slots, each slot's first word a model. On a model,
+   vtable +208 (model, &name) is a material's index (negative: none) and vtable +456 (model, index, visible) shows or hides it.
+   The head is the face, eyes, eyebrows, eyelashes, teeth and front hair of the body model (Player_Child / Player_Adult) and the
+   hair model (Armor_*_Default_Head, Mt_Hair); the hat is the tunic's material and stays (22 materials on the child, logged
+   at the first hide). */
+static volatile float fp_link[3], fp_link_yaw, fp_eye_height = 1.15f;
+static volatile int fp_link_known;
+
+static const char *const kHeadMaterials[] = {"Mt_Face", "Mt_Face_Eyelid", "Mt_Face_SoftEdge", "Mt_Eye_Inner", "Mt_Eye_Outer",
+    "Mt_Eyebrow", "Mt_Eyelashes", "Mt_Eyelashes_01", "Mt_Eyelashes_02", "Mt_Eyelashes_03", "Mt_Eyeshadow", "Mt_EyeShadow_test",
+    "Mt_Teeth", "Mt_Hairs", "Mt_Hair"};
+
+static int fp_in_main(uint64_t a) { return a >= 0x80020000ULL && a < 0x85020000ULL; }
+
+/* a guest call with the stack at sp and up to three arguments: x0 after it, in *ret; 0 when the function is not known */
+static int fp_guest_call(Ctx *c, uint64_t fn, uint64_t sp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *ret) {
+    if (!fp_in_main(fn)) return 0;
+    A64Fn f = a64_lookup(fn);
+    if (!f) return 0;
+    const Ctx saved = *c;
+    c->x[31] = sp;
+    c->x[0] = a0, c->x[1] = a1, c->x[2] = a2;
+    f(c);
+    if (ret) *ret = c->x[0];
+    *c = saved;
+    return 1;
+}
+
+/* Shows or hides the head materials on each of the actor's models; how many were set */
+static int fp_set_head_visible(Ctx *c, uint64_t components, int visible, int log) {
+    const uint64_t comp = recomp_load64(c, components + 8);
+    if (!comp || !fp_in_main(recomp_load64(c, comp))) return 0;
+    const uint64_t getter = recomp_load64(c, recomp_load64(c, comp) + 248);
+    const uint64_t scratch = (c->x[31] - 256) & ~15ULL;   /* (below the guest stack: the name's pointer, then the name) */
+    uint64_t holder = 0;
+    if (getter == recomp_load64(c, 0x84cd9d58ULL)) holder = recomp_load64(c, comp + 24);
+    else if (!fp_guest_call(c, getter, scratch - 16, comp, 0, 0, &holder)) return 0;
+    const uint64_t slots = holder ? recomp_load64(c, holder + 40) : 0;
+    if (!slots) return 0;
+    int set = 0;
+    for (int i = 0; i < 16; i++) {
+        const uint64_t slot = recomp_load64(c, slots + i * 8);
+        const uint64_t model = slot ? recomp_load64(c, slot) : 0;
+        if (!model) break;
+        const uint64_t vt = recomp_load64(c, model);
+        if (!fp_in_main(vt)) break;
+        int found = 0;
+        for (unsigned n = 0; n < sizeof kHeadMaterials / sizeof kHeadMaterials[0]; n++) {
+            const char *name = kHeadMaterials[n];
+            const size_t len = strlen(name);
+            for (size_t k = 0; k <= len; k++) recomp_store8_sp(c, scratch + 16 + k, (uint8_t)name[k]);
+            recomp_store64_sp(c, scratch, scratch + 16);
+            uint64_t index = ~0ULL;
+            if (!fp_guest_call(c, recomp_load64(c, vt + 208), scratch - 16, model, scratch, 0, &index) || (index & 0x80000000u))
+                continue;
+            fp_guest_call(c, recomp_load64(c, vt + 456), scratch - 16, model, (uint32_t)index, visible ? 1 : 0, NULL);
+            found++;
+        }
+        if (log)
+            hos_log("first person: model %d (vtable %#llx): %d head materials %s", i, (unsigned long long)vt, found,
+                    visible ? "shown" : "hidden");
+        set += found;
+    }
+    return set;
+}
+
+static void oot_first_person_player(Ctx *c, uint64_t actor, uint64_t components, int64_t now) {
+    int rx_option(int id, int otherwise);
+    static int hidden, logs;
+    static int64_t hidden_at, age_at;
+    const int want = rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+    for (unsigned i = 0; i < 3; i++) fp_link[i] = oot_load_float(c, actor + 796 + i * 4);
+    fp_link_yaw = atan2f(oot_load_float(c, actor + 816), oot_load_float(c, actor + 840));
+    fp_link_known = 1;
+    if (want && now - age_at > 2000000000LL) {   /* (his eyes: about 1.15 m as a child, 1.55 m as an adult) */
+        int child = 1;
+        if (oot_gamedata_bool(c, 0xcea220d3u, &child)) fp_eye_height = child ? 1.15f : 1.55f;
+        age_at = now;
+    }
+    /* again every half second while on: a scene load or a change of age or tunic makes new models */
+    if (want && (!hidden || now - hidden_at > 500000000LL)) {
+        const int n = fp_set_head_visible(c, components, 0, logs < 2);
+        if (logs < 2) logs++, hos_log("first person: %d head materials hidden", n);
+        hidden = 1;
+        hidden_at = now;
+    } else if (!want && hidden) {
+        hos_log("first person: %d head materials shown again", fp_set_head_visible(c, components, 1, 1));
+        hidden = 0;
+        logs = 0;
+    }
+}
+
 static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components) {
     int rx_option(int id, int otherwise);
     static uint64_t flying_actor, marked_actor, marked_controller;
@@ -1126,6 +1224,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
         hos_log("play: began at clock %lld ns, %.2f s after the process started", (long long)now,
                 (double)(now - process_start_ns) / 1e9);
     }
+    oot_first_person_player(c, actor, components, now);
     if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
     last_player_tick = now;
     int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
@@ -1323,10 +1422,14 @@ void hos_oot_lift_player(Ctx *c, uint64_t actor) {
 }
 
 #if defined(_WIN32) || defined(__linux__)   /* (the debug tools: host/posix has what they call) */
-static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out) {
+/* first: the first-person view: the eye at Link's eyes, 0.35 m out along the way you look so his head, hair and hat stay
+   behind it, turned by the right stick from his facing; the free camera's flying is not used. The view is an eye, a yaw and a
+   pitch, as the free camera's, so another source of the look (a headset) can take their place. */
+static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out, int first) {
     int rx_option(int id, int otherwise);
     static uint64_t active_view;
     static int64_t last_tick;
+    static int was_first;
     static double eye[3], yaw, pitch;
     const int64_t now = hos_now_ns();
     const int64_t elapsed = now - last_tick;
@@ -1335,6 +1438,8 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out) {
         active_view = 0;
         return;
     }
+    if (first != was_first) active_view = 0, was_first = first;   /* (switching between the two starts again) */
+    if (first && !fp_link_known) return;
     if (active_view != view || elapsed > 500000000) {
         double target[3];
         memcpy(eye, A64_PTR(view + 96), sizeof eye);
@@ -1342,8 +1447,9 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out) {
         const double x = eye[0] - target[0], y = eye[1] - target[1], z = eye[2] - target[2];
         yaw = atan2(x, z);
         pitch = atan2(y, hypot(x, z));
+        if (first) yaw = fp_link_yaw + 3.14159265358979, pitch = 0;   /* (the way Link faces: the view's z axis points back) */
         active_view = view;
-        hos_log("cheats: free camera at %.2f %.2f %.2f", eye[0], eye[1], eye[2]);
+        hos_log("%s at %.2f %.2f %.2f", first ? "first person: view" : "cheats: free camera", eye[0], eye[1], eye[2]);
     }
     last_tick = now;
     DWORD foreground = 0;
@@ -1356,11 +1462,16 @@ static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out) {
     if (control) {
         yaw -= 1.6 * dt * (int16_t)(input >> 32) / 32767.0;
         pitch -= 1.2 * dt * (int16_t)(input >> 48) / 32767.0;
-        pitch = fmax(-1.55, fmin(1.55, pitch));
+        pitch = first ? fmax(-1.1, fmin(1.3, pitch)) : fmax(-1.55, fmin(1.55, pitch));   /* (first: not straight down at his feet) */
     }
     const double sy = sin(yaw), cy = cos(yaw), sp = sin(pitch), cp = cos(pitch);
     const double axes[3][3] = {{cy, 0, -sy}, {-sp * sy, cp, -sp * cy}, {cp * sy, sp, cp * cy}};
-    if (control) {
+    if (first) {
+        const double out_m = 0.35;
+        eye[0] = fp_link[0] - out_m * axes[2][0];
+        eye[1] = fp_link[1] + fp_eye_height - out_m * axes[2][1];
+        eye[2] = fp_link[2] - out_m * axes[2][2];
+    } else if (control) {
         const double step = dt * (GetAsyncKeyState(VK_CONTROL) < 0 ? 30.0 : 8.0);
         const double right = (int16_t)input / 32767.0;
         const double forward = (int16_t)(input >> 16) / 32767.0;
@@ -1393,7 +1504,8 @@ void hos_oot_free_view(Ctx *c, uint64_t view) {
     static SRWLOCK lock = SRWLOCK_INIT;
     AcquireSRWLockExclusive(&lock);
     const int enabled = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
-    oot_build_free_view(c, enabled ? view : 0, view + 8);
+    const int first = !enabled && rx_option(HL_OPT_FIRST_PERSON, 0);   /* (first person) */
+    oot_build_free_view(c, enabled || first ? view : 0, view + 8, first);
     ReleaseSRWLockExclusive(&lock);
 #else
     (void)c;
