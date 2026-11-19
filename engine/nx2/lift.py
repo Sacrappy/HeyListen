@@ -165,6 +165,8 @@ def main():
         oot_jitter.install(L, img)
         import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
         oot_occlusion.install(L, img)
+        import oot_view   # (fork: the gameplay view's hook, which oot_patches.py's patch_view no longer finds; host/hos_main.c)
+        oot_view.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     total = coverage(L, img, img_dir)
