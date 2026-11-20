@@ -22,8 +22,6 @@
    The sensitivity is the mouse's (the menu's Mouse sensitivity, - and =): 0.1 degrees a count at 1. HOS_MOUSE_INVERT_Y=1
    or the menu's Invert mouse vertical flips up and down. */
 #include "hos.h"
-#include "../gpu/vk/vk_api.h"       /* (HOS_OPT_CHEAT_CAMERA) */
-#include "../gpu/vk/vk_opt_ids.h"   /* (HL_OPT_FIRST_PERSON) */
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -35,6 +33,10 @@ int hos_mouse_take(int32_t *dx, int32_t *dy);                                   
 void hos_mouse_give_back(int32_t dx, int32_t dy);                               /* display.c */
 int rx_option(int id, int otherwise);
 extern double hos_mouse_sens;
+
+/* The renderer's option ids this file reads, by number as 6 and 8 are (the gpu headers stay out of the host's own files;
+   tests/test_mouse_native.py checks them against gpu/vk/vk_opt_ids.h and gpu/vk/vk_api.h) */
+enum { OPT_FIRST_PERSON = 91 /* HL_OPT_FIRST_PERSON */, OPT_CHEAT_CAMERA = 35 /* HOS_OPT_CHEAT_CAMERA */ };
 
 enum { LIMITS_AT = 0x178, PITCH_AT = 0x18c, YAW_AT = 0x1a4, STATE_AT = 0x204 };
 #define LIVE_NS 150000000LL   /* (the hook ran this recently: the camera takes the mouse) */
@@ -53,7 +55,7 @@ static int native_on(void) {
     static int looked;
     if (!looked) looked = 1, env = getenv("HOS_MOUSE_NATIVE");
     /* first person always takes the mouse one to one, whatever the Mouse camera row says */
-    if (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) return 1;
+    if (rx_option(OPT_FIRST_PERSON, 0) && !rx_option(OPT_CHEAT_CAMERA, 0)) return 1;
     return env ? atoi(env) != 0 : rx_option(6, 0);
 }
 
@@ -75,7 +77,7 @@ void hos_mouse_camera(uint64_t cam) {
     if (!cam || !native_on() || !looks_like_camera(cam)) return;
     /* First person: the view is ours (host/hos_main.c oot_build_free_view), so the mouse's motion is left for it to
        take; the hook still counts as run, so the right stick is not given the motion either */
-    if (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) {
+    if (rx_option(OPT_FIRST_PERSON, 0) && !rx_option(OPT_CHEAT_CAMERA, 0)) {
         InterlockedExchange64(&last_hook_ns, hos_now_ns());
         return;
     }

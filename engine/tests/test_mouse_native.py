@@ -11,6 +11,7 @@ pause menu, another camera) give the motion back to the stick. The camera takes 
 camera draws, and the motion is then the stick's.
 python -I -B tests/test_mouse_native.py   (Linux: host/posix's windows.h)
 """
+import re
 import shutil
 import subprocess
 import sys
@@ -125,6 +126,18 @@ int main(void) {
 
 
 class MouseNativeTests(unittest.TestCase):
+    def test_option_ids_match_the_renderer(self):
+        """mouse_native.c reads the first-person and free-camera rows by number: the renderer's ids"""
+        src = (ROOT / "host" / "mouse_native.c").read_text(encoding="utf-8")
+        ids = (ROOT / "gpu" / "vk" / "vk_opt_ids.h").read_text(encoding="utf-8")
+        api = (ROOT / "gpu" / "vk" / "vk_api.h").read_text(encoding="utf-8")
+        first = int(re.search(r"OPT_FIRST_PERSON = (\d+)", src).group(1))
+        camera = int(re.search(r"OPT_CHEAT_CAMERA = (\d+)", src).group(1))
+        self.assertEqual(first, int(re.search(r"#define HL_OPT_FIRST_PERSON (\d+)", ids).group(1)))
+        cheats = re.search(r"enum \{ HOS_OPT_CHEAT_HEARTS = (\d+),([^}]*)\}", api)
+        names = [n.strip() for n in cheats.group(2).split(",")]
+        self.assertEqual(camera, int(cheats.group(1)) + 1 + names.index("HOS_OPT_CHEAT_CAMERA"))
+
     def test_turns_the_player_camera(self):
         if sys.platform == "win32":
             self.skipTest("host/posix's windows.h stands in for Windows here")
