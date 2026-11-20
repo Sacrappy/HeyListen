@@ -111,6 +111,10 @@ std::string program_textures(const NvnState& s, const Program& p);   // (hooksho
 std::string program_code_keys(const NvnState& s);   // (hookshot) " stage:key" for each of the bound program's codes
 const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]);   // (program_for without its cache)
 void program_wait(const Program* p);
+/// (Hookshot 53c8fa5a) draw() sets it around its pick: a pick there hands a cached program's read to the workers and gets a stand-in
+void program_load_async_here(bool on);
+/// (Hookshot 53c8fa5a) a cached program's stand-in: once ready (and failed), its records are read and the draw picks again
+bool program_is_stand_in(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
 size_t program_cache_kept();   // (hookshot) program keys in the cache now, SIZE_MAX: no cache
 /// (hookshot) RX_VK_SHADER_KEY (default on, 0: off): programs get a fingerprint of what the driver compiles, and a start after a translator

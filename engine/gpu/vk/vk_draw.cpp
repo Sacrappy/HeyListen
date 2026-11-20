@@ -8489,7 +8489,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             cp = front;
             FINE_N(FC_FRONT_HIT, 1);
         } else {
+            program_load_async_here(true);   // (Hookshot 53c8fa5a: a cached program's read goes to the workers: vk_shader.cpp)
             cp = program_for(s, d.mesh ? ProgramKind::Mesh : ProgramKind::Graphics, types);
+            program_load_async_here(false);
             if (front && cp != front) draw_check_note("program front", front->key);
             if (use_front) prog_front_keep(s, types, cp, front_now);
         }
@@ -8651,8 +8653,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         // queue advanced, no 6-12 s stall), and the next frame's pick re-validates the variant against the state by then.
         // RX_VK_STOLEN_SKIP=0: drawn at once, as 9c42f5e7 alone
         static const bool stolen_skip = !getenv("RX_VK_STOLEN_SKIP") || atoi(getenv("RX_VK_STOLEN_SKIP")) != 0;
+        const bool stand_in = program_is_stand_in(cp);   // (a read, not a translation: no stolen translation to skip for)
         const bool fresh = wait_for(cp->ready, true);
-        if (stolen_skip && fresh) {
+        if (stolen_skip && fresh && !stand_in) {
             st_pending_skips++;
             st_stolen_skips.fetch_add(1, std::memory_order_relaxed);
             if (st_stolen_skips.load(std::memory_order_relaxed) < 12 ||
@@ -8660,6 +8663,23 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 logf("vk: a draw waited out its own translation (program %016llx): left out for this frame",
                      (unsigned long long)cp->key);
             return;
+        }
+    }
+    // (Hookshot 53c8fa5a) a cached program's stand-in, its records now read (vk_shader.cpp): the pick again finds the variant read, or
+    // starts its translation as before
+    if (cp->failed && program_is_stand_in(cp)) {
+        {
+            ParLock lk(d.mesh);
+            cp = program_for(s, d.mesh ? ProgramKind::Mesh : ProgramKind::Graphics, types);
+        }
+        if (!cp) SKIP_HERE();
+        if (!cp->ready.load(std::memory_order_acquire)) {
+            if (may_skip_now()) {
+                auto& again = cp->ready;   // (the pick's own program, asked for as above)
+                jobs_demand(again);
+                return void(st_pending_skips++);
+            }
+            wait_for(cp->ready, true);
         }
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
