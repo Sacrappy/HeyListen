@@ -8,7 +8,7 @@
 depth mode, the GPU's mesh-shader support, the C++ library's ABI and `sizeof` of the cached structs, the translation's per-GPU
 settings (invariant positions, NaN guard, matrix layout) and every environment variable that starts with one of the
 translation switches (`RX_VK_OOT*`, `RX_VK_NAN*`, `RX_VK_MESH*`, `EDEN_*` ...). `program_cache_stamp()` is that hash.
-A second, coarser stamp, `HOOKSHOT_STATE_STAMP` (vk_state.h, vk_api.h, vk_draw.h, rx_nvn.h), says what the pipeline notes are laid
+A second, coarser stamp, `HOOKSHOT_STATE_STAMP` (vk_state.h, vk_draw.h, rx_nvn.h; not vk_api.h), says what the pipeline notes are laid
 out by.
 
 **The files** (all beside the exe):
@@ -55,8 +55,8 @@ The key of a thing the driver built is a hash of what the driver sees, not the s
   the same one read back from `hookshot_programs.bin` have the same `fp`.
 * The ledger `hookshot_compiled.bin` (vk_draw.cpp): 8-byte ids, `fp` mixed with what was built from it (stage libraries; a compute
   pipeline; a graphics pipeline, with `pipeline_key`'s state: topology class, samples, vertex formats, targets, blend and so on).
-  Its header holds a hash of what those ids are good for and nothing else: `HOOKSHOT_STATE_STAMP` (vk_state.h, vk_api.h, vk_draw.h,
-  rx_nvn.h: the renderer's interface), `kPipeKeyVersion`, vendor, device, driver version, API version, `pipelineCacheUUID`, mesh
+  Its header holds a hash of what those ids are good for and nothing else: `HOOKSHOT_STATE_STAMP` (vk_state.h, vk_draw.h,
+  rx_nvn.h, not vk_api.h: the renderer's interface), `kPipeKeyVersion`, vendor, device, driver version, API version, `pipelineCacheUUID`, mesh
   shader mode, which extended-dynamic-state-3 parts the device has, push descriptors. A different header, a file that is not one, or a
   `mkw_vk_pipelines.bin` that did not load (new driver, missing file): the list starts again. A half entry at the end is cut off.
   Entries are written by `ledger_commit` (every 10 s of a preparation, at its end, at the end of the prediction, and every 300 presents

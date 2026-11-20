@@ -307,8 +307,8 @@ A held present is not written as a shot: `RX_VK_SHOTS` keeps showing only what r
 The shader caches' stamp (`nx2/translator_files.py`, compiled in as `HOOKSHOT_SHADER_STAMP`): every file under
 `gpu/vk/{eden,sirit,compat}`, then `vk_shader.cpp`, `vk_bank.cpp` and `vk_state.h`. `vk_api.h` is not in it (Longshot
 26a2eab0, #370): the translator reads nothing from it but the host calls whose answers the stamp already holds, so a
-menu, input or audio row there no longer drops every player's translated programs (the *state* stamp, the pipeline
-notes' layout, still holds it). Changing the list changes the stamp once, and every player prepares the shaders again.
+menu, input or audio row there no longer drops every player's translated programs, and the *state* stamp (the pipeline
+notes' and ledger's layout, `HOOKSHOT_STATE_STAMP`: `vk_state.h`, `vk_draw.h`, `rx_nvn.h`, by `state_stamp()`) leaves it out too. Changing the list changes the stamp once, and every player prepares the shaders again.
 A C or C++ file is stamped by its tokens, not its bytes (`normal()`, Longshot aec1cb81, #1689, Jeff Aigner): a comment, a
 blank line or a change of indentation there keeps the caches. A file the scanner is not sure of (a raw string, a splice beside a
 comment marker) and every other file is stamped byte for byte. `tests/test_translator_stamp_text.py` pins what is kept and what moves.

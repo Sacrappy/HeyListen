@@ -50,4 +50,36 @@ with tempfile.TemporaryDirectory(prefix="shader-stamp-bank-") as tmp:
     assert stamp() != changed, "a file added to the recompiler kept the shader stamp"
     (vk / "eden/b.h").unlink()
     assert stamp() == changed
+
+# the pipeline notes' state stamp (HOOKSHOT_STATE_STAMP): the same rule, vk_api.h out, PipeNote's headers in
+assert 'translator_files.state_stamp(GPU)' in build, "nx2/build.py's HOOKSHOT_STATE_STAMP is no longer translator_files.state_stamp(GPU)"
+assert files.STATE_FILES == ("gpu/vk/vk_state.h", "gpu/vk/vk_draw.h", "gpu/render/rx_nvn.h"), \
+    "the state stamp's files changed: say in nx2/translator_files.py why each one is in or out, then update this check"
+with tempfile.TemporaryDirectory(prefix="state-stamp-") as tmp:
+    gpu = Path(tmp)
+    for rel in ("vk/vk_state.h", "vk/vk_draw.h", "render/rx_nvn.h", "vk/vk_api.h", "vk/vk_draw.cpp"):
+        f = gpu / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"authored input\n")
+    state = lambda: files.state_stamp(str(gpu))
+    first = state()
+    assert re.fullmatch(r"[0-9a-f]{16}", first)
+    (gpu / "vk/vk_api.h").write_bytes(b"enum { HOS_OPT_AUDIO_OUTPUT = 57 };\n")
+    (gpu / "vk/vk_draw.cpp").write_bytes(b"unrelated\n")
+    assert state() == first, "a vk_api.h edit changed the state stamp"
+    for rel in ("vk/vk_state.h", "vk/vk_draw.h", "render/rx_nvn.h"):
+        before = state()
+        (gpu / rel).write_bytes(b"changed\r\n")
+        assert state() != before, "a %s edit kept the state stamp" % rel
+        after = state()
+        (gpu / rel).write_bytes(b"changed\n")
+        assert state() == after, "CRLF normalization of the state stamp changed"
+
+# program_cache_stamp() (vk_shader.cpp disk_stamp) holds the compiled-in translator stamp and run-time facts, and nothing of vk_api.h
+shader = (ROOT / "gpu" / "vk" / "vk_shader.cpp").read_text(encoding="utf-8")
+start = shader.index("uint64_t disk_stamp() {")
+body = shader[start:shader.index("return h;", start)]
+assert "HOOKSHOT_SHADER_STAMP" in body, "disk_stamp no longer holds HOOKSHOT_SHADER_STAMP"
+for name in ("MKWVK_API_VERSION", "HOS_OPT", "HOOKSHOT_STATE_STAMP", "kStateStamp"):
+    assert name not in body, "program_cache_stamp() takes %s: a vk_api.h edit would move it" % name
 print("PASS: the shader stamp changes for the translator's sources and keeps the caches for vk_api.h and other renderer sources")

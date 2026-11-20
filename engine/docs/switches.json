@@ -4246,12 +4246,12 @@
    "files": [
     {
      "path": "nx2/build.py",
-     "line": 1051
+     "line": 1047
     }
    ],
    "default": "off (unset)",
    "values": "on or off (0, false, off, no and empty are off)",
-   "explanation": "undocumented: nx2/build.py:1051 reads it as an on/off switch: `GATE = None if os.environ.get(\"HOOKSHOT_MEM_GATE\") == \"0\" else MemoryGate()`. No comment in the source says what it changes.",
+   "explanation": "undocumented: nx2/build.py:1047 reads it as an on/off switch: `GATE = None if os.environ.get(\"HOOKSHOT_MEM_GATE\") == \"0\" else MemoryGate()`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -4608,12 +4608,12 @@
    "files": [
     {
      "path": "nx2/build.py",
-     "line": 1130
+     "line": 1126
     }
    ],
    "default": "",
    "values": "text",
-   "explanation": "undocumented: nx2/build.py:1130 reads it as a text value: `sdl = os.environ.get(\"HOOKSHOT_SDL2\", \"\") # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)`. No comment in the source says what it changes.",
+   "explanation": "undocumented: nx2/build.py:1126 reads it as a text value: `sdl = os.environ.get(\"HOOKSHOT_SDL2\", \"\") # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -4758,7 +4758,7 @@
    "files": [
     {
      "path": "nx2/build.py",
-     "line": 1053
+     "line": 1049
     },
     {
      "path": "nx2/make_game.py",
@@ -4767,7 +4767,7 @@
    ],
    "default": "unset",
    "values": "text",
-   "explanation": "undocumented: nx2/build.py:1053 reads it as a text value: `counted, expected, pending = os.environ.get(\"HOOKSHOT_TIMES\"), {}, []`. No comment in the source says what it changes.",
+   "explanation": "undocumented: nx2/build.py:1049 reads it as a text value: `counted, expected, pending = os.environ.get(\"HOOKSHOT_TIMES\"), {}, []`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -15297,11 +15297,11 @@
    "files": [
     {
      "path": "nx2/build.py",
-     "line": 949
+     "line": 945
     },
     {
      "path": "nx2/build.py",
-     "line": 1142
+     "line": 1138
     }
    ],
    "default": "off (unset)",
@@ -27028,7 +27028,7 @@
     },
     {
      "path": "nx2/build.py",
-     "line": 1037
+     "line": 1033
     }
    ],
    "default": "off (unset)",

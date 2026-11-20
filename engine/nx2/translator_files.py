@@ -19,7 +19,9 @@ the host's code (host/), which the stamp never held, and a change to how they ar
 The NVN types NvnState is made of are gpu/render/rx_nvn.h's, which vk_api.h includes but which the stamp never held either.
 The rest of vk_api.h (the menu's option ids, the controls, the prompts, MkwVkRenderer, the renderer callbacks) the translator
 does not use, and the menu, input and audio rows added there made every player translate every program again. vk_api.h is
-still in the *state* stamp (HOOKSHOT_STATE_STAMP, the pipeline notes' layout), which is a different question.
+not in the *state* stamp either (HOOKSHOT_STATE_STAMP, the pipeline notes' layout, state_stamp() below): a note is a PipeNote (vk_draw.h)
+holding an NvnState (vk_state.h) of rx_nvn.h's types, and vk_api.h adds nothing to that layout, so a menu, input or audio row
+there no longer makes every player's pipeline notes start again either.
 
 Files are stamped with Windows line ends as Unix ones, and a C or C++ file (C_FAMILY) by its tokens (normal(), Longshot issue
 1611, Jeff Aigner's 4fc22424): its comments, blank lines, trailing white space and indentation leave the stamp as they leave the
@@ -189,4 +191,19 @@ def stamp(vk):
         rel = os.path.relpath(f, vk).replace("\\", "/")
         with open(f, "rb") as src:
             h.update(rel.encode() + normal(rel, src.read().replace(b"\r\n", b"\n")))
+    return h.hexdigest()[:16]
+
+
+STATE_FILES = ("gpu/vk/vk_state.h", "gpu/vk/vk_draw.h", "gpu/render/rx_nvn.h")   # (the pipeline notes' layout: PipeNote and what it holds)
+
+
+def state_stamp(gpu):
+    """HOOKSHOT_STATE_STAMP's 16 hex digits (the pipeline notes' layout, vk_draw.cpp): the headers PipeNote is made of, below gpu
+    (the renderer's gpu/ folder), with Windows line ends as Unix ones. Not vk_api.h (see above)"""
+    h = hashlib.sha1(usedforsecurity=False)
+    for rel in STATE_FILES:
+        f = os.path.join(gpu, rel.split("/", 1)[1])
+        if os.path.isfile(f):
+            with open(f, "rb") as src:
+                h.update(os.path.basename(f).encode() + src.read().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:16]

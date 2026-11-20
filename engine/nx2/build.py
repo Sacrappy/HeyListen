@@ -935,12 +935,8 @@ def main():
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % translator_files.stamp(vk)
         # (TICK-008: what the pipeline notes (hookshot_pipelines.bin) are laid out by: the draw state they hold and the record. Apart from the
         # shader stamp, so that a change of the shader translation carries the notes over instead of dropping them)
-        layout = hashlib.sha1()
-        for f in [os.path.join(vk, n) for n in ("vk_state.h", "vk_api.h", "vk_draw.h")] + [os.path.join(GPU, "render", "rx_nvn.h")]:
-            if os.path.isfile(f):
-                with open(f, "rb") as src:
-                    layout.update(os.path.basename(f).encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
-        state_stamp = "-DHOOKSHOT_STATE_STAMP=0x%sull" % layout.hexdigest()[:16]   # (TICK-008: vk_draw.cpp only)
+        # (and without vk_api.h: nx2/translator_files.py state_stamp, the menu's, input's and audio's ids no longer start the notes again)
+        state_stamp = "-DHOOKSHOT_STATE_STAMP=0x%sull" % translator_files.state_stamp(GPU)   # (TICK-008: vk_draw.cpp only)
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",

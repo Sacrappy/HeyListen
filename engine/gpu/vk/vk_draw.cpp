@@ -1381,7 +1381,7 @@ std::string pipe_notes_path() {
 // notes were written for:
 //   format      this layout of the header and of a record
 //   key_version bumped by hand when pipeline_key() or the way a note is built changes meaning
-//   note_size   sizeof(PipeNote), and state: HOOKSHOT_STATE_STAMP (nx2/build.py: the hash of vk_state.h, vk_api.h, vk_draw.h, rx_nvn.h)
+//   note_size   sizeof(PipeNote), and state: HOOKSHOT_STATE_STAMP (nx2/build.py: the hash of vk_state.h, vk_draw.h, rx_nvn.h: not vk_api.h, nx2/translator_files.py)
 //   translator  program_cache_stamp() when it was written (HOOKSHOT_SHADER_STAMP: the shader translation)
 // A file whose format, key_version, note_size or state differs is of no use and is started again. One whose translator differs is
 // CARRIED: its notes are kept, every pipeline is made again from them with the new translation (never trusted as built: the

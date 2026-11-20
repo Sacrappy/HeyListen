@@ -15465,13 +15465,13 @@ undocumented: builder/linux/linux_update.py:504 reads it as a text value: `overr
 
 #### `HOOKSHOT_MEM_GATE` - developer
 
-undocumented: nx2/build.py:1051 reads it as an on/off switch: `GATE = None if os.environ.get("HOOKSHOT_MEM_GATE") == "0" else MemoryGate()`. No comment in the source says what it changes.
+undocumented: nx2/build.py:1047 reads it as an on/off switch: `GATE = None if os.environ.get("HOOKSHOT_MEM_GATE") == "0" else MemoryGate()`. No comment in the source says what it changes.
 
 **Values:** on or off (0, false, off, no and empty are off). **Default:** off (unset).
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:1051`.
+**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:1047`.
 
 #### `HOOKSHOT_MEM_RESERVE_GB` - developer
 
@@ -15605,13 +15605,13 @@ undocumented: scripts/changelog.py:71 reads it as a text value: `value = value o
 
 #### `HOOKSHOT_SDL2` - developer
 
-undocumented: nx2/build.py:1130 reads it as a text value: `sdl = os.environ.get("HOOKSHOT_SDL2", "") # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)`. No comment in the source says what it changes.
+undocumented: nx2/build.py:1126 reads it as a text value: `sdl = os.environ.get("HOOKSHOT_SDL2", "") # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)`. No comment in the source says what it changes.
 
 **Values:** text. **Default:** .
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:1130`.
+**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:1126`.
 
 #### `HOOKSHOT_SETUP_BASE` - developer
 
@@ -15665,13 +15665,13 @@ undocumented: builder/py/hookshot_builder/window.py:855 reads it as an on/off sw
 
 #### `HOOKSHOT_TIMES` - developer
 
-undocumented: nx2/build.py:1053 reads it as a text value: `counted, expected, pending = os.environ.get("HOOKSHOT_TIMES"), {}, []`. No comment in the source says what it changes.
+undocumented: nx2/build.py:1049 reads it as a text value: `counted, expected, pending = os.environ.get("HOOKSHOT_TIMES"), {}, []`. No comment in the source says what it changes.
 
 **Values:** text. **Default:** unset.
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:1053` and 1 more place.
+**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:1049` and 1 more place.
 
 #### `HOOKSHOT_TOOLS` - developer
 
@@ -15953,7 +15953,7 @@ A release build (`make_game.py` sets it): no console window, the shaders prepare
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:949` and 1 more place.
+**Set it:** In the build's environment (the builder or the command line), before the build runs. **Read at:** `nx2/build.py:945` and 1 more place.
 
 #### `RX_SOFT_WRITE_WATCH` - developer
 
