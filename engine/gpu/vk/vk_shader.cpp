@@ -1533,8 +1533,11 @@ uint64_t disk_stamp() {
     // (c4e8e2ea: and a GPU whose 32-lane subgroups cannot cover the largest guest workgroup, 1024 invocations: its larger compute
     // programs are not pinned, pins_32. Only then, so other GPUs keep their caches)
     if (dev.sg32_stages && 32ull * dev.max_workgroup_subgroups < 1024) add(&dev.max_workgroup_subgroups, sizeof dev.max_workgroup_subgroups);
+    // (Hookshot 79739445) "RX_VK_GP_" (RX_VK_GP_TEST), not "RX_VK_GP": that also took RX_VK_GPU_DUMP, RX_VK_GPU_UNSWIZZLE, RX_VK_GPU_PAGES,
+    // RX_VK_GPU_PROFILE, RX_VK_GPU_CLOCK and RX_VK_GPL, none of which the translation reads, and a line of them added to hookshot_env.txt
+    // or taken out prepared every shader again
     for (char** e = _environ; e && *e; e++)
-        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_LOCAL", "RX_VK_FOLD", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "EDEN_"})
+        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_LOCAL", "RX_VK_FOLD", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
 }
