@@ -584,6 +584,8 @@ void hos_bind(int set, int button, int slot, int code) {
 }
 
 static volatile LONG pad_raw_now;   /* the gamepads' inputs at the last read, 1 << HOS_PAD_* */
+static uint64_t pad_after_menu;     /* (the pads' inputs the Insert menu had, 1 << HOS_PAD_*: each waits until let go) */
+static uint64_t pad_raw_game;       /* (pads_read: the last read's inputs without the menu's chords, 1 << HOS_PAD_*) */
 uint32_t hos_pad_raw(void) { return (uint32_t)pad_raw_now; }
 
 /* A stick axis cut at the dead zone, as XInput's and SDL's pads both are (pad_sdl.c): zone is the Insert menu's "Stick
@@ -597,6 +599,14 @@ int32_t hos_stick_axis(int16_t v, int zone) {
 
 static volatile int xinput_pads_now;   /* (xinput_poll: the controllers XInput has, while it is polled) */
 int hos_xinput_pads(void) { return xinput_pads_now; }   /* (host/prompts.c: Auto's face) */
+
+/* The Switch buttons the controls' pad inputs (1 << HOS_PAD_*) give */
+static uint64_t bound_pad_buttons(uint64_t raw) {
+    uint64_t b = 0;
+    for (int i = 0; i < HOS_SW_N; i++)
+        if (pad_bind[i] >= 0 && (raw >> pad_bind[i] & 1)) b |= 1ULL << i;
+    return b;
+}
 
 /* (host/prompts.c: Auto follows the device in use) when a gamepad and the keyboard last gave input, hos_now_ns, 0 never. A
    gamepad's: a button down or a stick pushed more than halfway (a resting pad's noise and drift are none). The keyboard's: a key
@@ -767,9 +777,8 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
             if (menu_bind[k] >= 0) mm |= 1ULL << menu_bind[k];
         if (mm && (raw & mm) == mm) raw &= ~mm;
     }
-    uint64_t b = 0;
-    for (int i = 0; i < HOS_SW_N; i++)
-        if (pad_bind[i] >= 0 && (raw >> pad_bind[i] & 1)) b |= 1ULL << i;
+    pad_raw_game = raw;
+    const uint64_t b = bound_pad_buttons(raw);
     cached_buttons = b;
     memcpy(cached_stick, s, sizeof s);
     *buttons |= b;
@@ -866,11 +875,16 @@ static void pads_merge(uint64_t *buttons, int32_t stick[4]) {
     uint64_t pb = 0;
     int32_t ps[4] = {0};
     pads_read(&pb, ps);
-    static int after_menu;
-    if (rx_option(1, 0)) after_menu = 1;
-    else if (after_menu && !pad_raw_now) after_menu = 0;
-    if (!after_menu) {
-        *buttons |= pb;
+    /* (after Longshot c45be62f) After the menu closes each input it had waits for its own release: one that stays down
+       (a worn trigger, a second pad) no longer keeps the other buttons and the sticks from the game. The first read after
+       the close counts as the menu's too, so the press that closed it waits even when no read saw it while open */
+    static int menu_was;
+    const int menu = rx_option(1, 0);
+    if (menu || menu_was) pad_after_menu |= (uint32_t)pad_raw_now;
+    else pad_after_menu &= (uint32_t)pad_raw_now;
+    menu_was = menu;
+    if (!menu) {
+        *buttons |= pad_after_menu ? bound_pad_buttons(pad_raw_game & ~pad_after_menu) : pb;
         stick_max(stick, ps);
     }
 }

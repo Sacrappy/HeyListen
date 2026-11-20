@@ -30,6 +30,8 @@ LONG64 InterlockedCompareExchange64(volatile LONG64 *p, LONG64 value, LONG64 exp
 }
 static int64_t now_ns = 10000000000LL, sampling;
 static int key_bind[HOS_KEY_N][2], pad_raw_now;   /* (the keys-only controls after the Switch's buttons) */
+static uint64_t pad_after_menu, pad_raw_game;   /* (the pads' inputs waiting after the menu; pads_read's, here none) */
+static uint64_t bound_pad_buttons(uint64_t raw) { (void)raw; return 0; }   /* (the one pad input is held: nothing else) */
 static unsigned char *memory;
 static char last_log[256];
 volatile int64_t hos_hid_last_read;
@@ -206,7 +208,7 @@ int main(int argc, char **argv) {
         packet(0, 0, 0, 0);   /* the pad's B and sticks are the menu's */
         CHECK(pad_merges > 0);   /* (read all the same, so the letting go is seen) */
         insert_open = 0;
-        packet(0, 0, 0, 0);   /* the menu closed, B still held: not yet */
+        packet(0, -12000, 0, 8000);   /* the menu closed, B still held: B waits for its release, the sticks count at once */
         pads_up = 1;
         packet(0, 0, 0, 0);
         pads_up = 0;

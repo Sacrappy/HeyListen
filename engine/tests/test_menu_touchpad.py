@@ -80,8 +80,9 @@ def main():
     need(len(names) == 16 and "HOS_PAD_GUIDE" not in names and all(pos[n] < pos["HOS_PAD_N"] for n in names),
          "the default bindings changed: check none is the touchpad's click")
     need("pads_read" in hid and "uint32_t hos_pad_raw(void)" in hid, "nn_hid.c no longer hands the menu the raw pads")
-    # (while the menu is open, and after it closes until the pads are let go, the game gets no pad input)
-    need(re.search(r"if \(rx_option\(1, 0\)\) after_menu = 1;\s*else if \(after_menu && !pad_raw_now\) after_menu = 0;", hid),
+    # (while the menu is open the game gets no pad input; after it closes each input the menu had waits until let go: c45be62f)
+    need(re.search(r"if \(menu \|\| menu_was\) pad_after_menu \|= \(uint32_t\)pad_raw_now;\s*else pad_after_menu &= \(uint32_t\)pad_raw_now;"
+                   r"\s*menu_was = menu;\s*if \(!menu\) \{", hid),
          "the pads are no longer the menu's alone while it is open")
 
     # (the menu: toggles on it, does not bind it)
@@ -102,7 +103,7 @@ def main():
     need(re.search(r"button == HOS_BTN_OPEN_MENU\) \{.*?code >= HOS_PAD_N\) return;", hid, re.S), "hos_bind takes a code the game cannot get")
     # (a combination held opens the menu and is taken out of what the game gets: after pad_raw_now is set, before the bindings)
     strip = hid.index("if (mm && (raw & mm) == mm) raw &= ~mm;")
-    need(hid.index("InterlockedExchange(&pad_raw_now, (LONG)raw);") < strip < hid.index("if (pad_bind[i] >= 0 && (raw >> pad_bind[i] & 1))"),
+    need(hid.index("InterlockedExchange(&pad_raw_now, (LONG)raw);") < strip < hid.index("pad_raw_game = raw;") < hid.index("bound_pad_buttons(raw)", strip),
          "the Open menu's inputs are not taken out of the game's input after the menu's copy")
     need(re.search(r"HOS_BIND_PAD, HOS_BTN_OPEN_MENU, k\); b >= 0 && b < HOS_PAD_N\) combo \|= 1u << b;", tick), "the menu does not read the Open menu")
     need(re.search(r"\(combo && listening != 1 && \(raw & combo\) == combo && \(pad_held & combo\) != combo\)", tick),

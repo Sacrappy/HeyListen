@@ -162,6 +162,8 @@ def main():
         block(hid, "int32_t hos_stick_axis("),
         xinput,
         block(hid, "static void pads_read("),
+        # (pads_merge's state after the Insert menu, c45be62f: declared beside pad_raw_now, not used by this cut)
+        "static void use_menu_hold(void) { (void)pad_after_menu; (void)pad_raw_game; }",
         MAIN))
     with tempfile.TemporaryDirectory(prefix="xinput-thread-") as tmp:
         src = Path(tmp) / "t.c"
