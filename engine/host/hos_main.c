@@ -1165,8 +1165,17 @@ static int fp_guest_call(Ctx *c, uint64_t fn, uint64_t sp, uint64_t a0, uint64_t
     return 1;
 }
 
-/* Shows or hides the head materials on each of the actor's models; how many were set */
-static int fp_set_head_visible(Ctx *c, uint64_t components, int visible, int log) {
+/* Shows or hides the named materials on each of an actor's models; how many were set (visible < 0: only looked up, how many
+   are there) */
+static int fp_set_materials_on(Ctx *c, uint64_t components, const char *const *names, unsigned count, int visible, int log,
+                               const char *what, const char *only_with);
+static int fp_set_materials(Ctx *c, uint64_t components, const char *const *names, unsigned count, int visible, int log,
+                            const char *what) {
+    return fp_set_materials_on(c, components, names, count, visible, log, what, NULL);
+}
+/* (only_with: only the models that have a material of that name; NULL every model) */
+static int fp_set_materials_on(Ctx *c, uint64_t components, const char *const *names, unsigned count, int visible, int log,
+                               const char *what, const char *only_with) {
     const uint64_t comp = recomp_load64(c, components + 8);
     if (!comp || !fp_in_main(recomp_load64(c, comp))) return 0;
     const uint64_t getter = recomp_load64(c, recomp_load64(c, comp) + 248);
@@ -1183,25 +1192,123 @@ static int fp_set_head_visible(Ctx *c, uint64_t components, int visible, int log
         if (!model) break;
         const uint64_t vt = recomp_load64(c, model);
         if (!fp_in_main(vt)) break;
+        if (only_with) {   /* (the model counts only if it has that material) */
+            const size_t len = strlen(only_with);
+            for (size_t k = 0; k <= len; k++) recomp_store8_sp(c, scratch + 16 + k, (uint8_t)only_with[k]);
+            recomp_store64_sp(c, scratch, scratch + 16);
+            uint64_t index = ~0ULL;
+            const int has = fp_guest_call(c, recomp_load64(c, vt + 208), scratch - 16, model, scratch, 0, &index) &&
+                            !(index & 0x80000000u);
+            if (log) hos_log("first person: model %d (vtable %#llx): %s %s", i, (unsigned long long)vt, has ? "has" : "has no", only_with);
+            if (!has) continue;
+        }
         int found = 0;
-        for (unsigned n = 0; n < sizeof kHeadMaterials / sizeof kHeadMaterials[0]; n++) {
-            const char *name = kHeadMaterials[n];
+        for (unsigned n = 0; n < count; n++) {
+            const char *name = names[n];
             const size_t len = strlen(name);
             for (size_t k = 0; k <= len; k++) recomp_store8_sp(c, scratch + 16 + k, (uint8_t)name[k]);
             recomp_store64_sp(c, scratch, scratch + 16);
             uint64_t index = ~0ULL;
             if (!fp_guest_call(c, recomp_load64(c, vt + 208), scratch - 16, model, scratch, 0, &index) || (index & 0x80000000u))
                 continue;
-            fp_guest_call(c, recomp_load64(c, vt + 456), scratch - 16, model, (uint32_t)index, visible ? 1 : 0, NULL);
+            if (visible >= 0)
+                fp_guest_call(c, recomp_load64(c, vt + 456), scratch - 16, model, (uint32_t)index, visible ? 1 : 0, NULL);
             found++;
         }
         if (log)
-            hos_log("first person: model %d (vtable %#llx): %d head materials %s", i, (unsigned long long)vt, found,
+            hos_log("first person: model %d (vtable %#llx): %d %s materials %s", i, (unsigned long long)vt, found, what,
                     visible ? "shown" : "hidden");
         set += found;
     }
     return set;
 }
+static int fp_set_head_visible(Ctx *c, uint64_t components, int visible, int log) {
+    return fp_set_materials(c, components, kHeadMaterials, sizeof kHeadMaterials / sizeof kHeadMaterials[0], visible, log,
+                            "head");
+}
+
+static const char *const kNaviMaterials[] = {"Mt_Body", "Mt_Body_AlphaMask", "Mt_Wings"};
+/* Navi, kept out of the eye: she hovers by Link's head, so in first person her glowing body and wings filled the view. Here
+   she is a second actor of Link's own class (the same vtable), beside him, whose models carry her wings (Link's own models
+   have no Mt_Wings). The movement update runs for Link only, so she is looked for from him (fp_navi_search): the 8-byte
+   words of his actor (0x2000 bytes) and components (0x400), and one step further from each object found there, are taken
+   as pointers. An object counts only if it is in the heap, starts with a vtable in main, has components (+624) whose model
+   component (+8) is of the class Link's is (the same getter at its vtable +248: no other code is called on a guess), and
+   stands within 5 m of Link (+796); then its models are asked, look-up only, for a material named Mt_Wings. The first
+   such object is hers. While first person is on, her materials (Mt_Body, Mt_Body_AlphaMask, Mt_Wings) are hidden on that
+   actor's models that have Mt_Wings, and nowhere else; her place is not known, so she is hidden all the time in first
+   person, not only near the eye, and shown again when it is off. Her light (a small glow) stays. */
+static const char *const kNaviWings[] = {"Mt_Wings"};
+static volatile uint64_t fp_navi_vt, fp_navi_found;
+extern uint64_t hos_heap_size;
+static int fp_heap_ptr(uint64_t a) { return !(a & 7) && a >= HOS_HEAP_BASE && a + 0x1000 < HOS_HEAP_BASE + hos_heap_size; }
+static int fp_navi_try(Ctx *c, uint64_t obj, uint64_t link, uint64_t getter, int *logged) {
+    if (obj == link || !fp_heap_ptr(obj) || !fp_in_main(recomp_load64(c, obj))) return 0;   /* (Link himself: not her) */
+    const uint64_t comps = recomp_load64(c, obj + 624);
+    if (!fp_heap_ptr(comps)) return 0;
+    const uint64_t comp = recomp_load64(c, comps + 8);
+    if (!fp_heap_ptr(comp) || !fp_in_main(recomp_load64(c, comp)) || recomp_load64(c, recomp_load64(c, comp) + 248) != getter)
+        return 0;
+    float l2 = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        const float d = oot_load_float(c, obj + 796 + i * 4) - fp_link[i];
+        l2 += d * d;
+    }
+    if (!(l2 < 25.0f)) return 0;
+    const int wings = fp_set_materials(c, comps, kNaviWings, 1, -1, 0, "Navi");
+    if (*logged < 24)
+        (*logged)++, hos_log("first person: Navi search: object %#llx (vtable %#llx) %.2f m from Link, wings %d", (unsigned long long)obj,
+                             (unsigned long long)recomp_load64(c, obj), sqrtf(l2), wings);
+    if (wings <= 0) return 0;
+    fp_navi_vt = recomp_load64(c, obj), fp_navi_found = obj;
+    hos_log("first person: Navi is %#llx (vtable %#llx)", (unsigned long long)obj, (unsigned long long)fp_navi_vt);
+    return 1;
+}
+static void fp_navi_search(Ctx *c, uint64_t link, uint64_t components) {
+    const uint64_t lcomp = recomp_load64(c, components + 8);
+    if (!fp_heap_ptr(lcomp)) return;
+    const uint64_t getter = recomp_load64(c, recomp_load64(c, lcomp) + 248);
+    static uint64_t first[1280];
+    int n = 0, logged = 0, tried = 0;
+    const uint64_t roots[2][2] = {{link, 0x2000}, {components, 0x400}};
+    for (int r = 0; r < 2; r++)
+        for (uint64_t off = 0; off < roots[r][1]; off += 8) {
+            const uint64_t p = recomp_load64(c, roots[r][0] + off);
+            if (!fp_heap_ptr(p)) continue;
+            tried++;
+            if (fp_navi_try(c, p, link, getter, &logged)) return;
+            if (n < 1280) first[n++] = p;
+        }
+    for (int i = 0; i < n; i++)   /* (one step further: 0x400 bytes of each) */
+        for (uint64_t off = 0; off < 0x400; off += 8) {
+            const uint64_t p = recomp_load64(c, first[i] + off);
+            if (!fp_heap_ptr(p)) continue;
+            tried++;
+            if (fp_navi_try(c, p, link, getter, &logged)) return;
+        }
+    hos_log("first person: Navi search: not found (%d pointers, %d objects one step on, %d with a model near Link)", tried, n, logged);
+}
+static void fp_navi(Ctx *c, uint64_t link, uint64_t components, int want, int64_t now) {
+    static int hidden, logs, searches;
+    static int64_t at, searched_at;
+    if (!want) searches = 0;   /* (a new stretch of first person looks again) */
+    if (fp_navi_found && (recomp_load64(c, fp_navi_found) != fp_navi_vt || !fp_heap_ptr(recomp_load64(c, fp_navi_found + 624))))
+        fp_navi_found = 0, searches = 0, hidden = 0;   /* (gone with a scene load: looked for again) */
+    if (want && !fp_navi_found && searches < 5 && now - searched_at > 2000000000LL)
+        searched_at = now, searches++, fp_navi_search(c, link, components);
+    const uint64_t navi = fp_navi_found;
+    if (!navi) return;
+    if (!want && !hidden) return;
+    if (want && hidden && now - at < 500000000LL) return;   /* (again every half second while on: new models after a load) */
+    const uint64_t comps = recomp_load64(c, navi + 624);
+    if (!fp_heap_ptr(comps)) return;
+    const int n = fp_set_materials_on(c, comps, kNaviMaterials, sizeof kNaviMaterials / sizeof kNaviMaterials[0], !want,
+                                      logs < 2, "Navi", "Mt_Wings");
+    if (logs < 2 || (!want && hidden)) hos_log("first person: Navi %s (%d materials, on her models with wings)", want ? "hidden" : "shown", n);
+    if (logs < 2) logs++;
+    hidden = want, at = now;
+}
+
 
 /* Link's head through its bone: its local scale 0 while first person is on, so the head, hair and hat (the hat is
    the tunic's mesh, skinned to the head's bones) go with it, and the eye can sit at his eyes.
@@ -1280,6 +1387,7 @@ static void oot_first_person_player(Ctx *c, uint64_t actor, uint64_t components,
         if (oot_gamedata_bool(c, 0xcea220d3u, &child)) fp_eye_height = child ? 1.15f : 1.55f;
         age_at = now;
     }
+    fp_navi(c, actor, components, want, now);
     /* again every half second while on: a scene load or a change of age or tunic makes new models */
     if (want && (!hidden || now - hidden_at > 500000000LL)) {
         const int n = fp_set_head_visible(c, components, 0, logs < 2);
