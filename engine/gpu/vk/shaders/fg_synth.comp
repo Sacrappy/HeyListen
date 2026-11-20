@@ -8,7 +8,13 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D fa;
 layout(binding = 1) uniform sampler2D fb;
 layout(binding = 2) uniform sampler2D flow;
+// (HeyListen) FG_PQ: the game's own HDR10 picture (Native HDR), PQ codes kept at 10 bits (RGB10A2): through RGBA8 they lost
+// two bits, banding in the dark and in the sky (vk_framegen.cpp ensure_size's pq)
+#ifdef FG_PQ
+layout(binding = 3, rgb10_a2) uniform writeonly image2D dst;
+#else
 layout(binding = 3, rgba8) uniform writeonly image2D dst;
+#endif
 layout(push_constant) uniform P { float t; } pc;
 vec2 fl(ivec2 q) { return texelFetch(flow, clamp(q, ivec2(0), textureSize(flow, 0) - 1), 0).xy; }
 float gap(vec3 x, vec3 y) { const vec3 d = abs(x - y); return max(d.r, max(d.g, d.b)); }

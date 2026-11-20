@@ -75,9 +75,12 @@ int main(int argc, char **argv) {
             game_size(ur::percent(m[0]) / 100.0f, scene_w, scene_h);
             assert(scene_w == m[1] && scene_h == m[2] && scene_w * 1080 == scene_h * 1920);
         }
-        up_now = ur::DLAA;
-        assert(strcmp(tx_resolution(1), "Native (DLAA)") == 0);
+        // (DLAA and FSR 4's native AA are the Render resolution's native choice of DLSS and FSR 4 now: the full size)
+        assert(strcmp(tx_resolution(ur::kNativeAa), "DLAA (native)") == 0 && strcmp(tx_resolution(1), "Quality (67%)") == 0);
+        up_now = ur::FSR4;
+        assert(strcmp(tx_resolution(ur::kNativeAa), "Native AA (FSR 4)") == 0);
         up_now = ur::GAME;
+        assert(strcmp(tx_resolution(ur::kNativeAa), "100% (1920x1080)") == 0);   // (the game's own has no native choice: its 100%)
     }
 }
 '''

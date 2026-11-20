@@ -59,9 +59,9 @@ def main():
         sys.exit("FAIL: dlss_prep.comp's HDR constants (kColorMax, kSquare) are gone")
     if "constant_id = 0) const bool kSquare = true;" not in out or "if (kSquare) c *= c;" not in out:
         sys.exit("FAIL: dlss_out.comp's kSquare is gone")
-    # DLSS (NVIDIA) keeps the LDR pair: its engine does not say hdr here
-    if "memory, hdr}" in read("vk_dlss.cpp"):
-        sys.exit("FAIL: DLSS says it takes HDR colour, which this tree has not verified (no NGX here)")
+    # DLSS (NVIDIA) takes HDR colour too since its HDR feature was ported (Longshot a0dfd28b, #2243's part): its engine says hdr
+    if "memory, hdr}" not in read("vk_dlss.cpp"):
+        sys.exit("FAIL: DLSS does not say it takes HDR colour with the game's native HDR")
     print("test_fsr4_hdr: ok")
 
 

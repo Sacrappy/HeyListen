@@ -29,17 +29,42 @@ static struct {
 } f;
 #define CALL(type, fn) ((type)f.fn)
 
+static int loaded_beside;   /* (the last load_one's: from beside the executable, not the system's) */
 static HMODULE load_one(const char *dll) {   /* beside the executable, else the system's */
     char path[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
     snprintf(path + n, sizeof path - n, "%s", dll);
     HMODULE m = LoadLibraryA(path);
+    loaded_beside = m != NULL && n != 0;
 #ifdef _WIN32   /* (hookshot: else the system's, not the current folder's or PATH's) */
     return m ? m : LoadLibraryExA(dll, NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 #else
     return m ? m : LoadLibraryA(dll);
 #endif
+}
+/* What the loaded SDL says it is, for the log line: "3.2.8" and its revision, either left out when it has no such call (the
+   revision's characters are kept to the plain ones: it is a git tag and hash, and a log line must stay short and clean) */
+static void describe(HMODULE m, int three, char *out, size_t cap) {
+    void *get_version = (void *)GetProcAddress(m, "SDL_GetVersion"), *get_revision = (void *)GetProcAddress(m, "SDL_GetRevision");
+    char version_text[24] = "", revision[48] = "";
+    if (get_version && three) {   /* SDL3: major * 1000000 + minor * 1000 + micro */
+        const int v = ((int (*)(void))get_version)();
+        snprintf(version_text, sizeof version_text, "%d.%d.%d", v / 1000000, v / 1000 % 1000, v % 1000);
+    } else if (get_version) {   /* SDL2: the version into a struct of three bytes */
+        unsigned char v[3] = {0, 0, 0};
+        ((void (*)(unsigned char *))get_version)(v);
+        snprintf(version_text, sizeof version_text, "%u.%u.%u", v[0], v[1], v[2]);
+    }
+    if (get_revision) {
+        const char *r = ((const char *(*)(void))get_revision)();
+        size_t o = 0;
+        for (; r && *r && o + 1 < sizeof revision; r++)
+            if ((*r >= '0' && *r <= '9') || (*r >= 'a' && *r <= 'z') || (*r >= 'A' && *r <= 'Z') || *r == '.' || *r == '-' || *r == '_' || *r == ' ' || *r == '(' || *r == ')')
+                revision[o++] = *r;
+        revision[o] = 0;
+    }
+    snprintf(out, cap, "%s%s%s", version_text, revision[0] ? ", revision " : "", revision);
 }
 static int get_all(HMODULE m, int three) {
 #define GET(field, name) if (!(*(FARPROC *)&f.field = GetProcAddress(m, name))) { hos_log("sdl: SDL%d has no %s", three ? 3 : 2, name); return 0; }
@@ -114,7 +139,11 @@ int hos_sdl_load(void) {
         HMODULE m = want && atoi(want) == 2 ? NULL : load_one("SDL3.dll");
         if (m && get_all(m, 1)) version = 3;
         else if ((m = load_one("SDL2.dll")) && get_all(m, 0)) version = 2;
-        hos_log(version ? "sdl: SDL%d" : "sdl: no SDL3 or SDL2 found: no window, sound or SDL controllers", version);
+        if (version) {   /* (where from, as a word: the path would carry the user's name into the reports) */
+            char what[96];
+            describe(m, version == 3, what, sizeof what);
+            hos_log("sdl: SDL%d %s, from %s", version, what[0] ? what : "(version not known)", loaded_beside ? "beside the game" : "the system path");
+        } else hos_log("sdl: no SDL3 or SDL2 found: no window, sound or SDL controllers");
         InterlockedExchange(&state, 2);
     }
     while (state != 2) Sleep(0);

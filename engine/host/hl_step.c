@@ -16,6 +16,7 @@
    is in (hos_step_probe set by the first one), and keeps the nominal rate at 60 at most then. HOS_FPS_STEP=0: as before. */
 #include "hl_host.h"
 #include "frame_whole.h"
+#include "loop_step.h"
 #include <windows.h>   /* (SRWLOCK: hos_movie_frames, hos_frame_whole) */
 #include <stdlib.h>
 #include <string.h>
@@ -97,7 +98,10 @@ uint32_t hos_movie_frames(uint64_t player) {
      the game's (the hook's anchor is the cut stored to +60).
    - f_800672e0, the water renderer (after upstream 6df80a8d, #2409): its ripple simulation runs (int)step times the water's
      substeps (+76 of the pass) each frame. Cut to 0, the rings Link and the actors make in water stood still above 60 fps.
-     Its remainder is kept per water object (x21). Found by atk3001 for Lichii (zortos293/Lichii#1152), ported to Fritchii
+     Whole frames carried, a frame ran all its substeps or none (0 or 4 at 108 fps), and the rings stood still for a frame and then
+     jumped (Longshot 01d0263d by Jeff Aigner, issue 1199): the hook's "t8" hands out the whole substeps instead (hos_frame_whole_times,
+     the load of the substeps' count in x8 right before the cut; x8 then 1), 2 or 3 every frame; HOS_FPS_WATER=0 keeps the whole
+     frames carried and multiplies them, as before. Its remainder is kept per water object (x21). Found by atk3001 for Lichii (zortos293/Lichii#1152), ported to Fritchii
      by Frizti (Frizti/Fritchii d389685a4, 063dbb741), then to Hookshot by hckrman101.
    - f_80652cb0, the Deku Tree's floor web (after upstream db0dd7140, #2929): it cuts the elapsed time divided by 1/60 to
      whole simulation steps, then clamps them to 0..3. Cut to 0, the web did not react when Link jumped on it above 60 fps.
@@ -111,7 +115,7 @@ uint32_t hos_movie_frames(uint64_t player) {
      its hook is the one before the addition to x10: "u10"). A song whose rhythm was lost is not restored: record it again. */
 HL_WHOLE_HOOK(80a87e50, "7464f66dbdfb2fd2", 12, "c->x[19] + 864");
 HL_WHOLE_HOOK(803edf70, "29ce7b235d0d6bfd", 8, "c->x[19] + 60");
-HL_WHOLE_HOOK(800672e0, "feef3d08fe1f642d", 9, "c->x[21]");
+HL_WHOLE_HOOK(800672e0, "feef3d08fe1f642d", 9, "c->x[21]", "t8");
 HL_WHOLE_HOOK(80652cb0, "9593be89631328d3", 22, "c->x[19] + 2296");
 HL_WHOLE_HOOK(832b32b0, "5b78765ca27d412c", 8, "c->x[19] + 0x265fc", "u");
 HL_WHOLE_HOOK(832b6840, "51843fdaa0ed4e2d", 8, "c->x[9]", "u10");
@@ -128,4 +132,60 @@ uint32_t hos_frame_whole(uint64_t at, uint32_t amount_bits, uint32_t game) {
     const uint32_t whole = frame_whole(&state, at, amount_bits, 1);
     ReleaseSRWLockExclusive(&lock);
     return whole;
+}
+
+/* The water's ripple simulation's whole substeps (hl_gates' "t8" of the water hook above): the count of its substeps a frame in
+   `times`, game the game's whole frames, which the game multiplies by them. HOS_FPS_WATER=0, or no frame time published, the
+   whole frames (carried while the frame time is published, HOS_FPS_WHOLE) times the substeps, as the game would. */
+uint32_t hos_frame_whole_times(uint64_t at, uint32_t amount_bits, uint32_t times) {
+    static FrameWhole state;   /* (under the lock: the game's update threads) */
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static int on = -1, water = -1;
+    int v = __atomic_load_n(&on, __ATOMIC_RELAXED), w = __atomic_load_n(&water, __ATOMIC_RELAXED);
+    if (v < 0) v = !(getenv("HOS_FPS_WHOLE") && !atoi(getenv("HOS_FPS_WHOLE"))), __atomic_store_n(&on, v, __ATOMIC_RELAXED);
+    if (w < 0) w = !(getenv("HOS_FPS_WATER") && !atoi(getenv("HOS_FPS_WATER"))), __atomic_store_n(&water, w, __ATOMIC_RELAXED);
+    const int timed = __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED) != 0;
+    AcquireSRWLockExclusive(&lock);
+    uint32_t whole;
+    if (v && timed && !w) {   /* (the whole frames carried per counter, then multiplied: the substeps all or none) */
+        whole = frame_whole(&state, at, amount_bits, 1) * times;
+    } else {
+        whole = frame_whole_times(&state, at, amount_bits, times, v && timed);
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return whole;
+}
+
+/* A looping animation one frame long (the frozen Zoras under the ice in adult Zora's Domain: start 0, end 1) is one pose
+   (host/loop_step.h; Longshot 6aa5d653 by cuecuemoar, issue 988). Two lift hooks (nx2/hl_gates.py) make the time a skeleton is
+   drawn at:
+   - HL_LOOP_HOOK, f_802cfca0 advances the clock of each animation entry ([x20]: flags +0, time +4, speed +12, start +16, end +20)
+     and copies it to the skeleton's time. Its two advances multiply the step (vreg 8) by the definition's speed first: a loop
+     of one frame or less takes the step as whole frames, carried per entry (hos_loop_step); longer loops keep the fractional step.
+   - HL_POSE_HOOK, f_80944aa0 writes the time the skeletons are drawn at (x22: the value +0, the range it is kept in +4, +8)
+     from a clock of its own that also moved by the fractional step: a range of one frame or less is drawn at its start
+     (hos_loop_pose), the phase of a clock that moves in whole frames.
+   A cap of 60 (hos_frame_seconds_bits 0) leaves both as the game has them. HOS_FPS_LOOP=0: the game's, both places. */
+HL_LOOP_HOOK(802cfca0, "9111a12ac4e739a5");
+HL_POSE_HOOK(80944aa0, "7554cb8a60fc4426");
+
+static int loop_timed(void) {
+    static int on = -1;
+    int v = __atomic_load_n(&on, __ATOMIC_RELAXED);
+    if (v < 0) v = !(getenv("HOS_FPS_LOOP") && !atoi(getenv("HOS_FPS_LOOP"))), __atomic_store_n(&on, v, __ATOMIC_RELAXED);
+    return v && __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED) != 0;
+}
+
+uint32_t hos_loop_step(uint64_t at, uint32_t step_bits, uint32_t start_bits, uint32_t end_bits) {
+    static LoopStep state;   /* (the game's update threads: under the lock) */
+    static SRWLOCK lock = SRWLOCK_INIT;
+    if (!loop_timed() || !loop_is_pose(start_bits, end_bits)) return step_bits;   /* (most entries: no lock) */
+    AcquireSRWLockExclusive(&lock);
+    const uint32_t whole = loop_step(&state, at, step_bits, start_bits, end_bits, 1);
+    ReleaseSRWLockExclusive(&lock);
+    return whole;
+}
+
+uint32_t hos_loop_pose(uint32_t time_bits, uint32_t start_bits, uint32_t end_bits) {
+    return loop_pose(time_bits, start_bits, end_bits, loop_timed());
 }

@@ -5,7 +5,7 @@ framegen_record runs on the replay thread, the Insert menu on the display thread
 free set sits between ensure_size (which makes the sets' images for the multiplier then) and the rest. A step up in that window,
 with the multiplier read again, made the last copy's target set->frame[made] an image that was never made (a null handle in the
 driver). Checked here: after ensure_size, framegen_record reads the multiplier from fg.mult (what the images were made for) and
-the Auto row (opts.framegen == 1) once, and never calls multiplier() again.
+the Auto row (framegen_now() == 1) once, and never calls multiplier() again.
 python -I -B tests/test_framegen_multiplier_once.py
 """
 from pathlib import Path
@@ -33,7 +33,8 @@ def main():
         raise SystemExit("FAIL: framegen_record reads multiplier() after ensure_size made the sets")
     if "m = fg.mult" not in after:
         raise SystemExit("FAIL: framegen_record does not take m from fg.mult")
-    if after.count("opts.framegen") != 1 or "auto_rate = opts.framegen == 1" not in after:
+    # (the row as it runs, framegen_now: the mode's clamp and the limit's lowering, read once)
+    if after.count("framegen_now()") != 1 or "auto_rate = framegen_now() == 1" not in after or "opts.framegen" in after:
         raise SystemExit("FAIL: the Auto row must be read once (auto_rate), not again")
     if "if (auto_rate)" not in after:
         raise SystemExit("FAIL: the Auto branch does not use the single read")

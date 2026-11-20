@@ -60,7 +60,25 @@ int main() {
         w.upload = 20;
         CHECK("uploads", pr::cause_of(frame(60, 10, 25, 10, 5), w) == pr::kTextureUpload);
         CHECK("nothing stands out", pr::cause_of(frame(100, 20, 20, 20, 20), pr::Waits{}) == pr::kOther);
+        w = {};
+        w.readback = 30;   // (v0.4.3: the read-backs' waits are counted now, the game's CPU reads of GPU results)
+        CHECK("read-backs", pr::cause_of(frame(70, 30, 5, 3, 2), w) == pr::kReadback);
+        w = {};
+        w.driver_compile = 45;   // (the driver's vkCreate*Pipelines, the GPL libraries and their links)
+        CHECK("driver compiles", pr::cause_of(frame(60, 5, 10, 3, 2), w) == pr::kDriverCompile);
+        w = {};
+        w.descriptors = 28;   // (descriptor building and binding on the drawing threads)
+        CHECK("descriptors", pr::cause_of(frame(60, 10, 20, 2, 2), w) == pr::kDescriptors);
+        w = {};
+        w.present = 35;   // (the swapchain: waiting for its image and the present call)
+        CHECK("the swapchain", pr::cause_of(frame(60, 10, 12, 3, 2), w) == pr::kPresentBlock);
+        w.os_wait = 40;   // (the presenting thread off the CPU, a gap with no work: the game's part beyond its CPU time)
+        CHECK("the OS delayed it", pr::cause_of(frame(60, 45, 5, 3, 2), w) == pr::kOsWait);
+        CHECK("a frame of the game's own CPU work", pr::cause_of(frame(60, 45, 5, 3, 2), pr::Waits{}) == pr::kGameCpu);
         CHECK("names", !std::strcmp(pr::cause_name(pr::kGpuBound), "gpu_bound") && !std::strcmp(pr::cause_name(pr::kPacing), "pace") &&
+                           !std::strcmp(pr::cause_name(pr::kDriverCompile), "driver_compile") &&
+                           !std::strcmp(pr::cause_name(pr::kPresentBlock), "present") &&
+                           !std::strcmp(pr::cause_name(pr::kOsWait), "os_wait") &&
                            !std::strcmp(pr::event_name(pr::kDeviceLost), "device_lost"));
     }
 
@@ -81,11 +99,18 @@ int main() {
         CHECK("frames", m.frame[4] == 100 && m.frame[9] == 1);
         CHECK("seconds", m.seconds > 1.71 && m.seconds < 1.73);
         CHECK("the hitch", m.hitch[pr::kPipelineWait] == 1 && m.pacing_misses == 0);
+        CHECK("the parts' sums over the frames",
+              m.part[fs::kGame] == 1010 && m.part[fs::kRender] == 445 && m.part[fs::kGpuWait] == 203 &&
+              std::abs(m.part[fs::kPace] - 62) < 0.001);
+        CHECK("the hitch's detail", m.hitch_detail[pr::kPipelineWait].count == 1 &&
+                                     m.hitch_detail[pr::kPipelineWait].ms_sum == 60 && m.hitch_detail[pr::kPipelineWait].ms_max == 60 &&
+                                     m.hitch_detail[pr::kPipelineWait].load_count == 0);
         CHECK("an empty map is left out", !maps["Hyrule Field (adult)"].any());
         pr::Machine mc;
         mc.version = "2.4.1 (source 1234abcd)", mc.os = "Arch Linux", mc.kernel = "6.12.3-arch1-1", mc.gpu = "AMD \"Radeon\" RX 7800 XT";
         mc.driver = "radv Mesa 25.2.4", mc.cpu = "AMD Ryzen 7 7800X3D", mc.upscaler = "FSR 3.1", mc.preset = "High";
         mc.vram_gb = 16, mc.ram_gb = 32, mc.fps_cap = 60;
+        mc.framegen = pr::framegen_name(pr::kFramegenFsr3), mc.framegen_x = 2, mc.dlss_model = pr::dlss_model_name(11, true), mc.render_scale = 67;
         pr::Memory mem{5.25, 15.5, 7.75};
         const std::string j = pr::summary_json(mc, true, 312.5, "Kokiri Forest (child)", &mem, maps);
         CHECK("version 1", j.rfind("{\"v\":1,", 0) == 0);
@@ -94,9 +119,73 @@ int main() {
         CHECK("not the empty one", j.find("Hyrule Field") == std::string::npos);
         CHECK("buckets", j.find("\"frame_ms\":[0,0,0,0,100,0,0,0,0,1,0,0,0]") != std::string::npos);
         CHECK("hitches", j.find("\"hitches\":{\"pipeline_wait\":1,") != std::string::npos);
+        // (the parts are the average ms a frame over the summary's frames on the map: 1010/101, 445/101, 203/101, 62/101)
+        CHECK("parts as averages", j.find("\"parts_ms\":{\"game\":10,\"render\":4.406,\"gpu_wait\":2.01,\"pace\":0.614}") != std::string::npos);
+        CHECK("hitch detail", j.find("\"hitch_detail\":{\"pipeline_wait\":{\"count\":1,\"ms_sum\":60,\"ms_max\":60,"
+                                      "\"load_count\":0,\"load_ms_sum\":0,\"load_ms_max\":0}}") != std::string::npos);
         CHECK("memory", j.find("\"memory\":{\"vram_used_gb\":5.25,\"vram_allowed_gb\":15.5,\"ram_used_gb\":7.75}") != std::string::npos);
         CHECK("numbers", j.find("\"session_s\":312.5,") != std::string::npos && j.find("\"fps_cap\":60,") != std::string::npos);
+        CHECK("frame generation, DLSS model and render scale, after the cap", j.find("\"fps_cap\":60,\"framegen\":\"fsr3\",\"framegen_x\":2,\"framegen_auto\":false,\"dlss_model\":\"K\",\"render_scale\":67,\"map\":") != std::string::npos);
         CHECK("closed", j.back() == '}' && std::count(j.begin(), j.end(), '{') == std::count(j.begin(), j.end(), '}'));
+    }
+
+    // frame generation, the DLSS model and the render scale: the names the server takes, and what a PC without them says
+    {
+        CHECK("framegen names", !std::strcmp(pr::framegen_name(pr::kFramegenOff), "off") && !std::strcmp(pr::framegen_name(pr::kFramegenBuiltin), "builtin") &&
+                                    !std::strcmp(pr::framegen_name(pr::kFramegenFsr3), "fsr3") && !std::strcmp(pr::framegen_name(pr::kFramegenDlssg), "dlssg") &&
+                                    !std::strcmp(pr::framegen_name(pr::kFramegens), "other") &&
+                                    !std::strcmp(pr::framegen_name(-1), "other"));
+        CHECK("the presets by their letter", pr::dlss_model_name(11, true) == "K" && pr::dlss_model_name(13, true) == "M" &&
+                                                 pr::dlss_model_name(12, true) == "L" && pr::dlss_model_name(5, true) == "E");
+        CHECK("NVIDIA's own pick", pr::dlss_model_name(0, true) == "default");
+        CHECK("no DLSS network: none, whatever the row says", pr::dlss_model_name(11, false) == "none" && pr::dlss_model_name(0, false) == "none");
+        CHECK("a preset past the letters", pr::dlss_model_name(27, true) == "other" && pr::dlss_model_name(-1, true) == "other");
+        std::map<std::string, pr::MapTotals> maps;
+        pr::add_frame(maps["Title and intro"], frame(16.6f, 0, 0, 0, 0), pr::Waits{}, 16.7, 0);
+        pr::Machine off;   // (a machine nothing is read for: frame generation off, no DLSS, Auto resolution)
+        const std::string j = pr::summary_json(off, false, 1, "Title and intro", nullptr, maps);
+        CHECK("the defaults", j.find("\"framegen\":\"off\",\"framegen_x\":1,\"framegen_auto\":false,\"dlss_model\":\"none\",\"render_scale\":0,") != std::string::npos);
+        pr::Machine autom;
+        autom.framegen = pr::framegen_name(pr::kFramegenBuiltin), autom.framegen_x = 3, autom.framegen_auto = true, autom.render_scale = 100;
+        const std::string a = pr::summary_json(autom, false, 1, "Title and intro", nullptr, maps);
+        CHECK("Auto: its limit, marked", a.find("\"framegen\":\"builtin\",\"framegen_x\":3,\"framegen_auto\":true,") != std::string::npos &&
+                                             a.find("\"render_scale\":100,") != std::string::npos);
+        autom.framegen = std::string(100, 'f'), autom.dlss_model = std::string(100, 'd');
+        const std::string k = pr::summary_json(autom, false, 1, "Title and intro", nullptr, maps);
+        CHECK("framegen and model cut at 40", k.find("\"framegen\":\"" + std::string(40, 'f') + "\",") != std::string::npos &&
+                                                  k.find("\"dlss_model\":\"" + std::string(40, 'd') + "\",") != std::string::npos);
+    }
+
+    // a hitch while the game loads a map: the cause's row keeps it apart, whatever the cause was
+    {
+        std::map<std::string, pr::MapTotals> maps;
+        pr::Waits w;
+        w.os_wait = 70;   // (a load's page faults: the presenting thread off the CPU)
+        pr::MapTotals& m = maps["Hyrule Field (child)"];
+        pr::add_frame(m, frame(90, 80, 5, 3, 2), w, 16.7, 16.6, 16.6, true);
+        pr::add_frame(m, frame(30, 25, 2, 2, 1), pr::Waits{}, 16.7, 16.6, 16.6, false);
+        CHECK("the load's hitch", m.hitch[pr::kOsWait] == 1 && m.hitch_detail[pr::kOsWait].count == 1 &&
+                                   m.hitch_detail[pr::kOsWait].load_count == 1 &&
+                                   m.hitch_detail[pr::kOsWait].load_ms_sum == 90 && m.hitch_detail[pr::kOsWait].load_ms_max == 90);
+        CHECK("the steady frame beside it", m.hitch_detail[pr::kOsWait].ms_sum == 90 && m.frame[7] == 1 && m.pacing_misses == 1);
+        CHECK("a cause without hitches has no detail row",
+              m.hitch_detail[pr::kPipelineWait].count == 0 && m.hitch_detail[pr::kGameCpu].load_count == 0);
+        m.fresh = false;   // (a map seen before: the server's first_visit is this)
+        pr::Machine mc;
+        mc.version = "v0.4.3";
+        const std::string j = pr::summary_json(mc, false, 60, "Hyrule Field (child)", nullptr, maps);
+        CHECK("the load's row", j.find("\"hitch_detail\":{\"os_wait\":{\"count\":1,\"ms_sum\":90,\"ms_max\":90,"
+                                       "\"load_count\":1,\"load_ms_sum\":90,\"load_ms_max\":90}}") != std::string::npos);
+        CHECK("first visit from the map's new", j.find("\"new\":false,") != std::string::npos);
+    }
+
+    // the draws the replay left out are counted now (a program or pipeline not ready: skipped, not waited for)
+    {
+        pr::MapTotals m;
+        fs::Frame f = frame(16.6f, 1, 2, 3, 4);
+        f.left_out = 7;
+        pr::add_frame(m, f, pr::Waits{}, 16.7, 0);
+        CHECK("draws left out", m.left_out == 7);
     }
 
     // the kernel out of the Bug report's system line
@@ -113,7 +202,8 @@ int main() {
     CHECK("not a release's name", !pr::release_flag("movie-sync (source 1a2b3c4d)", "source=1a2b3c4d\n"));
     CHECK("no source", !pr::release_flag("v0.4.0", "source=1a2b3c4d\n"));
 
-    // the payload keeps Longshot's field tables, which the server validates: every key in them, the unmeasured ones 0
+    // the payload keeps Longshot's field tables, which the server validates: every key in them, the new causes and the
+    // hitch detail with them, the unmeasured ones 0
     {
         std::map<std::string, pr::MapTotals> maps;
         auto& m = maps["Title and intro"];
@@ -122,13 +212,17 @@ int main() {
         const std::string j = pr::summary_json(mc, false, 1, "Title and intro", nullptr, maps);
         for (const char* key : {"\"v\":1", "\"version\"", "\"release\"", "\"first\"", "\"session_s\"", "\"os\"", "\"kernel\"", "\"renderer\"",
                                 "\"gpu\"", "\"driver\"", "\"vram_gb\"", "\"cpu\"", "\"ram_gb\"", "\"upscaler\"", "\"preset\"", "\"fps_cap\"",
+                                "\"framegen\"", "\"framegen_x\"", "\"framegen_auto\"", "\"dlss_model\"", "\"render_scale\"",
                                 "\"map\"", "\"maps\"", "\"new\"", "\"seconds\"", "\"frame_ms\"", "\"frame_ms_sum\"", "\"gpu_ms\"", "\"gpu_ms_sum\"",
-                                "\"parts_ms\"", "\"hitches\"", "\"pacing_misses\"", "\"draws_left_out\"", "\"events\"", "\"movie\"",
-                                "\"pipeline_wait\"", "\"shader_translate\"", "\"texture_upload\"", "\"memsync\"", "\"gpu_bound\"", "\"readback\"",
-                                "\"game_cpu\"", "\"pace\"", "\"other\"", "\"device_lost\"", "\"dlss_recreated\"", "\"movie_upscaler_dropped\"",
-                                "\"program_failed\"", "\"swapchain_recreated\"", "\"vram_over_budget\"", "\"shown\"", "\"dropped\"", "\"late\"",
-                                "\"decode_ms\"", "\"fallbacks\""})
+                                "\"parts_ms\"", "\"hitches\"", "\"hitch_detail\"", "\"pacing_misses\"", "\"draws_left_out\"", "\"events\"",
+                                "\"movie\"", "\"pipeline_wait\"", "\"shader_translate\"", "\"texture_upload\"", "\"memsync\"",
+                                "\"gpu_bound\"", "\"readback\"", "\"game_cpu\"", "\"pace\"", "\"driver_compile\"", "\"descriptors\"",
+                                "\"present\"", "\"os_wait\"", "\"other\"", "\"device_lost\"", "\"dlss_recreated\"",
+                                "\"movie_upscaler_dropped\"", "\"program_failed\"", "\"swapchain_recreated\"", "\"vram_over_budget\"",
+                                "\"shown\"", "\"dropped\"", "\"late\"", "\"decode_ms\"", "\"fallbacks\""})
             CHECK(key, j.find(key) != std::string::npos);
+        // (a map with no hitches writes an empty hitch_detail: the server reads its rows as they come)
+        CHECK("no hitches, no detail", j.find("\"hitch_detail\":{},") != std::string::npos);
         // (the server's limits: a field's text is cut where its table says)
         mc.gpu = std::string(300, 'g'), mc.cpu = std::string(300, 'c'), mc.os = std::string(100, 'o'), mc.version = std::string(100, 'v');
         const std::string k = pr::summary_json(mc, false, 1, std::string(200, 'm'), nullptr, maps);

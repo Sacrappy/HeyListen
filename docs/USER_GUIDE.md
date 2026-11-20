@@ -50,15 +50,66 @@ the **Open menu** row takes one gamepad button, or two pressed together (L3 + R3
 the ways above keep working. A combination held does not reach the game. When a controller is opened the game's log
 (`hookshot_log.txt`) says what it is and which buttons open the menu. Frame generation is off by default.
 
-### Upscaler
+### Graphics: Upscaler, Render resolution and frame generation
 
-The menu's Graphics tab has an **Upscaler** row: what scales the 3D picture up to the output. **Game's own** (the default) is
-the game's own upscaling network. **NVIDIA DLSS**, **NVIDIA DLAA**, **AMD FSR 3.1**, **AMD FSR 4** and **AMD FSR 4 Native AA** are
-offered where they run. **Off** is on every GPU: the game's upscaling network is not run at all, and the 3D is drawn at the
-**Render resolution** and stretched to the output, with no anti-aliasing. Try it if the game's own network shows glitches on your
-GPU (some older AMD cards, handhelds), or to save its GPU time. Render resolution works as with the game's own upscaler (at 100% the
-picture is the 3D as drawn), **Sharpness** still applies (it works on the picture after the upscaler), and frame generation is
-unaffected. In `hookshot_options.ini` it is `dlss=6`; the launcher's Upscaler setting has it as **Off**.
+The Graphics tab has these rows together, in this order (the Quality preset, Fullscreen and GPU device first, the picture's output
+and window settings after):
+
+1. **Upscaler**: what scales the 3D picture up to the output. **Game's own** (the default) is the game's own upscaling network.
+   **NVIDIA DLSS**, **AMD FSR 3.1** and **AMD FSR 4** are offered where they run. **Off** is on every GPU: the game's upscaling
+   network is not run at all, and the 3D is drawn at the **Render resolution** and stretched to the output, with no anti-aliasing. Try
+   it if the game's own network shows glitches on your GPU (some older AMD cards, handhelds), or to save its GPU time. Render
+   resolution works as with the game's own upscaler (at 100% the picture is the 3D as drawn), **Sharpness** still applies (it works on
+   the picture after the upscaler), and frame generation is unaffected. In `hookshot_options.ini` it is `dlss=6`; the launcher's
+   Upscaler setting has it as **Off**.
+2. **Render resolution**: the share of the output the 3D is drawn at. With **NVIDIA DLSS** its last choice is **DLAA (native)**: the 3D
+   at full size (100%) with DLSS's anti-aliasing, the sharpest and the slowest. With **AMD FSR 4** the same choice is **Native AA (FSR
+   4)**. Other upscalers have no such choice. (They were Upscaler choices before; an options file saved with NVIDIA DLAA or FSR 4
+   Native AA as the Upscaler is read as DLSS or FSR 4 with this Render resolution, and runs as before. `resolution=7` in the options
+   file.)
+3. **DLSS model** (with NVIDIA DLSS).
+4. **Frame generation by**: who makes the made frames: **Built-in / AMD FSR 3.1** (the game's own interpolation, and AMD FSR 3.1's at 2x
+   where it runs), **NVIDIA DLSS FG** (RTX 40 and newer, with a temporal upscaler, DLSS or FSR 4, and NVIDIA's runtime files) or
+   **AMD FSR 3.1 FG**. In `hookshot_options.ini` it is `frame_generation_by` (0, 1, 2).
+5. **Frame generation**, directly under it: Off, Auto and 2x to 8x, but only what the mode above makes. **NVIDIA DLSS FG** goes up to
+   what NVIDIA's runtime makes on your GPU (**6x on an RTX 50, 2x on an RTX 40**) and has no Auto. **AMD FSR 3.1 FG** makes 2x only.
+   **Built-in** has Auto and 2x to 8x. Changing the mode keeps the multiplier within the new mode's, never raising it (8x becomes 6x
+   when you switch to DLSS FG on an RTX 50); a higher value saved before shows, and runs, as the top of the mode.
+6. **Frame pacing**.
+
+### Frame rate limit
+
+**Frame rate limit** is the rate shown: the game's own frames and, with frame generation on, the frames made between them. Frame
+generation Off or Auto: the game runs at the limit (with Auto, made frames fill what the game falls short of, up to the limit and your
+display's refresh). With a fixed multiplier the game runs at the limit divided by it: at 120 with 3x the game runs at 40 and 120 frames a
+second are shown; at 240 with 4x the game runs at 60. The game never runs under 20 frames a second for the limit: where the multiplier
+would leave it less (60 with 4x or more) the multiplier is lowered to the highest that does not (3x at 60, 4x at 90, 6x at 120). The
+FPS counter's line **Frame limit** says it, for example `120 fps (game 40 x 3)`. **Unlimited** (after 240; `frame_rate_limit=6`)
+holds nothing back: the game runs as fast as the PC can, and every one of its frames gets its made frames (your display, and a
+V-Sync setting of the driver, may still hold the shown rate). Above 60 the limit needs **Game speed** on Real time (the default); with
+Per frame the game runs at 60 as before and the limit does not apply.
+
+### HDR
+
+The Graphics tab's **HDR** row sends HDR10 to an HDR screen (Windows: turn on **Use HDR** in the display settings). **Off** is the
+SDR picture, **Expanded** is the game's SDR picture with its whites at the **HDR paper white** and its highlights up to the **HDR peak
+brightness** (set those two rows to your screen's), and **Native (the game's)** is the game's own HDR picture, told your screen's peak
+and paper white. With Native two more rows appear:
+
+- **HDR tone mapper**: **Vanilla** (the default) keeps the game's own curve. **PsychoV35** is [RenoDX](https://github.com/clshortfuse/renodx)'s
+  tone mapper for this game (its zelda-oot-oz mod, MIT, ported here by Duck912): the same mid grey, with highlights that roll off into
+  the peak and keep their colour, and no banding in the sky and in the dark (the game's scene is drawn in 16-bit floats with it). It
+  comes with rows of its own, each under 0 to 100 with 50 as the game's: **PsychoV35 UI brightness**, **color space**, **midgray**,
+  **match tone slope**, **tone slope**, **hue clip emulation**, **exposure**, **highlights**, **shadows**, **contrast**,
+  **saturation**, **bloom**, and **PsychoV35 reset all**, which puts them back to RenoDX's defaults. They apply at once.
+- **HDR contrast** (while HDR is on; hidden with PsychoV35, which has its own contrast).
+
+PsychoV35 works with every **Upscaler** (the game's own, NVIDIA DLSS, AMD FSR 3.1 and FSR 4, Off) and with frame generation, which keeps
+the HDR picture at 10 bits. **DLAA before the bloom** (with NVIDIA DLSS, under **DLSS model**; off by default) smooths the scene before
+the game's bloom and tone map, so the glow comes from a smooth picture. In `hookshot_options.ini` the rows are `hdr`, `hdr_tone_mapper`
+(0 Vanilla, 1 PsychoV35) and `dlss_pre_bloom`. An options file from the earlier build that had **Native + our tone mapper** (`hdr=3`)
+is read as Native with PsychoV35 (that tone mapper is gone: there is one). `RX_VK_PSYCHOV35_DLSS=0` turns PsychoV35's upscaler routes
+off for troubleshooting.
 
 ## Install with RecompLauncher
 
@@ -71,6 +122,7 @@ not replace the builder: it runs it for you, with no window.
 3. Tick **NVIDIA DLSS** or **AMD FSR 4** if you want them (each asks you to accept its maker's license; the files are
    downloaded from NVIDIA or AMD to your PC, checked, put in place for you, and never shared; nothing to copy by hand). On an NVIDIA RTX card the launcher also fetches NVIDIA's own `nvngx_dlss.dll`
    (the optional **NVIDIA DLSS runtime** item of Easy Setup, which you can switch off) into the game's `ngx` folder.
+   In the game's menu (Graphics, **DLSS model**) you choose **DLSS 4** or **DLSS 4.5** (preset M or L) for every mode, DLAA included, on any RTX card. **DLSS 3** (the older CNN model) is lighter on video memory. The first time, the game picks DLSS 3 on a card with less than 7 GB of video memory, else DLSS 4 on RTX 20 and 30 (DLSS 4.5 costs them more GPU time, but you can use it) and DLSS 4.5 on RTX 40 and 50, and saves it; after that your choice is kept.
    Two more ticks are **off** unless you turn them on: **Send anonymous performance statistics** and **Send crash reports
    automatically**. They only write `send_performance_stats=1` and `send_crash_reports=1` into the game's
    `hookshot_options.ini`, the two rows of the in-game menu (Gameplay tab); what they send is in
@@ -79,8 +131,10 @@ not replace the builder: it runs it for you, with no window.
    the same space; the screen shows the progress.
 4. Press **Play**. Video and gameplay settings (fullscreen, resolution, upscaler, frame generation, frame rate, text speed and
    more) are on the game's page in RecompLauncher; they change `hookshot_options.ini` in the game folder, the same file the
-   in-game menu (Insert or F1) saves. Your saves are in the game folder's `user\save` (Windows) or
-   `~/.local/share/heylisten/save` (Linux), and the launcher backs them up.
+   in-game menu (Insert or F1) saves. On a screen that is not 16:9 (an ultrawide, 4:3, 16:10), set **Ultrawide** to the
+   screen's shape: the HUD keeps its 16:9 size, its corners at the screen's edges, and the in-game menu's **HUD layout** row
+   (Graphics) puts it back in the middle 16:9, either in RecompLauncher or in the game. Your saves are in the game folder's
+   `user\save` (Windows) or `~/.local/share/heylisten/save` (Linux), and the launcher backs them up.
 
 The game is made in the `HeyListen` folder inside the folder RecompLauncher installed HeyListen in (the install folder is
 RecompLauncher's own setting: HeyListen's profile cannot choose it; ask for it in the launcher). To build it again (after
@@ -137,6 +191,15 @@ on CachyOS with a Radeon RX 9070 XT (Mesa's RADV driver). Expect problems and re
   its builder and its settings stay where they are, untouched, and HeyListen starts with no save. To carry on with a
   Hookshot save, close both games and copy `~/.local/share/hookshot/save` to `~/.local/share/heylisten/save` (copy, do not
   move).
+- **"Only a software renderer (llvmpipe) was found"**: a window with this message, and the game closes (its log has
+  `vk: only a software renderer was found`). The game needs your graphics card's own Vulkan driver, and Vulkan listed
+  only Mesa's `llvmpipe`, a renderer that runs on the CPU and cannot run the game (`vulkaninfo --summary` lists the same
+  device). Install your distribution's Mesa Vulkan driver for the GPU: `mesa-vulkan-drivers` (Debian, Ubuntu, Fedora;
+  it has AMD's and Intel's) or `vulkan-radeon` for AMD and `vulkan-intel` for Intel (Arch), or NVIDIA's own driver
+  (your distribution's NVIDIA driver package) for NVIDIA. Then check that `vulkaninfo --summary` lists your card and
+  start the game again. A game started inside a container, a Flatpak or a
+  sandbox that does not give it `/dev/dri` sees no card either: allow that device, or start the game outside it. The same
+  window can appear on Windows: install or update the graphics driver from AMD, NVIDIA or Intel there.
 - **If the game runs at a few frames a second**: it cannot use `/dev/udmabuf`. The game's log then says
   `guest memory as dma-bufs: no (/dev/udmabuf cannot be opened)`, and every block of the game's memory reaches the GPU by a
   slower way (3 to 8 fps in Kokiri Forest on the Radeon above). Some distributions give that device to the logged-in user,
@@ -159,6 +222,62 @@ on CachyOS with a Radeon RX 9070 XT (Mesa's RADV driver). Expect problems and re
   only the parts of the AppImage that changed from this repository's `linux-parts` release, checked by SHA-256, into
   `~/.local/share/heylisten/builder`; then it builds your game folder again from the game files the folder keeps. A
   release that has no Linux files yet cannot be installed on Linux: wait for its AppImage to appear on the release page.
+
+## V-Sync and G-Sync / FreeSync (VRR)
+
+Three rows on the Insert menu's Graphics tab (Insert or F1), all applied at once, no restart.
+
+**V-Sync** says whether frames wait for the screen's refresh.
+
+- **Off** (the default, how the game always was): the latest frame is shown at once. The least delay; the picture can tear
+  where the game's frame rate and the screen's do not match.
+- **On**: frames wait for the refresh: no tearing, a little more delay, and the frame rate cannot pass the refresh rate. With
+  frame generation, a multiplier the refresh has no room for shows fewer made frames per game frame (the game keeps its own rate).
+  **V-Sync mode**, just below, chooses how many images the swapchain keeps.
+
+**V-Sync mode** is greyed while V-Sync is Off; it says so in its hint there.
+
+- **FIFO (double buffering)**: two images. The least delay with V-Sync, but a frame that misses its refresh waits a whole one:
+  below 60 fps at 60 Hz the game falls to 30. A display or driver that asks for at least three images cannot do it (the row's
+  hint and the log say so).
+- **FIFO (triple buffering)** (the default, and what V-Sync On always was): three images, one kept free, so a slow frame costs
+  a refresh rather than half the frame rate.
+- **Mailbox (triple buffering)**: the Mailbox present mode with three images (four with frame generation). No tearing, the game
+  can render past the refresh instead of waiting for it, and the newest frame is shown. Mailbox needs a spare image, so it is
+  triple buffered by nature: there is no "Mailbox double". It is offered only where the display lists Mailbox; AMD's Windows
+  driver does not, so the row there says "not offered" and a saved Mailbox falls back to FIFO (triple buffering), said in the log.
+
+With frame generation on, the game keeps the images frame generation needs whatever the row says: FIFO (double buffering) uses
+three (the row's hint says so), and Mailbox uses four.
+
+The game's log (`logs/`) has one `vk: swapchain` line with V-Sync on or off, the mode, the present mode and the image count
+actually used; the F10 overlay's Presentation line shows the present mode. Both are useful in a report.
+
+**VRR (G-Sync / FreeSync)** is **new**, for a screen with a variable refresh rate. **Off** by default: nothing changes until
+you turn it on. **On** gives the screen what it needs to follow the game's frame rate:
+
+1. V-Sync On's present mode (no tearing); VRR uses FIFO whatever the V-Sync rows say while it is On.
+2. In fullscreen, the game's window is made as a borderless popup window covering the screen, which Windows can show directly
+   (independent flip) instead of through its desktop compositor. G-Sync and FreeSync only work on that path.
+3. The Frame rate limit, when above 60, is held 3 fps under the screen's refresh rate (NVIDIA's advice), a lower limit of
+   yours is kept: 141 fps on a 144 Hz screen, 237 on 240. With frame generation, the made frames are spaced the same way.
+4. NVIDIA Reflex is left as you set it: turn it **On** for the lowest delay (it is not used with frame generation).
+
+**Auto** is On in fullscreen when the display lists a variable refresh range in its EDID (a hint, not proof), Off otherwise.
+The game's log (`logs/`) says what was chosen and why on a line starting `vk: VRR:`; the F10 overlay's Presentation line says
+`fifo (VRR)` when it is on.
+
+**To use G-Sync (NVIDIA)**: in the NVIDIA Control Panel, *Set up G-Sync*, tick *Enable G-Sync, G-SYNC Compatible*, and choose
+*Enable for full screen mode* (or *windowed and full screen mode*). Then in the game: Fullscreen On, VRR On (the G-Sync
+indicator, *Display > G-SYNC Compatible Indicator* in the control panel, or your monitor's own refresh rate display, shows
+the screen following the game). **FreeSync (AMD)**: turn FreeSync on in the AMD software's *Display* page and in the monitor's
+menu, then the same rows. Windowed play also works with NVIDIA's *windowed and full screen* choice, with no popup window.
+
+VRR is new and has been tested only for what a PC without a variable refresh screen can show (the present mode, the window,
+the frame rate limit). If you have a G-Sync or FreeSync screen, please tell us whether it works for you, and what screen, GPU
+and driver you have, on the [issue tracker](https://github.com/Sacrappy/HeyListen/issues). On Linux the rows set the present
+mode in the same way, but variable refresh is the compositor's job (enable it in your desktop's display settings; the game
+has no window style to change there).
 
 ## Mods
 
@@ -233,7 +352,10 @@ release. On Linux the AppImage's `--play` starts the game, and the game asks as 
 ## Button prompts
 
 The **Button prompts** row (Insert menu, Controls page) chooses which controller's icons the game shows in its texts and menus:
-Auto follows the controller you plug in, or pick Xbox, PlayStation 4, PlayStation 5, Steam Deck or Switch. A new choice shows the
+Auto follows the controller you plug in, and is the **Keyboard**'s when none is connected (through SDL or XInput); or pick Xbox,
+PlayStation 4, PlayStation 5, Steam Deck, Switch or Keyboard. Keyboard shows the key or mouse button your controls put each action
+on (the first of its two keys), WASD for the left stick's ways (or the movement keys you bound) and the mouse for the camera; the
+ocarina's notes and the pause menu's controller picture keep the Switch's buttons. A new choice shows the
 next time you start the game. The icons are drawn when the builder makes your game folder, from your own game files and
 [Kenney's](https://kenney.nl/assets/input-prompts) CC0 Input Prompts, into the `prompts` folder there; they are not downloaded or
 copied from anywhere, so a folder from another build is not needed. No `prompts` folder in your game folder (a game built by a release up to 0.4.2,
@@ -251,17 +373,40 @@ in-game menu (Insert) control it:
 
 - **Send performance statistics**: off by default. On, the game counts how its frames went (frame times, stutters and what
   they waited on, per map) and sends a summary of the counts at the next start. A summary holds the PC's GPU, driver, CPU,
-  RAM, operating system, the upscaler, preset and frame rate cap, the game's version and the map names. It has no name, no
-  ID and no path, and what the team keeps is totals for all players, nothing per player. `perf_sent` in the game folder keeps
+  RAM, operating system, the upscaler (with its DLSS model and the render resolution), frame generation and its multiplier,
+  the preset and frame rate cap, the game's version and the map names. It has no name, no
+  ID and no path. Performance statistics are never published per player: what the team keeps is totals for all players,
+  nothing per player. `perf_sent` in the game folder keeps
   a copy of everything that was sent, to read.
+  The same row also lets the game send the **graphics pipeline states** it met that HeyListen's shipped list does not have
+  yet, at the next start, so the list can grow from what players actually run: for each, hashes of the game's shaders,
+  texture and vertex formats and a few render-state numbers, **nothing of the game's code or data**, plus the game version,
+  the GPU's vendor and driver and two build stamps. No name, no ID, no path. At most 1,800 a session, each one once;
+  `pipelines_sent` keeps a copy of what was sent. Set `HL_TELEMETRY_PIPELINES=0` to turn only this part off.
+  The same row also notes, **per map**, which shader programs and pipelines the game's draws used, as 64-bit hashes with a
+  use count and their order of first use — **hashes of shader programs and pipeline states only, no game code** — and sends
+  them at the next start, so a release can have the next zone's pipelines ready before you enter it; `zones_sent` keeps a
+  copy. Set `HL_TELEMETRY_ZONES=0` to turn only this part off.
+  The same row also sends, per map, a **detailed profile** of where the time goes, every 5 minutes and at exit: how many of
+  the CPU's samples (one for each 1/250 s of CPU time a thread uses) fell in the game's translated code, our native
+  engine, the renderer, the graphics driver and the operating system, the addresses of the functions with the most samples
+  (an address in the game's program or an offset in HeyListen's own files, **numbers only, no code, no names, no data**) and
+  how long the GPU spent in each render pass, with the GPU's vendor and driver, the PC's GPU, CPU and operating system names
+  and the build's id. `profile_sent` keeps a copy. Set `HL_TELEMETRY_PROFILE=0` to turn only this part off.
 - **Send crash reports automatically**: off by default. After a crash a window says what happened and asks. **Report
   manually** copies a report to your clipboard and opens a new issue on GitHub for you to paste it into; **Report
   automatically** shows you the exact report and sends it only when you press Send. With this row on, the report is sent at
-  once and the window shows only if that fails. The report has the crash's error line, the game version, your GPU, CPU,
-  RAM and operating system, the map, the last 150 lines of the game's log and its settings. Your home folder, user name and
-  the names of your audio devices are taken out first. It never has your saves, the game's files or keys.
+  once and the window shows only if that fails. The report has the crash's error line with the code of each step named
+  (`f_80580b38+0x1c4`, a function name, or a system file and offset), the game version and which lifted code it ran,
+  your GPU, CPU, RAM and operating system, the map, the last 150 lines of the game's log and its settings. Your home
+  folder, user name, every folder path and the names of your audio devices are taken out first. It never has your saves,
+  the game's files or keys. See [crash reports](crash-reports.md).
+- **Crash reports are published, not kept private**: a report becomes a comment on the project's GitHub issue #55 and a
+  message in the project's Discord server, with the detailed report as a .txt file. The server keeps a crash report until
+  it is removed on request. To get one deleted, open an issue or ask on Discord with the report's time and we remove it.
 
-Turn either row off and what was waiting to be sent (`perf_pending`, `perf_sent`) is deleted. A build with no address
+Turn either row off and what was waiting to be sent (`perf_pending`, `perf_sent`, `pipelines_pending`, `pipelines_sent`,
+`zones_pending`, `zones_sent`, `profile_pending`, `profile_sent`) is deleted. A build with no address
 to send to shows both rows as *Not available in this build* and sends nothing. Details and the exact fields:
 [performance statistics](performance-statistics.md).
 
@@ -270,6 +415,10 @@ to send to shows both rows as *Not available in this build* and sends nothing. D
 The builder's problem page has *Copy for a bug report*. Report issues at
 <https://github.com/Sacrappy/HeyListen/issues> with your GPU, driver and the log. Do not attach game files, keys or saves
 with personal data.
+
+A maintainer may ask you to try a switch, a line such as `RX_VK_ASTC_RGBA8=1` in `hookshot_env.txt` beside `image.bin`
+(in the game folder; on Linux `~/Games/HeyListen`, not `bin/`). [docs/SWITCHES.md](SWITCHES.md) lists every switch, what
+it does and which symptom it fixes, and says how to set one (also from Steam's launch options).
 
 ## Credits and license
 

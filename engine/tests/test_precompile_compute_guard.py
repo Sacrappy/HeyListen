@@ -45,8 +45,14 @@ struct VkComputePipelineCreateInfo {
 };
 struct {uintptr_t device=0x1234;}dev;
 VkPipelineCache pcache=0x5678;
-struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;std::atomic<int>compute_state{1};std::atomic<bool>optimize_owed{false};};
-struct Pre {std::vector<Program*>computes;};
+struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;std::atomic<int>compute_state{1};std::atomic<bool>optimize_owed{false};uint64_t key=0x99;};
+struct Pre {std::vector<Program*>computes;size_t done=0;};
+// (the compile gate's own pieces, not under test here: test_compile_gate.py compiles the header and its rules)
+struct CompileTurn {bool stopped=false;explicit CompileTurn(uint64_t){}~CompileTurn(){}};
+uint64_t compile_weight(const Program&){return 0;}
+bool compile_too_heavy(const Program&){return false;}
+void logf(const char*,...){}
+bool prepare_stopped(){return false;}
 int mode=0,calls=0,destroys=0,released=0; bool completed=false,quick_mode=false;
 void cs_module_release(Program&){++released;}
 bool precompile_compute_quick(VkComputePipelineCreateInfo&){return quick_mode;}   // (Intel serial builds: its own check, test_intel_quick_compute)
@@ -77,7 +83,7 @@ def main():
     if os.name != "nt":
         raise SystemExit("Windows structured exceptions required")
     source=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
-    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute(')
+    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute_once(')
     precompile=block(source,'void precompile_run(')
     # (TICK-008: the arm is the background worker's, over pre->computes; a finished build is kept, nothing waits on it)
     arm=block(precompile,'if (i < pre->computes.size()) {')
@@ -85,7 +91,7 @@ def main():
     armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
     assert armed != arm
     # (the arm builds through the cache-held guard: a fetch of the cache's data is not under way; none here)
-    held='\nVkResult guarded_compute_held(VkPipelineCache c,const VkComputePipelineCreateInfo*ci,VkPipeline*pl){return guarded_compute(c,ci,pl);}\n'
+    held='\nVkResult guarded_compute_held(VkPipelineCache c,const VkComputePipelineCreateInfo*ci,VkPipeline*pl){return guarded_compute_once(c,ci,pl);}\n'
     cpp=HEAD+wrapper+held+'\nVkResult gated_compute(VkPipelineCache c,const VkComputePipelineCreateInfo*ci,VkPipeline*p){return guarded_compute_held(c,ci,p);}   // (Intel gate: not under test)\nvoid actual_arm(Program&program,Pre*pre){pre->computes={&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
 int main(int argc,char**argv){
  SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX);
@@ -93,7 +99,7 @@ int main(int argc,char**argv){
  if(which==4){
   mode=1;VkComputePipelineCreateInfo ci{10};ci.stage={11,12,0x2468,"main"};ci.layout=0x1357;VkPipeline out=0;
   expected_ci=&ci;expected_out=&out;
-  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
+  CHECK(guarded_compute_once(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
  }
  mode=which==1?1:which==2?2:0;quick_mode=which==5;
  std::thread worker([&]{actual_arm(program,&pre);});worker.join();

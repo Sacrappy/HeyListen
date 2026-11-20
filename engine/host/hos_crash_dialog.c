@@ -1236,7 +1236,8 @@ static void put_settings(Buf *b, const Shown *s, char *mic, size_t mic_cap) {
     free(j), free(o.s), free(dtext), free(ctext);
 }
 /* The run's log again, from its file, for the crash's lines as they are (the ring of read_log is cut to fit the menu's
-   report): the 150 lines before the crash's first and its own (at most 80). 0 when the log has no crash */
+   report): the 150 lines before the crash's first and its own (at most 80). 0 when the log has no crash.
+   lifted: the build's lifted code key, from the log's "object keys: lifted code <key>" line ("" when it is not there) */
 typedef struct Lines { char **at; int n, cap; } Lines;
 static void lines_add(Lines *l, const char *line) {
     if (l->n == l->cap) {
@@ -1252,15 +1253,23 @@ static void lines_free(Lines *l) {
     free(l->at);
     memset(l, 0, sizeof *l);
 }
-static int crash_lines(const Shown *s, Lines *tail, Lines *crash) {
+static int crash_lines(const Shown *s, Lines *tail, Lines *crash, char *lifted, size_t lifted_cap) {
     FILE *f = s->log->path[0] ? open_utf8(s->log->path, "rb") : NULL;
     if (!f) return 0;
     char line[4096], one[4096];
     Lines ring = {0};
     int found = 0;
+    if (lifted_cap) lifted[0] = 0;
     for (uint64_t taken = 0; taken < (256ull << 20) && fgets(line, sizeof line, f);) {
         taken += strlen(line);
         line[strcspn(line, "\r\n")] = 0;
+        if (lifted_cap && !lifted[0]) {
+            const char *key = strstr(line, "object keys: lifted code ");
+            if (key) {
+                snprintf(lifted, lifted_cap, "%s", key + 25);
+                lifted[strcspn(lifted, " \t")] = 0;
+            }
+        }
         if (!found && hos_crash_starts(line)) found = 1;
         if (!found) {   /* (the lines before it: the last 150, a ring) */
             if (ring.n < HOS_CRASH_TAIL_LINES) lines_add(&ring, line);
@@ -1278,15 +1287,37 @@ static int crash_lines(const Shown *s, Lines *tail, Lines *crash) {
     *tail = ring;
     return found;
 }
+/* The crash's resolved frames, as JSON string array members (frame lines only, in the crash's order): host frames
+   or guest frames. 0 when the game named none (an older log, or a crash in a system DLL) */
+static int put_frame_array(Buf *json, const Lines *crash, const char *kind, const Shown *s,
+                           const char *const *devices, int nd) {
+    char want[24];
+    snprintf(want, sizeof want, "%s frame ", kind);
+    int taken = 0;
+    for (int i = 0; i < crash->n; i++) {
+        char function[200];
+        if (!strstr(crash->at[i], want)) continue;
+        hos_crash_frame_name(crash->at[i], function, sizeof function);
+        if (!function[0]) continue;
+        put_field(json, taken ? ",\n    " : "\n    ", NULL, function, 160, s, devices, nd);
+        taken++;
+    }
+    return taken;
+}
 /* The report: its JSON (the payload) and what the page shows of it; 0 with *why when there is none to send */
 static int build_report(const Shown *s, Buf *json, Buf *shown, const char **why) {
     Lines tail = {0}, crash = {0};
-    if (!crash_lines(s, &tail, &crash) || !crash.n) {
+    char lifted[64] = "";
+    if (!crash_lines(s, &tail, &crash, lifted, sizeof lifted) || !crash.n) {
         *why = s->log->path[0] ? "The log of the run that crashed has no crash in it, so there is no report to send."
                                : "The log of the run that crashed is gone (four runs since), so there is no report to send.";
         lines_free(&tail), lines_free(&crash);
         return 0;
     }
+    /* (the signature the server groups on: the resolved top frame, the same in every build of these sources) */
+    char signature[200] = "";
+    const char *const *crash_at = (const char *const *)crash.at;
+    hos_crash_signature(signature, sizeof signature, crash_at, crash.n);
     static Report in;
     report_facts(s, &in);
     const HosCrashLog *f = &s->log->facts;
@@ -1313,16 +1344,39 @@ static int build_report(const Shown *s, Buf *json, Buf *shown, const char **why)
     put_field(json, ",\n  ", "map", place, HOS_CRASH_MAX_MAP, s, devices, nd);
     put(json, ",\n  \"crash\": [");
     for (int i = 0; i < crash.n; i++) put_field(json, i ? ",\n    " : "\n    ", NULL, crash.at[i], HOS_CRASH_LINE_LIMIT, s, devices, nd);
-    put(json, "\n  ],\n  \"log_tail\": [");
+    put(json, crash.n ? "\n  ]" : "]");
+    if (signature[0]) {
+        char *j = (char *)malloc(strlen(signature) * 2 + 8);
+        if (j) hos_crash_json(j, strlen(signature) * 2 + 8, signature), putf(json, ",\n  \"signature\": %s", j);
+        free(j);
+    }
+    if (lifted[0]) put_field(json, ",\n  ", "lifted_code", lifted, 40, s, devices, nd);
+    {   /* (the resolved frames, when the game named them: absent from an older log or a system DLL's crash) */
+        const size_t mark = json->n;
+        put(json, ",\n  \"frames\": [");
+        const int host_frames = put_frame_array(json, &crash, "host", s, devices, nd);
+        if (host_frames) put(json, "\n  ]");
+        else json->n = mark, json->s[mark] = 0;
+        const size_t mark2 = json->n;
+        put(json, ",\n  \"guest_frames\": [");
+        const int guest_frames = put_frame_array(json, &crash, "guest", s, devices, nd);
+        if (guest_frames) put(json, "\n  ]");
+        else json->n = mark2, json->s[mark2] = 0;
+    }
+    put(json, ",\n  \"log_tail\": [");
     for (int i = 0; i < tail.n; i++) put_field(json, i ? ",\n    " : "\n    ", NULL, tail.at[i], HOS_CRASH_LINE_LIMIT, s, devices, nd);
     put(json, tail.n ? "\n  ]" : "]");
     put(json, settings.s);
     put(json, "\n}\n");
-    /* (the page: the card's rows, the crash's first lines, what else goes; the whole of it is the file Show all of it opens) */
-    putf(shown, "Version: %s\nRelease build: %s\nOperating system: %s\nRenderer: %s\nGraphics card: %s\nCPU and RAM: %s\nMap: %s\n"
-                "Settings: %d (%d changed from the defaults)\n\nThe crash:\n",
+    /* (the page: the card's rows, the crash's first lines, what else goes; the whole of it is the file Show all of it opens.
+       The first line says where it goes: players are not told anywhere else on this page that it becomes public) */
+    putf(shown, "%s\n\nVersion: %s\nRelease build: %s\nOperating system: %s\nRenderer: %s\nGraphics card: %s\nCPU and RAM: %s\nMap: %s\n",
+         HOS_CRASH_PUBLIC_TEXT,
          version, in.release ? "Yes" : "No (a local or modified build)", os, f->renderer[0] ? f->renderer : "not known",
-         gpu_text[0] ? gpu_text : "not known", cpu_text[0] ? cpu_text : "not known", place, in.settings, in.changed);
+         gpu_text[0] ? gpu_text : "not known", cpu_text[0] ? cpu_text : "not known", place);
+    if (lifted[0]) putf(shown, "Lifted code: %s\n", lifted);
+    if (signature[0]) putf(shown, "Signature: %s\n", signature);
+    putf(shown, "Settings: %d (%d changed from the defaults)\n\nThe crash:\n", in.settings, in.changed);
     for (int i = 0; i < crash.n && i < 12; i++) {
         char line[HOS_CRASH_LINE_LIMIT * 4 + 8];
         snprintf(line, sizeof line, "%s", crash.at[i]);
@@ -1454,8 +1508,8 @@ static int send_report(const Shown *s) {
     int sent = 0;
     for (;;) {
         const int hit = page_serving("HeyListen: send to the team",
-                                     "This is what goes to the HeyListen team, and nothing else. Show all of it opens the report as it "
-                                     "is sent, every line of it.",
+                                     "This is what is sent, and nothing else. Show all of it opens the report as it is sent, "
+                                     "every line of it.",
                                      shown.s ? shown.s : "", ask, 3);
         if (hit == 1) {
             open_thing(payload);
@@ -1885,7 +1939,8 @@ void hos_crash_watch_start(int argc, char **argv) {
 }
 
 /* ---- HOS_CRASH_TEST: a crash on purpose, to see the window ---- */
-static void crash_now(void) {
+/* (noinline: the deliberate crash keeps a frame of its own, so the report names it, as any named function is) */
+static __attribute__((noinline)) void crash_now(void) {
     void hos_log(const char *fmt, ...);
     void hos_log_flush(void);
     hos_log("crash test: crashing now (HOS_CRASH_TEST)");
@@ -1934,24 +1989,39 @@ static void perf_take(const char *name, void *user) {
 static int perf_cmp(const void *a, const void *b) {
     return hos_perf_older((const char *)a, (const char *)b) ? -1 : hos_perf_older((const char *)b, (const char *)a) ? 1 : 0;
 }
+/* What one kind of report is: where its files wait and are kept once sent, where it goes, what it says it is, and its limits. The
+   performance summaries and the pipeline state records (gpu/vk/state_report.h) are sent by the same code, each from its own folders */
+typedef struct PerfFeed {
+    const char *pending, *sent, *path, *agent;
+    long max_body;
+    int max_pending, max_sends, keep_sent;
+} PerfFeed;
+static const PerfFeed perf_summaries = {HOS_PERF_PENDING, HOS_PERF_SENT, HOS_TELEMETRY_PERF_PATH, "heylisten-perf-report",
+                                        HOS_PERF_MAX_BODY, HOS_PERF_MAX_PENDING, HOS_PERF_MAX_SENDS, HOS_PERF_MAX_PENDING};
+static const PerfFeed pipeline_states = {HOS_PIPES_PENDING, HOS_PIPES_SENT, HOS_TELEMETRY_PIPELINES_PATH, "heylisten-pipeline-states",
+                                         HOS_PIPES_MAX_BODY, HOS_PIPES_MAX_PENDING, HOS_PIPES_MAX_SENDS, HOS_PIPES_KEEP_SENT};
+static const PerfFeed zone_usage = {HOS_ZONES_PENDING, HOS_ZONES_SENT, HOS_TELEMETRY_ZONES_PATH, "heylisten-zone-usage",
+                                    HOS_ZONES_MAX_BODY, HOS_ZONES_MAX_PENDING, HOS_ZONES_MAX_SENDS, HOS_ZONES_KEEP_SENT};
+static const PerfFeed profile_usage = {HOS_PROFILE_PENDING, HOS_PROFILE_SENT, HOS_TELEMETRY_PROFILE_PATH, "heylisten-profile",
+                                       HOS_PROFILE_MAX_BODY, HOS_PROFILE_MAX_PENDING, HOS_PROFILE_MAX_SENDS, HOS_PROFILE_KEEP_SENT};
 /* (the sent summaries kept as they went, perf_sent/: what the team got, for the player to read; the newest 48) */
-static void perf_keep_sent(const char *dir, const char *name, const char *body, size_t n) {
+static void perf_keep_sent(const char *dir, const PerfFeed *feed, const char *name, const char *body, size_t n) {
     char sent[PATH_MAX_UTF8], path[PATH_MAX_UTF8];
-    if (!join(sent, sizeof sent, dir, HOS_PERF_SENT)) return;
+    if (!join(sent, sizeof sent, dir, feed->sent)) return;
     make_dir(sent);
     if (join(path, sizeof path, sent, name)) replace_text(path, body, n);
     static PerfNames kept;
     kept.n = 0;
     each_name(sent, perf_take, &kept);
     qsort(kept.names, (size_t)kept.n, sizeof kept.names[0], perf_cmp);
-    for (int i = 0; i + HOS_PERF_MAX_PENDING < kept.n; i++)
+    for (int i = 0; i + feed->keep_sent < kept.n; i++)
         if (join(path, sizeof path, sent, kept.names[i])) remove_utf8(path);
 }
 /* One summary posted: the server's HTTP status (0: no answer), its Retry-After in *retry (-1 none) */
-static int perf_post(const char *dir, const char *url, const char *file, long *retry) {
+static int perf_post(const char *dir, const PerfFeed *feed, const char *url, const char *file, long *retry) {
     char curl[PATH_MAX_UTF8], pending[PATH_MAX_UTF8], headers[PATH_MAX_UTF8], answer[PATH_MAX_UTF8], data[PATH_MAX_UTF8 + 1];
     *retry = -1;
-    if (!find_curl(curl, sizeof curl) || !join(pending, sizeof pending, dir, HOS_PERF_PENDING) ||
+    if (!find_curl(curl, sizeof curl) || !join(pending, sizeof pending, dir, feed->pending) ||
         !join(headers, sizeof headers, pending, ".sending.headers") || !join(answer, sizeof answer, pending, ".sending.answer"))
         return 0;
     remove_utf8(headers), remove_utf8(answer);
@@ -1961,7 +2031,7 @@ static int perf_post(const char *dir, const char *url, const char *file, long *r
     snprintf(secs, sizeof secs, "%ld", limit);
     const char *const proto = strncmp(url, "https://", 8) ? "=http" : "=https";   /* (http: only HL_TELEMETRY_TEST_HTTP's loopback) */
     const char *const args[] = {"--disable", "--silent", "--show-error", "--max-time", secs, "--connect-timeout", secs, "--proto", proto,
-                                "--header", "Content-Type: application/json", "--user-agent", "heylisten-perf-report",
+                                "--header", "Content-Type: application/json", "--user-agent", feed->agent,
                                 "--data-binary", data, "--dump-header", headers, "--output", answer, url};
     const int ran = spawn_exe(curl, args, (int)(sizeof args / sizeof args[0]), (int)limit * 1000 + 5000, NULL);
     char *head = ran == 1 ? read_text(headers, 16 << 10, NULL) : NULL;
@@ -1973,18 +2043,18 @@ static int perf_post(const char *dir, const char *url, const char *file, long *r
 /* Sends what waits in dir's perf_pending/ (dir: the game folder), when the player chose to and the build has an address.
    Returns the summaries the server took or refused; -1 when nothing was tried: not chosen, no address, no curl, or the server
    asked to be left alone (the summaries stay for the next start) */
-int hos_perf_send_run(const char *dir) {
+static int perf_feed_run(const char *dir, const PerfFeed *feed) {
     char path[PATH_MAX_UTF8], pending[PATH_MAX_UTF8], url[HOS_TELEMETRY_URL_MAX + 40], base[HOS_TELEMETRY_URL_MAX + 8];
     char stamped[HOS_TELEMETRY_URL_MAX + 8] = "";
     char *ini = join(path, sizeof path, dir, "hookshot_options.ini") ? read_text(path, 256 << 10, NULL) : NULL;
     const int chosen = ini && hos_telemetry_opt_on(ini, HOS_TELEMETRY_KEY_PERF);
     free(ini);
-    if (!chosen || !join(pending, sizeof pending, dir, HOS_PERF_PENDING)) return -1;
+    if (!chosen || !join(pending, sizeof pending, dir, feed->pending)) return -1;
     char *stamp = join(path, sizeof path, dir, "hookshot_version.txt") ? read_text(path, 16 << 10, NULL) : NULL;
     if (stamp) hos_telemetry_stamp_value(stamp, "telemetry", stamped, sizeof stamped);
     free(stamp);
     if (!hos_telemetry_base(getenv(HOS_TELEMETRY_ENV), getenv(HOS_TELEMETRY_TEST_HTTP_ENV), stamped, base, sizeof base) ||
-        !hos_telemetry_join(url, sizeof url, base, HOS_TELEMETRY_PERF_PATH))
+        !hos_telemetry_join(url, sizeof url, base, feed->path))
         return -1;
     char curl[PATH_MAX_UTF8];
     if (!find_curl(curl, sizeof curl)) return -1;
@@ -1993,7 +2063,7 @@ int hos_perf_send_run(const char *dir) {
     each_name(pending, perf_take, &waiting);
     qsort(waiting.names, (size_t)waiting.n, sizeof waiting.names[0], perf_cmp);
     int skip = 0;
-    for (; skip + HOS_PERF_MAX_PENDING < waiting.n; skip++)   /* (too many: the oldest go unsent) */
+    for (; skip + feed->max_pending < waiting.n; skip++)   /* (too many: the oldest go unsent) */
         if (join(path, sizeof path, pending, waiting.names[skip])) remove_utf8(path);
     const int backoff = hos_perf_env_number(getenv("HL_PERF_BACKOFF"), 1, 0, 1) != 0;
     char next[PATH_MAX_UTF8];
@@ -2009,18 +2079,18 @@ int hos_perf_send_run(const char *dir) {
         }
         free(text);
     }
-    const long most = hos_perf_env_number(getenv("HL_PERF_MAX_SENDS"), HOS_PERF_MAX_SENDS, 1, HOS_PERF_MAX_PENDING);
+    const long most = hos_perf_env_number(getenv("HL_PERF_MAX_SENDS"), feed->max_sends, 1, feed->max_pending);
     int done = 0, all = 1;
     for (int i = skip; i < waiting.n && done < most; i++) {
         if (!join(path, sizeof path, pending, waiting.names[i])) continue;
         size_t n = 0;
-        char *body = read_text(path, HOS_PERF_MAX_BODY + 1, &n);
+        char *body = read_text(path, (size_t)feed->max_body + 1, &n);
         int result;
-        if (!body || n == 0 || n > HOS_PERF_MAX_BODY) {
+        if (!body || n == 0 || n > (size_t)feed->max_body) {
             result = HOS_PERF_REFUSED;   /* (unreadable or too big: dropped) */
         } else {
             long retry = -1;
-            const int status = perf_post(dir, url, path, &retry);
+            const int status = perf_post(dir, feed, url, path, &retry);
             if (!status) {   /* (not reached: kept for the next start) */
                 free(body), all = 0;
                 break;
@@ -2038,12 +2108,34 @@ int hos_perf_send_run(const char *dir) {
             }
         }
         remove_utf8(path);   /* (before the copy: nothing between the server's yes and the summary leaving perf_pending/) */
-        if (result == HOS_PERF_SENT_OK && body) perf_keep_sent(dir, waiting.names[i], body, n);
+        if (result == HOS_PERF_SENT_OK && body) perf_keep_sent(dir, feed, waiting.names[i], body, n);
         free(body);
         done++;
     }
     if (all && done == waiting.n - skip) remove_utf8(next);
     return done;
+}
+int hos_perf_send_run(const char *dir) { return perf_feed_run(dir, &perf_summaries); }
+/* The pipeline state records the renderer queued in pipelines_pending/ (gpu/vk/state_report.h), by the same rules, to
+   <the build's address>/telemetry/pipelines. Nothing with HL_TELEMETRY_PIPELINES=0, nor without Send performance statistics. The
+   return is hos_perf_send_run's */
+int hos_pipes_send_run(const char *dir) {
+    if (!hos_telemetry_pipelines_on(getenv(HOS_TELEMETRY_PIPELINES_ENV))) return -1;
+    return perf_feed_run(dir, &pipeline_states);
+}
+/* The per-zone shader and pipeline usage the renderer queued in zones_pending/ (gpu/vk/zone_report.h), by the same rules,
+   to <the build's address>/telemetry/zones. Nothing with HL_TELEMETRY_ZONES=0, nor without Send performance statistics. The
+   return is hos_perf_send_run's */
+int hos_zones_send_run(const char *dir) {
+    if (!hos_telemetry_zones_on(getenv(HOS_TELEMETRY_ZONES_ENV))) return -1;
+    return perf_feed_run(dir, &zone_usage);
+}
+/* The detailed performance profile the renderer queued in profile_pending/ (gpu/vk/profile_report.h), by the same rules, to
+   <the build's address>/telemetry/profile. Nothing with HL_TELEMETRY_PROFILE=0, nor without Send performance statistics. The
+   return is hos_perf_send_run's */
+int hos_profile_send_run(const char *dir) {
+    if (!hos_telemetry_profile_on(getenv(HOS_TELEMETRY_PROFILE_ENV))) return -1;
+    return perf_feed_run(dir, &profile_usage);
 }
 #ifdef _WIN32
 static DWORD WINAPI perf_send_thread(void *p) {
@@ -2054,6 +2146,15 @@ static void *perf_send_thread(void *p) {
     void hos_log(const char *fmt, ...);
     const int n = hos_perf_send_run(dir);
     if (n >= 0) hos_log("perf: %d performance summaries sent or refused (Send performance statistics is on)", n);
+    const int m = hos_pipes_send_run(dir);
+    if (m > 0) hos_log("perf: %d pipeline state batches sent or refused (Send performance statistics is on, HL_TELEMETRY_PIPELINES is not 0)", m);
+    else if (n >= 0 && !hos_telemetry_pipelines_on(getenv(HOS_TELEMETRY_PIPELINES_ENV))) hos_log("perf: pipeline state records not sent: HL_TELEMETRY_PIPELINES=0");
+    const int k = hos_zones_send_run(dir);
+    if (k > 0) hos_log("perf: %d zone usage batches sent or refused (Send performance statistics is on, HL_TELEMETRY_ZONES is not 0)", k);
+    else if (n >= 0 && !hos_telemetry_zones_on(getenv(HOS_TELEMETRY_ZONES_ENV))) hos_log("perf: per-zone shader and pipeline usage not sent: HL_TELEMETRY_ZONES=0");
+    const int q = hos_profile_send_run(dir);
+    if (q > 0) hos_log("perf: %d performance profile batches sent or refused (Send performance statistics is on, HL_TELEMETRY_PROFILE is not 0)", q);
+    else if (n >= 0 && !hos_telemetry_profile_on(getenv(HOS_TELEMETRY_PROFILE_ENV))) hos_log("perf: performance profile not sent: HL_TELEMETRY_PROFILE=0");
     free(dir);
 #ifdef _WIN32
     return 0;

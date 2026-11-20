@@ -58,7 +58,7 @@ the table says what works and what does not yet.
 | Stutter when entering new areas | ⚠️ Still happens the first time you visit a place. The next visits are smooth |
 | Performance | ⚠️ Depends on the PC: some reach a steady 60 fps, others stay below it, more so in Hyrule Field |
 | Hyrule Field, Castle Town, Kakariko and the dungeons | ⚠️ Players got there, with open bugs: striped shadows in Hyrule Field ([#468](https://github.com/NotRexed/Hookshot/issues/468)), some crashes ([#317](https://github.com/NotRexed/Hookshot/issues/317), [#648](https://github.com/NotRexed/Hookshot/issues/648)) |
-| Ultrawide and 4:3 | ⚠️ The 3D keeps its shape, but the HUD is stretched and the picture is softer |
+| Ultrawide and 4:3 | ⚠️ The 3D keeps its shape, and the HUD keeps its 16:9 size at the screen's edges (Graphics' HUD layout); the picture is softer |
 | NVIDIA cards | ✅ Works. The most tested |
 | AMD cards | ⚠️ Some tested: reports from the RX 6600, RX 7800 XT and RX 7900 XTX. Known issue: the game loses the GPU in the Deku Tree on the RX 6600 ([#708](https://github.com/NotRexed/Hookshot/issues/708), [#614](https://github.com/NotRexed/Hookshot/issues/614)) |
 | Intel cards | ❓ Few reports, many of them black screens or crashes ([#17](https://github.com/NotRexed/Hookshot/issues/17)) |
@@ -228,22 +228,41 @@ restart" and the help on the Graphics tab lists it; closing the menu then asks w
 the change for the next start (and is not asked again until you change one of those rows); **Restart now** saves your
 choices and starts the game again, so progress since your last save is lost.
 
+The HDR tone mapper shows only with HDR set to Native, and the PsychoV35 rows only with that tone mapper on PsychoV35:
+they apply at once, with no new translation.
+
 | Tab | Option | Choices | Default |
 |---|---|---|---|
 | Graphics | Quality preset | Custom, Minimum (4GB), Low (6GB), Balanced (8GB), High (12GB), Ultra (16GB+) | Custom |
 | | Fullscreen | Off, On (the same as <kbd>F11</kbd>) | Off |
 | | GPU device | Auto, or each graphics card by name (after a restart) | Auto |
-| | Frame generation | Off, 2x to 8x | Off |
+| | Upscaler | Game's own, NVIDIA DLSS (only in builds with NVIDIA's DLSS SDK, below; on RTX GPUs), AMD FSR 3.1 (every build, on GPUs it runs on, below), AMD FSR 4 (only in builds with FSR 4, below), Off (every build and GPU, `dlss=6`: no upscaling network, the 3D at the Render resolution stretched to the output, no anti-aliasing; Render resolution steps as for the game's own, Sharpness applies) | Game's own |
+| | Render resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size). With DLSS, FSR 3.1 or FSR 4: Auto, Quality (67%), Balanced (58%), Performance (50%), Ultra Performance (33%). With DLSS also **DLAA (native)** and with FSR 4 **Native AA (FSR 4)**, after Auto: the 3D at 100% with the upscaler's anti-aliasing (saved as `resolution=7`; they were Upscaler choices before, and an options file that saved them as the Upscaler is read as DLSS or FSR 4 with this) | Auto |
+| | DLSS model | DLSS 4 (Transformer, preset K), DLSS 4.5 (Transformer 2, preset M), DLSS 4.5 (Transformer 2, preset L), NVIDIA default, DLSS 3 (CNN, preset E) (builds with DLSS; used by DLSS, DLAA included) | first run only, by GPU: DLSS 3 under 7 GB of video memory, else DLSS 4 on RTX 20 and 30, DLSS 4.5 (M) on RTX 40 and 50 |
+| | DLAA before the bloom | Off, On: where NVIDIA DLAA smooths the picture, after the game's bloom and tone map or before them, so the glow is made from a smooth picture (shown with NVIDIA DLSS; changeable with Render resolution Native (DLAA) only; changes at once; `RX_VK_DLSS_PRE_BLOOM` over it for one run) | Off |
+| | Frame generation by | Built-in / AMD FSR 3.1 (the renderer's own interpolation, and AMD FSR 3.1's at 2x where it runs), NVIDIA DLSS FG (RTX 40 and newer, with a temporal Upscaler and NVIDIA's runtime), AMD FSR 3.1 FG (shown in a build with DLSS, or where AMD FSR 3.1's frame interpolation runs; saved as `frame_generation_by`: 0, 1, 2) | Built-in / AMD FSR 3.1 |
+| | Frame generation | Off, Auto, 2x to 8x, but only what Frame generation by makes: NVIDIA DLSS FG 2x up to its runtime's most (6x on an RTX 50, 2x on an RTX 40) and no Auto, AMD FSR 3.1 FG 2x, Built-in Auto and 2x to 8x. Right under Frame generation by; changing the mode keeps the multiplier within the new mode's | Off |
 | | Frame pacing | Off, On | Off |
+| | HDR contrast | 50% to 200% around mid grey, in steps of 5, as the RenoDX HDR mods grade it (while HDR is on; with Native the game's own HDR picture too; hidden with PsychoV35, which has its own Contrast) | 100% |
+| | HDR tone mapper | Vanilla (the game's curve), PsychoV35 (RenoDX's zelda-oot-oz; with HDR set to Native. Every Upscaler takes its scene: DLSS, DLAA, FSR, TAAU and Off) | Vanilla |
+| | PsychoV35 UI brightness | 80 to 500 nits: the menus' and HUD's white; the scene keeps the paper white (RenoDX's UI Brightness) | 203 nits |
+| | PsychoV35 color space | Vanilla (the game's own matrix), BT.709, DCI-P3 (RenoDX's Global Color Space) | BT.709 |
+| | PsychoV35 midgray | Render, Vanilla (mid grey where the game's own curve puts it) | Vanilla |
+| | PsychoV35 match tone slope | Off, On (the game's own slope at mid grey) | On |
+| | PsychoV35 tone slope | 0 to 100: how steeply tones rise through mid grey | 50 |
+| | PsychoV35 hue clip emulation | 0 to 100: how much of the game's colour shift in its brightest parts is kept | 50 |
+| | PsychoV35 exposure | 0% to 200%: the scene's brightness at mid grey | 100% |
+| | PsychoV35 highlights, shadows, contrast, saturation | 0 to 100 each: RenoDX's grading (contrast 0 breaks the picture, as in the mod) | 50 |
+| | PsychoV35 bloom | 0 to 100: the glow around bright things (0 none, 100 twice the game's) | 50 |
+| | PsychoV35 reset all | Puts every PsychoV35 row back to RenoDX's defaults | |
 | | NVIDIA Reflex | Off, On, On + Boost (NVIDIA GPUs with `VK_NV_low_latency2`) | Off |
+| | Frame rate limit | 60, 90, 120, 144, 165, 240, Unlimited (saved as `frame_rate_limit` 0 to 6). The rate shown, the game's frames and the made ones: with a fixed Frame generation multiplier the game runs at the limit over it (120 at 3x: the game at 40; the multiplier is lowered where that would leave the game under 20 frames a second). Above 60 needs Game speed on Real time | 60 |
 | | Output resolution | 1920x1080, 2048x1152, 2560x1440, 3840x2160, 5120x1440 (after a restart) | 2048x1152 |
-| | Upscaler | Game's own, NVIDIA DLSS, NVIDIA DLAA (only in builds with NVIDIA's DLSS SDK, below; DLSS and DLAA on RTX GPUs), AMD FSR 3.1 (every build, on GPUs it runs on, below), AMD FSR 4, AMD FSR 4 Native AA (only in builds with FSR 4, below), Off (every build and GPU, `dlss=6`: no upscaling network, the 3D at the Render resolution stretched to the output, no anti-aliasing; Render resolution steps as for the game's own, Sharpness applies) | Game's own |
-| | DLSS model | Transformer (K), Transformer 2 (M), Transformer 2 (L), NVIDIA default (builds with DLSS; used by DLSS and DLAA) | Transformer (K) |
-| | Render resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size). With DLSS, FSR 3.1 or FSR 4: Auto, Quality (67%), Balanced (58%), Performance (50%), Ultra Performance (33%). With DLAA or FSR 4 Native AA: Native | Auto |
 | | Window scaling filter | Off, Catmull-Rom, Lanczos | Off |
 | | Sharpness | 0 to 100%, in steps of 10 | 0% |
 | | Handheld profile | Off, On (after a restart) | Off |
 | | Ultrawide | 16:9, Monitor's shape: wider than 16:9, or narrower down to 5:4 (after a restart) | 16:9 |
+| | HUD layout | Screen's edges, Middle 16:9 (on a screen that is not 16:9) | Screen's edges |
 | | Robust buffers | Auto, Off, On (after a restart) | Auto |
 | Gameplay | FPS counter | Off, On | Off |
 | | Menu size | Auto, Small, Medium, Large | Auto |
@@ -276,15 +295,20 @@ choices and starts the game again, so progress since your last save is lost.
   `hookshot_log.txt` lists every card as `vk: device <n>`; `RX_VK_DEVICE=<n>` chooses one for a single run and wins
   over the menu.
 - **Frame generation** makes extra frames between the game's own. It adds a little input delay, and fast motion can
-  show artifacts. At 2x, AMD FSR 3.1's frame interpolation makes the frame where it runs (below); at 3x and more, and
-  where it does not run, the renderer's own does. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay. It paces
+  show artifacts. **Frame generation by** chooses who makes them and sits right above the multiplier, which offers only what
+  that mode makes: **NVIDIA DLSS FG** 2x up to what its runtime makes on the GPU (6x on an RTX 50, 2x on an RTX 40, no Auto;
+  Hookshot ec76f696), **AMD FSR 3.1 FG** 2x, the built-in one Auto and 2x to 8x (at 2x AMD FSR 3.1's frame interpolation makes
+  the frame where it runs, below). A higher value saved before shows and runs as the top of the mode, and changing the mode keeps
+  the multiplier within the new mode's, never raising it. **Frame rate limit** is the rate shown: with a fixed multiplier the
+  game runs at the limit over it (120 at 3x: the game at 40, never under 20 frames a second: the multiplier is lowered where it
+  would), Off or Auto at the limit, Unlimited holds nothing back. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay. It paces
   the frames that frame generation shows, so it has no effect while Frame generation is Off.
-- **The scaling rows**, in the picture's order: **Output resolution** is the size of the game's whole frame, HUD
-  included. The **Upscaler** fills it from the 3D: the game's own network, NVIDIA DLSS or DLAA (the 3D at full size,
-  edges smoothed), AMD FSR 3.1, or AMD FSR 4 or its Native AA (below). DLSS and DLAA look softer than the game's own: set
-  **Sharpness** to around 80% with them. **DLSS model**
-  chooses their network (below). **Render
-  resolution** is the 3D's share of the output. The **Window scaling filter** then scales the frame to your window,
+- **The scaling rows**: the **Upscaler** and the **Render resolution** sit together above the frame generation rows. The
+  **Upscaler** fills the output from the 3D: the game's own network, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4 (below) or Off.
+  **Render resolution** is the 3D's share of the output; with DLSS its **DLAA (native)** choice draws the 3D at full size with
+  the edges smoothed, and with FSR 4 **Native AA (FSR 4)** (they were Upscaler choices, and a saved one is read as the Render
+  resolution's). DLSS and DLAA look softer than the game's own: set **Sharpness** to around 80% with them. **DLSS model** chooses
+  their network, DLSS 4 or 4.5 (below). **Output resolution** is the size of the game's whole frame, HUD included. The **Window scaling filter** then scales the frame to your window,
   and **Sharpness** sharpens it, by the picture's pixels: when the window is much larger than the picture (the Handheld
   profile's 1536x864 on a 4K screen), a Sharpness kept from an older version is stronger than it was, so a lower one may
   suit.
@@ -292,7 +316,8 @@ choices and starts the game again, so progress since your last save is lost.
   the 1920x1080 option keeps HUD and text sharp when the game fills the screen by mapping them pixel for pixel. At
   3840x2160 the game's render targets get a bigger GPU pool, so a full-size 3D fits. On a 5120x1440 (32:9) ultrawide
   monitor, 5120x1440 gives a native frame with a sharp HUD. Set **Ultrawide** to Monitor's shape with it: it widens the
-  cameras to the frame's shape and keeps the HUD and movies in the middle 16:9; without it, the game's 16:9 picture is
+  cameras to the frame's shape and keeps the movies in the middle 16:9; the HUD keeps its 16:9 size, its corners at the
+  screen's edges (**HUD layout** puts it back in the middle 16:9). Without Monitor's shape, the game's 16:9 picture is
   stretched across the 32:9 output, sharp but wide. For one run, set `HOS_OUTPUT_RES` to `3` for 1920x1080,
   `0` for 2048x1152, `1` for 2560x1440, `2` for 3840x2160, or `4` for 5120x1440.
 - **Window scaling filter** matters only when your window's size differs from the Output resolution: for the sharpest
@@ -308,7 +333,9 @@ choices and starts the game again, so progress since your last save is lost.
 - **FPS counter** shows in the top right corner. With frame generation on, it also shows the game's own rate.
 - **Audio output** is the speakers the game mixes its sound for. Auto is 5.1 when your default output device has 5.1
   or more speakers, else stereo; Stereo or 5.1 chooses one whatever the device has (5.1 on stereo speakers is mixed
-  down). For one run, `HOS_AUDIO_CHANNELS=2` or `6` chooses stereo or 5.1 and wins over the menu.
+  down). For one run, `HOS_AUDIO_CHANNELS=2` or `6` chooses stereo or 5.1 and wins over the menu. In a 5.1 mix the centre
+  channel (voices, the ocarina) also goes to the front pair at -3 dB, so a headset or driver that drops the centre still
+  plays them; `HOS_AUDIO_CENTRE=0` turns that off for one run.
 - **Skip title screen** starts the game with your most recent save: HeyListen presses A through the title screen and its
   file list as soon as the game has a save. Until you have saved once, it leaves the title screen alone, so a new game can
   still be started. It applies after a restart; turn it off to watch the intro and use the title. For one run,
@@ -335,6 +362,10 @@ choices and starts the game again, so progress since your last save is lost.
   creeps. `HOS_MOTION_DEBUG=1` (in `hookshot_env.txt`) logs what the game gets twice a second.
 - **Layout preset:** Nintendo has A on the right face button, Xbox / PC and Swap Face put A on the bottom one. Changing
   a button yourself sets it to Custom.
+- **Button prompts** (on the Controls tab, with the Layout preset, and on the Controls page): the button icons in the game's texts, hints and menus. Auto shows the first
+  controller's; with no controller connected (through SDL or XInput), the keyboard's. Keyboard shows the key or mouse button
+  your controls put each action on (the first of its two), WASD for the left stick's ways (or the movement keys you bound) and
+  the mouse for the camera; the ocarina's notes and the pause menu's controller keep the Switch's buttons.
 
 ### Controls
 
@@ -550,7 +581,7 @@ themselves can trail for now.
 <details>
 <summary>NVIDIA DLSS (optional, NVIDIA's SDK under NVIDIA's license)</summary>
 
-A game built with NVIDIA's DLSS SDK offers **NVIDIA DLSS** and **NVIDIA DLAA** in the Graphics tab's **Upscaler** row on
+A game built with NVIDIA's DLSS SDK offers **NVIDIA DLSS** in the Graphics tab's **Upscaler** row (and **DLAA (native)** in **Render resolution** with it) on
 NVIDIA RTX cards (`dlss=` in `hookshot_options.ini`, `RX_VK_DLSS=0/1/2` for one run): DLSS Super Resolution in place of
 the game's own upscaler, with camera jitter (**NVIDIA Reflex** needs no SDK and is in
 every build). NVIDIA's files are NVIDIA's, under its own license, the
@@ -560,26 +591,40 @@ license. Never share a game folder built with them, and do not post builds made 
 
 - **Windows, the Hookshot Builder:** tick **NVIDIA DLSS (downloads NVIDIA's SDK under NVIDIA's license)** before you
   build. It is off by default and shows NVIDIA's license when you tick it. The build downloads the SDK into
-  `%LOCALAPPDATA%\HookshotBuilder\ngx-sdk` and puts DLSS's runtime, `nvngx_dlss.dll`, in the game folder's `ngx` folder.
+  `%LOCALAPPDATA%\HookshotBuilder\ngx-sdk` and puts DLSS's runtime, `nvngx_dlss.dll`, and DLSS Frame Generation's,
+  `nvngx_dlssg.dll`, in the game folder's `ngx` folder.
 - **Windows, the command line:** `python -I scripts/ngx_sdk.py --platform windows <sdk folder>` asks you to accept
-  NVIDIA's license (or pass `--accept-nvidia-license`) and fetches the headers, `nvsdk_ngx_s.lib` and `nvngx_dlss.dll`,
-  each checked against its SHA-256. Then build with `HOOKSHOT_NGX_SDK=<sdk folder>`: `make_game.py` copies
-  `nvngx_dlss.dll` into `<game folder>\ngx`. NGX is also pointed at `%LOCALAPPDATA%\Hookshot\ngx`, and at
-  `RX_VK_DLSS_DIR` when it is set, and uses the newest `nvngx_dlss.dll` it finds across them (to try a given one, make
-  sure no other folder has a newer one). Never copy NGX's core, `_nvngx.dll`, beside the game: it comes with NVIDIA's
+  NVIDIA's license (or pass `--accept-nvidia-license`) and fetches the headers, `nvsdk_ngx_s.lib`, `nvngx_dlss.dll` and
+  `nvngx_dlssg.dll`, each checked against its SHA-256. Then build with `HOOKSHOT_NGX_SDK=<sdk folder>`: `make_game.py`
+  copies both runtimes into `<game folder>\ngx`. NGX is also pointed at `%LOCALAPPDATA%\Hookshot\ngx`, and at
+  `RX_VK_DLSS_DIR` when it is set, and uses the newest of each it finds across them (to try a given one, make sure no
+  other folder has a newer one). Without `nvngx_dlssg.dll` there, frame generation takes the driver's own copy, which
+  may be older: one that answers one made frame at most (no multi frame generation on an RTX 50) and refuses every set
+  (0xbad00005), so neither vendor choice makes a frame and the renderer's own does; the log's start line says the version
+  of the file it found. An SDK folder fetched before `nvngx_dlssg.dll` was in the table has only DLSS's: run the script
+  again and it fetches what is missing. Never copy NGX's core, `_nvngx.dll`, beside the game: it comes with NVIDIA's
   driver.
 - **Linux:** the same with `--platform linux` (or `scripts/linux/ngx-sdk.sh`): `libnvsdk_ngx.a` for the build and
-  `libnvidia-ngx-dlss.so` for the game folder's `ngx` folder (also looked for in `$XDG_DATA_HOME/hookshot/ngx`). NGX's
-  core comes with NVIDIA's Linux driver. NVIDIA's NGX on Linux loads the runtime only from a folder whose path is all
-  ASCII: with the game in a folder named otherwise (`~/Games/Zelda-Café`), put `libnvidia-ngx-dlss.so.*` in
+  `libnvidia-ngx-dlss.so` and `libnvidia-ngx-dlssg.so` for the game folder's `ngx` folder (also looked for in
+  `$XDG_DATA_HOME/hookshot/ngx`). NGX's core comes with NVIDIA's Linux driver. NVIDIA's NGX on Linux loads the
+  runtimes only from a folder whose path is all ASCII: with the game in a folder named otherwise (`~/Games/Zelda-Café`),
+  put `libnvidia-ngx-dlss.so.*` and `libnvidia-ngx-dlssg.so.*` in
   `$XDG_DATA_HOME/hookshot/ngx` (`~/.local/share/hookshot/ngx`) or another ASCII folder named by `RX_VK_DLSS_DIR`.
 
-The **DLSS model** row chooses DLSS's network, by NVIDIA's preset letter, for every mode: **Transformer (K)**, the
-transformer model and the one tested most here (the default); **Transformer 2 (M)**, NVIDIA's second-generation
-transformer as it picks it for Performance; **Transformer 2 (L)**, the same generation as tuned for Ultra Performance;
-**NVIDIA default**, which lets DLSS's runtime pick for each mode, so it can change with a runtime update. The runtime
-the SDK comes with (310.9.16) has all of them. A change applies at once, without a restart (`dlss_model=` in
-`hookshot_options.ini`, 0 to 3 in that order). `RX_VK_DLSS_PRESET=<letter>` (or `0` for NVIDIA's default) chooses
+The **DLSS model** row chooses DLSS's network, by NVIDIA's preset letter, for every mode and Render resolution (DLAA,
+Quality, Balanced, Performance, Ultra Performance) on any RTX card: **DLSS 4 (Transformer, preset K)**, NVIDIA's first
+transformer and the one tested most here; **DLSS 4.5 (Transformer 2, preset M)** and **(preset L)**, its second-generation
+transformer (NVIDIA tunes M for Performance and L for Ultra Performance, and both work in every mode); and **NVIDIA
+default**, which lets DLSS's runtime pick for each mode, so it can change with a runtime update; and **DLSS 3 (CNN, preset E)**, NVIDIA's older CNN model, lighter on video memory and GPU time. NVIDIA's programming
+guide (310.6.0) and its DLSS 4.5 announcement say the 4.5 presets are built for RTX 40 and 50 (FP8 tensor cores) and cost
+RTX 20 and 30 more GPU time (in the guide's table an RTX 3070 at 1080p output takes about 1.5 ms for K, 2.8 ms for M and
+4 ms for L), where NVIDIA suggests K; nothing stops an RTX 30 from choosing 4.5 L with DLAA. Only the first time, when
+`hookshot_options.ini` has no `dlss_model` yet, the game starts the row at DLSS 3 (the CNN) on a card with less than 7 GB
+of video memory, else at DLSS 4 (K) on an RTX 20 or 30 and DLSS 4.5 (M) on an RTX 40 or 50 (told by the GPU's PCI device id: NVIDIA's ids run by generation, `0x2600` and up is Ada, which has
+FP8) and writes it to the file at once; after that the file's value is the player's, every change in the menu is saved
+as it is made, and the GPU changes nothing. A chosen model is the one drawn, whatever the card's memory. The runtime the SDK comes with (310.9.16) has
+all of them. A change applies at once, without a restart (`dlss_model=` in `hookshot_options.ini`: 0 DLSS 4 K, 1
+DLSS 4.5 M, 2 DLSS 4.5 L, 3 NVIDIA default, 4 DLSS 3 CNN E; the numbers mean what they always did). `RX_VK_DLSS_PRESET=<letter>` (or `0` for NVIDIA's default) chooses
 the preset for one run and wins over the row; the log's `vk: NVIDIA DLSS: ... preset <letter>` line says which one was
 asked for, and with `RX_VK_DLSS_LOG=1` NGX's own `Using App hint Preset <letter>` lines say which it took.
 
@@ -602,7 +647,7 @@ of its own downloads (`C:\ProgramData\NVIDIA\NGX\models`) before it uses the gam
 <details>
 <summary>AMD FSR 4 (optional, AMD's DLLs not included)</summary>
 
-A game built with FSR 4 offers **AMD FSR 4** and **AMD FSR 4 Native AA** in the Graphics tab's **Upscaler** row: AMD's
+A game built with FSR 4 offers **AMD FSR 4** in the Graphics tab's **Upscaler** row, and **Native AA (FSR 4)** in **Render resolution** with it: AMD's
 machine-learned temporal upscaler in place of the game's own, on the same inputs as DLSS (the scene's colour and depth, the
 camera's and the characters' motion, and the camera jitter). Native AA draws the 3D at full size and smooths its edges.
 With HDR on **Native**, it takes the game's HDR colour as linear light, so highlights above the paper white are kept

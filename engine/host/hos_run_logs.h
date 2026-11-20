@@ -2,13 +2,13 @@
    .log of a declared "logs" folder to a crash report the player sends (recomplauncher.json "folders"). hookshot_log.txt and its
    .1.txt to .4.txt stay as they are, for players and the docs. Each .log is a hard link to the same file, so the run's log is there
    from its first line (a copy made at the end would not exist after a crash) and costs no space. A disk with no hard links (exFAT)
-   gets no logs folder; the .txt files are still written. Windows only: the Linux game logs to the terminal.
+   gets no logs folder; the .txt files are still written. Both systems: the game logs to a terminal when it has one, and started
+   without one (a desktop or the launcher) it logs to hookshot_log.txt beside itself, whose opening (host/hos_main.c) calls this.
    hos_run_logs_make(dir, log): dir is the game folder with its trailing separator, log this run's open log file. */
 #ifndef HOS_RUN_LOGS_H
 #define HOS_RUN_LOGS_H
-#ifdef _WIN32
 #include <stdio.h>
-#include <windows.h>
+#include <windows.h>   /* (on Linux host/posix/windows.h, on the include path: the same calls, made in win32_posix.c) */
 #define HOS_RUN_LOGS_KEEP 4   /* (the runs before this one) */
 
 static void hos_run_logs_make(const char *dir, const char *log) {
@@ -25,7 +25,4 @@ static void hos_run_logs_make(const char *dir, const char *log) {
     DeleteFileA(to);
     CreateHardLinkA(to, log, NULL);
 }
-#else
-static inline void hos_run_logs_make(const char *dir, const char *log) { (void)dir; (void)log; }
-#endif
 #endif

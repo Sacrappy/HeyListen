@@ -2947,6 +2947,13 @@ NV(nvnQueuePresentTexture) {
     held_init();
     present_thread = hos_self();   /* (TICK-054, HOS_NVN_HOLD=2: the presenting thread, whose submits are not held) */
     held_flush_why(HF_PRESENT);   /* (a present flushes the queue) */
+    {   /* (heylisten) this frame's pacing sleep (nn_vi.c), for the performance summary's pace part: pushed before the present
+           so the frame the renderer counts inside it carries it (gpu/vk/perf_parts.h's HOS_OPT_PERF_PACE, as the Cheats page's
+           counts go: the same id is vk_menu.cpp's) */
+        void rx_option_set(int id, int value);
+        extern int64_t hos_vi_pace_us(void);
+        rx_option_set(90 /* HOS_OPT_PERF_PACE, gpu/vk/perf_parts.h */, (int)hos_vi_pace_us());
+    }
     {
         const int away = hos_vcore_away();
         HOS_JT(JT_MARK, 5, o->presents);   /* (TICK-054: the present, on this thread) */

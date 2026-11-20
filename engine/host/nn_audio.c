@@ -16,7 +16,7 @@
    HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
    HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs);
    HOS_AUDIO_CHANNELS=2 or 6: stereo or 5.1 whatever the default output has and the Insert menu's Audio output say
-   (see au_speakers). */
+   (see au_speakers); HOS_AUDIO_CENTRE=0: no centre spread into the front pair in a 5.1 mix (see au_spread_centre). */
 #include "hos.h"
 #include <math.h>
 #include <stdio.h>
@@ -572,6 +572,14 @@ static void render_voice(Voice *v) {
     memcpy(v->ramp_vol, v->vol, sizeof v->ramp_vol);   /* (splitters catch up in render_frame) */
 }
 
+/* (hookshot) Issue 82: a 5.1 device or its driver can leave the centre channel out - a headset's virtual surround, a
+   soundbar in a stereo mode - and the game puts its voices, the ocarina and Link's own sounds there, so they went silent
+   while music and effects played. The output section's au_spread_centre puts the centre into the front pair as well (the
+   0.7071 the stereo down-mix gives it): a device that drops the centre still plays them, and a real 5.1 system keeps its
+   centre, its voices a little wider. HOS_AUDIO_CENTRE=0 turns the spread off. */
+static int au_centre_spread_on(void);
+static inline void au_spread_centre(float out[6][FRAME], int six, int on);
+
 static int mix_depth(int i, int guard) {   /* how many sub mixes lie between this one and the final mix */
     if (guard > MAX_MIXES || mixes[i].final_mix || mixes[i].dest_kind != DEST_MIX) return 0;
     return 1 + mix_depth(mixes[i].dest, guard + 1);
@@ -633,6 +641,9 @@ static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the de
         }
     }
     const int nch = six ? 6 : 2;
+    static int centre_spread = -1;   /* (HOS_AUDIO_CENTRE: read once, as the other switches) */
+    if (centre_spread < 0) centre_spread = au_centre_spread_on();
+    au_spread_centre(out, six, centre_spread);   /* (before the limiter: the added centre is limited with the rest) */
     {   /* HOS_AUDIO_STATS=1: once a second, what plays and where the signal is */
         static int stats = -1, frames;
         if (stats < 0) stats = getenv("HOS_AUDIO_STATS") != NULL;
@@ -867,20 +878,41 @@ static void output_error(const char *operation, MMRESULT result) {
         hos_log("audio: %s failed (MMRESULT %u)", operation, (unsigned)result);
     }
 }
+/* (hookshot) Issue 82: the centre also goes to the front pair at -3 dB in a 5.1 mix (au_spread_centre; HOS_AUDIO_CENTRE=0
+   turns it off). Here, in the output section, so tests/audio_output_errors_test.c compiles the real pair with its spies. */
+static int au_centre_spread_on(void) {
+    const char *v = getenv("HOS_AUDIO_CENTRE");
+    return !(v && *v && atoi(v) == 0);
+}
+static inline void au_spread_centre(float out[6][FRAME], int six, int on) {
+    if (!six || !on) return;
+    for (int i = 0; i < FRAME; i++) {
+        const float c = out[2][i] * 0.7071f;
+        out[0][i] += c;
+        out[1][i] += c;
+    }
+}
 /* The device: HOS_AUDIO_DEVICE=<n> (a waveOut device number) first, then the Windows default (WAVE_MAPPER), then each
    device in turn. Players had no sound at all while every other program played ("no sound in 2.0.5"): the log now
    names the device; one that takes no block for 1.5 s (an unplugged headset, a default bound to a dead output) is
    closed and the next candidate opened (at most 6 times a run); 10 s after opening the log says how many blocks the
-   device took and how loud the game's sound was, which tells a silent game from a deaf device. */
-static int out_next;           /* the next candidate: 0 = HOS_AUDIO_DEVICE, 1 = the default, 2.. = device n-2 */
+   device took and how loud the game's sound was, which tells a silent game from a deaf device.
+   Issue 99: when HOS_AUDIO_DEVICE is unset, device 0 is tried first (not skipped to WAVE_MAPPER). */
+static int out_next;           /* the next candidate: 0 = device 0 (or HOS_AUDIO_DEVICE), 1 = the default, 2.. = device n-2 */
 static uint64_t out_opened, out_stall_since;
 static unsigned out_played, out_peak, out_reported;
 static int output_try(int candidate, const WAVEFORMATEX *f) {
     const char *want = getenv("HOS_AUDIO_DEVICE");
     unsigned device;
     if (candidate == 0) {
-        if (!want || !*want) return 0;
-        device = (unsigned)atoi(want);
+        if (!want || !*want) {
+#ifndef _WIN32
+            device = 0;   /* Issue 99: try device 0 when HOS_AUDIO_DEVICE is unset (Linux only — Windows device 0 isn't always default) */
+#else
+            return 0;   /* (Windows: no device asked for, so the default is the first candidate, as before) */
+#endif
+        }
+        else device = (unsigned)atoi(want);
     } else device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
     const MMRESULT result = waveOutOpen(&wout, device, au_format(f), 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
@@ -892,7 +924,8 @@ static int output_try(int candidate, const WAVEFORMATEX *f) {
     char name[64];
     if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
     else au_device_name(device, name, sizeof name);
-    hos_log("audio: output on %s (%u devices), %s", name, au_device_count(), f->nChannels == 6 ? "5.1" : "stereo");
+    hos_log("audio: output on %s (%u devices), %s%s", name, au_device_count(), f->nChannels == 6 ? "5.1" : "stereo",
+            f->nChannels == 6 && au_centre_spread_on() ? " (the centre also to the front pair)" : "");
     return 1;
 }
 /* The channels: the game's speakers (au_speakers). A 5.1 format no device takes is stereo instead: the device sink's
@@ -1184,6 +1217,7 @@ static HANDLE renderer_thread;
 
 static DWORD WINAPI renderer_main(void *p) {
     (void)p;
+    SetThreadDescription(GetCurrentThread(), L"hos audio renderer");   /* (a name: the performance profile's audio role, gpu/vk/profile_report.h) */
     hos_thread_boost(2);
     output_open();
     int64_t period = 5000000, next = hos_now_ns() + period;   /* one audio frame: 240 samples at 48 kHz */

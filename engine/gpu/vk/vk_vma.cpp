@@ -10,8 +10,13 @@
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <map>
 #include <unordered_map>
 #ifdef _WIN32
@@ -124,10 +129,76 @@ void tag_mapped(const VmaAllocationInfo& info, MemKind kind) {
 }
 }  // namespace
 
+// (hookshot 8cb5a334, ported by hand; issue 136) VMA gives an emptied block (and a dedicated allocation) back to the driver with
+// vkFreeMemory on the thread that emptied it, here the render thread when the image generations' pools go (vmaDestroyPool) or a
+// dedicated image/buffer is destroyed: 4 to 7 ms a block on an RTX 3060 Ti, about 250 ms on a player's RTX 4080 SUPER (83 in a row
+// at the Market: 5 frames a second for half a minute). VMA is done with the handle when it calls (its own accounting is updated
+// before), so the call goes to a thread of its own, in the order given: the images and buffers destroyed before are gone before the
+// memory is. (Upstream's reaper thread and its defragmentation step limit do not exist here: this tree has no image defragmentation.)
+// RX_VK_FREE_LATER=0: on the caller's thread, as before
+namespace {
+std::mutex free_mu;
+std::condition_variable free_cv;
+std::deque<std::function<void()>> free_queue;
+std::atomic<int64_t> st_free_queued{0}, st_free_done{0}, st_free_now{0}, st_free_ns{0}, st_free_max_ns{0};
+thread_local bool on_free_thread = false;
+bool free_later_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_FREE_LATER");
+        const bool v = !e || atoi(e) != 0;
+        logf("vk: emptied memory blocks given back to the driver %s (RX_VK_FREE_LATER)", v ? "on a thread of their own" : "on the caller's thread, as before");
+        if (v)
+            std::thread([] {
+                on_free_thread = true;
+                std::deque<std::function<void()>> batch;
+                for (;;) {
+                    {
+                        std::unique_lock lk(free_mu);
+                        free_cv.wait(lk, [] { return !free_queue.empty(); });
+                        batch.swap(free_queue);
+                    }
+                    for (auto& fn : batch) fn();
+                    batch.clear();
+                }
+            }).detach();
+        return v;
+    }();
+    return on;
+}
+void free_memory_timed(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb, bool queued) {
+    const auto t0 = std::chrono::steady_clock::now();
+    vkFreeMemory(device, memory, cb);
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    st_free_ns += ns;
+    int64_t m = st_free_max_ns.load();
+    while (ns > m && !st_free_max_ns.compare_exchange_weak(m, ns)) {}
+    const int64_t n = ++st_free_done;
+    static std::atomic<int> logged{0};
+    if ((ns > 20000000 || n <= 4 || n % 64 == 0) && logged++ < 40)
+        logf("vk: a memory block given back to the driver in %.2f ms%s (%lld queued, %lld on the caller's thread, %.1f ms in all, %.2f ms the longest)",
+             ns / 1e6, queued ? ", off the thread that emptied it" : "", (long long)st_free_queued.load(), (long long)st_free_now.load(),
+             st_free_ns.load() / 1e6, st_free_max_ns.load() / 1e6);
+}
+VKAPI_ATTR void VKAPI_CALL free_memory_later(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb) {
+    if (!memory) return;
+    if (!free_later_on() || on_free_thread) {
+        st_free_now++;
+        return free_memory_timed(device, memory, cb, false);
+    }
+    st_free_queued++;
+    {
+        std::lock_guard lk(free_mu);
+        free_queue.push_back([device, memory, cb] { free_memory_timed(device, memory, cb, true); });
+    }
+    free_cv.notify_one();
+}
+}  // namespace
+
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
     f.vkGetInstanceProcAddr = gipa;
     f.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    f.vkFreeMemory = free_memory_later;   // (the others are fetched: VMA keeps the pointers it is given)
     VmaAllocatorCreateInfo ci{};
     ci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
                (dev.memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);

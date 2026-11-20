@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vk_gprof.h"
+#include "profile_run.h"   // (the performance profile's pass timestamps, when RX_VK_PASS_TIMING is off)
 
 namespace mkwvk {
 namespace {
@@ -99,6 +100,7 @@ static int level() {
 }
 
 void gprof_begin_recording(int slot, VkCommandBuffer cmd, VkCommandBuffer upload) {
+    tprof_bind(slot, cmd);
     if (!gprof_on() || slot < 0 || slot >= kSlots) return;
     if (!pool) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -127,6 +129,7 @@ void gprof_submitted(int slot, bool upload_sent) {
 }
 
 bool gprof_begin(VkCommandBuffer cmd) {
+    if (!gprof_on()) return tprof_begin(cmd);   // (the performance profile: render passes, dispatches and the renderer's own passes only)
     Stream* st = find(cmd);
     if (!st || st->outer >= 0 || st->nq + 4 > kQ) {
         if (st && st->outer < 0) dropped++;
@@ -140,6 +143,7 @@ bool gprof_begin(VkCommandBuffer cmd) {
 }
 
 void gprof_end(VkCommandBuffer cmd, const std::string& label, int items, uint64_t bytes) {
+    if (!gprof_on()) return tprof_end_label(cmd, label);
     Stream* st = find(cmd);
     if (!st || st->outer < 0) return;
     const uint32_t q = stamp(*st, cmd);
@@ -169,6 +173,7 @@ void gprof_run(VkCommandBuffer cmd, uint64_t key) {
 }
 
 void gprof_collect(int slot) {
+    tprof_collect(slot);
     if (!pool || slot < 0 || slot >= kSlots) return;
     Slot& s = slots[slot];
     if (!s.used) return;

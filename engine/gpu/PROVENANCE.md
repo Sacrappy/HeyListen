@@ -36,3 +36,11 @@ Hookshot's AMD FSR 4 (`vk/vk_fsr4.cpp`) was first written for Lichii's OoT branc
 N3oTraX. It draws with the frame chain of hckrman101's NVIDIA DLSS (#841), moved into `vk/vk_temporal.cpp` so both
 upscalers share it. `third_party/fidelityfx/` is AMD's FSR API headers from FidelityFX SDK v2.4.0 (MIT, `LICENSE.md`);
 AMD's signed DLLs are loaded from the user's PC at run time and are not vendored.
+
+The HDR tone mapper's PsychoV35 (`vk/eden/shader_recompiler/ir_opt/psychov35.h`) is the scene tone map of ShortFuse's RenoDX
+mod for this game (clshortfuse/renodx, `src/games/zelda-oot-oz/scene_tonemap.slangi`, and Carlos Lopez's
+`src/shaders/tonemap/psychov/test35.hlsl`; MIT, `ir_opt/LICENSE-renodx.md`; `tests/test_psychov35.py`'s reference is a
+port of the same files under it), written over the IR emitter, with the mod's grading settings read from a constant bank the
+renderer owns. `ir_opt/scene_tonemap_pass.h`, which finds the game's fit in the IR and puts it there, and
+`ir_opt/output_encode_pass.h`, which gives the game's HDR10 encoder the mod's colour space and UI brightness, are Hookshot's
+and Longshot's (Hookshot #2481 by Joey Magnus, Longshot #400 by futondestroyer and #1393 by LRF17), ported to HeyListen.

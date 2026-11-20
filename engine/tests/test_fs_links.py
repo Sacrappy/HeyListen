@@ -14,6 +14,7 @@ python -I -B tests/test_fs_links.py [--cc gcc]
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,10 @@ def main():
     posix = (ROOT / "host/posix/win32_posix.c").read_text(encoding="utf-8")
     fs = (ROOT / "host/nn_fs.c").read_text(encoding="utf-8")
     mods = (ROOT / "host/mods.c").read_text(encoding="utf-8")
+    # (the host paths' size, as nn_fs.c defines it: delete_tree's buffers are that long)
+    fs_path = re.search(r"^#define HOS_FS_PATH [0-9]+$", fs, re.M).group(0)
     pieces = [
+        fs_path,
         block(posix, "static DWORD error_of(int e) {"),
         "static BOOL fail_errno(void) { last_error = error_of(errno); return FALSE; }",
         "enum { H_THREAD = 0x48540001, H_EVENT, H_SEMA, H_TIMER, H_FILE, H_FIND };",

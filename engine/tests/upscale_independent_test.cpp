@@ -25,6 +25,9 @@ constexpr int VK_FORMAT_R8G8B8A8_UNORM = 7, VK_IMAGE_LAYOUT_GENERAL = 8, VK_IMAG
 constexpr int VK_IMAGE_USAGE_SAMPLED_BIT = 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT = 2;
 constexpr int VK_IMAGE_USAGE_STORAGE_BIT = 4, VK_IMAGE_USAGE_TRANSFER_SRC_BIT = 8;
 const uint32_t FG_SCALE_COMP_SPV[] = {123};
+const uint32_t FG_SCALE_PQ_COMP_SPV[] = {124, 125};   // (fg_scale.comp with FG_SCALE_PQ: an RGB10A2 destination)
+using VkFormat = int;
+constexpr int VK_FORMAT_A2B10G10R10_UNORM_PACK32 = 64;
 struct Img { VkImage image = 0; VkImageView view = 0; };
 struct Pipe { uint64_t set = 0, layout = 0, pipe = 0; };
 struct VkSamplerCreateInfo {
@@ -34,6 +37,8 @@ struct VkSamplerCreateInfo {
 struct Offset { int x = 0, y = 0, z = 0; };
 struct Layers { int aspect = 0, level = 0, first = 0, count = 0; };
 struct VkImageBlit { Layers srcSubresource, dstSubresource; Offset srcOffsets[2], dstOffsets[2]; };
+struct Extent { uint32_t width = 0, height = 0, depth = 0; };
+struct VkImageCopy { Layers srcSubresource, dstSubresource; Offset srcOffset, dstOffset; Extent extent; };
 struct { int upscale = 0, sharpness = 0, framegen = 0; } opts;
 struct SpyMutex {
     bool held = false;
@@ -48,19 +53,23 @@ struct {
     uint32_t cropped_w = 0, cropped_h = 0, scaled_w = 0, scaled_h = 0;
 } fg;
 bool vkCmdPushDescriptorSetKHR = true;
-int pipe_calls = 0, sampler_calls = 0, image_calls = 0, dispatches = 0, blits = 0, logs = 0;
+int pipe_calls = 0, sampler_calls = 0, image_calls = 0, dispatches = 0, blits = 0, copies = 0, logs = 0;
 int destroyed_pipes = 0, destroyed_layouts = 0, destroyed_sets = 0, waits = 0, flushes = 0;
 bool pipe_fail = false, sampler_fail = false, image_fail = false;
 uint64_t next_handle = 100;
 uint32_t made_w = 0, made_h = 0, dispatched_w = 0, dispatched_h = 0;
-int made_usage = 0, dispatched_mode = -1;
+int made_usage = 0, made_format = 0, dispatched_mode = -1;
+uint64_t dispatched_pipe = 0;
 float dispatched_sharp = -1;
 VkImageView sampled_view = 0;
 VkImageBlit last_blit;
+VkImageCopy last_copy;
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<int> types, uint32_t push) {
-    CHECK(code == FG_SCALE_COMP_SPV && bytes == sizeof FG_SCALE_COMP_SPV && types.size() == 2 && push == 8);
+    const bool pq = code == FG_SCALE_PQ_COMP_SPV;   // (fg_scale's pipeline is 3; fg_scale_pq's, made after it, 5)
+    CHECK((pq ? bytes == sizeof FG_SCALE_PQ_COMP_SPV : code == FG_SCALE_COMP_SPV && bytes == sizeof FG_SCALE_COMP_SPV) &&
+          types.size() == 2 && push == 8);
     CHECK(*types.begin() == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && *(types.begin() + 1) == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-    ++pipe_calls; p.set = 1; p.layout = 2; p.pipe = pipe_fail ? 0 : 3; return !pipe_fail;
+    ++pipe_calls; p.set = 1; p.layout = 2; p.pipe = pipe_fail ? 0 : pq ? 5 : 3; return !pipe_fail;
 }
 int vkCreateSampler(int, const VkSamplerCreateInfo* s, void*, VkSampler* out) {
     CHECK(s->magFilter == VK_FILTER_LINEAR && s->minFilter == VK_FILTER_LINEAR);
@@ -79,8 +88,8 @@ void vkDeviceWaitIdle(int) {
 void device_wait_idle_locked() { queue_flush_locked(); vkDeviceWaitIdle(dev.device); }
 void drop_img(Img& i) { i = {}; }
 bool make_img(Img& i, uint32_t w, uint32_t h, int format, int usage) {
-    CHECK(w && h && format == VK_FORMAT_R8G8B8A8_UNORM);
-    ++image_calls; made_w = w; made_h = h; made_usage = usage;
+    CHECK(w && h && (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32));
+    ++image_calls; made_w = w; made_h = h; made_usage = usage; made_format = format;
     if (image_fail) { image_fail = false; i.image = ++next_handle; return false; } // image made, view failed
     i.image = ++next_handle; i.view = ++next_handle; return true;
 }
@@ -90,20 +99,26 @@ void vkCmdBlitImage(int, VkImage src, int, VkImage dst, int, int count, const Vk
     CHECK(src == 11 && dst && count == 1 && filter == VK_FILTER_NEAREST);
     ++blits; last_blit = *b;
 }
+void vkCmdCopyImage(int, VkImage src, int, VkImage dst, int, int count, const VkImageCopy* c) {
+    CHECK(src == 11 && dst && count == 1);
+    ++copies; last_copy = *c;
+}
 void pass(int, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>> b,
           uint32_t w, uint32_t h, const void* data, uint32_t bytes) {
-    CHECK(p.pipe == 3 && b.size() == 2 && b.begin()->first && b.begin()->second == 4 && bytes == 8);
+    CHECK((p.pipe == 3 || p.pipe == 5) && b.size() == 2 && b.begin()->first && b.begin()->second == 4 && bytes == 8);
     CHECK((b.begin() + 1)->first && !(b.begin() + 1)->second);
     struct PC { int mode; float sharp; } pc;
     std::memcpy(&pc, data, sizeof pc);
     ++dispatches; dispatched_mode = pc.mode; dispatched_sharp = pc.sharp;
-    dispatched_w = w; dispatched_h = h; sampled_view = b.begin()->first;
+    dispatched_w = w; dispatched_h = h; sampled_view = b.begin()->first; dispatched_pipe = p.pipe;
 }
 void logf(const char*, ...) { CHECK(dispatches > 0); ++logs; }
+VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw,
+                       uint32_t dh, bool pq = false);
 // PRODUCTION_FUNCTIONS
 void reset() {
     scale = {}; fg = {}; opts = {}; dev.push_descriptor = true; vkCmdPushDescriptorSetKHR = true;
-    pipe_calls = sampler_calls = image_calls = dispatches = blits = waits = flushes = 0;
+    pipe_calls = sampler_calls = image_calls = dispatches = blits = copies = waits = flushes = 0;
     destroyed_pipes = destroyed_layouts = destroyed_sets = 0;
     pipe_fail = sampler_fail = image_fail = false;
 }
@@ -154,5 +169,12 @@ int main() {
     CHECK(!scale.cropped.image && scale.cropped_w == 0 && scale.cropped_h == 0);
     CHECK(draw(crop, 1920, 1080)); CHECK(blits == 2 && !fg.init && !fg.thread_started);
     CHECK(logs == (std::getenv("RX_VK_UPSCALE_LOG") ? 1 : 0));
+    // (HeyListen, after Longshot a0dfd28b) Native HDR's picture (pq): scaled into RGB10A2 images by the PQ pipe, its crop copied
+    // (its 10-bit codes as they are), never blitted; then the SDR picture again makes RGBA8 images again
+    reset(); opts.upscale = 1;
+    CHECK(framegen_scale(1, 12, 11, 2560, 1440, crop, 1920, 1080, true));
+    CHECK(pipe_calls == 2 && dispatched_pipe == 5 && made_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && scale.pq);
+    CHECK(copies == 1 && blits == 0 && last_copy.srcOffset.x == 2500 && last_copy.extent.width == 60 && last_copy.extent.height == 40);
+    CHECK(draw(crop, 1920, 1080)); CHECK(dispatched_pipe == 3 && made_format == VK_FORMAT_R8G8B8A8_UNORM && !scale.pq && blits == 1);
     std::puts("PASS: production scaler works independently, caches/retries safely, and leaves interpolation uninitialized");
 }

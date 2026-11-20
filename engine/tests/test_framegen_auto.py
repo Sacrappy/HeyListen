@@ -35,6 +35,7 @@ PREFIX = r'''#include <algorithm>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 constexpr int kMaxMult = 8;
 struct { int framegen = 1; } opts;
+int framegen_now() { return opts.framegen; }   // (vk_framegen.cpp: the row's, as no DLSS FG top caps it here)
 static int refresh_mhz = 60000;
 int display_refresh_mhz() { return refresh_mhz; }
 '''

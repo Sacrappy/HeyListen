@@ -36,7 +36,7 @@ extern double hos_mouse_sens;
 
 /* The renderer's option ids this file reads, by number as 6 and 8 are (the gpu headers stay out of the host's own files;
    tests/test_mouse_native.py checks them against gpu/vk/vk_opt_ids.h and gpu/vk/vk_api.h) */
-enum { OPT_FIRST_PERSON = 91 /* HL_OPT_FIRST_PERSON */, OPT_CHEAT_CAMERA = 35 /* HOS_OPT_CHEAT_CAMERA */ };
+enum { OPT_FIRST_PERSON = 120 /* HL_OPT_FIRST_PERSON */, OPT_CHEAT_CAMERA = 35 /* HOS_OPT_CHEAT_CAMERA */ };
 
 enum { LIMITS_AT = 0x178, PITCH_AT = 0x18c, YAW_AT = 0x1a4, STATE_AT = 0x204 };
 #define LIVE_NS 150000000LL   /* (the hook ran this recently: the camera takes the mouse) */

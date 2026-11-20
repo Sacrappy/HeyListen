@@ -105,7 +105,7 @@ def main():
     need("if (p->idle_freed_epoch && mirror_epoch - p->idle_freed_epoch <= kLongIdle)" in mk and "p->remade++" in mk,
          "vk_memory.cpp: a mirror made again soon after it went counted")
     need("gpu_tail_note_late(c->late_value)" in mem and
-         mem.index("gpu_tail_note_late(c->late_value)") < mem.index("vk_timeline_wait(c->late_value);"),
+         mem.index("gpu_tail_note_late(c->late_value)") < mem.index("vk_timeline_wait_for(c->late_value"),
          "vk_memory.cpp: the late value noted before the wait")
 
     rep = read("vk_replay.cpp")

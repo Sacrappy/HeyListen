@@ -87,6 +87,7 @@ static void vkDestroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {}
 static std::vector<GuestPool> guest_pools;
 static std::map<uint64_t, Pool> imported;
 static std::deque<std::map<uint64_t, Pool>::node_type> retired_pools, evicted_pools;
+static std::atomic<int64_t> st_retired_walk_ns{0};   // (vk_memory.cpp: the time in the walks over retired_pools, for the imports line)
 static Pool* last_pool;
 static Pool* pool_cache[4096];
 static std::atomic<uint64_t> pools_gen{1};

@@ -3,7 +3,13 @@
 // window texture) copied, as it may be drawn over by the next one
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
+// (HeyListen) FG_PQ: the game's own HDR10 picture (Native HDR), PQ codes kept at 10 bits (RGB10A2): through RGBA8 they lost
+// two bits, banding in the dark and in the sky (vk_framegen.cpp ensure_size's pq)
+#ifdef FG_PQ
+layout(binding = 1, rgb10_a2) uniform writeonly image2D dst;
+#else
 layout(binding = 1, rgba8) uniform writeonly image2D dst;
+#endif
 layout(push_constant) uniform P { ivec2 offset; ivec2 size; } pc;
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);

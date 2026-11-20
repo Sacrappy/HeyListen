@@ -80,6 +80,10 @@ std::mutex nvn_pools_mu;
 std::map<uint64_t, NvnPool> nvn_pools;
 std::unordered_set<uint32_t> cpu_pages, skipped_pages;
 int64_t st_lazy_cpu = 0;
+// (issue 50: the pool rule stays off here: the two helpers are compared as before, the rule is tests/test_wb_pool_eager.py's)
+namespace wb_pool_eager { inline bool cpu_write_makes_eager(bool, bool) { return false; } }
+static bool wb_pool_eager_on() { return false; }
+static void nvn_pools_eager(uint64_t, uint64_t, bool) {}
 ''' + pool_at + "\n" + one + "\n" + bits.group(0) + "\n" + many + r'''
 static void stamp(uint64_t p, uint32_t g) {
     auto& c = gen_chunks[p / kChunkPages];

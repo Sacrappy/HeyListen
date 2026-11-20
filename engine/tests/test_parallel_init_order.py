@@ -86,11 +86,14 @@ def main():
         if call not in start or start.index(call) < start.index("for (Frame& f : frames)") or                 "return false" in start[start.index(call) + len(call):]:
             raise SystemExit("FAIL: replay_start does not make the init pools last (a later failure would leave them made)")
     inc = {
-        "init_upload.inc": cut(texture, "// ---- the recording's upload command buffer ----", "// ---- staging:"),
+        # (the Linux memory-pressure shortfall the cut upload code reads: linux_pressure_shortfall's two counters)
+        "init_upload.inc": "\n".join(cut(texture, "std::atomic<uint64_t> " + n, "\n") for n in ("linux_shortfall_bytes", "linux_shortfall_seq"))
+        + "\n" + cut(texture, "// ---- the recording's upload command buffer ----", "// ---- staging:"),
         "init_create.inc": create,
         "init_scratch.inc": block(texture, "bool bc_scratch_layout("),
         "init_hooks.inc": "\n".join(hooks),
         "init_recording.inc": block(replay, "struct Recording {") + ";",
+        "init_barrier.inc": block(replay, "void host_read_barrier(VkCommandBuffer cmd) {"),   # (each segment's recording ends with it)
         "init_jobs.inc": jobs,
         "init_pools.inc": "\n".join(block(replay, m) for m in ("void init_pools_destroy() {", "bool init_pools_make(")) if have_pools else "",
         "init_fatal.inc": block(replay, "[[noreturn]] void replay_fatal(") if have_seg_init else "",

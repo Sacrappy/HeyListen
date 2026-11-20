@@ -10,6 +10,9 @@
    vreg 0 again after the game's load, the solver's line sets x1 again after the game's cut.
 
    Both act only while the host publishes the frame's seconds (hos_frame_seconds_bits: a cap above 60 with the step hooks in).
+   Also (Longshot d30b9479 and 10010630, both by CraftyCorvid): HL_DRIVE_HOOK, Link's driven body's target while he pulls himself up a
+   ledge, and HL_SONG_HOOK, the ocarina playbacks' note flag once a note (host/oot_high_fps.h has both). HOS_FPS_LEDGE=0 and
+   HOS_FPS_SONG=0 leave the game's.
    HOS_FPS_SOUND=0: the sound job every frame with the game's step; HOS_FPS_SOLVER=0: the game's solver count (comparisons;
    HeyListen's, upstream has no switch). HOS_FPS_LOG (set): what they do, every 600 calls. */
 #include "hl_host.h"
@@ -26,6 +29,9 @@ HL_FLOOR_HOOK(8015d490, "923be46f8950ebcd", "L_8015dad4");    /* Temple's barge:
 HL_FLOOR_HOOK(838baa40, "a40b3f20377e9b73", "L_838baf24");
 HL_SOLVER_HOOK(838ceb80, "c4203f2465e06081");   /* the solver's step count, the two places the game sets it */
 HL_SOLVER_HOOK(838cfc10, "228fd7a71a1ca0f0");
+HL_DRIVE_HOOK(804f5030, "c502d681942b9169");    /* a rigid body's update before the physics step: Link's driven body's target (Longshot d30b9479) */
+HL_SONG_HOOK(832b2af0, "46558136b433148c");     /* the song just played, and the ocarina's other melody playback: the note flag */
+HL_SONG_HOOK(832b2dc0, "828538cb182b748e");     /* (Longshot 10010630) */
 
 extern volatile uint32_t hos_frame_seconds_bits;   /* (hl_step.c: the frame's seconds, 0 at a cap of 60) */
 
@@ -57,6 +63,9 @@ static uint64_t bgm_flags_at;   /* (the guest address of the music manager's cha
 static uint8_t bgm_held;        /* (the flags seen on frames the gate held the job, since the update last ran; under sound_lock) */
 /* shortcut (upstream's): one bit set on two held frames between runs is handled once (bit 6 then counts down once) */
 static uint8_t bgm_run;         /* (those, handed to the update's run: its own thread) */
+static long long sound_job_runs;   /* (phase 0's runs, for the song playbacks' note flag; under sound_lock) */
+static OotSongCue song_cue[2];     /* (each playback's last read of it; under sound_lock) */
+static long long cue_reads, cue_held;   /* (HOS_FPS_LOG's counts, under sound_lock) */
 
 /* f_80435300's head: phase w2, slot the guest address of the pointer to the object whose +0x10 is the game step (the job's own
    load). 0: the job returns at once */
@@ -73,6 +82,7 @@ int hos_oot_sound_gate(Ctx *c, uint32_t phase, uint64_t slot) {
     AcquireSRWLockExclusive(&sound_lock);
     const int run = oot_sound_gate(&sound_gate, phase, step, t);
     if (!run && bgm_flags_at) bgm_held |= *(const uint8_t *)GP(bgm_flags_at);   /* (what the update would have read now) */
+    if (run && phase == 0) sound_job_runs++;
     if (phase == 0 && fps_log()) {
         sound_runs += run;
         if (!(++sound_calls % 600)) ran = sound_runs, sound_runs = 0;
@@ -82,6 +92,27 @@ int hos_oot_sound_gate(Ctx *c, uint32_t phase, uint64_t slot) {
         hos_log("oot: sound job ran %lld of the last 600 frames (step %.3f%s)", ran, step,
                 oot_sound_partial(step, t) ? ", held to 60 Hz" : "");
     return run;
+}
+
+/* After f_832b7b50 in a song's playback (site 0: f_832b2af0, the song just played; 1: f_832b2dc0, the ocarina's other melody
+   playback): game, its result (bit 0: the note flag is set). Above a cap of 60, bit 0 cleared when the flag was read set before
+   and the sound job has not run since (host/oot_high_fps.h). HOS_FPS_SONG=0: the game's */
+static int song_timed(void) {
+    static int on = -1;
+    return __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED) != 0 && switched(&on, "HOS_FPS_SONG");
+}
+uint64_t hos_oot_song_cue(uint32_t site, uint64_t game) {
+    const int t = song_timed();
+    long long held = -1;
+    AcquireSRWLockExclusive(&sound_lock);
+    const int cue = oot_song_cue(&song_cue[site & 1], (int)(game & 1), sound_job_runs, t);
+    if (t && fps_log()) {
+        cue_held += (int)(game & 1) && !cue;
+        if (!(++cue_reads % 600)) held = cue_held, cue_held = 0;
+    }
+    ReleaseSRWLockExclusive(&sound_lock);
+    if (held >= 0) hos_log("oot: a song's playback read its note flag set again before the sound job ran %lld of the last 600 reads", held);
+    return cue ? game : game & ~(uint64_t)1;
 }
 
 /* The step f_80435300's phase 0 hands to the sound engine (its float's bits) */
@@ -177,4 +208,55 @@ int hos_oot_floor_carry_slow(uint32_t inv_dt_bits, uint64_t slot) {
                     (long long)k, (long long)n, oot_bits_float(inv_dt_bits), oot_bits_float(frame));
     }
     return slow;
+}
+
+/* Link's driven body's target (f_804f5030 on its path for a body driven to a target: host/oot_high_fps.h has why; Longshot
+   d30b9479 by CraftyCorvid). HOS_FPS_LEDGE=0: the game's target. */
+static int ledge_timed(void) {
+    static int on = -1;
+    return frame_timed() && switched(&on, "HOS_FPS_LEDGE");
+}
+static volatile uint64_t link_body;      /* (Link's rigid body: hos_oot_note_link, from his update) */
+static volatile uint32_t link_updates;   /* (Link's updates, counted there: a carry needs the update before) */
+static OotDriveCarry drive_carry;        /* (under drive_lock) */
+static SRWLOCK drive_lock = SRWLOCK_INIT;
+
+/* Link's update (host/hos_main.c, hos_oot_lift_player): his components (actor +624); their +0x50, +0x20, +0x10, +8 is his
+   physics character, whose +0x20 is his rigid body. Each pointer is checked to be in guest memory. The count of his updates
+   goes first, whatever the walk finds */
+void hos_oot_note_link(uint64_t components) {
+    __atomic_add_fetch(&link_updates, 1, __ATOMIC_RELAXED);
+    uint64_t p = components;
+    static const uint32_t walk[5] = {0x50, 0x20, 0x10, 8, 0x20};
+    for (int i = 0; i < 5; i++) p = p >= HOS_HEAP_BASE && hos_guest_range(p + walk[i], 8) ? G64(p + walk[i]) : 0;
+    if (p >= HOS_HEAP_BASE && hos_guest_range(p + 0x8c, 0x24)) __atomic_store_n(&link_body, p, __ATOMIC_RELAXED);
+}
+
+/* f_804f5030, on its path for a body driven to a target, before it reads the target: controller x20 (its target at +0x3c, its
+   flags at +0x100), body x23 or x24 (its position at +0x8c, +0x9c, +0xac), slot the guest address of the pointer to the
+   game's time object (its +0x10 the frame's step) */
+void hos_oot_drive_target(uint64_t controller, uint64_t body, uint64_t slot) {
+    if (!body || body != __atomic_load_n(&link_body, __ATOMIC_RELAXED)) return;
+    const uint64_t object = G64(slot);
+    const uint64_t time = object ? G64(object) : 0;
+    const float step = time ? oot_bits_float(*(const uint32_t *)GP(time + 0x10)) : 0.0f;
+    const int driven = ledge_timed() && step > 0.0f && step < 1.0f && (G64(controller + 0x100) & 0x180) == 0x180;
+    float at[3], target[3], game[3];
+    memcpy(&at[0], GP(body + 0x8c), 4);
+    memcpy(&at[1], GP(body + 0x9c), 4);
+    memcpy(&at[2], GP(body + 0xac), 4);
+    memcpy(target, GP(controller + 0x3c), sizeof target);
+    memcpy(game, target, sizeof game);
+    AcquireSRWLockExclusive(&drive_lock);
+    oot_drive_carry(&drive_carry, body, __atomic_load_n(&link_updates, __ATOMIC_RELAXED), driven, at, target);
+    ReleaseSRWLockExclusive(&drive_lock);
+    if (!driven || !memcmp(game, target, sizeof game)) return;
+    memcpy(GP(controller + 0x3c), target, sizeof target);
+    if (fps_log()) {
+        static volatile LONG64 calls;
+        if (InterlockedIncrement64(&calls) % 600 == 0)
+            hos_log("oot: Link's driven body: its target carried %.4f m more than the game's (step %.3f)",
+                    sqrtf((target[0] - game[0]) * (target[0] - game[0]) + (target[1] - game[1]) * (target[1] - game[1]) +
+                          (target[2] - game[2]) * (target[2] - game[2])), step);
+    }
 }

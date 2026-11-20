@@ -836,11 +836,27 @@ static int short_sleep_how(const char *asked, int posix) {
     if (asked) return asked[0] && asked[0] != '0' ? 2 : 0;
     return posix ? 1 : 0;
 }
+/* (longshot 11-18, #1663) A yield gives up the virtual core only, not the processor too (HOS_OS_YIELD=1: SwitchToThread
+   as well, as before). OoT's job system yields after every job and every actor callback. On a PC of 4 cores in Castle
+   Town's market the job threads' CPU time was about their running time plus their time inside SwitchToThread (the six
+   BaseProc executors 107 % of a core measured, 45.5 % of it running, 51.6 % in SwitchToThread): kernel time handing the
+   processor to another thread and taking it back, about 0.75 of the four processors over the job threads. On 4 cores
+   their frames were 2.1 % and 1.7 % shorter without it; on 16 cores no difference. hos_vcore_yield already hands the
+   virtual core to a waiting game thread of better or equal priority, which is what the game's yield asks for, and the OS
+   still moves threads between processors at the end of their time slices. */
+static int os_yield(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("HOS_OS_YIELD");
+        v = e && e[0] && e[0] != '0';
+    }
+    return v;
+}
 /* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) guest: the game's own sleep */
 static void sleep_away(int64_t ns, int guest) {
     if (ns <= 0) {
         hos_vcore_yield();
-        SwitchToThread();
+        if (os_yield()) SwitchToThread();
         return;
     }
     const int away = hos_vcore_away();
@@ -1017,7 +1033,7 @@ HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
 
 HLE(_ZN2nn2os11YieldThreadEv) {
     hos_vcore_yield();
-    SwitchToThread();
+    if (os_yield()) SwitchToThread();   /* (longshot 11-18, #1663: the virtual core only, HOS_OS_YIELD=1: as before) */
 }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
 void hos_sleep_logged(int64_t ns, uint64_t lr) {

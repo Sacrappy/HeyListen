@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 15
+#define MKWVK_API_VERSION 18
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -44,9 +44,10 @@ enum { HOS_PAD_TOUCHPAD = HOS_PAD_N };
    touchpad's click. Saved as pad_menu=<a>,<b>. A combination held does not reach the game) */
 enum { HOS_BTN_OPEN_MENU = 100 };
 enum { HOS_BIND_PAD, HOS_BIND_KEY };
-/* (hookshot) the controller faces of the button prompts (host/prompts.c): the Switch, then nx2/prompt_faces.py FACES' order;
-   the Button prompts row's value is one more (0 Auto) */
-enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_N };
+/* (hookshot) the controller faces of the button prompts (host/prompts.c): the Switch, then nx2/prompt_faces.py FACES' order, then
+   the keyboard's (nx2/prompt_keys.py: the keys bound, not the pad inputs); the Button prompts row's value is one more (0 Auto) */
+enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_KEYBOARD,
+       HOS_PROMPT_N };
 /* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions */
 enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY_MOVE_RIGHT, HOS_KEY_CAM_UP,
        HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_N };
@@ -153,6 +154,21 @@ typedef struct MkwVkHost {
        for, then the game stops, as for the host's own allocations (host/mkw_glue.c hos_alloc_failed). what names it in the
        log. Does not return */
     void (*out_of_memory)(const char *what);
+    /* (version 16) the only Vulkan device is a software renderer (llvmpipe, lavapipe, SwiftShader: the GPU's own driver is missing;
+       gpu/vk/vk_main.cpp pick_device, RX_VK_ALLOW_CPU=1 runs on it anyway): the host shows the message (text: what is wrong and
+       what to install, UTF-8) in a window, unless it has none (HOS_HEADLESS), and ends the game with exit code 3, as for no
+       usable Vulkan in a --prepare-shaders run (which the back end does not ask this for). Does not return */
+    void (*no_usable_gpu)(const char *text);
+    /* (version 18, the detailed performance profile: gpu/vk/profile_run.cpp, host/hos_profile.c) which kind of code a sampled program
+       counter in the executable is in, asked by the sampler thread once the sampled thread runs again: the bucket (0 the game's lifted
+       code, 1 the native engine, 3 the host, 4 audio: gpu/vk/profile_report.h's Module) and in *key the lifted function's guest
+       address, else the function's offset in the executable */
+    int (*profile_pc)(uintptr_t pc, uint64_t *key);
+    /* (version 18) the executable's build id (the symbol tables' identity: PE fields hashed), 0 when unknown */
+    uint64_t (*build_id)(void);
+    /* (version 18) the thread ids (the OS's) of the guest's own threads, at most max: their names are the game's, so the profile
+       tells their role (the game) from this. Returns how many */
+    int (*profile_threads)(uint32_t *tids, int max);
 } MkwVkHost;
 enum {
     MKWVK_TRACE_WRITEBACK = 1,     /* a mirror's GPU writes copied into guest memory (in a submission) */

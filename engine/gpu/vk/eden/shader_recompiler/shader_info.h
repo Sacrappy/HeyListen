@@ -279,7 +279,9 @@ struct MeshInfo {
 
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
-    static constexpr size_t MAX_CBUFS{18};
+    // (HeyListen, after Longshot 79a34381) 20: the guest's banks, and past them the renderer's own (ir_opt/psychov35.h
+    // kSettingsBank, 19)
+    static constexpr size_t MAX_CBUFS{20};
     // (hookshot, as Lichii #434: 64. Fritchii's pass binds every candidate pointer of an ambiguous access; the back end's
     // layouts are built from the list, gpu/vk/vk_draw.cpp ensure_layout)
     static constexpr size_t MAX_SSBOS{64};

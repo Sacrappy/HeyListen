@@ -24,6 +24,7 @@
 #include "vk_framegen.h"
 #include "vk_internal.h"
 #include "gpu_choice.h"
+#include "present_mode.h"
 #include "sparse_queue.h"
 #include "vk_menu.h"
 #include "perf_report.h"
@@ -35,6 +36,7 @@
 #include "vk_progress.h"
 #include "mesh_mode.h"
 #include "vk_tl_clock.h"   // (RX_VK_TL: the timeline's host time domain)
+#include "vk_push_fix.h"
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -133,6 +135,100 @@ static void new_refused() {
 
 namespace {
 
+// (Hookshot b9b48dfd, pixl27; issue 43) A driver that faults in vkCreateShaderModule. On an RX 570 (Polaris, AMD's driver 2.0.220 and
+// 2.0.279) the game closed with no message during its first shader preparation, one crash line per preparation worker. The shader
+// translator calls vkCreateShaderModule (vk_shader.cpp), which no guard covered (pipelines have guarded_graphics / guarded_compute,
+// vk_draw.cpp's own calls have guarded_shader_module). Its pointer goes through this guard now: a fault is that shader failing (the
+// translator takes a null module for a failed program), logged with the SPIR-V kept beside the game (the first two), and said once in
+// a box. RX_VK_NO_MODULE_GUARD=1: the driver's pointer as before
+#ifdef _WIN32
+PFN_vkCreateShaderModule driver_create_shader_module = nullptr;
+std::atomic<int> module_faults{0};
+__declspec(noinline) VkResult module_call(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a,
+                                          VkShaderModule* m, int* faulted) {
+    __try {
+        return driver_create_shader_module(d, ci, a, m);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION ||
+                        GetExceptionCode() == EXCEPTION_INT_DIVIDE_BY_ZERO ? 1 : 0) {
+        *faulted = 1;
+        return VK_ERROR_UNKNOWN;
+    }
+}
+void module_fault(const VkShaderModuleCreateInfo* ci) {
+    const int n = ++module_faults;
+    char saved[MAX_PATH + 48] = "";
+    if (n <= 2 && ci && ci->pCode && ci->codeSize) {   // (the SPIR-V the driver could not take: spirv-val / spirv-dis it here)
+        char path[MAX_PATH];
+        std::string dir(path, game_module_path(path, MAX_PATH));
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        snprintf(saved, sizeof saved, "%sheylisten_driver_fault_%d.spv", dir.c_str(), n);
+        if (FILE* f = fopen(saved, "wb")) fwrite(ci->pCode, 1, ci->codeSize, f), fclose(f);
+        else saved[0] = 0;
+    }
+    if (n <= 8 || (n & (n - 1)) == 0)
+        logf("vk: THE GRAPHICS DRIVER CRASHED reading a shader (vkCreateShaderModule, %zu bytes of SPIR-V%s%s): it is left out "
+             "(%d so far)", ci ? (size_t)ci->codeSize : 0, saved[0] ? ", kept as " : "", saved, n);
+    if (n != 1 || dev.offscreen || getenv("HOS_HEADLESS")) return;
+    std::thread([name = std::string(dev.props.deviceName), old = !dev.mesh_shader] {
+        std::string text = "The graphics driver of your " + name + " crashed while HeyListen handed it one of the game's shaders. "
+            "HeyListen leaves such shaders out and goes on, but parts of the picture may be missing, and the driver may fail again.";
+        if (old)
+            text += "\n\nThis card has no mesh shaders and is below what HeyListen supports (NVIDIA GeForce RTX 20 series or newer, "
+                    "AMD Radeon RX 6000 series or newer, or Intel Arc). Updating its driver is worth a try, but it may not run "
+                    "the game.";
+        text += "\n\nIf you report it on HeyListen's GitHub page, please attach the log and the heylisten_driver_fault_1.spv file "
+                "from the game folder.";
+        MessageBoxA(nullptr, text.c_str(), "HeyListen: graphics driver", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+    }).detach();
+}
+VKAPI_ATTR VkResult VKAPI_CALL guarded_create_shader_module(VkDevice d, const VkShaderModuleCreateInfo* ci,
+                                                            const VkAllocationCallbacks* a, VkShaderModule* m) {
+    int faulted = 0;
+    const VkResult r = module_call(d, ci, a, m, &faulted);
+    if (faulted) {
+        if (m) *m = VK_NULL_HANDLE;
+        module_fault(ci);
+    }
+    return r;
+}
+void guard_shader_modules() {
+    if (getenv("RX_VK_NO_MODULE_GUARD") || !vkx::vkCreateShaderModule) return;
+    driver_create_shader_module = vkx::vkCreateShaderModule;
+    vkx::vkCreateShaderModule = guarded_create_shader_module;
+}
+#else
+void guard_shader_modules() {}
+#endif
+
+// (hookshot, issue 640) The mesh shader fallback's task programs read the task payloads' address from the push constants by the
+// member's byte offset (64) where SPIR-V takes the member's index (3): an access chain past the block's last member. Such a module
+// is invalid, and NVIDIA's compiler faulted on it (vkCreateComputePipelines, "a fault in the driver", 10 ms). A GTX 1060's and a
+// GTX 1070's logs ended there: their first task + mesh draw (a5da9f84b72d1471, Kokiri Forest after a save is loaded) "could not be
+// made", the next fallback compile never returned, and the picture stayed black with the game running behind it. Measured with
+// RX_VK_FORCE_MESH_FALLBACK=1 on an RTX 3060 Ti: the same fault on a5da9f84b72d1471, then the render thread's last line. The
+// translator makes them so, and the program caches players have keep them: here, as each module is made, such an index becomes
+// the index of the member at that offset (vk_push_fix.h). Only on a GPU that runs the fallback. RX_VK_NO_PUSH_FIX=1: the modules
+// as they are
+PFN_vkCreateShaderModule unfixed_create_shader_module = nullptr;
+std::atomic<int> push_fixes_told{0};
+VKAPI_ATTR VkResult VKAPI_CALL fixing_create_shader_module(VkDevice d, const VkShaderModuleCreateInfo* ci,
+                                                           const VkAllocationCallbacks* a, VkShaderModule* m) {
+    std::vector<uint32_t> w;
+    const size_t fixed = ci && ci->pCode && !(ci->codeSize % 4) ? push_offset_fix(ci->pCode, ci->codeSize / 4, w) : 0;
+    if (!fixed) return unfixed_create_shader_module(d, ci, a, m);
+    if (push_fixes_told++ < 4)
+        logf("vk: fallback: %zu push constant access%s by byte offset made by member index (issue 640)", fixed, fixed == 1 ? "" : "es");
+    VkShaderModuleCreateInfo with = *ci;
+    with.pCode = w.data();
+    with.codeSize = w.size() * 4;
+    return unfixed_create_shader_module(d, &with, a, m);
+}
+void fix_fallback_modules() {
+    if (!dev.mesh_fallback || getenv("RX_VK_NO_PUSH_FIX") || !vkx::vkCreateShaderModule) return;
+    unfixed_create_shader_module = vkx::vkCreateShaderModule;   // (the guard's, or the driver's)
+    vkx::vkCreateShaderModule = fixing_create_shader_module;
+}
+
 bool has_extension(const std::vector<VkExtensionProperties>& all, const char* name) {
     for (const auto& e : all)
         if (!std::strcmp(e.extensionName, name)) return true;
@@ -181,6 +277,11 @@ bool create_instance() {
     }
     ci.enabledExtensionCount = (uint32_t)ext_list.size();
     ci.ppEnabledExtensionNames = ext_list.data();
+    // (Longshot c392df3a sets Mesa's Intel driconf shader_spilling_rate to 2 here, before the driver loads. Not ported: the
+    // renderer sets no environment variable from here, because a `setenv` while another thread may be in `getenv` is undefined,
+    // and the switches that need it are decided in the host before its first thread. A player can still set
+    // shader_spilling_rate=2 themselves; create_device logs it, and the README's fixes line says what it is worth on Mesa's
+    // Intel compiler)
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
     if (getenv("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
@@ -192,6 +293,14 @@ bool create_instance() {
     return true;
 }
 
+static_assert(gpu_choice::TYPE_CPU == (int)VK_PHYSICAL_DEVICE_TYPE_CPU && gpu_choice::TYPE_DISCRETE == (int)VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
+              gpu_choice::TYPE_INTEGRATED == (int)VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+              gpu_choice::TYPE_VIRTUAL == (int)VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU && gpu_choice::TYPE_OTHER == (int)VK_PHYSICAL_DEVICE_TYPE_OTHER,
+              "gpu_choice.h's device types are Vulkan's");
+
+// (the one device there is is a software renderer, and RX_VK_ALLOW_CPU is not set: pick_device fails, and mkwvk_init says why)
+static std::string software_only_name;
+
 bool pick_device() {
     menu_init();
     uint32_t n = 0;
@@ -199,14 +308,24 @@ bool pick_device() {
     std::vector<VkPhysicalDevice> all(n);
     vkEnumeratePhysicalDevices(dev.instance, &n, all.data());
 
+    // (a software renderer, VK_PHYSICAL_DEVICE_TYPE_CPU: Mesa's llvmpipe and lavapipe, SwiftShader. Without the GPU's own Vulkan driver
+    // (Mesa's RADV or ANV, a vendor's) the loader lists only that one, and the game started on it and crashed (a Ryzen 5 5600H with
+    // llvmpipe, v0.4.2). Never taken while a GPU is there, nor alone, unless RX_VK_ALLOW_CPU=1 (developers: a run with no GPU))
+    const bool allow_cpu = gpu_choice::allow_cpu(getenv("RX_VK_ALLOW_CPU"));
+    std::vector<gpu_choice::Candidate> cands(n);
+    std::vector<std::string> names(n);
     std::vector<uint32_t> valid_gpus;
     gpu_device_names.clear();
+    software_only_name.clear();
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(all[i], &p);
-        logf("vk: device %u: %s, Vulkan %u.%u, driver %#x, type %d", i, p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
-             VK_API_VERSION_MINOR(p.apiVersion), p.driverVersion, (int)p.deviceType);
-        if (p.apiVersion >= VK_API_VERSION_1_3) {
+        const bool software = gpu_choice::is_software((int)p.deviceType);
+        logf("vk: device %u: %s, Vulkan %u.%u, driver %#x, type %d%s", i, p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
+             VK_API_VERSION_MINOR(p.apiVersion), p.driverVersion, (int)p.deviceType, software ? " (a software renderer)" : "");
+        cands[i] = {p.apiVersion >= VK_API_VERSION_1_3, (int)p.deviceType, p.driverVersion};
+        names[i] = p.deviceName;
+        if (gpu_choice::usable(cands[i], allow_cpu)) {
             valid_gpus.push_back(i);
             gpu_device_names.push_back(p.deviceName);
         }
@@ -219,8 +338,6 @@ bool pick_device() {
     // (amdvlk64.dll 32.0.11036.4002) crashed in its shader compiler (0xc0000409) on the game's compute pipelines while
     // the card's 32.0.32015.7029 built them. The same kind of GPU twice: the one with the newer driver wins.
     // RX_VK_DEVICE=<n> or opts.gpu_device: that device, as listed in the log
-    int best = -1, best_score = -1;
-    uint32_t best_driver = 0;
     int target_raw_idx = -1;
     if (const char* want = getenv("RX_VK_DEVICE")) {
         if (*want) target_raw_idx = atoi(want);
@@ -228,36 +345,31 @@ bool pick_device() {
         target_raw_idx = (int)valid_gpus[k];
     }
 
-    for (uint32_t i : valid_gpus) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(all[i], &p);
-        if (target_raw_idx >= 0) {
-            if ((int)i == target_raw_idx) best = (int)i, best_score = 3;
-            continue;
-        }
-        const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
-                          p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
-        if (score > best_score || (score == best_score && p.driverVersion > best_driver))
-            best = (int)i, best_score = score, best_driver = p.driverVersion;
+    const gpu_choice::Pick pick = gpu_choice::choose(cands.data(), (int)n, target_raw_idx, allow_cpu);
+    if (pick.target_unavailable)
+        logf("vk: preferred device %d not available, lacks Vulkan 1.3 or is a software renderer (RX_VK_ALLOW_CPU=1 allows one), "
+             "falling back to auto selection", target_raw_idx);
+    for (uint32_t i = 0; i < n; i++)
+        if (gpu_choice::is_software(cands[i].type) && pick.device >= 0 && !allow_cpu)
+            logf("vk: device %u (%s) is a software renderer: not used while a GPU is there", i, names[i].c_str());
+    if (pick.device < 0 && pick.software_only) {
+        software_only_name = names[0];
+        logf("vk: only a software renderer was found (%s), which cannot run the game: the GPU's Vulkan driver is missing, or "
+             "hidden from this process (Linux: Mesa's Vulkan driver for the GPU, such as mesa-vulkan-drivers, vulkan-radeon or "
+             "vulkan-intel, or NVIDIA's; Windows: the driver from AMD, NVIDIA or Intel). RX_VK_ALLOW_CPU=1 runs on it anyway",
+             names[0].c_str());
+        return false;
     }
-    if (best < 0 && target_raw_idx >= 0) {
-        logf("vk: preferred device %d not available or lacks Vulkan 1.3, falling back to auto selection", target_raw_idx);
-        for (uint32_t i : valid_gpus) {
-            VkPhysicalDeviceProperties p;
-            vkGetPhysicalDeviceProperties(all[i], &p);
-            const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
-                              p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
-            if (score > best_score || (score == best_score && p.driverVersion > best_driver))
-                best = (int)i, best_score = score, best_driver = p.driverVersion;
-        }
-    }
-    if (best < 0) {
+    if (pick.device < 0) {
         logf("vk: no Vulkan 1.3 GPU");
         return false;
     }
-    dev.physical = all[best];
+    if (gpu_choice::is_software(cands[pick.device].type))
+        logf("vk: RX_VK_ALLOW_CPU: running on the software renderer %s: far too slow to play, and it can crash", names[pick.device].c_str());
+    dev.physical = all[pick.device];
     vkGetPhysicalDeviceProperties(dev.physical, &dev.props);
     vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
+    menu_first_run_model(dev.props.vendorID, dev.props.deviceID);   // (the DLSS model row's first-run default, by the GPU)
     return true;
 }
 
@@ -297,9 +409,10 @@ bool create_device() {
     // (RX_VK_FORCE_MESH_FALLBACK=1, a test: mesh shaders not used where they are, so the no-mesh fallback the GTX 10xx and RX 5000
     // cards run (issue 640) can be tried on any GPU)
     // (hookshot, issue 2245; the switch is Longshot's 8694e3c6) mesh_mode.h: RX_VK_MESH_SHADERS=native or compute chooses, unset is
-    // Automatic, and RX_VK_FORCE_MESH_FALLBACK=1 is Compute over it. Automatic is the compute path on Linux with an RDNA 2 AMD GPU (RADV, mesh_mode.h's ID list; RDNA 3 and 4 keep native):
-    // its native task/mesh draws lose the GPU (an RX 6800, issue 51). native keeps them there. A GPU without mesh shaders runs the
-    // compute path whatever the choice
+    // Automatic, and RX_VK_FORCE_MESH_FALLBACK=1 is Compute over it. Automatic is the compute path on Linux with an RDNA 2 or
+    // RDNA 3.5 AMD GPU (RADV, mesh_mode.h's ID list: its native task/mesh draws lose the GPU on RDNA 2, issue 51, and draw white
+    // foliage and glows on RDNA 3.5, issue 81; other RDNA 3 and 4 keep native): native keeps them there. A GPU without mesh
+    // shaders runs the compute path whatever the choice
 #ifdef _WIN32
     constexpr bool linux_os = false;
 #else
@@ -351,6 +464,11 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
     }
     const bool fadd_wanted = native_fadd_wanted(fadd_env, fadd_driver.driverID, dev.props.deviceID, dev.props.driverVersion);
+    // (Longshot c392df3a: says the spilling rate Mesa's Intel compiler (ANV) will use. The renderer does not set it here: see
+    // create_instance's note. The driverID alone tells the driver, so no platform guard is needed)
+    if (fadd_driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && getenv("shader_spilling_rate"))
+        logf("vk: Mesa's Intel compiler spills at rate %s (driconf shader_spilling_rate: set by the player; 2 was measured as "
+             "the best on an Iris Xe, Longshot c392df3a)", getenv("shader_spilling_rate"));
     bool atomic_float = false;
     if (fadd_wanted) optional(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME, atomic_float);
     optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)
@@ -380,6 +498,7 @@ bool create_device() {
     }
 #endif
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
+    dlss_fg_device_extensions(want, exts);   // (and DLSS Frame Generation's, which NGX names: vk_dlss.cpp)
     bool fsr_descriptor_buffer = false;   // (hookshot, linux: only with a Vulkan FSR 4 library beside the game, vk_fsr4.cpp)
     if (fsr4_wants_descriptor_buffer()) optional(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, fsr_descriptor_buffer);
     reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
@@ -543,6 +662,7 @@ bool create_device() {
     dev.null_descriptor = dev.null_descriptor && robust2.nullDescriptor;
     pv.transformFeedbackPreservesProvokingVertex = VK_FALSE;
     dev.provoking_vertex = dev.provoking_vertex && pv.provokingVertexLast;
+    dev.vertex_divisor = dev.vertex_divisor && vdiv.vertexAttributeInstanceRateDivisor;   // (a divisor over 1 needs the feature, not only the extension; Longshot 89447c39)
     dev.conditional_rendering = dev.conditional_rendering && cond.conditionalRendering;
     dev.custom_border_color = dev.custom_border_color && border.customBorderColors && border.customBorderColorWithoutFormat;
     dev.depth_clip_control = dev.depth_clip_control && clip.depthClipControl;
@@ -658,6 +778,10 @@ bool create_device() {
 
 
     load_device(dev.device);
+    guard_shader_modules();   // (Hookshot b9b48dfd)
+    // (hookshot, issue 640) after the load, in front of the driver's: our own module guard (guarded_shader_module, vk_draw.cpp)
+    // calls the pointer this chains onto, so a module is made through both
+    fix_fallback_modules();
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
     dev.probe_queue = VK_NULL_HANDLE;
     if (q.queueCount >= 2) vkGetDeviceQueue(dev.device, dev.queue_family, 1, &dev.probe_queue);
@@ -678,6 +802,13 @@ bool create_device() {
         p2.pNext = &pp;
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         dev.max_push_descriptors = pp.maxPushDescriptors;
+    }
+    if (dev.vertex_divisor) {   // (Longshot b46d7732: a divisor is at most maxVertexAttribDivisor, VUID-...-divisor-01870)
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &vp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        dev.max_vertex_divisor = vp.maxVertexAttribDivisor;
     }
     return true;
 }
@@ -758,11 +889,16 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // (hookshot) the Insert menu's HDR: a 10-bit HDR10 surface when the display lists one (Windows: "Use HDR" on in its display
     // settings), the picture then written by framegen_hdr. Otherwise the SDR one above, said once
     dev.hdr = false;
+    // (HeyListen) whether the display lists one is looked at with the HDR row Off too: the menu says so, and shows its HDR rows only
+    // where HDR can run (menu_rows.h hdr_effective)
+    VkSurfaceFormatKHR hdr_fmt = fmt;
+    dev.hdr_listed = false;
+    for (const auto& f : formats)
+        if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+            f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+            hdr_fmt = f, dev.hdr_listed = true;
     if (opts.hdr) {
-        for (const auto& f : formats)
-            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
-                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
-                fmt = f, dev.hdr = true;
+        if (dev.hdr_listed) fmt = hdr_fmt, dev.hdr = true;
         static bool told;
         if (!told) {
             told = true;
@@ -784,27 +920,61 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     if (result != VK_SUCCESS || modes.empty())
         logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
-    if (!force_fifo) {
-        for (auto m : modes)
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-        // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
-        //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
-        //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
-        const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
-#ifdef _WIN32
-        if (want_immediate || mode == VK_PRESENT_MODE_FIFO_KHR)
-#else
-        if (want_immediate)
-#endif
-            for (auto m : modes)
-                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+    // (the Insert menu's V-Sync and V-Sync mode rows, RX_VK_FIFO and RX_VK_IMMEDIATE over them: present_mode.h)
+    unsigned offered = 0;
+    for (auto m : modes) {
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR) offered |= present_mode::kHasMailbox;
+        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) offered |= present_mode::kHasImmediate;
     }
+    dev.present_modes_offered = offered;
+    dev.present_modes_known = true;   // (the V-Sync rows say when they cannot have what they ask)
+    dev.swap_min_images = caps.minImageCount;
+    dev.swap_max_images = caps.maxImageCount;
+    present_mode::Input pin;
+    pin.row = opts.vsync;
+    pin.buffering = opts.vsync_mode;
+    const present_mode::VrrState vrr = vrr_resolved(true);   // (logs its choice and why, once for each change)
+    pin.vrr = vrr.active;
+    pin.env_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
+    pin.env_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    pin.offered = offered;
+#ifdef _WIN32
+    pin.windows = true;
+#endif
+    // (Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other monitor and other programs tear:
+    //  only asked for, by RX_VK_IMMEDIATE=1 or the row)
+    const present_mode::Mode picked = present_mode::pick(pin);
+    const VkPresentModeKHR mode = picked == present_mode::kMailboxMode ? VK_PRESENT_MODE_MAILBOX_KHR
+                                  : picked == present_mode::kImmediateMode ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                                            : VK_PRESENT_MODE_FIFO_KHR;
+    dev.vrr_active = vrr.active && !pin.env_fifo && !pin.env_immediate;
+    if (vrr.active && picked != present_mode::kFifo)
+        logf("vk: VRR: %s is used, the environment's choice: no FIFO", present_mode::mode_name(picked));
+    // (the V-Sync mode row's Mailbox, where there is none: AMD's Windows driver lists no MAILBOX. Said once, and the row's
+    // hint says it while it is chosen)
+    const bool want_mailbox = opts.vsync == present_mode::kOn && opts.vsync_mode == present_mode::kMailbox;
+    if (want_mailbox && picked != present_mode::kMailboxMode) {
+        if (pin.env_fifo || pin.env_immediate)
+            logf("vk: V-Sync: RX_VK_FIFO / RX_VK_IMMEDIATE decide the present mode: %s, not Mailbox", present_mode::mode_name(picked));
+        else if (!(offered & present_mode::kHasMailbox))
+            logf("vk: V-Sync: this surface offers no Mailbox: FIFO (triple buffering) is used");
+        else
+            logf("vk: V-Sync: VRR is on: FIFO, not Mailbox");
+    }
+    // (the image count: FIFO double 2, FIFO triple 3, Mailbox 3 (4 with frame generation); frame generation's images kept
+    // whatever the row says, then the surface's minImageCount/maxImageCount)
+    const present_mode::Images plan = present_mode::image_plan(pin, picked, framegen_on(), caps.minImageCount, caps.maxImageCount);
+    if (plan.framegen_raised)
+        logf("vk: V-Sync: frame generation needs %d images: %s asks for %d, %d used", plan.count,
+             present_mode::buffering_name(opts.vsync_mode), plan.want, plan.count);
+    if (plan.min_raised)
+        logf("vk: V-Sync: the surface asks for at least %u images%s: %d used", caps.minImageCount,
+             opts.vsync == present_mode::kOn && opts.vsync_mode == present_mode::kFifoDouble ? " (FIFO double buffering is not possible here)" : "",
+             plan.count);
+    if (plan.max_capped) logf("vk: V-Sync: the surface allows at most %u images: %d used", caps.maxImageCount, plan.count);
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
-    ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
-    if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+    ci.minImageCount = (uint32_t)plan.count;
     ci.imageFormat = fmt.format;
     ci.imageColorSpace = fmt.colorSpace;
     ci.imageExtent = {width, height};
@@ -889,10 +1059,14 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swap_rendered = std::move(rendered);
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
-    dev.present_mode_name = mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo";
+    dev.present_mode_name = mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate"
+                                                                                                                      : dev.vrr_active ? "fifo (VRR)" : "fifo";
     dev.swap_images = std::move(images);
-    logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
-         mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    // (one line: V-Sync On or Off, the mode the row asks for, the present mode and the images the swapchain has)
+    logf("vk: swapchain %ux%u, %u images, %s (V-Sync %s, %s%s)", width, height, n, present_mode::mode_name(picked),
+         opts.vsync == present_mode::kOn ? "On" : "Off",
+         opts.vsync == present_mode::kOn ? present_mode::buffering_name(opts.vsync_mode) : "no mode",
+         dev.vrr_active ? ", VRR" : "");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     return true;
@@ -1244,7 +1418,20 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
     }
-    if (!create_instance() || !pick_device() || !create_device()) return nullptr;
+    if (!create_instance()) return nullptr;
+    if (!pick_device()) {
+        // (only a software renderer: a builder's --prepare-shaders run just fails (exit 3, as with no Vulkan at all, and it has no
+        // one to show a window to); the game's run shows the window and ends, in the host: it must not fall back to WebGPU either)
+#ifdef _WIN32
+        constexpr bool windows = true;
+#else
+        constexpr bool windows = false;
+#endif
+        if (!software_only_name.empty() && !prepare_only() && h->no_usable_gpu)
+            h->no_usable_gpu(gpu_choice::software_only_text(software_only_name.c_str(), windows).c_str());
+        return nullptr;
+    }
+    if (!create_device()) return nullptr;
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
@@ -1305,4 +1492,172 @@ int display_refresh_mhz() {
     cached.store(mhz, std::memory_order_relaxed);
     return mhz;
 }
+} // namespace mkwvk
+
+namespace mkwvk {
+namespace {
+
+#ifdef _WIN32
+/// Whether the display the window is on lists a refresh range wide enough to be variable (FreeSync / G-Sync Compatible), from
+/// its EDID in the registry (Enum\DISPLAY\<id>\<instance>\Device Parameters\EDID). -1: not found. Windows' own VRR flag has no
+/// documented query outside DXGI's tearing support, which every modern GPU says yes to; the EDID range is the usable hint
+int display_variable(int* lo, int* hi) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (!main_window || !GetMonitorInfoW(MonitorFromWindow(main_window, MONITOR_DEFAULTTONEAREST), &mi)) return -1;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof dd;
+    for (DWORD i = 0; EnumDisplayDevicesW(mi.szDevice, i, &dd, 0); i++) {
+        std::wstring id = dd.DeviceID;   // (MONITOR\<hardware id>\{class guid}\<number>)
+        const size_t a = id.find(L'\\'), b = a == std::wstring::npos ? a : id.find(L'\\', a + 1);
+        if (b == std::wstring::npos) continue;
+        const std::wstring hw = id.substr(a + 1, b - a - 1), drv = id.substr(b + 1);
+        HKEY base = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, (L"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\" + hw).c_str(), 0, KEY_READ, &base) !=
+            ERROR_SUCCESS)
+            continue;
+        int result = -1;
+        wchar_t inst[128];
+        for (DWORD k = 0, n = 128; result < 0 && RegEnumKeyExW(base, k, inst, &n, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+             k++, n = 128) {
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(base, inst, 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
+            wchar_t driver[160];
+            DWORD bytes = sizeof driver - sizeof(wchar_t), type = 0;
+            if (RegQueryValueExW(key, L"Driver", nullptr, &type, (LPBYTE)driver, &bytes) == ERROR_SUCCESS && type == REG_SZ) {
+                driver[bytes / sizeof(wchar_t)] = 0;
+                HKEY par = nullptr;
+                unsigned char edid[512];
+                DWORD size = sizeof edid;
+                if (!_wcsicmp(driver, drv.c_str()) && RegOpenKeyExW(key, L"Device Parameters", 0, KEY_READ, &par) == ERROR_SUCCESS) {
+                    if (RegQueryValueExW(par, L"EDID", nullptr, nullptr, edid, &size) == ERROR_SUCCESS)
+                        result = present_mode::edid_variable(edid, (int)size, lo, hi);
+                    RegCloseKey(par);
+                }
+            }
+            RegCloseKey(key);
+        }
+        RegCloseKey(base);
+        if (result >= 0) return result;
+    }
+    return -1;
+}
+#endif
+
+std::atomic<bool> vrr_touched{false};   // (a state other than the default was made: the Off path leaves everything alone until then)
+
+} // namespace
+
+present_mode::VrrState vrr_resolved(bool fresh) {
+    using namespace present_mode;
+    static std::mutex mu;
+    static VrrState st;
+    static int64_t at = 0;
+    static std::atomic<int> logged_key{-1};
+    if (opts.vrr == kVrrOff && !vrr_touched.load(std::memory_order_relaxed)) return VrrState{};
+    std::lock_guard lk(mu);
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    // (cached: a row change shows within a quarter second, and the swapchain is made again then)
+    if (!fresh && at && now - at < 250) return st;
+    at = now;
+    VrrInput in;
+    in.row = opts.vrr;
+    in.fullscreen = opts.fullscreen != 0;
+    in.refresh_mhz = display_refresh_mhz();
+    in.env_forced = getenv("RX_VK_FIFO") != nullptr || getenv("RX_VK_IMMEDIATE") != nullptr;
+    int lo = 0, hi = 0;
+    in.detected = -1;
+#ifdef _WIN32
+    static int detected = -2, dlo = 0, dhi = 0;
+    static HMONITOR detected_for = nullptr;
+    const HMONITOR mon = main_window ? MonitorFromWindow(main_window, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (in.row == kVrrAuto && (detected == -2 || detected_for != mon)) detected = display_variable(&dlo, &dhi), detected_for = mon;
+    if (in.row == kVrrAuto) in.detected = detected, lo = dlo, hi = dhi;
+#endif
+    st = vrr_resolve(in);
+    if (st.active || st.popup || vrr_touched.load()) vrr_touched = true;
+#ifdef _WIN32
+    static bool popup_applied = false;
+    if (st.popup != popup_applied) {
+        popup_applied = st.popup;
+        // (host/display.c: the fullscreen window as a WS_POPUP that Windows can flip, or as it was; WM_APP + 10 on its thread)
+        if (main_window) PostMessageA(main_window, WM_APP + 10, (WPARAM)(st.popup ? 1 : 0), 0);
+    }
+#endif
+#ifdef _WIN32
+    {   // (does the fullscreen window have what flip needs: WS_POPUP, no caption, the monitor's whole rectangle? Said when that
+        // changes, and as "not" only when it stays so for a second evaluation: the window's thread takes the style a moment after)
+        static int flip_said = -1, not_yet = 0;
+        if (st.active && in.fullscreen && main_window) {
+            const LONG style = GetWindowLongA(main_window, GWL_STYLE);
+            RECT r{};
+            MONITORINFO mi{};
+            mi.cbSize = sizeof mi;
+            const bool covers = GetWindowRect(main_window, &r) && GetMonitorInfoA(MonitorFromWindow(main_window, MONITOR_DEFAULTTONEAREST), &mi) &&
+                                r.left == mi.rcMonitor.left && r.top == mi.rcMonitor.top && r.right == mi.rcMonitor.right && r.bottom == mi.rcMonitor.bottom;
+            const int ok = (style & WS_POPUP) && !(style & WS_CAPTION) && covers ? 1 : 0;
+            not_yet = ok ? 0 : not_yet + 1;
+            if (ok != flip_said && (ok || not_yet >= 2)) {
+                flip_said = ok;
+                logf("vk: VRR: the fullscreen window %s", ok ? "is a borderless popup over the whole monitor: Windows can flip it" :
+                     "is not a popup covering the monitor: Windows composes it and G-Sync / FreeSync may not follow");
+            }
+        } else {
+            flip_said = -1, not_yet = 0;
+        }
+    }
+#endif
+    // (one line for each change: the row, the fullscreen row, the refresh, the choice)
+    const int hz = (in.refresh_mhz + 500) / 1000;
+    const int key = (in.row << 20) | (in.fullscreen << 19) | ((int)st.why << 15) | (st.active << 14) | (hz & 0x3fff);
+    if (key != logged_key.load()) {
+        logged_key = key;
+        char why[160];
+        switch (st.why) {
+        case kWhyOff: snprintf(why, sizeof why, "off"); break;
+        case kWhyForcedByEnv: snprintf(why, sizeof why, "RX_VK_FIFO / RX_VK_IMMEDIATE decide the present mode: VRR leaves the presents alone"); break;
+        case kWhyAutoWindowed: snprintf(why, sizeof why, "Auto, windowed: off (fullscreen is needed to flip)"); break;
+        case kWhyAutoNotFound: snprintf(why, sizeof why, "Auto: the display lists no variable refresh range in its EDID: off"); break;
+        case kWhyAutoDetected: snprintf(why, sizeof why, "Auto: the display's EDID lists %d-%d Hz", lo, hi); break;
+        default: snprintf(why, sizeof why, "On"); break;
+        }
+        if (st.active) {
+            char cap[96];
+            if (st.cap_below > 0) snprintf(cap, sizeof cap, "a frame rate limit above 60 held at %d fps (refresh %d Hz - %d)", hz - st.cap_below, hz, st.cap_below);
+            else snprintf(cap, sizeof cap, "refresh rate unknown: no frame limit cap");
+            logf("vk: VRR: %s; FIFO present mode (V-Sync row: %s), %s, %s; %s%s", why,
+                 opts.vsync == kOn ? "On" : "Off, overridden",
+                 in.fullscreen ? "borderless popup window (can flip)" : "windowed: the window cannot flip, G-Sync for windowed mode must be on in the driver", cap,
+                 reflex_available() ? (opts.reflex ? "NVIDIA Reflex on" : "NVIDIA Reflex off (turn it on for the lowest delay)") : "no NVIDIA Reflex here",
+                 framegen_on() ? "; frame generation presents are spaced to the same limit" : "");
+        } else {
+            logf("vk: VRR: %s", why);
+        }
+    }
+    return st;
+}
+
+int present_choice_key() {
+    const present_mode::VrrState s = vrr_resolved(false);
+    // (the V-Sync row, the V-Sync mode row and the VRR row as one number: a change makes the swapchain again)
+    return (opts.vsync * 8 + opts.vsync_mode) * 4 + (s.active ? 1 : 0) + (s.popup ? 2 : 0);
+}
+
+int vrr_fps_cap() {
+    if (opts.vrr == present_mode::kVrrOff && !vrr_touched.load(std::memory_order_relaxed)) return 0;
+    const present_mode::VrrState s = vrr_resolved(false);
+    const int mhz = display_refresh_mhz();
+    if (!s.active || s.cap_below <= 0 || mhz <= 0) return 0;
+    const int cap = (mhz + 500) / 1000 - s.cap_below;
+    return cap >= 60 ? cap : 0;
+}
+
+int64_t vrr_min_gap_ns() {
+    if (opts.vrr == present_mode::kVrrOff && !vrr_touched.load(std::memory_order_relaxed)) return 0;
+    const present_mode::VrrState s = vrr_resolved(false);
+    const int mhz = display_refresh_mhz();
+    if (!s.active || s.cap_below <= 0 || mhz <= 3000 * s.cap_below) return 0;
+    return (int64_t)(1e12 / (double)(mhz - 1000 * s.cap_below));
+}
+
 } // namespace mkwvk

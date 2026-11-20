@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* (the fixture stands in for the Windows waveOut API, so it takes nn_audio.c's Windows rule: HOS_AUDIO_DEVICE unset opens the
+   default output first; Linux's device 0 first (issue 99) is the #ifndef _WIN32 branch) */
+#ifndef _WIN32
+#define _WIN32 1
+#endif
+
 typedef void *HWAVEOUT;
 typedef char *LPSTR;
 typedef unsigned MMRESULT;

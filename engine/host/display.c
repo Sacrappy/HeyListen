@@ -67,6 +67,24 @@ static HANDLE renderer_up;
 static int fullscreen;
 static WINDOWPLACEMENT windowed_place;
 
+/* (the VRR row, gpu/vk/vk_main.cpp vrr_resolved) The fullscreen window as a WS_POPUP that covers the monitor, which Windows can show
+   directly (independent flip) instead of composing it through the desktop window manager: G-Sync and FreeSync only work on that
+   path. Off (every other player): the window's style is what it always was, the overlapped style stripped. */
+static volatile LONG popup_wanted;
+
+/* the monitor's whole rectangle in the style asked (the window as fullscreen) */
+static void fullscreen_style(HWND w) {
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    LONG style = GetWindowLongA(w, GWL_STYLE) & ~(LONG)(WS_OVERLAPPEDWINDOW | WS_POPUP);
+    if (popup_wanted) style |= (LONG)WS_POPUP | WS_VISIBLE;
+    SetWindowLongA(w, GWL_STYLE, style);
+    SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (popup_wanted ? SWP_SHOWWINDOW : 0));
+}
+
 static void set_fullscreen(HWND w, int on) {
     if (on == fullscreen) return;
     const LONG style = GetWindowLongA(w, GWL_STYLE);
@@ -78,17 +96,15 @@ static void set_fullscreen(HWND w, int on) {
             !GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi))
             return;
         fullscreen = 1;
-        SetWindowLongA(w, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-        SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        fullscreen_style(w);
     } else {
         fullscreen = 0;
-        SetWindowLongA(w, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowLongA(w, GWL_STYLE, (style & ~(LONG)WS_POPUP) | WS_OVERLAPPEDWINDOW);   /* (the popup style off again) */
         SetWindowPlacement(w, &windowed_place);
         SetWindowPos(w, NULL, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     }
-    hos_log("display: %s", on ? "fullscreen (F11 for a window)" : "windowed");
+    hos_log("display: %s%s", on ? "fullscreen (F11 for a window)" : "windowed", on && popup_wanted ? ", as a popup window that can flip (VRR)" : "");
 }
 
 static void dpi_aware_thread(void) {
@@ -233,6 +249,14 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_APP + 7:   /* (the Insert menu's row) */
         set_fullscreen(w, (int)wp);
+        return 0;
+    case WM_APP + 10:   /* (the VRR row, gpu/vk/vk_main.cpp: wp 1 the fullscreen window as a popup that can flip, 0 as it was) */
+        if ((int)(wp != 0) == popup_wanted) return 0;
+        popup_wanted = wp != 0;
+        if (fullscreen) {
+            fullscreen_style(w);
+            hos_log("display: fullscreen window as %s", popup_wanted ? "a popup that can flip (VRR)" : "it was before VRR");
+        }
         return 0;
     case WM_DPICHANGED:
         if (!fullscreen) {

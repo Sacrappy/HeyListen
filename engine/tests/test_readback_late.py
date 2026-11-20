@@ -84,8 +84,15 @@ def main():
     assert strict.index('r.sizes = readback_late::parse("1040,c0");', i_default) < strict.index("} else if (e && strcmp", i_default), \
         "RADV's default is not the light meter's sizes"
     assert "r.all = e && atoi(e) != 0;" in strict, "only RX_VK_READBACK_STRICT=1 makes every range wait"
-    i_strict = inv.index("readback_strict_wanted(size) && v > completed()")
+    i_strict = inv.index("(readback_strict_wanted(size) || readback_strict_slow(size)) && v > completed()")
     assert i_wait < i_strict, "the strict wait is asked outside the pending range's wait"
+    # while the presents run slow (a loaded machine) the light meter's sizes wait for their write-back on any driver: without it
+    # the CPU reads the meter's stale or reset sums and the exposure pulses, a white flash of ~16 frames (stream W1)
+    slow = function(rp, "bool readback_strict_slow(uint64_t size) {")
+    assert 'getenv("RX_VK_STRICT_SLOW_MS")' in slow and "22.0" in slow, "the slow limit is not RX_VK_STRICT_SLOW_MS, 22 ms"
+    assert 'readback_late::parse("1040,c0")' in slow and "readback_late::wanted(meter, size, false)" in slow,         "the slow wait is not for the light meter's sizes only"
+    assert "present_ms_ema.load" in slow and "limit > 0" in slow, "the slow wait does not follow the presents' interval, or cannot be off"
+    assert "present_ms_ema.store(" in rp[rp.index("presents_now = presents;"):][:900], "the presents' interval is not smoothed at the present"
     print("PASS the wiring")
 
 

@@ -34,6 +34,8 @@
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/ir_opt/scene_tonemap_pass.h"   // (HeyListen: PsychoV35, after Longshot ddb156df / 79a34381)
+#include "shader_recompiler/ir_opt/output_encode_pass.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
@@ -56,6 +58,7 @@
 #include "vk_internal.h"
 #include "vk_jobs.h"
 #include "vk_draw.h"
+#include "vk_menu.h"   // (scene_tonemap_on: the HDR tone mapper row)
 #include "flat_map.h"
 
 // (EvilOOT, RX_VK_PTR_DIAG) the pointer pass's counts for this thread's translations
@@ -129,6 +132,12 @@ struct Code {
     // 31:16; +0x5f the output topology, 1 points, 3 triangles)
     uint32_t mesh_threads = 0, payload_bytes = 0, max_vertices = 0, max_primitives = 0, topology = 0;
     bool header_only = false;       // a graphics header and no code (NVN2's per-primitive output map of a mesh program)
+    // (HeyListen, after Longshot ddb156df) a fragment stage with the game's tone map fit's five constants in its code: a scene
+    // mapping program, which PsychoV35 may take (scene_tonemap_for)
+    bool scene_fit = false;
+    // (after Longshot 79a34381) a fragment stage with PQ's constants and its 1e-4 in its code: the HDR10 output encoder, which
+    // PsychoV35's output encoder may take (output_encode_pass.h)
+    bool pq_fit = false;
     uint8_t sph[sizeof(Shader::ProgramHeader)]{};
     bool ok = false;
 };
@@ -175,6 +184,22 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
     std::memcpy(&st, ctl + 0x56, 2);
     c.key = code_key(ctl, area.data(), end);
     c.stage = st;
+    if (st == 1) {
+        static constexpr float kFit[] = {2.51f, 0.03f, 2.43f, 0.59f, 0.14f};
+        c.scene_fit = true;
+        for (const float f : kFit) {
+            uint8_t bits[4];
+            std::memcpy(bits, &f, 4);
+            c.scene_fit = c.scene_fit && std::search(area.begin(), area.end(), bits, bits + 4) != area.end();
+        }
+        static constexpr float kPq[] = {0.1593017578125f, 78.84375f, 0.8359375f, 18.8515625f, 18.6875f, 1e-4f};
+        c.pq_fit = !c.scene_fit;
+        for (const float f : kPq) {
+            uint8_t bits[4];
+            std::memcpy(bits, &f, 4);
+            c.pq_fit = c.pq_fit && std::search(area.begin(), area.end(), bits, bits + 4) != area.end();
+        }
+    }
     if (st == 6 || st == 7) {
         uint32_t w58, w60;
         std::memcpy(&w58, ctl + 0x58, 4), std::memcpy(&w60, ctl + 0x60, 4);
@@ -1009,8 +1034,14 @@ void written_types(const Code* fs, const uint8_t color_types[8], uint8_t out[8])
     for (int i = 0; i < 8; i++) out[i] = fs && header_of(*fs).ps.HasOutputComponents(i) ? color_types[i] : 0;
 }
 /// A vertex and fragment program's key: their code, and the vertex input and colour output types that change what they translate to
-uint64_t graphics_key(const Code& vs, const Code* fs, const uint32_t vattr[16], const uint8_t color_types[8]) {
+/// (HeyListen, after Longshot ddb156df / 79a34381) Whether this fragment stage's program is to have PsychoV35 for its scene tone map
+/// (scene_tonemap_pass.h), or the mod's output encoder (output_encode_pass.h): a scene mapping program or the HDR10 encoder while
+/// the Tone mapper row asks for it. Its own key, so the row's change translates only these programs
+bool scene_tonemap_for(const Code* fs) { return fs && (fs->scene_fit || fs->pq_fit) && scene_tonemap_on(); }
+uint64_t graphics_key(const Code& vs, const Code* fs, const uint32_t vattr[16], const uint8_t color_types[8],
+                      bool tonemap = false) {
     uint64_t key = vs.key ^ (fs ? fs->key * 31 : 0);
+    if (tonemap) key = hash_bytes("psychov35", 9, key);
     for (int i = 0; i < 16; i++) {
         const auto used = header_of(vs).vtg.InputGeneric((size_t)i);
         const bool read = used[0] || used[1] || used[2] || used[3];
@@ -2102,6 +2133,15 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Shader::RuntimeInfo frt{};
                 frt.previous_stage_stores = vs->program.info.stores;
                 for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
+                if (p.scene_tonemap) {   // (the HDR tone mapper row: PsychoV35; before the NaN guard, which then guards it)
+                    const bool encoder = fsc->pq_fit;   // (else a scene mapping program: scene_tonemap_for)
+                    const char* why = encoder ? Shader::Optimization::OutputEncodePass(fs->program)
+                                              : Shader::Optimization::SceneToneMapPass(fs->program);
+                    static std::atomic<int> told{0};
+                    if (told++ < 64)
+                        logf("vk: program %016llx: %s %s%s", (unsigned long long)p.key, encoder ? "output encoder" : "scene tone map",
+                             why ? "left as the game's: " : "PsychoV35", why ? why : "");
+                }
                 static const bool nan_guard = !getenv("RX_VK_NAN_GUARD") || atoi(getenv("RX_VK_NAN_GUARD")) != 0;
                 if (nan_guard) {
                     uint32_t float_targets = 0;
@@ -2620,6 +2660,15 @@ thread_local ProgFast prog_fast[2];
 const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {
     if (!s.has_prog) return nullptr;
     if (kind == ProgramKind::Mesh) return mesh_program_for(s, color_types);
+    {   // (the HDR tone mapper changed: the picks before it name the other variant of the scene mapping programs)
+        static thread_local int tonemap_seen = -1;
+        const int tonemap_now = scene_tonemap_on() ? 1 : 0;
+        if (tonemap_now != tonemap_seen) {
+            tonemap_seen = tonemap_now;
+            picks.clear();
+            prog_fast[0].on = prog_fast[1].on = false;
+        }
+    }
     const bool compute = kind == ProgramKind::Compute;
     static int64_t st_hit, st_none, st_differ, st_calls, st_by_tex;   // (logged now and then: how the cache does)
     if (++st_calls % 200000 == 0)
@@ -2720,7 +2769,8 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
         if (logged++ < 40) log_program_stages(s, "dropped stages");
     }
     // the variants of these stages, for these vertex input types and colour output types
-    const uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types);
+    const bool tonemap = !compute && scene_tonemap_for(stage_code[1]);
+    const uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types, tonemap);
     auto& variants = programs[key];
     program_cache_load(key, variants);
     const uint64_t codes[4] = {stage_code[compute ? 5 : 0]->key, !compute && stage_code[1] ? stage_code[1]->key : 0, 0, 0};
@@ -2736,6 +2786,7 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     auto p = std::make_unique<Program>();
     p->key = key;
     p->compute = compute;
+    p->scene_tonemap = tonemap;
     std::memcpy(p->codes, codes, sizeof codes);
     Program* raw = p.get();
     variants.push_back(std::move(p));
@@ -3264,8 +3315,9 @@ const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t
     blank->nvattr = 16;
     std::memcpy(blank->vattr, attributes, sizeof blank->vattr);
     auto p = std::make_unique<Program>();
+    p->scene_tonemap = !mesh && scene_tonemap_for(fs);
     p->key = mesh ? mesh_key(by_stage[6] ? &code_of[6] : nullptr, code_of[7], fs, nullptr, color_types)
-                  : graphics_key(code_of[0], fs, attributes, color_types);
+                  : graphics_key(code_of[0], fs, attributes, color_types, p->scene_tonemap);
     if (mesh && !dev.mesh_shader && !dev.mesh_fallback) return nullptr;
     p->fallback = mesh && dev.uses_mesh_fallback(by_stage[6] != nullptr);   // (as play makes it, mesh_program_locked: a fallback one is an ordinary graphics pipeline)
     p->mesh = mesh && !p->fallback;

@@ -90,6 +90,13 @@ static int map_floor(uint64_t va) {
 static volatile LONG maps_changed = 1;   /* the mappings changed since hos_gpu_guest_ranges last merged them */
 volatile LONG maps_generation = 1;   /* bumped by every change (hos_gpu_ptr's per-thread cache, the renderer's gpu_read) */
 static void map_add(uint64_t va, uint64_t size, uint64_t guest) {
+    /* (longshot 11-18, 35a4a9fc #1617) the pages the GPU can read, for the lifted code's marks: set before the mapping
+       counts (host/mark_bitmap.c). The guest range is the memory behind the mapping, whatever its GPU address, and the
+       renderer reads guest memory: every page of it must mark. Nothing when the build has no bitmap (RX_MARK_BITMAP unset) */
+#if defined(A64_MARK_BITMAP)
+    void hos_gpu_pages_set(uint64_t guest, uint64_t size);
+    if (guest) hos_gpu_pages_set(guest, size);
+#endif
     maps_changed = 1;
     InterlockedIncrement(&maps_generation);
     MAP_LOG("nvdrv: map GPU %#llx..%#llx -> %#llx", (unsigned long long)va, (unsigned long long)(va + size),

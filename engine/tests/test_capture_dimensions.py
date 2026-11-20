@@ -32,7 +32,7 @@ def main():
     globals_and_setup = source[start:source.index("void image_barrier(", start)]
     gate = "if (src && (dev.offscreen || shots) && offscreen_init())"
     assert gate in source
-    tail = "if (dev.offscreen || interpolated) return;\n    present_image(src, sw, sh, crop, direct_view);"
+    tail = "if (dev.offscreen || interpolated) return;\n    present_image(src, sw, sh, crop, direct_view, present_native_pq.load(std::memory_order_relaxed));"
     assert tail in source
     png = block(source, "uint32_t crc32(") + "\n" + block(source, "bool write_png(")
     template = (ROOT / "tests/capture_dimensions_test.cpp").read_text(encoding="utf-8")

@@ -29,6 +29,13 @@ void perf_event(int event);
 void perf_report_final(int event);
 /// (vk_replay.cpp) the GPU's own time so far, ns
 int64_t gpu_time_ns();
+/// (vk_replay.cpp) the read-backs' waits for the GPU so far, ns: the game's CPU reads of GPU results (invalidate), any thread
+int64_t readback_wait_ns();
+/// (perf_report.cpp) a draw's program key, once per key per map: the zone usage recorder (zone_report.h), on only while
+/// the performance statistics row is on, the build has an address and HL_TELEMETRY_ZONES is not 0
+void zone_note_program(uint64_t key);
+/// (perf_report.cpp) the same for a graphics pipeline's key, where the draw looks it up
+void zone_note_state(uint64_t key);
 }   // namespace mkwvk
 
 namespace mkwvk::perf_report {
@@ -47,11 +54,13 @@ inline int bucket_of(double ms, const double (&bounds)[N]) {
     return (int)N;
 }
 
-/// What a slow frame waited on most (the relay's CAUSES, in its order)
-enum Cause { kPipelineWait, kShaderTranslate, kTextureUpload, kMemsync, kGpuBound, kReadback, kGameCpu, kPacing, kOther, kCauses };
+/// What a slow frame waited on most (the relay's CAUSES, in its order; v0.4.3 adds the four after "pace", before "other",
+/// and the server takes new keys as they come: it stores the summary's JSON as it is)
+enum Cause { kPipelineWait, kShaderTranslate, kTextureUpload, kMemsync, kGpuBound, kReadback, kGameCpu, kPacing,
+             kDriverCompile, kDescriptors, kPresentBlock, kOsWait, kOther, kCauses };
 inline const char* cause_name(int c) {
     static const char* const t[] = {"pipeline_wait", "shader_translate", "texture_upload", "memsync", "gpu_bound", "readback",
-                                    "game_cpu", "pace", "other"};
+                                    "game_cpu", "pace", "driver_compile", "descriptors", "present", "os_wait", "other"};
     return c >= 0 && c < kCauses ? t[c] : "other";
 }
 
@@ -68,13 +77,35 @@ inline const char* event_name(int e) {
     return e >= 0 && e < kEvents ? t[e] : "";
 }
 
-/// A frame's times beyond the FPS counter's parts, ms: from the renderer's counters, since the frame before
+/// Who makes the frames the Frame generation row asks for (vk_framegen.h framegen_engine's values): not running, the renderer's
+/// own interpolation, AMD FSR 3.1's frame interpolation (at 2x, where it runs), NVIDIA DLSS FG (the Frame generation by row's
+/// choice, where its runtime runs and a temporal Upscaler's inputs are there: the renderer's own makes them elsewhere)
+enum FrameGen { kFramegenOff, kFramegenBuiltin, kFramegenFsr3, kFramegenDlssg, kFramegens };
+inline const char* framegen_name(int e) {
+    static const char* const t[] = {"off", "builtin", "fsr3", "dlssg"};
+    return e >= 0 && e < kFramegens ? t[e] : "other";
+}
+
+/// A DLSS preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*: 1 A ... 26 Z, 0 NVIDIA's own pick) by its letter; "none" for no DLSS network
+/// (the game's own or FSR upscales: the model row does nothing then)
+inline std::string dlss_model_name(int preset, bool dlss_runs) {
+    if (!dlss_runs) return "none";
+    if (preset == 0) return "default";
+    return preset >= 1 && preset <= 26 ? std::string(1, (char)('A' + preset - 1)) : "other";
+}
+
+/// A frame's times beyond the FPS counter's parts, ms: from the renderer's counters, since the frame before. The parts
+/// themselves (fps_stats::Frame) are measured on the presenting thread (perf_parts.h); these are what the parts were made of
 struct Waits {
     double pipeline = 0;    // (building pipelines and picking programs on the drawing threads)
     double translate = 0;   // (draws waiting for a shader translation, or translating one in place)
     double upload = 0;      // (texture uploads and their CPU unswizzle)
     double memsync = 0;     // (the guest memory's sync to the GPU)
-    double readback = 0;    // (read-backs' waits for the GPU)
+    double readback = 0;    // (read-backs' waits for the GPU: the game's CPU reads of GPU results, vk_replay.cpp invalidate)
+    double driver_compile = 0;  // (the driver's pipeline compiles: vkCreate*Pipelines, the GPL libraries and their links)
+    double descriptors = 0;    // (descriptor building and binding on the drawing threads)
+    double present = 0;        // (the swapchain: waiting for its image and the present call, vk_replay.cpp present_image)
+    double os_wait = 0;        // (the presenting thread off the CPU while nothing of the renderer ran: a gap with no work)
 };
 
 /// Seconds of play between summaries: RX_VK_PERF_INTERVAL's whole seconds, 60 to 840, else 300. A summary ends on the frame
@@ -94,10 +125,14 @@ inline int summary_period(const char* env) {
 inline bool is_hitch(double ms, double target_ms) { return ms > std::max(2.0 * target_ms, 25.0); }
 
 /// What the hitch waited on most: the renderer's own waits first, then the FPS counter's parts (the GPU's, the pacing's, the
-/// game's); "other" when nothing measured is a quarter of the frame
+/// game's); "other" when nothing measured is a quarter of the frame. The game's part splits in two: its CPU at work
+/// (game_cpu) and the wall time the presenting thread was neither running nor in the renderer nor sleeping for pacing
+/// (os_wait: the OS delayed it, or something the renderer cannot see). The driver's compiles, the descriptor work and the
+/// swapchain's block are their own causes even inside the render part
 inline Cause cause_of(const fps_stats::Frame& f, const Waits& w) {
     const double c[kCauses] = {w.pipeline, w.translate, w.upload, w.memsync, std::max<double>(f.part[fps_stats::kGpuWait], f.gpu_ms), w.readback,
-                               f.part[fps_stats::kGame], f.part[fps_stats::kPace], 0};
+                               std::max(0.0, f.part[fps_stats::kGame] - w.os_wait), f.part[fps_stats::kPace], w.driver_compile,
+                               w.descriptors, w.present, w.os_wait, 0};
     int best = kOther;
     double most = f.ms * 0.25;
     for (int i = 0; i < kOther; i++)
@@ -111,6 +146,16 @@ inline bool is_pacing_miss(double ms, double last_ms, double target_ms) {
     return last_ms > 0 && std::abs(ms - last_ms) > 0.25 * target_ms;
 }
 
+/// One hitch cause's detail since the summary before: the hitch frames' count, their times' sum and their longest, and the
+/// same three of those that happened while the game was loading a map (an area change: host/hos_main.c's push). The map's
+/// "new" says whether that was the session's first visit
+struct HitchDetail {
+    int64_t count = 0;
+    double ms_sum = 0, ms_max = 0;
+    int64_t load_count = 0;
+    double load_ms_sum = 0, load_ms_max = 0;
+};
+
 /// The totals of one map since the summary before
 struct MapTotals {
     bool fresh = true;   // (the first summary of this session with this map: the relay counts it as a session on it)
@@ -121,6 +166,7 @@ struct MapTotals {
     double gpu_sum = 0;
     double part[fps_stats::kParts] = {};
     int64_t hitch[kCauses] = {};
+    HitchDetail hitch_detail[kCauses] = {};
     int64_t pacing_misses = 0, left_out = 0;
     int64_t event[kEvents] = {};
     int64_t movie_shown = 0, movie_dropped = 0, movie_late = 0, movie_fallbacks = 0;
@@ -132,16 +178,22 @@ struct MapTotals {
 };
 
 /// usual_ms: the recent average frame. A hitch is measured against the longer of it and the target: a game the GPU holds
-/// at 20 fps under a 60 cap has slow frames, not stutters (its fps says so), and each of its frames would be one otherwise
+/// at 20 fps under a 60 cap has slow frames, not stutters (its fps says so), and each of its frames would be one otherwise.
+/// loading: the game is loading a map (host/hos_main.c's flag), the hitch rows' load side
 inline void add_frame(MapTotals& m, const fps_stats::Frame& f, const Waits& w, double target_ms, double last_ms,
-                      double usual_ms = 0) {
+                      double usual_ms = 0, bool loading = false) {
     m.seconds += f.ms / 1000.0;
     m.frame[bucket_of(f.ms, kFrameBuckets)]++;
     m.frame_sum += f.ms;
     if (f.gpu_ms > 0) m.gpu[bucket_of(f.gpu_ms, kGpuBuckets)]++, m.gpu_sum += f.gpu_ms;
     for (int p = 0; p < fps_stats::kParts; p++) m.part[p] += f.part[p];
-    if (is_hitch(f.ms, std::max(target_ms, usual_ms))) m.hitch[cause_of(f, w)]++;
-    else if (is_pacing_miss(f.ms, last_ms, target_ms)) m.pacing_misses++;
+    if (is_hitch(f.ms, std::max(target_ms, usual_ms))) {
+        const Cause c = cause_of(f, w);
+        m.hitch[c]++;
+        HitchDetail& d = m.hitch_detail[c];
+        d.count++, d.ms_sum += f.ms, d.ms_max = std::max<double>(d.ms_max, f.ms);
+        if (loading) d.load_count++, d.load_ms_sum += f.ms, d.load_ms_max = std::max<double>(d.load_ms_max, f.ms);
+    } else if (is_pacing_miss(f.ms, last_ms, target_ms)) m.pacing_misses++;
     m.left_out += f.left_out;
 }
 
@@ -151,6 +203,10 @@ struct Machine {
     bool release = false;
     double vram_gb = 0, ram_gb = 0;
     int fps_cap = 0;   // (0: uncapped)
+    std::string framegen = "off", dlss_model = "none";   // (framegen_name; dlss_model_name)
+    int framegen_x = 1;      // (the frames shown for each of the game's: 1 with frame generation off; Auto: the most it makes)
+    bool framegen_auto = false;   // (the Auto row: framegen_x is then its limit, not a fixed multiplier)
+    int render_scale = 0;    // (the 3D's share of the output in percent, 0: Auto, the game's dynamic resolution)
 };
 
 struct Memory {
@@ -198,7 +254,10 @@ inline std::string summary_json(const Machine& m, bool first, double session_s, 
                     ",\"driver\":" + json_text(m.driver, 60) + ",\"vram_gb\":" + json_num(m.vram_gb) +
                     ",\"cpu\":" + json_text(m.cpu) + ",\"ram_gb\":" + json_num(m.ram_gb) +
                     ",\"upscaler\":" + json_text(m.upscaler, 40) + ",\"preset\":" + json_text(m.preset, 40) +
-                    ",\"fps_cap\":" + std::to_string(m.fps_cap) + ",\"map\":" + json_text(map);
+                    ",\"fps_cap\":" + std::to_string(m.fps_cap) + ",\"framegen\":" + json_text(m.framegen, 40) +
+                    ",\"framegen_x\":" + std::to_string(m.framegen_x) + ",\"framegen_auto\":" + (m.framegen_auto ? "true" : "false") +
+                    ",\"dlss_model\":" + json_text(m.dlss_model, 40) + ",\"render_scale\":" + std::to_string(m.render_scale) +
+                    ",\"map\":" + json_text(map);
     if (mem)
         o += ",\"memory\":{\"vram_used_gb\":" + json_num(mem->vram_used_gb) + ",\"vram_allowed_gb\":" +
              json_num(mem->vram_allowed_gb) + ",\"ram_used_gb\":" + json_num(mem->ram_used_gb) + "}";
@@ -206,13 +265,27 @@ inline std::string summary_json(const Machine& m, bool first, double session_s, 
     bool comma = false;
     for (const auto& [name, t] : maps) {
         if (!t.any()) continue;
+        double frames = 0;   // (the frames this summary counted on the map: the parts' averages are over them)
+        for (int b = 0; b < kFrameBucketCount; b++) frames += (double)t.frame[b];
+        const auto avg = [&](double sum) { return frames > 0 ? sum / frames : 0; };
         o += std::string(comma ? "," : "") + json_text(name) + ":{\"new\":" + (t.fresh ? "true" : "false") +
              ",\"seconds\":" + json_num(t.seconds) + ",\"frame_ms\":" + json_list(t.frame) + ",\"frame_ms_sum\":" +
              json_num(t.frame_sum) + ",\"gpu_ms\":" + json_list(t.gpu) + ",\"gpu_ms_sum\":" + json_num(t.gpu_sum) +
-             ",\"parts_ms\":{\"game\":" + json_num(t.part[fps_stats::kGame]) + ",\"render\":" +
-             json_num(t.part[fps_stats::kRender]) + ",\"gpu_wait\":" + json_num(t.part[fps_stats::kGpuWait]) + ",\"pace\":" +
-             json_num(t.part[fps_stats::kPace]) + "},\"hitches\":{";
+             ",\"parts_ms\":{\"game\":" + json_num(avg(t.part[fps_stats::kGame])) + ",\"render\":" +
+             json_num(avg(t.part[fps_stats::kRender])) + ",\"gpu_wait\":" + json_num(avg(t.part[fps_stats::kGpuWait])) +
+             ",\"pace\":" + json_num(avg(t.part[fps_stats::kPace])) + "},\"hitches\":{";
         for (int c = 0; c < kCauses; c++) o += std::string(c ? "," : "") + "\"" + cause_name(c) + "\":" + std::to_string(t.hitch[c]);
+        o += "},\"hitch_detail\":{";
+        bool comma2 = false;
+        for (int c = 0; c < kCauses; c++) {
+            const HitchDetail& d = t.hitch_detail[c];
+            if (!d.count) continue;
+            o += std::string(comma2 ? "," : "") + "\"" + cause_name(c) + "\":{\"count\":" + std::to_string(d.count) +
+                 ",\"ms_sum\":" + json_num(d.ms_sum) + ",\"ms_max\":" + json_num(d.ms_max) +
+                 ",\"load_count\":" + std::to_string(d.load_count) + ",\"load_ms_sum\":" + json_num(d.load_ms_sum) +
+                 ",\"load_ms_max\":" + json_num(d.load_ms_max) + "}";
+            comma2 = true;
+        }
         o += "},\"pacing_misses\":" + std::to_string(t.pacing_misses) + ",\"draws_left_out\":" + std::to_string(t.left_out) +
              ",\"events\":{";
         for (int e = 0; e < kEvents; e++) o += std::string(e ? "," : "") + "\"" + event_name(e) + "\":" + std::to_string(t.event[e]);

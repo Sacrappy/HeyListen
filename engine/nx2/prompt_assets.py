@@ -3,12 +3,14 @@ and Kenney's Input Prompts (CC0, third_party/kenney_input).
 
     python -I nx2/prompt_assets.py --romfs <dir> --out <game folder>/prompts
 
-Writes <out>/<face>/External.bfotf for each face (switch, xbox, ps4, ps5, steamdeck). Every text in the game draws its button icons
-from Font2/Scalable/External.*.bfotf (dialogue, the control hints, menus): A B X Y at U+E040..E043, L R ZL ZR at E044..E047, Plus
-and Minus at E04B and E04C, the stick presses at E056 and E057, the d-pad at E060..E063. Each written font has one icon per pad
-input at U+F700 + HOS_PAD_* (gpu/vk/vk_api.h), and each of those Switch buttons' code points in a cmap segment of its own: the
-game (host/prompts.c) points each one at the icon of the pad input bound to that button when it serves the font, so the icons
-follow the controls, changed ones too.
+Writes <out>/<face>/External.bfotf for each face (switch, xbox, ps4, ps5, steamdeck, keyboard). Every text in the game draws its
+button icons from Font2/Scalable/External.*.bfotf (dialogue, the control hints, menus): A B X Y at U+E040..E043, L R ZL ZR at
+E044..E047, Plus and Minus at E04B and E04C, the stick presses at E056 and E057, the d-pad at E060..E063. Each written font has one
+icon per pad input at U+F700 + HOS_PAD_* (gpu/vk/vk_api.h), and each of those Switch buttons' code points in a cmap segment of its
+own: the game (host/prompts.c) points each one at the icon of the pad input bound to that button when it serves the font, so the
+icons follow the controls, changed ones too. The keyboard face (nx2/prompt_keys.py): the icon of each key at U+F7C0 + its key code,
+and the sticks' pictures as the keys that move and the mouse (nx2/prompt_draw.py draws the keys whose names are words in the game's
+bold font, and the mice); host/prompts.c points each Switch button at the first key bound to it there.
 
 The textures with button icons (the ocarina's notes, the letters on black, the controller in the pause menu) the same way, with
 Pillow, astc_encoder and texture2ddecoder: <out>/Common.bntx is the game's UI/Layout2Archive/Common bntx decompressed, and
@@ -36,11 +38,14 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)   # (python -I leaves the script folder off)
 from prompt_faces import FACES, override, parts   # noqa: E402 (the faces: their icons, drawings and their parts)
+import prompt_keys   # noqa: E402 (the keyboard face)
 KENNEY = os.path.join(os.path.dirname(HERE), "third_party", "kenney_input")
+KENNEY_KEYBOARD = os.path.join(os.path.dirname(HERE), "third_party", "kenney_input_keyboard")   # (the keyboard face's)
 FONT = "Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs"
 MAGIC = 0x18029A7F
 PAD_BASE = 0xF700
 WIDE = 1.6   # (how much wider than the game's icon a wide Kenney icon may be)
+ALL_FACES = ["switch"] + list(FACES) + ["keyboard"]   # (HOS_PROMPT_*: the keyboard last, nx2/prompt_keys.py)
 # the HOS_PAD_* inputs (gpu/vk/vk_api.h), in order
 PADS = ["south", "east", "west", "north", "back", "guide", "start", "lstick", "rstick", "lshoulder", "rshoulder", "up", "down", "left",
         "right", "ltrigger", "rtrigger"]
@@ -146,9 +151,12 @@ def cmap4(mapping, single):
     return struct.pack(">HHHHIHHI", 0, 2, 0, 3, 20, 3, 1, 20) + sub
 
 
-def face_font(otf, face):
-    """the game's font (decrypted) with this face's icons: a pad icon per input at PAD_BASE + its number, and the Switch buttons'
-    code points on the default controls' icons"""
+def face_font(otf, face, label_otf=None):
+    """the game's font (decrypted) with this face's icons ((font, widths): each icon's advance, by pad input; the keyboard
+    face's, by key code): a pad icon per input at PAD_BASE + its number, and the Switch buttons' code points on the default
+    controls' icons. The keyboard face (nx2/prompt_keys.py; label_otf: the game's own bold font, for the keys whose names are
+    words): the Switch's pad icons (the textures and the Talk ring stay the Switch's), then the icon of each key at KEY_BASE +
+    its key code and the sticks' pictures at STICK_KEYS.. and STICK_GAME.."""
     from fontTools.pens.boundsPen import BoundsPen
     from fontTools.pens.t2CharStringPen import T2CharStringPen
     from fontTools.pens.transformPen import TransformPen
@@ -160,6 +168,7 @@ def face_font(otf, face):
     top = game["CFF "].cff.topDictIndex[0]
     chars = top.CharStrings
     order = list(game.getGlyphOrder())
+    hmtx = game["hmtx"]
 
     def bounds(glyphset, name):
         p = BoundsPen(glyphset)
@@ -171,14 +180,38 @@ def face_font(otf, face):
         chars.charStrings[name] = len(chars.charStringsIndex) - 1
         top.charset.append(name)
         order.append(name)
-        game["hmtx"].metrics[name] = (width, 0)
+        hmtx.metrics[name] = (width, 0)
+        return name
 
-    if face == "switch":
-        icon = {p: cmap[SWITCH_ICON[p]] for p in PADS}
-        for i, p in enumerate(PADS):
-            src = chars[icon[p]]
+    def drawer(kset):
+        def draw(target, kn, scale=1):
+            """the Kenney glyph scaled into the box of the game's glyph `target` (as a square around its centre); a wide one (the
+            Menu and View pills on the square Plus and Minus) as high as the box, up to WIDE times as wide, the glyph widened.
+            scale: a little larger than that box (the keyboard's mouse moving, whose arrows take room)"""
+            gb, kb = bounds(gset, target), bounds(kset, kn)
+            side = max(gb[2] - gb[0], gb[3] - gb[1])
+            s = scale * min(side * WIDE / (kb[2] - kb[0]), side / (kb[3] - kb[1]))
+            over = max(0, s * (kb[2] - kb[0]) - side)
+            dx = (gb[0] + gb[2] + over) / 2 - s * (kb[0] + kb[2]) / 2
+            dy = (gb[1] + gb[3]) / 2 - s * (kb[1] + kb[3]) / 2
+            width = hmtx[target][0] + round(over)
+            pen = T2CharStringPen(width, gset)
+            kset[kn].draw(TransformPen(pen, (s, 0, 0, s, dx, dy)))
+            cs = chars[target]
+            return pen.getCharString(private=cs.private, globalSubrs=cs.globalSubrs), width
+        return draw
+
+    keys = {}
+    if face in ("switch", "keyboard"):
+        for p in PADS:   # (the game's own icons)
+            icon = cmap[SWITCH_ICON[p]]
+            src = chars[icon]
             src.decompile()
-            add(f"pad_{p}", src, game["hmtx"][icon[p]][0])
+            add(f"pad_{p}", src, hmtx[icon][0])
+        if face == "keyboard":
+            import prompt_draw
+            kset = TTFont(os.path.join(KENNEY_KEYBOARD, prompt_keys.FONT)).getGlyphSet()
+            keys, widths = prompt_draw.keyboard_glyphs(add, gset, cmap, chars, hmtx, label_otf, kset, drawer(kset))
     else:
         f = FACES[face]
         prefix, names = f["prefix"], f["icons"]
@@ -188,21 +221,7 @@ def face_font(otf, face):
         def kname(s):
             return s[1:] if s.startswith("/") else prefix + s
 
-        def draw(target, kn):
-            """the Kenney glyph scaled into the box of the game's glyph `target` (as a square around its centre); a wide one (the
-            Menu and View pills on the square Plus and Minus) as high as the box, up to WIDE times as wide, the glyph widened"""
-            gb, kb = bounds(gset, target), bounds(kset, kn)
-            side = max(gb[2] - gb[0], gb[3] - gb[1])
-            s = min(side * WIDE / (kb[2] - kb[0]), side / (kb[3] - kb[1]))
-            over = max(0, s * (kb[2] - kb[0]) - side)
-            dx = (gb[0] + gb[2] + over) / 2 - s * (kb[0] + kb[2]) / 2
-            dy = (gb[1] + gb[3]) / 2 - s * (kb[1] + kb[3]) / 2
-            width = game["hmtx"][target][0] + round(over)
-            pen = T2CharStringPen(width, gset)
-            kset[kn].draw(TransformPen(pen, (s, 0, 0, s, dx, dy)))
-            cs = chars[target]
-            return pen.getCharString(private=cs.private, globalSubrs=cs.globalSubrs), width
-
+        draw = drawer(kset)
         for p in PADS:
             kn = kname(names[p]) if p in names else None
             if kn not in kset:   # (no such button on this face, the PlayStation's PS button: the game's own icon)
@@ -213,7 +232,7 @@ def face_font(otf, face):
             else:
                 src = chars[target]
                 src.decompile()
-                add(f"pad_{p}", src, game["hmtx"][target][0])
+                add(f"pad_{p}", src, hmtx[target][0])
         for c, s in STATIC.items():
             kn = prefix + s
             if c in cmap and kn in kset:
@@ -225,14 +244,24 @@ def face_font(otf, face):
     mapping = {c: gid[n] for c, n in cmap.items() if c <= 0xFFFF}
     for i, p in enumerate(PADS):
         mapping[PAD_BASE + i] = gid[f"pad_{p}"]
-    for c, p in zip(SWITCH, DEFAULT):
-        mapping[c] = gid[f"pad_{p}"]
+    if face == "keyboard":
+        mapping.update({c: gid[n] for c, n in keys.items()})
+        for c, k in zip(SWITCH, prompt_keys.DEFAULT):   # (the keys of the defaults, till host/prompts.c points them at the controls)
+            mapping[c] = mapping[prompt_keys.KEY_BASE + k]
+    else:
+        for c, p in zip(SWITCH, DEFAULT):
+            mapping[c] = gid[f"pad_{p}"]
+    single = set(SWITCH)   # (each a segment of its own: host/prompts.c points them at the face's icons)
+    if face == "keyboard":
+        single |= {c for c, _, _ in prompt_keys.STICKS}   # (host/prompts.c points them at the movement keys)
     t = DefaultTable("cmap")
-    t.data = cmap4(mapping, set(SWITCH))
+    t.data = cmap4(mapping, single)
     game["cmap"] = t
     out = io.BytesIO()
     game.save(out)
-    return out.getvalue()
+    if face != "keyboard":
+        widths = [hmtx[f"pad_{p}"][0] for p in PADS]
+    return out.getvalue(), widths
 
 
 # ---- the textures with button icons (UI/Layout2Archive/Common.*.bntx: 878 textures, ASTC 4x4 and BC4, the Switch 2's block-linear
@@ -873,12 +902,11 @@ def hint_panes(blarc):
     return out or None
 
 
-def write_hint(path, otf, panes):
-    from fontTools.ttLib import TTFont
-    hmtx = TTFont(io.BytesIO(otf))["hmtx"]
+def write_hint(path, widths, panes):
+    """widths: each icon's advance, by pad input (face_font; the keyboard's: by key code)"""
     with open(path, "wb") as f:
-        f.write(b"HPHN" + struct.pack("<I", len(PADS)))
-        f.write(b"".join(struct.pack("<f", round(max(0, hmtx[f"pad_{p}"][0] - HINT_FITS) * HINT_SCALE)) for p in PADS))
+        f.write(b"HPHN" + struct.pack("<I", len(widths)))
+        f.write(b"".join(struct.pack("<f", round(max(0, w - HINT_FITS) * HINT_SCALE)) for w in widths))
         f.write(struct.pack("<I", len(panes)) + b"".join(struct.pack("<IB3xf", at, slot, x) for at, slot, x in panes))
 
 
@@ -897,7 +925,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--romfs", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--faces", default=",".join(["switch"] + list(FACES)))
+    ap.add_argument("--faces", default=",".join(ALL_FACES))
     ap.add_argument("--no-textures", action="store_true")
     ap.add_argument("--dump", help="also write every face's images as PNG into <dir>/<face>/ (the names nx2/prompt_faces/<face>/ "
                     "takes in their place), and the game's textures they go into into <dir>/game/")
@@ -923,18 +951,25 @@ def main():
     hint = hint_panes(blarc)
     if not hint:
         print("prompts: the ocarina's hint keeps the game's spacing (its layout is not the one known)", file=sys.stderr)
+    faces = a.faces.split(",")
+    if faces != ALL_FACES[:len(faces)]:
+        raise SystemExit("prompts: --faces must be the Switch, then prompt_faces.FACES in their order, then the keyboard (HOS_PROMPT_*)")
+    try:   # (the keyboard face's word keys are set in the game's own bold font; without it, Kenney's keys)
+        label = unwrap(read_zs(a.romfs, prompt_keys.LABEL_FONT, dictionary))[1]
+    except OSError:
+        label = None
     largest = 0
-    for face in a.faces.split(","):
+    for face in faces:
         d = os.path.join(a.out, face)
         os.makedirs(d, exist_ok=True)
-        plain = face_font(otf, face)
+        plain, widths = face_font(otf, face, label)
         font = wrap(key, plain)
         if hint:
-            write_hint(os.path.join(d, "hint.bin"), plain, hint)
+            write_hint(os.path.join(d, "hint.bin"), widths, hint)
         largest = max(largest, len(font))
         with open(os.path.join(d, "External.bfotf"), "wb") as f:
             f.write(font)
-        if textures:
+        if textures and face != "keyboard":   # (the keyboard's: the Switch's textures, host/prompts.c texture_face)
             layers = face_layers(textures, tex, face, otf)
             write_textures(os.path.join(d, "textures.bin"), face_textures(textures, tex, layers))
             if a.dump:

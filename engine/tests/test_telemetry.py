@@ -7,6 +7,8 @@
   nothing waiting; with both, the summaries go oldest first to <address>/telemetry/perf, one a connection, the ones the server
   took or refused are deleted (a copy of those taken kept in perf_sent), a busy server is left alone until its Retry-After (and
   doubled when it is busy again), a server not reached keeps them for the next start, 12 a start at most, the newest 48 kept.
+- The pipeline state records' sender (hos_pipes_send_run): the same rules from pipelines_pending to /telemetry/pipelines, off by itself\n  with HL_TELEMETRY_PIPELINES=0, 2 a start, the newest 4 kept, a batch up to 1.5 MiB, the last 3 sent kept in pipelines_sent.
+- The per-zone shader and pipeline usage's sender (hos_zones_send_run): the same rules from zones_pending to /telemetry/zones, off by\n  itself with HL_TELEMETRY_ZONES=0, 2 a start, the newest 4 kept, a batch up to 512 KiB, the last 3 sent kept in zones_sent.
 - nx2/addresses.py: the build stamps an https telemetry address only, and nothing when it is empty (the default).
 
     python -I -B tests/test_telemetry.py [--cc gcc]
@@ -40,6 +42,7 @@ int main(int argc, char **argv) {
                                           strcmp(argv[4], "-") ? argv[4] : NULL, out, sizeof out);
         printf("%d|%s\n", ok, out);
     } else if (!strcmp(cmd, "on")) printf("%d\n", hos_telemetry_opt_on(argv[2], argv[3]));
+    else if (!strcmp(cmd, "zoneson")) printf("%d\n", hos_telemetry_zones_on(strcmp(argv[2], "-") ? argv[2] : NULL));
     else if (!strcmp(cmd, "stamp")) {
         char out[400];
         const int ok = hos_telemetry_stamp_value(argv[2], argv[3], out, sizeof out);
@@ -66,14 +69,20 @@ SENDER = r"""
 #include <stdio.h>
 #include <stdlib.h>
 int hos_perf_send_run(const char *dir);
+int hos_pipes_send_run(const char *dir);
+int hos_zones_send_run(const char *dir);
+int hos_profile_send_run(const char *dir);
 void hos_log(const char *fmt, ...) { (void)fmt; }
 void hos_log_flush(void) {}
+const char *hos_version(void) { return "vtest-1"; }
+const char *hos_lift_key(void) { return "testlift01"; }
 int hos_crash_test_box(const char *t, const char *x, const char *const *b, int n) { (void)t, (void)x, (void)b; return n - 1; }
 int hos_crash_test_clipboard(const char *t) { (void)t; return 1; }
 int hos_crash_test_open(const char *w) { (void)w; return 1; }
 int main(int argc, char **argv) {
-    (void)argc;
-    printf("%d\n", hos_perf_send_run(argv[1]));
+    printf("%d\n", argc > 2 && argv[2][0] == 'p' ? hos_pipes_send_run(argv[1])
+                              : argc > 2 && argv[2][0] == 'z' ? hos_zones_send_run(argv[1])
+                              : argc > 2 && argv[2][0] == 'f' ? hos_profile_send_run(argv[1]) : hos_perf_send_run(argv[1]));
     return 0;
 }
 """
@@ -135,7 +144,8 @@ def build(cc, tmp):
     libs = ["-lole32", "-lshell32", "-luser32", "-ladvapi32", "-ldbghelp"] if os.name == "nt" else ["-pthread", "-ldl"]
     subprocess.run([cc, "-std=gnu11", "-O1", "-DHOS_CRASH_DIALOG_TEST", "-I", str(ROOT / "host"),
                     str(tmp / "sender.c"), str(ROOT / "host/hos_crash_dialog.c"), str(ROOT / "host/hos_crash_record.c"),
-                    str(ROOT / "host/hos_report_run.c"), "-o", str(tmp / ("sender" + EXE)), *libs], check=True, timeout=300)
+                    str(ROOT / "host/hos_crash_names.c"), str(ROOT / "host/hos_report_run.c"), "-o", str(tmp / ("sender" + EXE)),
+                    *libs], check=True, timeout=300)
 
 
 def pure(tmp, *args):
@@ -174,6 +184,9 @@ def rules(tmp):
         check(int(pure(tmp, "on", text, "send_performance_stats")) == want, "send_performance_stats in %r: %d" % (text, want))
     check(int(pure(tmp, "on", "send_crash_reports=1\n", "send_crash_reports")) == 1 and
           int(pure(tmp, "on", "send_performance_stats=1\n", "send_crash_reports")) == 0, "each row has its own key")
+    # the separate switches: off only when they are exactly "0"
+    check([int(pure(tmp, "zoneson", v)) for v in ("-", "", "0", "1", "00", "off")] == [1, 1, 0, 1, 1, 1],
+          "the zone usage is on unless HL_TELEMETRY_ZONES is exactly 0")
     # the sender's decisions
     check(pure(tmp, "name", "1763366400-0.json") == "1|1763366400|0" and pure(tmp, "name", "x.json").startswith("0|"), "a summary's name")
     check(pure(tmp, "name", "1763366400-0.json.tmp").startswith("0|") and pure(tmp, "name", "-1-0.json").startswith("0|"), "only whole names")
@@ -286,6 +299,220 @@ def sender(tmp):
     check(n == 2 and (f / "perf_pending" / "notes.txt").exists() and (f / "perf_pending" / "1763366400-5.json.tmp").exists(), "other files are left alone")
 
 
+def pipelines(tmp):
+    """The pipeline state records' sender (hos_pipes_send_run): the performance summaries' rules, from pipelines_pending, to /telemetry/pipelines"""
+    curl = tmp / ("curl" + EXE)
+    exe = tmp / ("sender" + EXE)
+    case = [0]
+
+    def folder(on=True, stamp="telemetry=https://t.example\n", waiting=1):
+        case[0] += 100
+        f = tmp / ("game%d" % case[0])
+        (f / "pipelines_pending").mkdir(parents=True)
+        (f / "perf_pending").mkdir()
+        (f / "hookshot_options.ini").write_text("send_performance_stats=%d\n" % (1 if on else 0), encoding="utf-8")
+        if stamp is not None:
+            (f / "hookshot_version.txt").write_text("version=v1\n" + stamp, encoding="utf-8")
+        for i in range(waiting):
+            (f / "pipelines_pending" / ("%d-0.json" % (1763366400 + i))).write_text('{"v":1,"i":%d}' % i, encoding="utf-8")
+        return f
+
+    def run(f, answer="sent", **env):
+        calls = f / "calls.txt"
+        calls.unlink(missing_ok=True)
+        e = {k: v for k, v in os.environ.items() if not k.startswith(("HL_", "CURL_"))}
+        e.update(CRASH_TEST_CURL=str(curl), CURL_CALLS=str(calls), CURL_ANSWER=answer, **env)
+        r = subprocess.run([str(exe), str(f), "p"], capture_output=True, text=True, env=e, timeout=120)
+        assert r.returncode == 0, r.stderr
+        return int(r.stdout.strip()), (calls.read_text(encoding="utf-8").splitlines() if calls.exists() else [])
+
+    def waiting(f):
+        return sorted(p.name for p in (f / "pipelines_pending").glob("*.json"))
+
+    f = folder()
+    n, calls = run(f)
+    check(n == 1 and len(calls) == 1 and calls[0].startswith('https://t.example/telemetry/pipelines =https {"v":1,"i":0}'),
+          "pipeline records: the row on and an address: posted to <address>/telemetry/pipelines over https only")
+    check(waiting(f) == [] and len(list((f / "pipelines_sent").glob("*.json"))) == 1, "the batch taken is deleted, a copy kept in pipelines_sent for the player to read")
+    f = folder(on=False)
+    check(run(f) == (-1, []) and len(waiting(f)) == 1, "the performance statistics row off: nothing sent, the batch stays")
+    f = folder(stamp="")
+    check(run(f) == (-1, []) and len(waiting(f)) == 1, "no address: nothing sent")
+    f = folder()
+    check(run(f, HL_TELEMETRY_PIPELINES="0") == (-1, []) and len(waiting(f)) == 1, "HL_TELEMETRY_PIPELINES=0: nothing sent, by itself")
+    n, calls = run(f, HL_TELEMETRY_PIPELINES="1")
+    check(n == 1 and len(calls) == 1, "HL_TELEMETRY_PIPELINES=1 is not off")
+    f = folder(waiting=1)
+    (f / "perf_pending" / "1763366400-0.json").write_text('{"v":1}', encoding="utf-8")
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("HL_", "CURL_"))}
+    e.update(CRASH_TEST_CURL=str(curl), CURL_ANSWER="sent", CURL_CALLS=str(f / "perf-calls.txt"), HL_TELEMETRY_PIPELINES="0")
+    r = subprocess.run([str(exe), str(f)], capture_output=True, text=True, env=e, timeout=120)
+    check(r.stdout.strip() == "1" and "/telemetry/perf " in (f / "perf-calls.txt").read_text(encoding="utf-8") and len(waiting(f)) == 1,
+          "a summary still goes with HL_TELEMETRY_PIPELINES=0, and the batch is left where it is")
+    f = folder(waiting=3)
+    n, calls = run(f)
+    check(n == 2 and len(calls) == 2 and len(waiting(f)) == 1, "two batches a start at most")
+    f = folder(waiting=6)
+    n, calls = run(f, HL_PERF_MAX_SENDS="1")
+    check(n == 1 and len(waiting(f)) == 3 and calls[0].endswith('"i":2}'), "more than 4 waiting: the oldest go unsent, the newest 4 stay")
+    f = folder(waiting=3)
+    for i in range(3):
+        run(f)
+    check(len(list((f / "pipelines_sent").glob("*.json"))) == 3, "the last 3 sent are kept")
+    f = folder(waiting=1)
+    (f / "pipelines_pending" / "1763366400-0.json").write_bytes(b"x" * (1500 * 1024))
+    n, calls = run(f)
+    check(n == 1 and len(calls) == 1 and waiting(f) == [], "a batch of 1.5 MB goes (a summary's 60 KiB limit does not apply to it)")
+    f = folder(waiting=1)
+    (f / "pipelines_pending" / "1763366400-0.json").write_bytes(b"x" * (1536 * 1024 + 1))
+    n, calls = run(f)
+    check(n == 1 and calls == [] and waiting(f) == [], "a batch over 1.5 MiB is dropped, never posted")
+    f = folder()
+    n, calls = run(f, "busy")
+    check(n == 0 and len(waiting(f)) == 1 and (f / "pipelines_pending" / ".next").exists() and not (f / "perf_pending" / ".next").exists(),
+          "a busy server: the batch is kept, the wait noted in its own folder")
+    check(run(f) == (-1, []), "and left alone until then")
+
+
+def zones(tmp):
+    """The per-zone shader and pipeline usage's sender (hos_zones_send_run): the performance summaries' rules, from zones_pending, to /telemetry/zones"""
+    curl = tmp / ("curl" + EXE)
+    exe = tmp / ("sender" + EXE)
+    case = [2000]   # (this test's own folders: the summaries' and the pipeline records' tests made theirs below)
+
+    def folder(on=True, stamp="telemetry=https://t.example\n", waiting=1):
+        case[0] += 100
+        f = tmp / ("game%d" % case[0])
+        (f / "zones_pending").mkdir(parents=True)
+        (f / "perf_pending").mkdir()
+        (f / "hookshot_options.ini").write_text("send_performance_stats=%d\n" % (1 if on else 0), encoding="utf-8")
+        if stamp is not None:
+            (f / "hookshot_version.txt").write_text("version=v1\n" + stamp, encoding="utf-8")
+        for i in range(waiting):
+            (f / "zones_pending" / ("%d-0.json" % (1763366400 + i))).write_text('{"v":1,"i":%d}' % i, encoding="utf-8")
+        return f
+
+    def run(f, answer="sent", **env):
+        calls = f / "calls.txt"
+        calls.unlink(missing_ok=True)
+        e = {k: v for k, v in os.environ.items() if not k.startswith(("HL_", "CURL_"))}
+        e.update(CRASH_TEST_CURL=str(curl), CURL_CALLS=str(calls), CURL_ANSWER=answer, **env)
+        r = subprocess.run([str(exe), str(f), "z"], capture_output=True, text=True, env=e, timeout=120)
+        assert r.returncode == 0, r.stderr
+        return int(r.stdout.strip()), (calls.read_text(encoding="utf-8").splitlines() if calls.exists() else [])
+
+    def waiting(f):
+        return sorted(p.name for p in (f / "zones_pending").glob("*.json"))
+
+    f = folder()
+    n, calls = run(f)
+    check(n == 1 and len(calls) == 1 and calls[0].startswith('https://t.example/telemetry/zones =https {"v":1,"i":0}'),
+          "zone usage: the row on and an address: posted to <address>/telemetry/zones over https only")
+    check(waiting(f) == [] and len(list((f / "zones_sent").glob("*.json"))) == 1, "the batch taken is deleted, a copy kept in zones_sent for the player to read")
+    f = folder(on=False)
+    check(run(f) == (-1, []) and len(waiting(f)) == 1, "the performance statistics row off: nothing sent, the batch stays")
+    f = folder(stamp="")
+    check(run(f) == (-1, []) and len(waiting(f)) == 1, "no address: nothing sent")
+    f = folder()
+    check(run(f, HL_TELEMETRY_ZONES="0") == (-1, []) and len(waiting(f)) == 1, "HL_TELEMETRY_ZONES=0: nothing sent, by itself")
+    n, calls = run(f, HL_TELEMETRY_ZONES="1")
+    check(n == 1 and len(calls) == 1, "HL_TELEMETRY_ZONES=1 is not off")
+    f = folder(waiting=1)
+    (f / "perf_pending" / "1763366400-0.json").write_text('{"v":1}', encoding="utf-8")
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("HL_", "CURL_"))}
+    e.update(CRASH_TEST_CURL=str(curl), CURL_ANSWER="sent", CURL_CALLS=str(f / "perf-calls.txt"), HL_TELEMETRY_ZONES="0")
+    r = subprocess.run([str(exe), str(f)], capture_output=True, text=True, env=e, timeout=120)
+    check(r.stdout.strip() == "1" and "/telemetry/perf " in (f / "perf-calls.txt").read_text(encoding="utf-8") and len(waiting(f)) == 1,
+          "a summary still goes with HL_TELEMETRY_ZONES=0, and the zone batch is left where it is")
+    f = folder(waiting=3)
+    n, calls = run(f)
+    check(n == 2 and len(calls) == 2 and len(waiting(f)) == 1, "two batches a start at most")
+    f = folder(waiting=6)
+    n, calls = run(f, HL_PERF_MAX_SENDS="1")
+    check(n == 1 and len(waiting(f)) == 3 and calls[0].endswith('"i":2}'), "more than 4 waiting: the oldest go unsent, the newest 4 stay")
+    f = folder(waiting=3)
+    for i in range(3):
+        run(f)
+    check(len(list((f / "zones_sent").glob("*.json"))) == 3, "the last 3 sent are kept")
+    f = folder(waiting=1)
+    (f / "zones_pending" / "1763366400-0.json").write_bytes(b"x" * (500 * 1024))
+    n, calls = run(f)
+    check(n == 1 and len(calls) == 1 and waiting(f) == [], "a batch of 500 KB goes (a summary's 60 KiB limit does not apply to it)")
+    f = folder(waiting=1)
+    (f / "zones_pending" / "1763366400-0.json").write_bytes(b"x" * (512 * 1024 + 1))
+    n, calls = run(f)
+    check(n == 1 and calls == [] and waiting(f) == [], "a batch over 512 KiB is dropped, never posted")
+    f = folder()
+    n, calls = run(f, "busy")
+    check(n == 0 and len(waiting(f)) == 1 and (f / "zones_pending" / ".next").exists() and not (f / "perf_pending" / ".next").exists(),
+          "a busy server: the zone batch is kept, the wait noted in its own folder")
+    check(run(f) == (-1, []), "and left alone until then")
+
+
+def profile(tmp):
+    """The detailed profile's sender (hos_profile_send_run): the performance summaries' rules, from profile_pending, to /telemetry/profile"""
+    curl = tmp / ("curl" + EXE)
+    exe = tmp / ("sender" + EXE)
+    case = [7000]
+
+    def folder(on=True, stamp="telemetry=https://t.example\n", waiting=1):
+        case[0] += 100
+        f = tmp / ("game%d" % case[0])
+        (f / "profile_pending").mkdir(parents=True)
+        (f / "perf_pending").mkdir()
+        (f / "hookshot_options.ini").write_text("send_performance_stats=%d\n" % (1 if on else 0), encoding="utf-8")
+        if stamp is not None:
+            (f / "hookshot_version.txt").write_text("version=v1\n" + stamp, encoding="utf-8")
+        for i in range(waiting):
+            (f / "profile_pending" / ("%d-0.json" % (1763366400 + i))).write_text('{"v":1,"i":%d}' % i, encoding="utf-8")
+        return f
+
+    def run(f, answer="sent", **env):
+        calls = f / "calls.txt"
+        calls.unlink(missing_ok=True)
+        e = {k: v for k, v in os.environ.items() if not k.startswith(("HL_", "CURL_"))}
+        e.update(CRASH_TEST_CURL=str(curl), CURL_CALLS=str(calls), CURL_ANSWER=answer, **env)
+        r = subprocess.run([str(exe), str(f), "f"], capture_output=True, text=True, env=e, timeout=120)
+        assert r.returncode == 0, r.stderr
+        return int(r.stdout.strip()), (calls.read_text(encoding="utf-8").splitlines() if calls.exists() else [])
+
+    def waiting(f):
+        return sorted(p.name for p in (f / "profile_pending").glob("*.json"))
+
+    f = folder()
+    n, calls = run(f)
+    check(n == 1 and len(calls) == 1 and calls[0].startswith('https://t.example/telemetry/profile =https {"v":1,"i":0}'),
+          "profile: the row on and an address: posted to <address>/telemetry/profile over https only")
+    check(waiting(f) == [] and len(list((f / "profile_sent").glob("*.json"))) == 1, "the batch taken is deleted, a copy kept in profile_sent")
+    f = folder(on=False)
+    check(run(f) == (-1, []) and len(waiting(f)) == 1, "the row off: nothing sent, the batch stays")
+    f = folder(stamp="")
+    check(run(f) == (-1, []) and len(waiting(f)) == 1, "no address: nothing sent")
+    f = folder()
+    check(run(f, HL_TELEMETRY_PROFILE="0") == (-1, []) and len(waiting(f)) == 1, "HL_TELEMETRY_PROFILE=0: nothing sent, by itself")
+    n, calls = run(f, HL_TELEMETRY_PROFILE="1")
+    check(n == 1 and len(calls) == 1, "HL_TELEMETRY_PROFILE=1 is not off")
+    f = folder(waiting=5)
+    n, calls = run(f)
+    check(n == 2 and len(calls) == 2 and len(waiting(f)) == 3, "two batches a start at most")
+    f = folder(waiting=11)
+    n, calls = run(f, HL_PERF_MAX_SENDS="1")
+    check(n == 1 and len(waiting(f)) == 7 and calls[0].endswith('"i":3}'), "more than 8 waiting: the oldest go unsent, the newest 8 stay")
+    f = folder(waiting=1)
+    (f / "profile_pending" / "1763366400-0.json").write_bytes(b"x" * (256 * 1024 + 1))
+    n, calls = run(f)
+    check(n == 1 and calls == [] and waiting(f) == [], "a batch over 256 KiB is dropped, never posted")
+    f = folder(waiting=1)
+    (f / "profile_pending" / "1763366400-0.json").write_bytes(b"x" * (200 * 1024))
+    n, calls = run(f)
+    check(n == 1 and len(calls) == 1, "a batch of 200 KB goes")
+    f = folder()
+    n, calls = run(f, "busy")
+    check(n == 0 and len(waiting(f)) == 1 and (f / "profile_pending" / ".next").exists() and not (f / "perf_pending" / ".next").exists(),
+          "a busy server: the batch is kept, the wait noted in its own folder")
+    check(run(f) == (-1, []), "and left alone until then")
+
+
 def stamp_lines():
     sys.path.insert(0, str(ROOT / "nx2"))
     import addresses
@@ -317,6 +544,9 @@ def main():
         build(args.cc, tmp)
         rules(tmp)
         sender(tmp)
+        pipelines(tmp)
+        zones(tmp)
+        profile(tmp)
 
 
 if __name__ == "__main__":

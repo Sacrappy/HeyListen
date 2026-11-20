@@ -77,7 +77,7 @@ class FrameTraceTests(unittest.TestCase):
         mem = (VK / "vk_memory.cpp").read_text(encoding="utf-8")
         take = block(mem, "bool take_capture(")
         late = block(take, "if (c->late_value && c->map)")
-        wait = late.index("vk_timeline_wait(c->late_value);")
+        wait = late.index("vk_timeline_wait_for(c->late_value")
         self.assertIn("st_tr_late_ns.fetch_add(", late[wait:])
         self.assertIn("st_tr_late_n.fetch_add(1", late[wait:])
         self.assertNotIn("st_tr_late_ns = ", mem, "the trace's totals are reset: its differences go negative")

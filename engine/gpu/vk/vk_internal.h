@@ -12,6 +12,7 @@
 #include "vk_loader.h"
 #include "vk_api.h"
 #include "split_count.h"   // (TICK-052)
+#include "present_mode.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -35,10 +36,26 @@ void queue_flush();          // (the same, taking dev.present_mu)
 // (hookshot) held submits out, then vkDeviceWaitIdle with the present queue's lock taken too (dev.present_mu held): the device's
 // every queue is synchronized by the host around it
 void device_wait_idle_locked();
+/// The display's refresh in mHz, 0 unknown (vk_main.cpp)
+int display_refresh_mhz();
+/// (VRR row) What it comes to now: the row, the fullscreen row, the display's refresh range, RX_VK_FIFO / RX_VK_IMMEDIATE. Cached a
+/// fraction of a second; log says one line for each change (why, mode, cap) and the window's style follows (host/display.c)
+present_mode::VrrState vrr_resolved(bool log);
+/// A number that changes when the V-Sync or VRR rows change what the swapchain should be (present_image makes it again)
+int present_choice_key();
+/// The most the game's frame rate limit may be under VRR (host/nn_vi.c, HL_OPT_VRR_CAP): the refresh - 3; 0 when VRR is off, or
+/// the refresh is not known, or the cap would be under 60
+int vrr_fps_cap();
+/// The gap the display thread keeps between frame generation's presents under VRR (ns), 0: none
+int64_t vrr_min_gap_ns();
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;
     const char* present_mode_name = nullptr;   // (the swapchain's: the overlay shows it)
+    unsigned present_modes_offered = 0;        // (present_mode.h Offered bits of the surface; the V-Sync mode row reads them)
+    bool present_modes_known = false;          // (create_swapchain has asked the surface)
+    uint32_t swap_min_images = 0, swap_max_images = 0;   // (its minImageCount/maxImageCount: the V-Sync mode row's clamp)
+    bool vrr_active = false;                   // (present_mode.h vrr_resolve: the VRR row's effect as the swapchain was made)
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceMemoryProperties memory{};
@@ -64,6 +81,7 @@ struct Device {
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool swapchain_colorspace = false;   // (hookshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
     bool hdr = false;                    // (hookshot) the swapchain is HDR10 (ST 2084, Rec. 2020): framegen_hdr writes it
+    bool hdr_listed = false;             // (HeyListen) the display lists an HDR10 surface (Windows' "Use HDR" on), found at each swapchain whatever the HDR row says: the menu's HDR rows
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
     // (hookshot, issue 996, d1d6caa7) the GPU has mesh shaders but the draws that have a task stage run through the compute fallback
     // (AMD's Windows driver times out on them on RDNA 2, Navi 21 to 23; RX_VK_TASK_MESH_FALLBACK): mesh_mode.h. Mesh-only draws stay native
@@ -83,6 +101,7 @@ struct Device {
     VkShaderStageFlags warp_wide_stages = 0;
     uint32_t warp_lanes = 32;
     uint32_t max_push_descriptors = 0;
+    uint32_t max_vertex_divisor = 0;   // (maxVertexAttribDivisor, with dev.vertex_divisor)
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;
     // the window
@@ -373,6 +392,22 @@ void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its
 void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel replay's segments: their order, base on)
 /// (hookshot) a range a program may write in the mirror that is not bound as written (not copied back): memory_rb_refresh
 void memory_note_gpu_write(uint64_t gpu, uint64_t size);
+/// (ported from hookshot 53eb0441, pixl27: its RX_VK_METER_ZERO / RX_VK_METER_HOLD parts only) OoT's exposure meter: two compute
+/// programs add a frame's sums into the first 16 bytes of a 0x1040 block that the game reads and sets back to zero. A read that
+/// came before the new sums landed (or after a write-back brought the old ones back over the game's zeros) gave zero or doubled
+/// sums: the exposure stepped, the white flashes. RX_VK_METER_ZERO: the sums are cleared on the GPU right before each program.
+/// RX_VK_METER_HOLD: a read that finds zeros is given the last result again. Both on by default; =0 turns one off
+inline bool meter_zero_on() {
+    static const bool on = !getenv("RX_VK_METER_ZERO") || atoi(getenv("RX_VK_METER_ZERO")) != 0;
+    return on;
+}
+inline bool meter_hold_on() {
+    static const bool on = !getenv("RX_VK_METER_HOLD") || atoi(getenv("RX_VK_METER_HOLD")) != 0;
+    return on;
+}
+/// the block's start, noted where the meter's programs bind it (vk_draw.cpp), and whether guest is one (vk_replay.cpp invalidate)
+void memory_meter_range(uint64_t guest, uint64_t size);
+bool memory_is_meter(uint64_t guest);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 /// (longshot #442) The timeline's value without the write-backs it applies: a plain read, safe under the replay's lock
@@ -388,6 +423,9 @@ inline void trace_gpu(uint32_t what, uint64_t guest, uint64_t size, uint64_t poo
     if (host && host->trace_gpu) host->trace_gpu(what, guest, size, pool, value, vk_timeline_completed());
 }
 void vk_timeline_wait(uint64_t v);
+/// (ported from Hookshot 54530a0d) A wait for the timeline to reach v, at most timeout_ms: true when it did. The capture's wait for
+/// its late pages names its own bound (its cap follows the GPU, vk_memory.cpp take_capture); every other caller keeps vk_timeline_wait
+bool vk_timeline_wait_for(uint64_t v, uint32_t timeout_ms);
 void vk_tl_note(const char* what, uint64_t a = 0, uint64_t b = 0);   // (stream R2, vk_replay.cpp: an event of RX_VK_TL's timeline from another file)
 void gpu_tail_note_late(uint64_t v);   // (TICK-057, vk_replay.cpp: a capture waited for v's late pages: the GPU's busy tail before it)
 /// (TICK-060, RX_VK_LATE_DEFER) vk_memory.cpp: the highest late value a pending fix waits for (0: none); the fixes whose value done

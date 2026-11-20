@@ -580,6 +580,9 @@ int32_t hos_stick_axis(int16_t v, int zone) {
     return (a > t || a < -t) ? a : 0;
 }
 
+static volatile int xinput_pads_now;   /* (pads_read: the controllers XInput has, while it is polled) */
+int hos_xinput_pads(void) { return xinput_pads_now; }   /* (host/prompts.c: Auto's face) */
+
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     static int64_t next_read, retry[XUSER_MAX_COUNT];
     static int was_connected[XUSER_MAX_COUNT];
@@ -632,11 +635,15 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
         if (xinput_get((DWORD)p, &xs) != ERROR_SUCCESS) {
             if (was_connected[p]) hos_log("hid: controller %d disconnected", p);
             was_connected[p] = 0;
+            int any = 0;
+            for (int q = 0; q < XUSER_MAX_COUNT; q++) any |= was_connected[q];
+            xinput_pads_now = any;
             retry[p] = now + 1000000000LL;
             continue;
         }
         if (!was_connected[p]) hos_log("hid: controller %d connected", p);
         was_connected[p] = 1;
+        xinput_pads_now = 1;
         const WORD w = xs.Gamepad.wButtons;
         for (unsigned i = 0; i < sizeof map / sizeof *map; i++)
             if (w & map[i].x) raw |= 1ULL << map[i].b;

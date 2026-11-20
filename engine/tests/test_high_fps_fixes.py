@@ -168,6 +168,8 @@ static uint8_t guest[0x4000] __attribute__((aligned(16)));
 #define GP(a) ((void *)(guest + ((uint64_t)(a) - BASE)))
 #define G64(a) (*(uint64_t *)GP(a))
 #define G32(a) (*(uint32_t *)GP(a))
+#define HOS_HEAP_BASE 0x1000ULL   /* (hos_oot_note_link's walk: this fixture never calls it) */
+static void *hos_guest_range(uint64_t a, uint64_t n) { (void)n; return GP(a); }
 typedef int SRWLOCK;
 #define SRWLOCK_INIT 0
 static void AcquireSRWLockExclusive(SRWLOCK *l) { CHECK(!*l); *l = 1; }

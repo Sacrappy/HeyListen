@@ -1,6 +1,8 @@
 """host/hos_run_logs.h: logs/hookshot.log (this run's log, a hard link to hookshot_log.txt) and hookshot.1.log to .4.log (the runs
 before), the folder recomplauncher.json declares as "logs" so RecompLauncher attaches the newest .log to a player's crash report;
-and the manifest declares it. Builds a small program with the compiler on PATH (llvm-mingw's clang on Windows); skipped elsewhere.
+and the manifest declares it. Made on Windows and Linux alike (on Linux host/posix/windows.h gives the same file calls, and the game
+opens hookshot_log.txt whenever it is started with no terminal, as the launcher starts it); a source check covers the Linux side.
+Builds a small program with the compiler on PATH (llvm-mingw's clang on Windows); skipped elsewhere.
 
 python -I -B tests/test_run_logs.py
 """
@@ -38,6 +40,18 @@ class RunLogsTests(unittest.TestCase):
     def test_main_calls_it_after_the_log_is_open(self):
         src = (ENGINE / "host" / "hos_main.c").read_text(encoding="utf-8")
         self.assertLess(src.index('freopen(path, "w", stderr)'), src.index("hos_run_logs_make(gdir, path)"))
+
+    def test_the_linux_build_makes_the_folder_too(self):
+        """(a source check: this PC is Windows, and Linux's hard link is made by host/posix) The header had a Linux no-op
+        before; now one implementation runs on both, and win32_posix.c gives it CreateHardLinkA."""
+        header = (ENGINE / "host" / "hos_run_logs.h").read_text(encoding="utf-8")
+        self.assertNotIn("static inline void hos_run_logs_make", header)   # (the no-op branch, removed)
+        self.assertIn("#include <windows.h>", header)   # (on Linux, host/posix/windows.h through the include path)
+        shim = (ENGINE / "host" / "posix" / "windows.h").read_text(encoding="utf-8")
+        self.assertIn("BOOL CreateHardLinkA(LPCSTR link, LPCSTR target, void *attr);", shim)
+        impl = (ENGINE / "host" / "posix" / "win32_posix.c").read_text(encoding="utf-8")
+        link = impl[impl.index("BOOL CreateHardLinkA("):impl.index("BOOL CopyFileA(")]
+        self.assertIn("link(b, a)", link)   # (the link's path first, the file it names second, as on Windows)
 
     @unittest.skipUnless(os.name == "nt", "Windows only (hard links on NTFS)")
     def test_five_runs_keep_the_last_five_logs(self):

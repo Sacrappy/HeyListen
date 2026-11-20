@@ -12,6 +12,7 @@
 #endif
 #include <windows.h>
 #endif
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -42,7 +43,8 @@ void destroy_image(VkImage,VmaAllocation) {}
 void destroy_buffer(VkBuffer,VmaAllocation) {}
 VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice,VkImageView,const VkAllocationCallbacks*) {}
 /* SETUP */
-void present_image(VkImage,uint32_t,uint32_t,const int*,VkImageView) { presented++; }
+std::atomic<bool> present_native_pq{false};
+void present_image(VkImage,uint32_t,uint32_t,const int*,VkImageView,bool) { presented++; }
 void tick() {
     VkImage src=reinterpret_cast<VkImage>(uintptr_t(0xff)); const char* shots="test";
     uint32_t sw=1720,sh=720; const int* crop=nullptr; VkImageView direct_view{}; bool interpolated=false;

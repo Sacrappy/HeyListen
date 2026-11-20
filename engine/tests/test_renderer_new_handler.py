@@ -57,7 +57,8 @@ def check_sites():
     stop = block(rx, "static void host_out_of_memory(const char *what)")
     if "hos_out_of_memory(1)" not in stop or "hos_fatal(" not in stop:
         raise SystemExit("FAIL: the host's out_of_memory does not show the notice (waited for) and stop")
-    if not re.search(r"hos_perf_info,\s*host_out_of_memory,\s*\};", rx):
+    # (later fields follow it: version 16's no_usable_gpu)
+    if not re.search(r"hos_perf_info,\s*host_out_of_memory,\s*(?:\w+,\s*)*\};", rx):
         raise SystemExit("FAIL: vk_host does not fill out_of_memory after perf_info")
 
 

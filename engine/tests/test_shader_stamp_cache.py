@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = ROOT / "nx2" / "build.py"
 sys.path.insert(0, str(ROOT / "nx2"))
 import vk_pgo   # (the back end's play profile: none in the fixture's work folder, so no flag)
+import translator_files   # (the shader stamp's file list: the back end's branch calls it)
 
 
 # What starting a program needs, kept when the fixture clears the environment: PATH to find the compiler (POSIX falls back to
@@ -124,6 +125,7 @@ class ShaderStampCacheTests(unittest.TestCase):
             "LINUX": linux, "CPU": ["-march=x86-64"],
             "kit": SimpleNamespace(ROOT=str(self.root), HERE=str(self.root / "nx2"), WORK=str(self.root / "work")),
             "vk_pgo": vk_pgo,
+            "translator_files": translator_files,
             "toolchain": SimpleNamespace(find=lambda name: name, need=lambda name: name, mingw=lambda: mingw),
             "target": lambda: ["--target=x86_64-linux-gnu" if linux else "--target=x86_64-w64-mingw32"],
             "cpm_package": lambda name: str(self.root / "deps" / name),

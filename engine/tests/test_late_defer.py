@@ -54,8 +54,9 @@ def main():
     need("late_fix_count() >= kLateFixMax" in gate, "take_capture: at most kLateFixMax pending")
     need(gate.rstrip().endswith("}") and "else late_defer = true" in gate, "take_capture: late_defer set only in the last branch")
     old = take[take.index("if (!late_merge && !late_defer) {"):]
-    need("vk_timeline_wait(c->late_value);" in old and "guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096" in old,
-         "take_capture: the wait and the copies as before otherwise")
+    need("vk_timeline_wait_for(c->late_value, (uint32_t)cap_ms);" in old and
+         "guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096" in old,
+         "take_capture: the wait (its cap following the GPU, 54530a0d) and the copies as before otherwise")
     kept = take[take.index("if (!c->copied.empty() && g && c->map) {"):]
     reg = kept[kept.index("if (late_defer) {"):]
     need("f.value = c->late_value, f.gen = g, f.map = (uint8_t*)b.map" in reg and "late_fix_push(std::move(f));" in reg,

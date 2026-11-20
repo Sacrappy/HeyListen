@@ -107,11 +107,16 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
    interval's vsyncs (1: 60 fps, 2: 30) after the last present, so the game runs at the display's rate.
    HOS_NO_PACING=1: as fast as it can. */
 static volatile int present_interval = 1;
-/* (hookshot) The frame rate limit: 60, or what the Insert menu's Frame rate limit (HOS_FPS_LIMIT=<30..360> over it) gives. Above 60 the game
-   runs its frames at that rate with its time following the clock (Game speed Real time): the display queue, the step (realtime_step)
-   and the game's own limiter (+0xfc) are all at the limit. (Sync 11: upstream's Frame rate cap, frame_rate_cap= / HOS_FPS_MAX read once at
-   the start, is the same feature; ours is kept, read live, and HOS_FPS_MAX is taken as HOS_FPS_LIMIT) */
-static int fps_limit(void) {
+/* (hookshot) The frame rate limit: 60, or what the Insert menu's Frame rate limit (HOS_FPS_LIMIT=<30..360> over it) gives. The limit
+   is the rate PRESENTED (HeyListen): the game's frames and the frames the frame generation makes between them. Frame generation
+   Off or Auto, the game runs at the limit; at a fixed multiplier m (HL_OPT_FRAMEGEN_MULT: the multiplier that runs, which the
+   renderer has already lowered so that this stays at 20 or more) the game runs at the limit over m, and m - 1 made frames fill
+   each of its frames. Unlimited (the row's: HL_OPT_FPS_LIMIT answers 0): the game is not held at all, and the frame generation
+   multiplies what it gets. The game runs its frames at that rate with its time following the clock (Game speed Real time): the
+   display queue, the step (realtime_step) and the game's own limiter (+0xfc) are all at the game's rate. (Sync 11: upstream's Frame
+   rate cap, frame_rate_cap= / HOS_FPS_MAX read once at the start, is the same feature; ours is kept, read live, and HOS_FPS_MAX is
+   taken as HOS_FPS_LIMIT) */
+static void fps_plan(int *limit, int *mult) {
     static int env = -1;
     if (env < 0) {
         const char *e = getenv("HOS_FPS_LIMIT") ? getenv("HOS_FPS_LIMIT") : getenv("HOS_FPS_MAX");
@@ -119,8 +124,39 @@ static int fps_limit(void) {
     }
     int rx_option(int id, int otherwise);
     int v = env > 0 ? env : rx_option(HL_OPT_FPS_LIMIT, 60);
-    v = v < 30 ? 30 : v > 360 ? 360 : v;
-    return rx_option(0, 1) && v > 60 ? v : 60;   /* (Per frame: the game's steps are whole frames of 1/60 s: 60) */
+    int m = rx_option(HL_OPT_FRAMEGEN_MULT, 1);
+    m = m < 2 ? 1 : m > 8 ? 8 : m;
+    if (!rx_option(0, 1)) v = 60, m = 1;   /* (Per frame: the game's steps are whole frames of 1/60 s: 60, with the frames made on top) */
+    else if (v > 0) {
+        v = v < 30 ? 30 : v > 360 ? 360 : v;
+        if (v > 60) {   /* (the VRR row: a few fps under the refresh; 0 when VRR is off, which leaves the limit alone) */
+            const int cap = rx_option(HL_OPT_VRR_CAP, 0);
+            if (cap >= 60 && cap < v) v = cap;
+        }
+    }
+    else v = 0;   /* (Unlimited) */
+    *limit = v, *mult = m;
+}
+/* The game's rate in frames a second, as the engine's own limiter and its step want it: up to 360; 360 for Unlimited */
+static int fps_limit(void) {
+    int v, m;
+    fps_plan(&v, &m);
+    if (v <= 0) return 360;
+    const int g = (v + m / 2) / m;
+    return g < 20 ? 20 : g;
+}
+static int fps_unlimited(void) {
+    int v, m;
+    fps_plan(&v, &m);
+    return v <= 0;
+}
+/* The time between the game's frames, exact for a limit that does not divide by the multiplier (165 / 4), 0 for Unlimited */
+static int64_t fps_period_ns(void) {
+    int v, m;
+    fps_plan(&v, &m);
+    if (v <= 0) return 0;
+    const int64_t period = 1000000000LL * m / v;
+    return period < 1000000000LL / 360 ? 1000000000LL / 360 : period > 1000000000LL / 20 ? 1000000000LL / 20 : period;
 }
 static int64_t next_frame_at, window_start, frames_in_window;
 static volatile LONG64 presents;
@@ -150,6 +186,14 @@ int hos_vi_native_interval(Ctx *c, int requested) {
    that behaviour */
 static int64_t shown_at[16];
 static volatile LONG64 shown_count;
+/* (heylisten) the pacing sleeps since the present before, us: the performance summary's pace part (gpu/vk/perf_parts.h),
+   taken by nvn_native.c at each present and handed to the renderer there. The presenting thread's own */
+static int64_t pace_since_present_us;
+int64_t hos_vi_pace_us(void) {
+    const int64_t us = pace_since_present_us;
+    pace_since_present_us = 0;
+    return us;
+}
 void hos_vi_native_acquire(int active) {
     static int no_pacing = -1, double_buffered = -1;
     if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
@@ -161,7 +205,10 @@ void hos_vi_native_acquire(int active) {
         until = frame >= 0 && frame < n ? shown_at[frame & 15] : 0;
     }
     const int64_t now = hos_now_ns();
-    if (until > now) hos_sleep_ns(until - now);
+    if (until > now) {
+        hos_sleep_ns(until - now);
+        pace_since_present_us += (hos_now_ns() - now) / 1000;
+    }
 }
 /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
@@ -225,6 +272,9 @@ static float text_scale(const char *env, int menu) {
     return v == 1 ? 2.0f : v == 2 ? 4.0f : v >= 3 ? 1e6f : 1.0f;
 }
 volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is the 3D's scale: nx2/oot_patches.py) */
+volatile int hos_scene_rgba16f = 0;   /* (HeyListen, after Longshot ddb156df: the scene buffer RGBA16F, not R11G11B10F, f_80672260:
+                                         nx2/oot_patches.py; HDR set to Native with the PsychoV35 tone mapper: the temporal upscalers
+                                         take only R11G11B10F, so Vanilla keeps it) */
 static void realtime_step(int64_t now) {
     int rx_option(int id, int otherwise);
     /* (Resolution 100% from the start: the fixed path skipped the dynamic block from the first frame, its fields stayed
@@ -236,6 +286,7 @@ static void realtime_step(int64_t now) {
         if (!looked) looked = 1, env = getenv("HOS_TEXT_SPEED");
         hos_text_scale = text_scale(env, rx_option(5, 0));
     }
+    hos_scene_rgba16f = rx_option(HL_OPT_HDR_TONEMAP, 0) != 0;
     {   /* (the Insert menu's Resolution: the fixed path's scale in 1/10000, live; HOS_RES_SCALE
            below stays over it) */
         const int scale = rx_option(3, 0);
@@ -300,7 +351,7 @@ static void realtime_step(int64_t now) {
             clock_before = game_clock, at_before = now, global_sum = 0;
         }
         const int cap = fps_limit();
-        if (cap > 60 && target < cap) target = cap;   /* (the Insert menu's limit raises the game's own limiter too) */
+        if (cap > 60 && target < cap) target = fps_unlimited() ? 1000 : cap;   /* (the Insert menu's limit raises the game's own limiter too: Unlimited, out of the way) */
         if (target && *limit > 0 && *limit < target) *limit = target;
     }
     /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time; fps_limit() is 60 then) */
@@ -445,7 +496,11 @@ void hos_vi_native_presented(void) {
         if (ms) hos_sleep_ns(ms * 1000000LL);
     }
     const int limit = fps_limit();
-    const int64_t period = limit > 60 ? 1000000000LL / limit : 1000000000LL / 60 * present_interval, now = hos_now_ns();
+    int rx_option(int id, int otherwise);
+    /* (the game's rate above or below 60: its exact period, 0 for Unlimited; at 60, and in Per frame, the console's 1/60 s a display
+       interval (present_interval is 1 in Real time, where the limit applies)) */
+    const int64_t now = hos_now_ns();
+    const int64_t period = limit == 60 || !rx_option(0, 1) ? 1000000000LL / 60 * present_interval : fps_period_ns();
     realtime_step(now);
     /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */
     next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now + period;

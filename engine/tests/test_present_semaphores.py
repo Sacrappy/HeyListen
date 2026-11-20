@@ -45,13 +45,13 @@ fixture = r'''
 using VkSemaphore=uint64_t; using VkImage=uint64_t; using VkSwapchainKHR=uint64_t; using VkResult=int;
 constexpr uint64_t VK_NULL_HANDLE=0;
 constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0;
-constexpr int VK_PRESENT_MODE_MAILBOX_KHR=1, VK_PRESENT_MODE_IMMEDIATE_KHR=2;
+constexpr int VK_PRESENT_MODE_MAILBOX_KHR=1, VK_PRESENT_MODE_IMMEDIATE_KHR=2, VK_PRESENT_MODE_FIFO_RELAXED_KHR=3;
 struct VkSemaphoreCreateInfo { int type; };
 struct Extent { uint32_t width,height; };
 struct Device { int device=1;uint64_t swapchain=0;int swap_format=0;Extent swap_extent{};bool swap_mutable=false;
     std::vector<VkImage> swap_images;std::vector<VkSemaphore> swap_rendered;
-    std::atomic<uint64_t> swap_resize{0};std::mutex present_mu;const char* present_mode_name=""; } dev;
-struct { int hdr=0; } opts;   // (the Insert menu's HDR row: present_image remakes the swapchain when it changes)
+    std::atomic<uint64_t> swap_resize{0};std::mutex present_mu;const char* present_mode_name=""; bool vrr_active=false; } dev;
+struct { int hdr=0; int vsync=0; int vrr=0; } opts;   // (the Insert menu's HDR row: present_image remakes the swapchain when it changes)
 unsigned image_count=4, made=0, fail_at=0;uint64_t serial=1000;
 int query_result=0,data_result=0;uint64_t destroyed_swapchain=0;
 bool idle=false, bad_destroy=false; std::set<uint64_t> live,used;
@@ -116,6 +116,7 @@ bool create_swapchain(unsigned width,unsigned height) {
     return recreate();
 }
 bool reflex_swapchain_stale() {return stale;}
+int present_choice_key() {return opts.vsync*4;}   // (the V-Sync and VRR rows as one number: vk_main.cpp)
 std::mutex present_image_mu;
 void present_begin() {
 ''' + begin + r'''

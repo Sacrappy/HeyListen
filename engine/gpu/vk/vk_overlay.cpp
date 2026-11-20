@@ -15,6 +15,7 @@
 
 #include "vk_internal.h"   // (first: it sets the Win32 platform before any Vulkan header)
 #include "vk_menu.h"
+#include "vk_framegen.h"  // (framegen_on, framegen_now: the Frame limit line)
 #include "vk_perf.h"
 #include "vk_fsr3.h"      // (fsr3_wanted: the Scaling line names the upscaler)
 #include "vk_temporal.h"  // (temporal_mode)
@@ -189,12 +190,17 @@ void perf_picture(uint32_t w, uint32_t h, const ImVec4& c) {
     const int mode = temporal_mode();
     const char* engine = upscaler_off() ? "no upscaler" : fsr3_wanted() ? "FSR 3.1" : (mode > 0 && mode < upscaler_rows::kUpscalers ? engines[mode] : "");
     snprintf(v[3], sizeof v[3], "%s%s%s", engine, *engine ? " + " : "", scaling[opts.upscale < 0 || opts.upscale > 2 ? 0 : opts.upscale]);
-    {   // (HeyListen) the game's frame rate limit (option 9 / HOS_FPS_LIMIT, what host/nn_vi.c paces at), and frame generation on top
-        static const int lim[] = {60, 90, 120, 144, 165, 240};
-        int fps = !opts.realtime ? 60 : lim[opts.fps_limit < 0 || opts.fps_limit > 5 ? 0 : opts.fps_limit];
-        if (const char* e = getenv("HOS_FPS_LIMIT")) fps = atoi(e) > 0 ? atoi(e) : fps;
-        if (opts.framegen >= 2) snprintf(v[4], sizeof v[4], "%d fps + frame generation", fps);
-        else snprintf(v[4], sizeof v[4], "%d fps", fps);
+    {   // (HeyListen) the frame rate limit (what host/nn_vi.c paces at): the rate shown, the game's frames and the made ones. With a
+        // fixed frame generation multiplier the game runs at the limit over it. The VRR row holds a limit above 60 under the refresh
+        int limit = menu_fps_limit();
+        if (const int cap = vrr_fps_cap(); limit > 60 && cap >= 60 && cap < limit) limit = cap;   // (the VRR row: held under the refresh)
+        const int mult = framegen_on() && framegen_now() >= 2 ? framegen_now() : 1;
+        if (limit == 0 && mult > 1) snprintf(v[4], sizeof v[4], "Unlimited, %dx frame generation", mult);
+        else if (limit == 0) snprintf(v[4], sizeof v[4], "Unlimited");
+        else if (limit < 0) snprintf(v[4], sizeof v[4], "%s", opts.framegen >= 1 ? "60 fps + frame generation" : "60 fps");
+        else if (mult > 1) snprintf(v[4], sizeof v[4], "%d fps (game %d x %d)", limit, limit / mult, mult);
+        else if (opts.framegen == 1) snprintf(v[4], sizeof v[4], "%d fps, Auto frame generation", limit);
+        else snprintf(v[4], sizeof v[4], "%d fps", limit);
     }
     snprintf(v[5], sizeof v[5], "%s", dev.present_mode_name ? dev.present_mode_name : kNone);
     static const char* const labels[6] = {"Window", "Game image", "3D scene", "Scaling", "Frame limit", "Presentation"};

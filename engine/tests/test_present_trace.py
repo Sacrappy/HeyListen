@@ -47,6 +47,8 @@ static void realtime_step(int64_t now) { (void)now; ++steps; }
 static void hos_log(const char *fmt, ...) { (void)fmt; }
 static uint64_t hos_ticks(void) { return 0; }
 static int fps_limit(void) { return 60; }   /* (nn_vi.c's Frame rate limit: the console's 60 here) */
+static int64_t fps_period_ns(void) { return 1000000000LL / 60; }   /* (and its exact period: at 60 the code takes the console's own) */
+int rx_option(int id, int otherwise) { (void)id; return otherwise; }   /* (Game speed Real time) */
 static void speed_log(int64_t now) { (void)now; }   /* (HOS_SPEED_LOG, TICK-014: a diagnostic of its own; its argument is a clock read) */
 '''
 

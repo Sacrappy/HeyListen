@@ -56,13 +56,25 @@ MARK_NATIVE_64 = r"""extern uint8_t a64_dirty[A64_DIRTY_PAGES];
    at most 64 bytes (DC ZVA): its first and last byte's granules are all it touches. */
 extern uint8_t *a64_gran;
 #define A64_GRAN_AT(a) (((uint64_t)(a) >> 9) & (A64_DIRTY_PAGES * 8 - 1))
-#define A64_MARK(a, n) (__atomic_store_n(&a64_gran[A64_GRAN_AT(a)], 1, __ATOMIC_RELEASE), \
+#define A64_MARK_BYTES(a, n) (__atomic_store_n(&a64_gran[A64_GRAN_AT(a)], 1, __ATOMIC_RELEASE), \
                         __atomic_store_n(&a64_gran[A64_GRAN_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE), \
                         __atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
                         __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
 #else
-#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
+#define A64_MARK_BYTES(a, n) (__atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
                         __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
+#endif
+#if defined(A64_MARK_BITMAP)
+/* (longshot 11-18, 35a4a9fc #1617: build.py RX_MARK_BITMAP, host/mark_bitmap.c) only a store that starts on a page the GPU
+   can read marks: a bit per page of the window, set when a GPU mapping covering it is made and for the page before it too,
+   so a store crossing into a mapping from the page before is caught by its first byte; read-only on the store path. The
+   renderer reads the marks of GPU pages only, and OoT's GPU pools lie in the heap among its CPU data. The host's own writes
+   (HOS_WRITTEN) still mark every page. RX_MARK_BITMAP=0 at build time: A64_MARK as below, every page. */
+extern uint8_t a64_gpu_pages[A64_DIRTY_PAGES / 8];
+#define A64_GPU_PAGE(a) ((a64_gpu_pages[A64_DIRTY_AT(a) >> 3] >> (A64_DIRTY_AT(a) & 7)) & 1)
+#define A64_MARK(a, n) (A64_GPU_PAGE(a) ? (void)A64_MARK_BYTES(a, n) : (void)0)
+#else
+#define A64_MARK(a, n) A64_MARK_BYTES(a, n)
 #endif"""
 
 SUBST = {

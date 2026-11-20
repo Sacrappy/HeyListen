@@ -329,6 +329,7 @@ void RunJobs::notify_all() {
     std::lock_guard lk(par_pool.mu);
     par_pool.pending = 0;
 }
+#include "init_barrier.inc"   // (replay_handle's host_read_barrier at each recording's end)
 Recording recordings[8];
 int recording_count = 0;
 uint64_t rec_cur_value = 1;

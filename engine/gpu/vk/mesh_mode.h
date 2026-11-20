@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // (hookshot, #1001, issue 2245; the switch from Longshot 8694e3c6) How the game's task and mesh programs run: 0 Automatic
-// (the GPU's own mesh shaders where it has them, the compute fallback where not, and on Linux with an RDNA 2 AMD GPU, RADV, the
-// compute path), 1 Native (the GPU's own mesh shaders, RADV's too), 2 Compute (the fallback on every GPU). Chosen by the
+// (the GPU's own mesh shaders where it has them, the compute fallback where not, and on Linux with an RDNA 2 or RDNA 3.5 AMD GPU,
+// RADV, the compute path), 1 Native (the GPU's own mesh shaders, RADV's too), 2 Compute (the fallback on every GPU). Chosen by the
 // launch switch RX_VK_MESH_SHADERS=native or compute; RX_VK_FORCE_MESH_FALLBACK=1 is Compute over it. Nothing of Vulkan
 // here, so tests/test_mesh_mode_switch.py compiles and runs it without a GPU or a game.
 #pragma once
@@ -49,23 +49,40 @@ inline bool rdna2_extra(uint32_t device) {
     }
 }
 
+/// RDNA 3.5 APUs (gfx1150 to gfx1152): Strix Point (0x150e: Radeon 880M, 890M), Krackan Point (0x1114: Radeon 840M, 860M)
+/// and Strix Halo (0x1586: Radeon 8040S, 8050S, 8060S). On Linux they are RADV's RDNA 3.5, whose native mesh path draws foliage
+/// and glows white (an 890M on SteamOS 3.9.5 and a Legion Go 2, issue 81); the compute path draws them correctly
+inline bool rdna35_extra(uint32_t device) {
+    switch (device) {
+    case 0x150e:   // Strix Point: Radeon 880M, 890M
+    case 0x1114:   // Krackan Point: Radeon 840M, 860M
+    case 0x1586:   // Strix Halo: Radeon 8040S, 8050S, 8060S
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// (hookshot, issue 2245) RADV's native task/mesh path deadlocks the GPU on RDNA 2: the gfx ring and RADV's gang compute ring end
 /// up waiting on each other, and a mesh-only draw hangs with the compute queue empty (devcoredumps on an RX 6800: no VM fault).
 /// Task + mesh draws alone on the fallback still crash, so only the full compute path is stable there; the reports span Navi 2x
-/// (RX 6800, RX 6600 XT) and Van Gogh (Steam Deck). RDNA 3 and 4 on RADV run the native path without the hang (an RX 9070 XT), and
-/// RDNA 1 and older have no mesh shaders on RADV. So on Linux, with an AMD GPU (RADV) of the RDNA 2 device IDs
-/// (task_mesh_fallback_default's Navi 21 to 23, rdna2_extra), Automatic picks Compute; every other AMD ID stays Automatic.
+/// (RX 6800, RX 6600 XT) and Van Gogh (Steam Deck). RDNA 3 and 4 on RADV run the native path without the hang (an RX 9070 XT),
+/// except the RDNA 3.5 APUs (rdna35_extra, issue 81), whose native path draws foliage and glows white; RDNA 1 and older have no
+/// mesh shaders on RADV. So on Linux, with an AMD GPU (RADV) of the RDNA 2 device IDs (task_mesh_fallback_default's Navi 21 to
+/// 23, rdna2_extra) or the RDNA 3.5 APUs (rdna35_extra), Automatic picks Compute; every other AMD ID stays Automatic.
 /// RX_VK_MESH_SHADERS=native or compute overrides either way. linux_os: the OS the game runs on (Windows' AMD driver is not RADV)
 inline bool automatic_is_compute(bool linux_os, uint32_t vendor_id, uint32_t device_id) {
-    return linux_os && vendor_id == kVendorAmd && (task_mesh_fallback_default(vendor_id, device_id) || rdna2_extra(device_id));
+    return linux_os && vendor_id == kVendorAmd &&
+           (task_mesh_fallback_default(vendor_id, device_id) || rdna2_extra(device_id) || rdna35_extra(device_id));
 }
 
 /// The mode a device runs: the choice, with Automatic made Compute where automatic_is_compute says so. why: for the log, the
 /// choice's own reason, or the rule that made Automatic Compute
 inline Choice effective(Choice c, bool linux_os, uint32_t vendor_id, uint32_t device_id) {
-    if (c.mode == 0 && automatic_is_compute(linux_os, vendor_id, device_id))
-        return {2, "the default on Linux AMD RDNA 2 (RADV's mesh shaders stop the GPU, issue 2245; RX_VK_MESH_SHADERS=native keeps them)"};
-    return c;
+    if (c.mode != 0 || !automatic_is_compute(linux_os, vendor_id, device_id)) return c;
+    if (rdna35_extra(device_id))
+        return {2, "the default on Linux AMD RDNA 3.5 (RADV's mesh shaders draw foliage and glows white, issue 81; RX_VK_MESH_SHADERS=native keeps them)"};
+    return {2, "the default on Linux AMD RDNA 2 (RADV's mesh shaders stop the GPU, issue 2245; RX_VK_MESH_SHADERS=native keeps them)"};
 }
 
 /// (hookshot, https://github.com/NotRexed/Hookshot/issues/996; Hookshot d1d6caa7, 1396428d, f95d80f5, Longshot ce4deca9) The GPUs

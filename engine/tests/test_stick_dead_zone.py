@@ -5,7 +5,8 @@ Both pad paths, SDL (host/pad_sdl.c) and XInput (host/nn_hid.c), cut each axis a
 worn or a precise stick. They now cut through one function, host/nn_hid.c's hos_stick_axis, whose threshold is the
 row's (option 11): Default (7849, the same output as before for every input), 5%, 10%, 15%, 20%, 30%.
 The function, pad_sdl.c's stick_value and the menu's row, label and ini parsing are compiled alone (gcc, g++) and
-checked over every int16 input.
+checked over every int16 input. The ini loop is menu_init's as it is (with fix/fg-vendor-inputs it also marks a saved
+dlss_model line, menu_first_run_model: the fixture carries the DLSS model row and checks the marking).
 
 python -I -B tests/test_stick_dead_zone.py [--cc gcc] [--cxx g++]
 """
@@ -76,6 +77,9 @@ def main():
     row = re.search(r'\{TAB_CONTROLS, "Stick dead zone", &opts\.stick_dead_zone, 0, 5, 1, tx_stick_dead_zone,\s*"[^}]*\},',
                     menu)
     check(row is not None, "the Insert menu has no Stick dead zone row (0 to 5)")
+    model = re.search(r'\{TAB_GRAPHICS, "DLSS model", &opts\.dlss_model, 0, ur::kModels - 1, 1, tx_dlss_model,\s*"[^}]*\},',
+                      menu)
+    check(model is not None, "the Insert menu has no DLSS model row")   # (menu_init's loop marks a saved one: menu_first_run_model)
     check(row.group(0).rstrip().endswith("nullptr, false, true},"),
           "the row is not preset_exempt: changing the dead zone would set the quality preset to Custom")
     check("| | Stick dead zone | Default (24%), 5%, 10%, 15%, 20%, 30% | Default (24%) |" in readme,
@@ -124,13 +128,18 @@ int main(void) {
 #include <cstdlib>
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
-enum MenuTab { TAB_CONTROLS };
-struct Options { int output_res = 0, resolution = 0, upscale = 0, dlss = 0, stick_dead_zone = 0, send_perf = 0, send_crash = 0, update_check = 1; } opts;
+enum MenuTab { TAB_CONTROLS, TAB_GRAPHICS };
+namespace ur { enum { kModels = 5 }; }   // (upscaler_rows.h: the DLSS model row's top, the last the CNN)
+static const char* tx_dlss_model(int) { return ""; }   // (stubs: the row's own, cut by the regex, only names them)
+static const char* hn_dlss_model(int, int) { return nullptr; }
+struct Options { int output_res = 0, resolution = 0, upscale = 0, dlss = 0, dlss_pre_bloom = 0, hdr = 0, dlss_model = 0, stick_dead_zone = 0, send_perf = 0, send_crash = 0, update_check = 1, vsync = 0, vsync_mode = 1, vrr = 0; } opts;
+static bool saved_hdr_ours;   // (menu_init's: the HDR row saved as the old fourth value)
+static bool dlss_model_saved;   // (vk_menu.cpp's, set by menu_init's loop when the file has a dlss_model line: menu_first_run_model)
 bool telemetry_available() { return true; }   // (heylisten: the two telemetry rows' availability, perf_report.cpp)
 static int output_choice(int v) { return v; }
 static int output_choice_text(const char* s) { return output_choice(atoi(s)); }   // (vk_menu.cpp: also the sizes written out)
 ''' + block(menu, "struct Row {") + ";\n" + block(menu, "const char* tx_stick_dead_zone(") + "\n" + \
-        "Row rows[] = {" + row.group(0) + "};\n" + block(menu, "const char* ini_key(") + r'''
+        "Row rows[] = {" + row.group(0) + model.group(0) + "};\n" + block(menu, "const char* ini_key(") + r'''
 static int parse(const char* text) {
     opts.stick_dead_zone = 0;
     char line[80];
@@ -146,11 +155,16 @@ int main() {
     CHECK(parse("stick_dead_zone=0\n") == 0 && parse("stick_dead_zone=3\n") == 3 && parse("stick_dead_zone=5\n") == 5);
     CHECK(parse("stick_dead_zone=9\n") == 5 && parse("stick_dead_zone=-4\n") == 0 && parse("stick_dead_zone=x\n") == 0);
     CHECK(parse("stick_deadzone=3\n") == 0);
+    CHECK(!strcmp(ini_key(rows[1]), "dlss_model"));
+    CHECK(!saved_hdr_ours);   // (no hdr row among these two: the old fourth value is not seen)
+    CHECK(!dlss_model_saved);   // (a stick_dead_zone line marks no saved DLSS model)
+    CHECK(parse("dlss_model=3\n") == 0 && dlss_model_saved && opts.dlss_model == 3);   // (the loop marks it: menu_first_run_model)
+    CHECK(parse("dlss_model=9\n") == 0 && opts.dlss_model == 4);   // (clamped to the row's top, as the menu does)
     static const char* want[] = {"Default (24%)", "5%", "10%", "15%", "20%", "30%"};
     for (int v = 0; v < 6; v++) CHECK(!strcmp(rows[0].text(v), want[v]));
     CHECK(!strcmp(rows[0].text(-1), want[0]) && !strcmp(rows[0].text(6), want[0]));
     (void)output_choice(0);
-    printf("menu: stick_dead_zone parses and clamps to 0..5; labels Default (24%%) ... 30%%\n");
+    printf("menu: stick_dead_zone parses and clamps to 0..5, labels Default (24%%) ... 30%%; a saved dlss_model line is marked\n");
     return 0;
 }
 '''

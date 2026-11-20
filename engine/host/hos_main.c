@@ -5,7 +5,7 @@
    guest main thread, run every module's DT_INIT in rtld's order (the SDK crt's _init: TLS registration with musl,
    then the module's constructors), then nninitStartup and nnMain.
 
-   Usage: <game>.exe [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--prepare-shaders]
+   Usage: <game>.exe [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--fullscreen] [--prepare-shaders]
    Environment: HOS_TRACE=1 (log HLE calls), HOS_MEMORY_MB (memory the game is told it has),
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
@@ -22,7 +22,11 @@
 #ifndef HOOKSHOT_VERSION   /* (nx2/build.py gives it: the release and a fingerprint of the sources, nx2/version.py) */
 #define HOOKSHOT_VERSION "unknown"
 #endif
+#ifndef HOOKSHOT_LIFT_KEY   /* (nx2/build.py gives it: the lifted code's key, its "object keys: ... lifted code ...") */
+#define HOOKSHOT_LIFT_KEY "unknown"
+#endif
 const char *hos_version(void) { return HOOKSHOT_VERSION; }   /* (discord_rpc.c's status) */
+const char *hos_lift_key(void) { return HOOKSHOT_LIFT_KEY; } /* (the crash record: which game code ran) */
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -701,6 +705,20 @@ static void oot_inventory_refresh(Ctx *c, int64_t now) {
                 AcquireSRWLockExclusive(&map_lock);
                 snprintf(map_now, sizeof map_now, "%s", line);
                 ReleaseSRWLockExclusive(&map_lock);
+            }
+        }
+        {   /* (heylisten) whether the game is loading a map, for the performance summary's hitch rows (an area change):
+               Sequence_IsLoadingBanc, pushed to the renderer when it changes, as the inventory counts are
+               (gpu/vk/perf_parts.h's HOS_OPT_PERF_LOADING, vk_menu.cpp's) */
+            void rx_option_set(int id, int value);
+            static int was = -1;
+            int loading = 0;
+            if (oot_gamedata_bool(c, 0xef2b60c2u, &loading) && loading) {
+                if (was != 1) rx_option_set(91 /* HOS_OPT_PERF_LOADING */, 1);
+                was = 1;
+            } else if (was == 1) {
+                rx_option_set(91 /* HOS_OPT_PERF_LOADING */, 0);
+                was = 0;
             }
         }
     }
@@ -1476,6 +1494,9 @@ void hos_oot_lift_player(Ctx *c, uint64_t actor) {
     const uint64_t movement = components ? recomp_load64(c, components + 800) : 0;
     if (movement < HOS_HEAP_BASE + 0x1d50 || recomp_load64(c, movement + 24) != actor ||
         !hos_oot_is_player(c, movement - 0x1d50)) return;
+    void hos_oot_note_link(uint64_t components);   /* host/hl_high_fps.c: his driven body's target above 60 fps (Longshot d30b9479;
+                                                      here, in the debug tools' block, as the player's other hooks: built on both) */
+    hos_oot_note_link(components);
 
     // Link can be updated by different guest workers on successive frames.
     static SRWLOCK cheats_lock = SRWLOCK_INIT;
@@ -1640,6 +1661,10 @@ volatile uint64_t hos_wide_out, hos_wide_scene;
 volatile int hos_native_scene;
 volatile int hos_fix_res;   /* (nx2/oot_native_resolution.py's cached-scale refresh: HOS_FIX_RES=1; #849's fixed-scale patch does it by default) */
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
+/* (the screens whose UI keeps the whole picture, bit k of nx2/oot_wide.py's KEEP_VTABLES: the item wheel's background, the
+   pause / system menus, the event fade, the loading fade. Every bit on a wider picture, as this tree draws them; on a
+   narrower one the menus and the loading fade fit its width instead (host/hos_wide_ui.c) */
+volatile uint32_t hos_wide_keep_mask;
 /* (nx2/oot_occlusion.py) read by the game's code where it decides to make occlusion queries: 1, none (HOOKSHOT_OCCLUSION_OFF=1) */
 volatile int hos_occlusion_off;
 static void occlusion_switch(void) {
@@ -1795,6 +1820,7 @@ static int game_main(int argc, char **argv) {
     hos_log("hookshot %s", HOOKSHOT_VERSION);   /* (the log's first line: which build a report comes from) */
     const char *hos_report_run_id(void);
     hos_log("run_id: %s", hos_report_run_id());
+    hos_log("object keys: lifted code %s", HOOKSHOT_LIFT_KEY);   /* (which game code ran, as the build said it) */
     void hos_crash_record_log_notes(void);
     hos_crash_record_log_notes();
 #ifdef __linux__
@@ -1814,6 +1840,15 @@ static int game_main(int argc, char **argv) {
         if (!strcmp(argv[i], "--romfs") && i + 1 < argc) hos_romfs_dir = argv[++i];
         else if (!strcmp(argv[i], "--user") && i + 1 < argc) hos_user_dir = argv[++i];
         else if (!strcmp(argv[i], "--trace")) hos_trace = 1;
+        else if (!strcmp(argv[i], "--fullscreen")) {   /* (heylisten) the start's display mode for this one run (RecompLauncher's PR 91
+                                                           asked for it): as the Fullscreen row of hookshot_options.ini, which the
+                                                           launcher writes for its own setting, but written nowhere, so the player's
+                                                           saved row is not touched (vk_menu.cpp fullscreen_tick leaves it alone) */
+#ifdef _WIN32
+            _putenv("HOS_FULLSCREEN=1");   /* (the window is made after this, hos_display_start: host/display.c goes fullscreen) */
+#endif
+            /* (Linux's main sets it before the display is made: here the argument is only kept out of the image's place) */
+        }
         else if (!strcmp(argv[i], "--prepare-shaders")) {   /* (hookshot) a build's last step: no game */
 #ifdef _WIN32
             _putenv("HOOKSHOT_PREPARE_ONLY=1");
@@ -1861,7 +1896,7 @@ static int game_main(int argc, char **argv) {
         }
     }
     if (!image) {
-        fprintf(stderr, "usage: %s [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--prepare-shaders]\n",
+        fprintf(stderr, "usage: %s [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--fullscreen] [--prepare-shaders]\n",
                 argv[0]);
         return 2;
     }
@@ -1939,6 +1974,7 @@ static int game_main(int argc, char **argv) {
         if (hos_native_scene) hos_log("boot: HOS_SCENE_NATIVE=1: the scene's base scale 1.0 (the game's 0.8 otherwise)");
         extern volatile uint64_t hos_wide_out, hos_wide_scene;
         extern volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
+        extern volatile uint32_t hos_wide_keep_mask;
         const double game = 16.0 / 9.0;
         /* (a screen narrower than 16:9 too, 16:10 to 5:4: the picture keeps the game's height and is narrower, the
            cameras take its ratio, and the HUD fills its width instead of a middle 16:9 wider than the screen. A 4:3 CRT
@@ -1961,9 +1997,15 @@ static int game_main(int argc, char **argv) {
             hos_wide_ratio = (float)ow / (float)oh;
             hos_wide_squeeze = (float)fmin(1.0, game / ((double)ow / oh));   /* (a narrower screen: the whole width) */
             hos_wide_margin = (1.0f - hos_wide_squeeze) / 2.0f;
+            /* (nx2/oot_wide.py's KEEP_VTABLES, by bit: 0 the item wheel's background, 1 the pause / system menus, 2 the
+               event fade, 3 the loading fade. A wider picture keeps them all whole, as before; a narrower one keeps only
+               0 and 2, so the menus and the loading fade are drawn smaller to fit its width, never stretched taller
+               (host/hos_wide_ui.c) */
+            hos_wide_keep_mask = want > game ? 0xfu : 0x5u;
             hos_aspect_ratio = hos_wide_ratio;
-            hos_log("boot: widescreen: picture %ux%u, scene %ux%u, camera ratio %.4f, HUD and movies in the middle %.1f%%", ow, oh, sw, sh,
-                    (double)hos_wide_ratio, hos_wide_squeeze * 100.0);
+            hos_log("boot: widescreen: picture %ux%u, scene %ux%u, camera ratio %.4f, movies in the middle %.1f%%, "
+                    "HUD at the screen's edges (Graphics' HUD layout row)", ow, oh, sw, sh, (double)hos_wide_ratio,
+                    hos_wide_squeeze * 100.0);
         } else if (want > 1.0f) {
             hos_log("boot: widescreen: a %.4f screen is 16:9: the game's own picture", (double)want);
         }
@@ -2045,6 +2087,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--prepare-shaders")) prepare_shaders = 1;
         else if (!strcmp(argv[i], "--romfs") || !strcmp(argv[i], "--user")) i++;
+        else if (!strcmp(argv[i], "--fullscreen")) setenv("HOS_FULLSCREEN", "1", 1);   /* (before the display: display_sdl.c reads it
+                                                                                            when the window is made; the parse inside
+                                                                                            game_main only keeps it out of the
+                                                                                            image's place) */
     }
     /* The builder's preparation worker needs Vulkan, but no SDL display. */
     const int window = prepare_shaders ? 0 : hos_display_init();

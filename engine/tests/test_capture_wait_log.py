@@ -30,7 +30,7 @@ class CaptureWaitLogTests(unittest.TestCase):
 
     def test_the_late_page_wait_is_timed_on_its_own(self):
         late = block(self.take, "if (c->late_value && c->map)")
-        wait = late.index("vk_timeline_wait(c->late_value);")
+        wait = late.index("vk_timeline_wait_for(c->late_value")
         self.assertRegex(late[:wait], r"const auto (\w+) = std::chrono::steady_clock::now\(\);")
         self.assertIn("st_tk_late +=", late[wait:])
         self.assertIn("st_tk_late_n++", late[wait:])

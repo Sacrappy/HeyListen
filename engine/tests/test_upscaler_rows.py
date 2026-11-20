@@ -1,7 +1,8 @@
-"""The Insert menu's scaling rows: the Upscaler (opts.dlss: the game's own, NVIDIA DLSS and DLAA, AMD FSR 3.1, AMD FSR 4 and
-its native AA) and the Render resolution's steps for it (gpu/vk/upscaler_rows.h), their order on the Graphics tab, options
-files from before still loading, and their help (why DLSS or FSR 4 is not offered, the Sharpness DLSS wants). No game or GPU
-required.
+"""The Insert menu's scaling rows: the Upscaler (opts.dlss: the game's own, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4, Off) and the
+Render resolution's steps for it, DLAA and FSR 4's Native AA being the native choice of DLSS's and FSR 4's (gpu/vk/upscaler_rows.h),
+their order on the Graphics tab (together, just above the frame generation rows), options files from before still loading (a
+saved DLAA or FSR 4 Native AA Upscaler is DLSS or FSR 4 with the native Render resolution), and their help (why DLSS or FSR 4 is
+not offered, the Sharpness DLSS wants). No game or GPU required.
 
 python -I -B tests/test_upscaler_rows.py [--cxx g++]
 """
@@ -28,16 +29,25 @@ def main():
     parser.add_argument("--cxx", default="g++")
     args = parser.parse_args()
     menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
-    # the picture's way, top to bottom; Reflex with the frame rows
-    order = ['"Frame generation", &opts.framegen', '"Frame pacing", &opts.pace', '"NVIDIA Reflex", &opts.reflex',
-             '"Output resolution", &opts.output_res', '"Upscaler", &opts.dlss', '"DLSS model", &opts.dlss_model',
-             '"Render resolution", &opts.resolution',
+    # the Upscaler and the Render resolution together, just above the frame generation rows (Frame generation by, its multiplier
+    # under it, Frame pacing); the output's size and the window's filter after Reflex
+    order = ['"Upscaler", &opts.dlss', '"Render resolution", &opts.resolution', '"DLSS model", &opts.dlss_model',
+             '"Frame generation by", &opts.framegen_by', '"Frame generation", &opts.framegen', '"Frame pacing", &opts.pace',
+             '"NVIDIA Reflex", &opts.reflex', '"Output resolution", &opts.output_res',
              '"Window scaling filter", &opts.upscale', '"Sharpness", &opts.sharpness']
     at = [menu.find(row) for row in order]
     if -1 in at:
         raise SystemExit("vk_menu.cpp: a scaling row is missing: " + order[at.index(-1)])
     if at != sorted(at):
         raise SystemExit("vk_menu.cpp: the scaling rows are not in the picture's order")
+    # (the pair together: no other row between the Upscaler and the Render resolution; only the DLSS model, which is theirs, may sit
+    # between them and the frame rows)
+    between = menu[at[0]:at[1]]
+    if between.count('{TAB_') != 1:
+        raise SystemExit("vk_menu.cpp: a row sits between the Upscaler and the Render resolution")
+    between = menu[at[1]:at[3]]
+    if between.count('{TAB_') != 3:   # (Render resolution, DLSS model, DLAA before the bloom)
+        raise SystemExit("vk_menu.cpp: rows other than the DLSS model and DLAA before the bloom sit between the Render resolution and Frame generation by")
     if '"NVIDIA DLSS", &opts.' in menu or '"AMD FSR 4", &opts.' in menu:
         raise SystemExit("vk_menu.cpp: DLSS or FSR has a row of its own beside the Upscaler")
     # saved options: the renamed rows keep their keys (data, so read from the source)
@@ -47,8 +57,8 @@ def main():
             raise SystemExit("ini_key: %s is not saved as %s (an options file from before would lose it)" % (value, name))
     # the menu's rules are upscaler_rows.h's, checked by behaviour in test_upscaler_rows.cpp: here only that the menu uses them
     uses = {
-        "row_fixed": ("ur::resolution_fixed(", "reflex_available()", "ur::model_fixed("),
-        "row_shown": ("ur::model_shown(dlss_built())",),
+        "row_fixed": ("reflex_available()", "ur::model_fixed("),
+        "row_shown": ("ur::model_shown(dlss_built(), upscaler())",),
         "set_row": ("ur::step_upscaler(", "ur::step(", "ur::snap(", "row_fixed("),
     }
     for name, calls in uses.items():
@@ -93,14 +103,24 @@ def main():
         raise SystemExit("vk_dlss.cpp: DLSS's feature is not made again for another DLSS model")
     if "upscaler_rows::dlss_preset(opts.dlss_model" not in function(dlss, "unsigned wanted_preset() {"):
         raise SystemExit("vk_dlss.cpp: the DLSS model row (and RX_VK_DLSS_PRESET over it) is not the preset asked for")
-    # (the K row's CNN preset E on a card under 7 GB: DLSS and the row's text by the one rule, upscaler_rows.h
-    # cnn_for_vram, checked by behaviour in test_upscaler_rows.cpp)
-    if "device_vram_bytes()" not in function(dlss, "unsigned wanted_preset() {"):
-        raise SystemExit("vk_dlss.cpp wanted_preset: the card's memory is not given to dlss_preset (no CNN preset E under 7 GB)")
-    for name in ("const char* tx_dlss_model(int v) {", "const char* hn_dlss_model(int v, int variant) {"):
-        if "ur::cnn_for_vram(" not in function(menu, name) or "device_vram_bytes()" not in function(menu, name):
-            raise SystemExit("vk_menu.cpp %s: a card under 7 GB is not shown the CNN preset E that DLSS draws with"
-                             % name.split("(")[0].split()[-1])
+    # (the chosen model is for every mode and GPU: wanted_preset asks nothing of the card; the first run's default is written to
+    # the ini at once, and only when the ini has no model)
+    if "device_" in function(dlss, "unsigned wanted_preset() {"):
+        raise SystemExit("vk_dlss.cpp wanted_preset: the card overrides the DLSS model row")
+    if "ur::step_model(" in menu or "MODEL_AUTO" in menu:
+        raise SystemExit("vk_menu.cpp: the DLSS model row has an Auto again")
+    if "int dlss_model = 0;" not in (ROOT / "gpu" / "vk" / "vk_menu.h").read_text(encoding="utf-8"):
+        raise SystemExit("vk_menu.h: the DLSS model row's default is not K (0)")
+    first = function(menu, "void menu_first_run_model(uint32_t vendor_id, uint32_t device_id) {")
+    if "dlss_model_saved" not in first or "ur::default_model(vendor_id, device_id, device_vram_bytes())" not in first or "save();" not in first:
+        raise SystemExit("menu_first_run_model: does not give an ini with no model the GPU's default and save it at once")
+    init = function(menu, "void menu_init() {")
+    if "dlss_model_saved = true" not in init:
+        raise SystemExit("menu_init: a model in the ini is not remembered as the player's")
+    if "menu_first_run_model(dev.props.vendorID, dev.props.deviceID)" not in (ROOT / "gpu" / "vk" / "vk_main.cpp").read_text(encoding="utf-8"):
+        raise SystemExit("vk_main.cpp: the first run's model is not set from the GPU once it is chosen")
+    if "if (keep) save();" not in function(menu, "void set_row(Row& r, int v, int dir, bool keep = true) {"):
+        raise SystemExit("set_row: a row's change is not saved to the ini at once")
     temporal = (ROOT / "gpu" / "vk" / "vk_temporal.cpp").read_text(encoding="utf-8")
     mode = function(temporal, "int temporal_mode() {")
     if "dlss_why() != DLSS_OK" not in mode or "fsr4_why() != FSR_OK" not in mode:
@@ -108,11 +128,30 @@ def main():
                          "full scale for nothing)")
     if "std::clamp(" in mode:
         raise SystemExit("temporal_mode clamps the row's value: FSR 3.1 (3) would run on the chain")
+    if "ur::mode_for(v, opts.resolution)" not in mode:
+        raise SystemExit("temporal_mode: DLSS and FSR 4 at the Render resolution's native choice do not run as DLAA and native AA")
     if "fsr3_wanted()" not in mode:
         raise SystemExit("temporal_mode runs DLSS or FSR 4 while FSR 3.1 upscales (two upscalers, two jitters)")
     fsr3 = (ROOT / "gpu" / "vk" / "vk_fsr3.cpp").read_text(encoding="utf-8")
-    if "!temporal_env_chosen()" not in function(fsr3, "bool fsr3_wanted() {"):
-        raise SystemExit("fsr3_wanted: a saved FSR 3.1 drops RX_VK_DLSS / RX_VK_FSR4, which go over the row")
+    if "!temporal_env_chosen()" not in function(fsr3, "bool fsr3_chosen() {"):
+        raise SystemExit("fsr3_chosen: a saved FSR 3.1 drops RX_VK_DLSS / RX_VK_FSR4, which go over the row")
+    # FSR 3.1 is an engine of the chain (the skinned draws' motion), unless RX_VK_FSR3_CHAIN=0 keeps its own inputs: the chain
+    # takes it before its fallback to the game's own, fsr3_wanted (its own inputs) is then off, and the chain has its slot
+    if "return !fsr3_on_chain() && fsr3_chosen();" not in function(fsr3, "bool fsr3_wanted() {"):
+        raise SystemExit("fsr3_wanted: FSR 3.1 would upscale with its own inputs while it draws on the chain (two upscales)")
+    on_chain = "if (fsr3_on_chain() && fsr3_chosen()) return ur::FSR3;"
+    if on_chain not in mode or mode.index(on_chain) > mode.index("if (!ur::is_dlss(v) && !ur::is_fsr4(v)) return ur::GAME;"):
+        raise SystemExit("temporal_mode does not run the row's FSR 3.1 on the chain before falling back to the game's own")
+    if "fsr3_engine()" not in function(temporal, "Engine& engine_of("):
+        raise SystemExit("engine_of has no slot for FSR 3.1's engine")
+    # The chain's depth is reversed for FSR 3.1 (the prep's bit 3, from fsr_flip): the frame says so, for whatever else reads it
+    upscale = function(temporal, "bool draw_engine(")   # (the engine's evaluation, after Longshot a7621bd7)
+    if "(fsr_flip ? 8 : 0)" not in upscale or "f.depth_reversed = fsr_flip;" not in upscale:
+        raise SystemExit("draw_engine reverses the depth without saying so in the frame (TemporalFrame::depth_reversed)")
+    # (HeyListen has no DLSS Frame Generation: upstream's check of its depth convention is not here.) FSR 3.1 goes on the chain only
+    # while PsychoV35 is on, unless RX_VK_FSR3_CHAIN says otherwise
+    if "return env > 0 || (env != 0 && scene_tonemap_on());" not in function(fsr3, "bool fsr3_on_chain() {"):
+        raise SystemExit("fsr3_on_chain: FSR 3.1 is not on the chain exactly while PsychoV35 is on (RX_VK_FSR3_CHAIN over it)")
     chosen = function(temporal, "bool temporal_env_chosen() {")
     if "dlss_why() == DLSS_OK" not in chosen or "fsr4_why() == FSR_OK" not in chosen:
         raise SystemExit("temporal_env_chosen: a switch for an engine that cannot run here leaves the game's own, not the saved FSR 3.1")
@@ -135,6 +174,21 @@ def main():
             raise SystemExit("%s does not read the saved Render resolution through the Upscaler's steps" % name)
     if "ur::step(upscaler(), ur::snap(upscaler(), *r.value), dir)" not in function(menu, "void set_row("):
         raise SystemExit("set_row steps the Render resolution from the saved value, not from the step the row shows")
+    # an options file from before: a saved DLAA or FSR 4 Native AA Upscaler is DLSS or FSR 4 with the native Render resolution, in
+    # the load path, after the file's rows (and the oldest file's dynamic resolution) are read
+    init = function(menu, "void menu_init() {")
+    if "ur::migrate(opts.dlss, opts.resolution)" not in init or init.index("ur::migrate(") < init.index("old_dynres ? 0 : 1"):
+        raise SystemExit("menu_init: a saved DLAA or FSR 4 Native AA is not made DLSS or FSR 4 with the native choice after the load")
+    if "ur::migrate(" in function(menu, "void set_row(Row& r, int v, int dir, bool keep = true) {"):
+        raise SystemExit("set_row migrates: the saved values are for the load path")
+    # DLAA and the native AA are no stop of the Upscaler row, and the row shows DLSS or FSR 4 while they run
+    if "ur::engine(upscaler_mode())" not in function(menu, "int upscaler() {") or "temporal_mode()" not in function(menu, "int upscaler_mode() {"):
+        raise SystemExit("upscaler(): the Upscaler row shows DLAA and FSR 4 Native AA, which are Render resolution choices now")
+    resolution_text = function(menu, "const char* tx_resolution(int v) {")
+    if '"DLAA (native)"' not in resolution_text or '"Native AA (FSR 4)"' not in resolution_text or "ur::kNativeAa" not in resolution_text:
+        raise SystemExit("tx_resolution: the native choice is not named DLAA (native) with DLSS and Native AA with FSR 4")
+    if '"NVIDIA DLAA"' in menu or '"AMD FSR 4 Native AA"' in menu:
+        raise SystemExit("vk_menu.cpp: DLAA or FSR 4 Native AA is named as an Upscaler choice")
     with tempfile.TemporaryDirectory(prefix="upscaler-rows-") as tmp:
         exe = Path(tmp) / "upscaler-rows"
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror",

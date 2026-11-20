@@ -42,8 +42,10 @@ import kit
 import lifted_c
 import rtgen
 import logo_rgba
+import symtab
 import ui_fonts
 import toolchain
+import translator_files
 import version
 import vk_pgo
 import win_manifest
@@ -75,6 +77,22 @@ def icon_res():
         if os.path.exists(p):
             return p
     return None
+
+
+def write_symtab(map_path, binary_path, cc):
+    """The crash handler's names beside a freshly linked binary (nx2/symtab.py): the map the linker just wrote,
+    compacted to the functions' names and RVAs. Played on every player's PC, the game reads it at start-up, so a
+    report from another build still says f_<guest address> or the host function's name. A missing table only
+    leaves the frames module+offset."""
+    if not (os.path.exists(map_path) and os.path.exists(binary_path)):
+        return
+    try:
+        out_path = os.path.splitext(binary_path)[0] + ".sym"
+        n = symtab.write_map(map_path, binary_path, out_path, symtab.find_cxxfilt(cc))
+        if n:
+            print("crash names: %s (%d MB)" % (os.path.basename(out_path), n >> 20), flush=True)
+    except (OSError, ValueError) as e:
+        print("crash names: not written for %s: %s" % (os.path.basename(binary_path), e), flush=True)
 
 
 def check_vk_symbols(so):
@@ -523,6 +541,14 @@ def ffmpeg_version_key():
 WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WRITE_TRACK"]
 if WRITE_TRACK and os.environ.get("A64_GRAN") == "1":   # (HeyListen, sprint 5: a write mark per 512 bytes too, nx2/rtgen.py)
     WRITE_TRACK = WRITE_TRACK + ["-DA64_GRAN"]
+# (longshot 11-18, 35a4a9fc #1617) a lifted store marks its page only where the page is one the GPU can read
+# (host/mark_bitmap.c sets a bit per GPU-mapped page, nx2/rtgen.py A64_MARK_BITMAP reads it); the host's own marks
+# (HOS_WRITTEN) keep marking every page. Off by default (RX_MARK_BITMAP=1 turns it on): measured on the main PC
+# (Ryzen 7 7800X3D, RTX 5070, castle-move, 3 interleaved rounds against the same build without it) 87.0 -> 85.9 fps,
+# within the runs' spread either way, and the 1% lows a little lower: our mark grouping (A64_MARK_STACK/FRAME,
+# group_marks: 155k shared marks for 689k stores) already removed the cost Longshot measured on an ungrouped build
+# (a 5600X: 40.4 -> 46.1 fps). With it off the bitmap is not built either: no 16 MB table, and map_add sets no bits
+MARK_BITMAP = ["-DA64_MARK_BITMAP"] if os.environ.get("RX_MARK_BITMAP", "").strip().lower() in ("1", "on", "true", "yes") else []
 
 # (hookshot) the host CPU the lifted game and the runtime are built for: x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT,
 # MOVBE; Haswell and Zen 1 on). With FMA the FPX1 fast paths cover double-precision FMA (RECOMP_FPX_FMA64; it took
@@ -543,7 +569,7 @@ def flags(gen, rt64, opt, polls):
         "-I" + rt64, "-I" + gen, "-I" + os.path.join(kit.KIT, "rt"), "-I" + NX2_RT, "-Wno-everything",
         "-fno-strict-aliasing", "-mcx16", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
         "-ffunction-sections", "-mllvm", "-capture-tracking-max-uses-to-explore=5000"] + \
-        (["-DA64_POLLING"] if polls else []) + WRITE_TRACK
+        (["-DA64_POLLING"] if polls else []) + WRITE_TRACK + MARK_BITMAP
 
 
 def write_info(out):
@@ -812,10 +838,12 @@ def main():
     print("object keys: game-code headers %s, flags %s, hot flags %s, lifted code %s (%d files)" % (
         fp(deps), fp(norm(fl)), fp(norm(hot_fl)), code.hexdigest()[:10],
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
+    # (the same key in the game's log and crash record: which lifted code a report ran, whatever PC built it)
+    lift_def = '-DHOOKSHOT_LIFT_KEY="%s"' % code.hexdigest()[:10]
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
         ["-I" + HOST, "-I" + rt64, "-I" + gen, "-I" + os.path.join(NATIVE, "include"),
-         "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+         "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK + MARK_BITMAP
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     # (the native engine's C surface, hl/c: what host/hl_*.c include)
@@ -823,7 +851,10 @@ def main():
                           for f in sorted(os.listdir(os.path.join(NATIVE, "include", "hl", "c"))) if f.endswith(".h"))
     if LINUX:
         host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
-        host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
+    # (heylisten: on Windows too: host/rx_backend.c passes MKWVK_API_VERSION to the back end, and a cached object from before a
+    # change of it (a stale one, with the old version) made the Vulkan back end refuse to start. vk_api.h is one of the shader
+    # stamp files: a change of it is a change of every host object that reads the API)
+    host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
     host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
     host_deps += ffmpeg_version_key()
     # (HeyListen) zstd's decoder (third_party/zstd, plain C) in the game's executable too: host/hl_stream.c decodes the
@@ -839,7 +870,7 @@ def main():
               (["-I" + os.path.join(FFMPEG, "include")] if FFMPEG else []) +
               (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
               (["-I" + ZSTD] if os.path.basename(s) == "hl_stream.c" else []) +
-              ([stamp_def] if os.path.basename(s) == "hos_main.c" else []),
+              ([stamp_def, lift_def] if os.path.basename(s) == "hos_main.c" else []),
               host_deps + (zstd_deps if os.path.basename(s) == "hl_stream.c" else b"")) for s in host_srcs]
     if host_srcs:
         zflags_exe = target() + CPU + ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DZSTD_DISABLE_ASM",
@@ -897,12 +928,9 @@ def main():
         fonts_cpp = os.path.join(gen_dir, "ui_fonts.cpp")
         ui_fonts.write(fonts_cpp)
         # (what the shader caches are good for: what translates shaders, not the whole DLL, so a build that changes something else
-        # keeps them)
-        stamp = hashlib.sha1(usedforsecurity=False)
-        translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
-        for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h", "vk_api.h")]:
-            with open(f, "rb") as src:
-                stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+        # keeps them. nx2/translator_files.py names the files: it leaves vk_api.h out (longshot 26a2eab0, #370), so a menu,
+        # input or audio row there no longer drops every player's translated programs)
+        shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % translator_files.stamp(vk)
         # (TICK-008: what the pipeline notes (hookshot_pipelines.bin) are laid out by: the draw state they hold and the record. Apart from the
         # shader stamp, so that a change of the shader translation carries the notes over instead of dropping them)
         layout = hashlib.sha1()
@@ -911,7 +939,6 @@ def main():
                 with open(f, "rb") as src:
                     layout.update(os.path.basename(f).encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         state_stamp = "-DHOOKSHOT_STATE_STAMP=0x%sull" % layout.hexdigest()[:16]   # (TICK-008: vk_draw.cpp only)
-        shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
@@ -1097,6 +1124,7 @@ def main():
             print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
+        write_symtab(exe + ".map", exe, cc)
         sdl = os.environ.get("HOOKSHOT_SDL2", "")   # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)
         if sdl and os.path.exists(sdl):
             import shutil
@@ -1121,6 +1149,7 @@ def main():
             print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
+        write_symtab(exe[:-4] + ".map", exe, cc)
         if wgpu:   # (wgpu_native.dll beside it; in use while the game runs)
             import shutil
             dll, dst = os.path.join(WGPU, "lib", "wgpu_native.dll"), os.path.join(out, "wgpu_native.dll")
@@ -1170,6 +1199,7 @@ def main():
         if LINUX and not check_vk_symbols(vdll):
             return 1
         print("linked %s: %d MB (%.0fs)" % (vdll, os.path.getsize(vdll) >> 20, time.time() - t))
+        write_symtab(vdll + ".map" if LINUX else vdll[:-4] + ".map", vdll, cc)
     if a.dll and not a.only:
         dll = os.path.join(out, "hookshot_game.dll")   # (+ hookshot_game.map: crash offsets -> f_<guest address>)
         t = time.time()

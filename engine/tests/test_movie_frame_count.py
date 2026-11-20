@@ -200,9 +200,10 @@ def hook_text():
         # (an exeFS mod patches the function: no hook, and one there is taken out)
         hl_gates.apply(str(gen), str(host), quiet=True, skip={ADDR: "some_mod"})
         check(code.read_text(encoding="utf-8") == LIFTED, "a patched function was hooked")
-        # (another game version: the function's text differs, it is left alone)
-        for what, other in (("another step", LIFTED.replace("_b=1ULL", "_b=2ULL", 1)),
-                            ("another field", LIFTED.replace("+ 760", "+ 764", 2))):
+        # (another game version: the function's text differs, it is left alone; longer too, so a filesystem with a coarse mtime
+        #  still reads the file again: hl_gates' stamp is the size and mtime)
+        for what, other in (("another step", LIFTED.replace("_b=1ULL", "_b=1ULL + 0ULL", 1)),
+                            ("another field", LIFTED.replace("+ 760", "+ 7600", 2))):
             code.write_text(other, encoding="utf-8", newline="")
             hl_gates.apply(str(gen), str(host), quiet=True)
             check(code.read_text(encoding="utf-8") == other, "a function with %s was hooked" % what)

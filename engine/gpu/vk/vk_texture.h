@@ -183,6 +183,10 @@ void texture_watch_prog(uint64_t prog);
 void texture_rendered(Texture* tex);
 /// The presents so far (the frame number textures are aged by)
 uint64_t texture_frame_no();
+/// (Longshot f1b17d59) The latest Linux memory-pressure shortfall in bytes (0: none, or not Linux) and, when seq is given,
+/// the number of the /proc/meminfo sample it came from (vk_texture.cpp texture_frame publishes it every
+/// linux_pressure::kSampleEveryPresents presents; vk_memory.cpp's imports_give_back reads it there, without pools_mu)
+uint64_t linux_pressure_shortfall(uint64_t* seq = nullptr);
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)
 VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage);
 /// Release an imported buffer's views immediately before its completed destruction (memory.cpp).

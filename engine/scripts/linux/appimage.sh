@@ -61,6 +61,7 @@ for h in $(grep -rhoE 'gpu/vk/[A-Za-z0-9_]+[.]h' host | sort -u); do if [ -f "$h
 mkdir -p "$T/gpu/vk/compat"; cp -a gpu/vk/compat/hookshot_env.h "$T/gpu/vk/compat/"
 cp -a third_party/opus "$T/third_party/"
 cp -a third_party/kenney_input "$T/third_party/"
+cp -a third_party/kenney_input_keyboard "$T/third_party/"
 # (zstd's decoder: nx2/build.py compiles it into the game for host/hl_stream.c)
 mkdir -p "$T/third_party/zbic" "$T/third_party/a64-kit" "$T/third_party/zstd"
 cp -a third_party/zstd/lib "$T/third_party/zstd/"

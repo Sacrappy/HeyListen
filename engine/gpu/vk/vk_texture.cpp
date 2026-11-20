@@ -38,6 +38,7 @@
 #include "vk_ledger.h"   // (RX_VK_LEDGER)
 #include "vk_menu.h"
 #include "vk_draw.h"
+#include "linux_pressure.h"   // (Longshot f1b17d59: /proc/meminfo's reserves and the budget hold)
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
@@ -253,27 +254,39 @@ std::unordered_map<uint64_t, std::vector<Pooled>> target_pool;   // by pool_key_
 uint64_t pool_bytes, pool_n, st_pool_reused, st_pool_made, st_pool_destroyed;
 uint8_t pool_pressure = 0;   // (VRAM near what the driver allows: texture_frame's budget) 0 normal, 1 short (>90%: half the pool), 2 critical (>97%: all given back)
 // (Hookshot 2972 by NotRexed, Longshot 91a1ae8b; issue 55 and 62) the commit the textures leave free for the rest of the system:
-// texture_frame's commit rule. RX_VK_COMMIT_RESERVE_MB (default 2560, 0: off). Windows only: Linux overcommits, and its limit is
-// not one commit can reach
+// texture_frame's commit rule. RX_VK_COMMIT_RESERVE_MB (default 2560, 0: off). Windows: RAM plus the page file. Linux
+// (Longshot f1b17d59): MemAvailable plus SwapFree, the same value in the same field (host/posix/win32_posix.c
+// GlobalMemoryStatusEx), because a Linux PC that runs out of RAM and swap is killed the same way its commit limit refuses an
+// allocation, and issue 88's Arc run was killed with 31 GB. The physical reserve beside it (RX_VK_AVAIL_RESERVE_MB) is
+// linux_pressure.h's.
 static uint64_t commit_reserve() {
     static const uint64_t v = getenv("RX_VK_COMMIT_RESERVE_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_COMMIT_RESERVE_MB"))) << 20
                                                                 : 2560ull << 20;
     return v;
 }
-// (what Windows lets the process commit before its limit, RAM plus the page file: GlobalMemoryStatusEx's ullAvailPageFile, the
-// limit less the whole system's commit. false where it cannot be read)
+// (what the process may still commit before the system's limit: Windows' RAM plus the page file in ullAvailPageFile; Linux'
+// MemAvailable plus SwapFree in the same field. false where it cannot be read)
 static bool commit_headroom(uint64_t* free_bytes) {
-#if defined(_WIN32)
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof m;
     if (!GlobalMemoryStatusEx(&m)) return false;
     *free_bytes = m.ullAvailPageFile;
     return true;
+}
+// (Longshot f1b17d59) Linux's physical reserve (RX_VK_AVAIL_RESERVE_MB, 1536 MB by default, 0: off) and the sample that
+// texture_frame takes of /proc/meminfo. The latest shortfall (bytes) and its sample number are published here for
+// vk_memory.cpp's imports_give_back, which must not read a file under pools_mu: linux_pressure_shortfall below. Nothing off
+// Linux: the reserve is 0 there, so none of it runs (and a Windows run behaves exactly as it did)
+static uint64_t linux_avail_reserve() {
+#if defined(__linux__)
+    static const uint64_t v = linux_pressure::avail_reserve(getenv("RX_VK_AVAIL_RESERVE_MB"));
+    return v;
 #else
-    (void)free_bytes;
-    return false;
+    return 0;
 #endif
 }
+std::atomic<uint64_t> linux_shortfall_bytes{0};
+std::atomic<uint64_t> linux_shortfall_seq{0};
 uint64_t pool_cap() {
     // (Longshot 1db4c290, #994) RX_VK_TARGET_POOL_MB=<MB>, else a twelfth of what the driver allows, 256 to 768 MB (target_pool.h)
     static const uint64_t mb = [] {
@@ -470,6 +483,12 @@ struct InitRedirect {
     InitRedirect& operator=(const InitRedirect&) = delete;
 };
 }  // namespace
+// (Longshot f1b17d59) the latest Linux memory-pressure shortfall and its sample's number (vk_memory.cpp: the idle imports are
+// given back under it). 0: none, or not Linux
+uint64_t linux_pressure_shortfall(uint64_t* seq) {
+    if (seq) *seq = linux_shortfall_seq.load(std::memory_order_acquire);
+    return linux_shortfall_bytes.load(std::memory_order_relaxed);
+}
 // (RX_VK_POOL_MIRROR, vk_memory.cpp) a never-imported pool's mirror made by a segment's worker goes the same way
 void* upload_to_earliest_begin() { return new InitRedirect(true); }
 void upload_to_earliest_end(void* h) { delete static_cast<InitRedirect*>(h); }
@@ -1133,14 +1152,25 @@ const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scrat
     return scratch.data();
 }
 
-void widen_rows(uint8_t* dst, const uint8_t* src, size_t texels, int from, int to) {
-    const int comp = from / 3;
+/// The alpha an RGB format widened to RGBA gets: one in the format's own encoding (by component size alone, SNORM8 read
+/// -0.008, UNORM16 0.23 and the integer formats 255, 15360 or 0x3F800000)
+uint32_t widen_alpha(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8_SNORM: return 0x7F;
+    case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R16G16B16_UINT:
+    case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: return 1;
+    case VK_FORMAT_R16G16B16_SFLOAT: return 0x3C00;
+    case VK_FORMAT_R16G16B16_UNORM: return 0xFFFF;
+    case VK_FORMAT_R16G16B16_SNORM: return 0x7FFF;
+    case VK_FORMAT_R32G32B32_SFLOAT: return 0x3F800000;
+    default: return 0xFF;
+    }
+}
+void widen_rows(uint8_t* dst, const uint8_t* src, size_t texels, int from, int to, uint32_t alpha) {
+    const int n = to - from;
     for (size_t i = 0; i < texels; i++) {
         std::memcpy(dst + i * to, src + i * from, from);
-        uint8_t* a = dst + i * to + from;
-        if (comp == 1) a[0] = 0xFF;
-        else if (comp == 2) a[0] = 0x00, a[1] = 0x3C;   // (half 1.0; UNORM16 would want 0xFFFF: close enough for alpha)
-        else { const float one = 1.0f; std::memcpy(a, &one, 4); }
+        std::memcpy(dst + i * to + from, &alpha, n);   // (little endian: the low n bytes)
     }
 }
 
@@ -1840,18 +1870,34 @@ void watch_tex(const Texture* tex, const char* what) {
 }
 /// Whether [gpu, gpu + n) is storage the GPU's images rendered last (covered by ranges render targets took), and the
 /// generation from which the CPU's writes would count (0: not the GPU's)
+/// (hookshot, issue 10) The targets' ranges may overlap one another: what they cover is measured as a union, a byte counted once.
+/// Added up range by range, an overlap counted twice could make up for a hole no target ever drew into, and the texture over
+/// that hole was taken for the GPU's and never uploaded.
 uint32_t gpu_owned_since(uint64_t gpu, uint64_t n) {
-    uint64_t covered = 0;
+    const uint64_t lo = gpu, hi = gpu + n;
+    uint64_t covered = 0, done_to = lo;   // (done_to: the bytes below it are counted; the map is in address order)
     uint32_t since = UINT32_MAX;
-    auto it = gpu_owned.upper_bound(gpu);
+    auto it = gpu_owned.upper_bound(lo);
     if (it != gpu_owned.begin()) --it;
-    for (; it != gpu_owned.end() && it->first < gpu + n; ++it) {
-        const uint64_t a = std::max(it->first, gpu), b = std::min(it->second.first, gpu + n);
-        if (b <= a) continue;
-        covered += b - a;
-        since = std::min(since, it->second.second);
+    for (; it != gpu_owned.end() && it->first < hi; ++it) {
+        const uint64_t from = std::max({it->first, lo, done_to}), to = std::min(it->second.first, hi);
+        if (it->second.first > lo && it->first < hi) since = std::min(since, it->second.second);
+        if (to <= from) continue;
+        covered += to - from;
+        done_to = to;
     }
     return covered >= n && since != UINT32_MAX ? std::max(since, 1u) : 0;
+}
+/// (hookshot, issue 10) Whether the GPU can draw into a texture's format at all. A block-compressed one (BC, ETC, ASTC, and the
+/// ASTC textures kept decoded or re-encoded) cannot be a render target, so storage targets used before tells nothing about it:
+/// its texels are the game's, in memory. Taken for the GPU's, such a texture was left empty: the Kokiri Emerald drawn as its
+/// sparkles alone, enemies without their texture on first sight.
+static bool drawable_format(const Texture& t) {
+    if (t.astc || t.bc) return false;
+    const int f = (int)t.format;
+    const bool block = (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
+                       (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
+    return !block;
 }
 
 // (hookshot, smoothness) What a frame's uploads cost by the way they went: when a frame's uploads take over 50 ms (the stutters at
@@ -2044,7 +2090,8 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
         return up_route = UP_GPU, true;
     const bool linear = nvn_tex_is_linear(&tex.d);
     int widen_from = 0;
-    widened(tex.d.format ? vk_format(tex.nvn_format).format : tex.format, &widen_from);
+    const VkFormat src_vf = tex.d.format ? vk_format(tex.nvn_format).format : tex.format;
+    widened(src_vf, &widen_from);
     const int src_bpb = tex.bpb;
     const int out_bpb = tex.astc ? 4 : widen_from ? (widen_from == 3 ? 4 : widen_from == 6 ? 8 : 16) : src_bpb;
     const uint32_t copy_layers = tex.type == VK_IMAGE_TYPE_3D ? 1 : tex.layers;
@@ -2187,7 +2234,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                                                            (u32)tex.block_w, (u32)tex.block_h,
                                                            std::span<uint8_t>(out, (size_t)g.w * px_h * g.d * 4));
                 } else if (widen_from) {
-                    widen_rows(out, blocks, (size_t)g.tw * th * g.td, src_bpb, out_bpb);
+                    widen_rows(out, blocks, (size_t)g.tw * th * g.td, src_bpb, out_bpb, widen_alpha(src_vf));
                 }
                 st_bytes += (int64_t)out_bytes;
                 // (a sparse image: only its blocks this holds texels other than zero get memory; the others read
@@ -2628,7 +2675,24 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     x.ci_key = pool_key ? 0 : image_key(ci);   // (TICK-031: a spare image of the same create info may be taken; the retry below changes it)
     if (x.sparse) {
         ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
-        bool ok = vkCreateImage(dev.device, &ci, nullptr, &x.image) == VK_SUCCESS;
+        // (the sparse flags and usage within the device's limits for them: extent, levels, layers, samples)
+        const auto fits = [&] {
+            VkImageFormatProperties ifp{};
+            return vkGetPhysicalDeviceImageFormatProperties(dev.physical, ci.format, ci.imageType, ci.tiling, ci.usage,
+                                                            ci.flags, &ifp) == VK_SUCCESS &&
+                   ci.extent.width <= ifp.maxExtent.width && ci.extent.height <= ifp.maxExtent.height &&
+                   ci.extent.depth <= ifp.maxExtent.depth && ci.mipLevels <= ifp.maxMipLevels &&
+                   ci.arrayLayers <= ifp.maxArrayLayers && (ci.samples & ifp.sampleCounts);
+        };
+        // (a compressed one the driver refuses sparse with its raw attachment usage, or then its raw storage usage, the
+        // residency query above did not ask about: asked again without it, as a compressed image refused is made below;
+        // its raw views are then not made)
+        bool ok = fits() ||
+                  ((ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && is_bc(x.format) &&
+                   (ci.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, x.usage = ci.usage, fits())) ||
+                  ((ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) && is_bc(x.format) &&
+                   (ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT, x.usage = ci.usage, fits()));
+        ok = ok && vkCreateImage(dev.device, &ci, nullptr, &x.image) == VK_SUCCESS;
         if (ok) {
             VkMemoryRequirements mr{};
             vkGetImageMemoryRequirements(dev.device, x.image, &mr);
@@ -3311,7 +3375,16 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // was unswizzled from that memory: 55 MB for the 3072 x 3072 x 3 shadow map, frame after frame. Not "storage
     // the write watch never saw written": the game fills memory before it makes a pool of it.)
     static const bool upload_all = getenv("RX_VK_UPLOAD_ALL") != nullptr;   // (A/B: such storage uploaded too)
+    // (hookshot, issue 10) only for a format the GPU can draw into (drawable_format above); RX_VK_RT_SKIP_ANY_FORMAT=1: any, as before
+    static const bool any_format = getenv("RX_VK_RT_SKIP_ANY_FORMAT") && atoi(getenv("RX_VK_RT_SKIP_ANY_FORMAT")) != 0;
     uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    if (owned && !any_format && !drawable_format(*tex)) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 30)
+            logf("vk: texture #%u %#llx %ux%u NVN %#x is block-compressed: uploaded from memory although render targets used its "
+                 "storage", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->nvn_format);
+        owned = 0;
+    }
     if (owned && !remade_skip_old()) {   // (one evicted that came from memory: uploaded from it again. Above)
         std::lock_guard lk(from_memory_mu);
         auto e = evicted_from_memory.find(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format));
@@ -5087,6 +5160,61 @@ void texture_frame(uint64_t completed) {
             }
         }
     }
+#if defined(__linux__)
+    // (Longshot f1b17d59) and Linux's memory pressure (MemAvailable and SwapFree in /proc/meminfo, linux_pressure.h): the device
+    // heap can report room while the PC has none left, because every VMA block, staging arena, spare capture buffer and imported
+    // pool is kernel-pinned in physical RAM and cannot be swapped out. Sampled every 30 presents (and once at the start). Below
+    // RX_VK_AVAIL_RESERVE_MB (1536) of MemAvailable or RX_VK_COMMIT_RESERVE_MB (2560) of MemAvailable + SwapFree, PressureHold
+    // cuts the texture budget on an integrated GPU (where VRAM is system RAM) from the texture total at entry, with a 512 MB
+    // floor, and steps it back up once both reserves clear by 256 MB. On a discrete card VRAM and RAM are different memories and
+    // the budget is not cut (the RAM-side valves run on every GPU: malloc_trim, the staging arenas, the idle imports in
+    // vk_memory.cpp, which read linux_pressure_shortfall). Issue 88's Arc B580 is one, with 31 GB: nothing here would have been
+    // the death, and the driver's compiles are compile_gate.h's).
+    {
+        static linux_pressure::PressureHold hold;
+        static uint64_t cached_avail = 0, cached_swap = 0, held_cached = UINT64_MAX;
+        static bool cached_has_swap = true, have_meminfo = false;
+        static const bool igpu = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        const uint64_t avail_res = linux_avail_reserve(), commit_res = commit_reserve();
+        if (!avail_res && !commit_res) {
+            hold = linux_pressure::PressureHold{};
+            held_cached = UINT64_MAX;
+            have_meminfo = false;
+            linux_shortfall_bytes.store(0, std::memory_order_relaxed);
+        } else if (frame_no % linux_pressure::kSampleEveryPresents == 0) {   // (a file read: not every present)
+            have_meminfo = linux_pressure::read_meminfo(&cached_avail, &cached_swap, nullptr, nullptr, &cached_has_swap);
+            if (have_meminfo) {
+                const bool was_active = hold.active;
+                const uint64_t over = linux_pressure::shortfall(cached_avail, cached_swap, avail_res, commit_res, cached_has_swap);
+                linux_shortfall_bytes.store(over, std::memory_order_relaxed);
+                linux_shortfall_seq.fetch_add(1, std::memory_order_release);
+                held_cached = hold.step(total_bytes, cached_avail, cached_swap, avail_res, commit_res,
+                                        linux_pressure::kClearMargin, linux_pressure::kBudgetFloor, cached_has_swap);
+                if (hold.active) {
+                    if (igpu) budget = std::min(budget, held_cached);
+                    static uint64_t said_at;
+                    if (hold.active != was_active || !said_at || frame_no - said_at >= 600) {
+                        said_at = frame_no;
+                        if (igpu)
+                            logf("vk: memory pressure on Linux: %llu MB available, %llu MB swap free (reserves %llu / %llu MB); the "
+                                 "textures' budget %s %llu MB of their %llu MB (RX_VK_AVAIL_RESERVE_MB, RX_VK_COMMIT_RESERVE_MB)",
+                                 (unsigned long long)(cached_avail >> 20), (unsigned long long)(cached_swap >> 20),
+                                 (unsigned long long)(avail_res >> 20), (unsigned long long)(commit_res >> 20),
+                                 budget < total_bytes ? "down to" : "held at", (unsigned long long)(budget >> 20),
+                                 (unsigned long long)(total_bytes >> 20));
+                        else
+                            logf("vk: memory pressure on Linux: %llu MB available, %llu MB swap free (reserves %llu / %llu MB); the "
+                                 "textures' budget is not cut on a discrete GPU (%llu MB, %llu MB in use) (RX_VK_AVAIL_RESERVE_MB, "
+                                 "RX_VK_COMMIT_RESERVE_MB)", (unsigned long long)(cached_avail >> 20),
+                                 (unsigned long long)(cached_swap >> 20), (unsigned long long)(avail_res >> 20),
+                                 (unsigned long long)(commit_res >> 20), (unsigned long long)(budget >> 20),
+                                 (unsigned long long)(total_bytes >> 20));
+                    }
+                }
+            }
+        }
+    }
+#endif
     // (TICK-023) from what the driver allows (VK_EXT_memory_budget), less a margin: the whole process held to
     // RX_VK_VRAM_TARGET_PCT of it (80), the textures getting what the rest (mirrors, pools, pipelines, streams, swapchain and the
     // free space VMA's blocks hold) leaves. A 12 GB card ran at 9.8 of 10.9 GB allowed with the textures at 5.6 GB under the

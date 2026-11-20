@@ -5,8 +5,11 @@
    button to press on this pad, custom controls too.
 
    The face: hookshot_options.ini's button_prompts (the menu's Button prompts row): 0 Auto, from the first controller's name
-   (SDL), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam Deck. The game reads the font once, at its start:
-   a new face or new controls show at the next start.
+   (SDL; with none, and none through XInput either, the keyboard's), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5,
+   5 Steam Deck, 6 Keyboard. The keyboard face (nx2/prompt_keys.py) points each Switch button at the icon of the first key
+   bound to it, the sticks at the keys that move (the Controls page's: stick_shows) and the mouse that turns the camera, and
+   keeps the Switch's textures and the Talk ring's places. The game reads the font once, at its start: a new face or new
+   controls show at the next start.
 
    The font as built: an OpenType font behind an 8-byte header, XORed per little-endian word with the key the header's magic
    (0x18029a7f) gives. Its cmap has one icon per pad input at U+F700 + HOS_PAD_*, and each Switch button's code point in a
@@ -26,6 +29,7 @@ int hos_binding(int set, int button, int slot);   /* nn_hid.c */
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);   /* pad_sdl.c */
 void hos_sdl_pad_first_name(char *out, size_t cap);
 int hos_mods_has(const char *prefix, const char *suffix);   /* mods.c */
+int hos_xinput_pads(void);   /* nn_hid.c */
 
 #define FONT_PATH "font2/scalable/external.nin_ounce_nvn2.bfotf.zs"   /* (as hos_mods_romfs's keys: lower case) */
 #define TEXTURES_PATH "ui/layout2archive/common.product.100.nin_ounce_nvn2.bntx.zs"
@@ -33,10 +37,19 @@ int hos_mods_has(const char *prefix, const char *suffix);   /* mods.c */
 #define SIZES_PATH "system/resource/resourcesizetable."   /* (then the version, ".rsizetable.zs") */
 #define MAGIC 0x18029a7fu
 #define PAD_BASE 0xF700
-static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", "steamdeck"};
+/* the keyboard face (nx2/prompt_keys.py): each key's icon at KEY_BASE + its key code; the sticks' pictures as the keys that
+   move and the mouse, at STICK_KEYS + its place (the build's) and STICK_GAME + its place (the game's own icon) */
+#define KEY_BASE 0xF7C0
+#define STICK_KEYS 0xF8C0
+#define STICK_GAME 0xF8D0
+static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", "steamdeck", "keyboard"};
 /* the Switch buttons' code points in the font, in HOS_SW_* order (nx2/prompt_assets.py SWITCH) */
 static const uint16_t switch_code[HOS_SW_N] = {0xE040, 0xE041, 0xE042, 0xE043, 0xE056, 0xE057, 0xE044, 0xE045,
                                                0xE046, 0xE047, 0xE04B, 0xE04C, 0xE062, 0xE060, 0xE063, 0xE061};
+/* the sticks' icons the keyboard face shows as keys (nx2/prompt_keys.py STICKS): L down, up, left-right, right, left, up-down,
+   any way; R the same; R's four ways */
+static const uint16_t stick_code[15] = {0xE050, 0xE052, 0xE054, 0xE058, 0xE05A, 0xE05C, 0xE05E, 0xE051, 0xE053, 0xE055,
+                                        0xE059, 0xE05B, 0xE05D, 0xE05F, 0xE068};
 
 static int game_dir(char *out, size_t cap) {   /* the game folder, with its separator */
     char path[MAX_PATH];
@@ -57,10 +70,29 @@ static int contains(const char *text, const char *word) {   /* (any case) */
     return 0;
 }
 
+/* HOS_PROMPT_* (faces[]): the face a controller's name gives (SDL's) */
+static int face_of_name(const char *name) {
+    if (!name[0]) return HOS_PROMPT_SWITCH;   /* (no controller: the game's own icons) */
+    if (contains(name, "dualsense") || contains(name, "ps5")) return HOS_PROMPT_PS5;
+    if (contains(name, "dualshock") || contains(name, "ps4") || contains(name, "playstation")) return HOS_PROMPT_PS4;
+    if (contains(name, "steam deck")) return HOS_PROMPT_STEAMDECK;
+    if (contains(name, "nintendo") || contains(name, "switch") || contains(name, "joy-con")) return HOS_PROMPT_SWITCH;
+    return HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
+}
+
+static int keyboard_built;   /* (the build made the keyboard face: prompts/keyboard/; choose_face) */
+
+/* Auto's face: the first controller's (by SDL's name); with none, and none through XInput either, the keyboard's */
+static int auto_face(const char *name) {
+    return !name[0] && keyboard_built && !hos_xinput_pads() ? HOS_PROMPT_KEYBOARD : face_of_name(name);
+}
+
 /* HOS_PROMPT_* (faces[]) */
 static int choose_face(const char *dir) {
     char path[MAX_PATH], line[80];
     int choice = 0;
+    snprintf(path, sizeof path, "%sprompts/keyboard", dir);
+    keyboard_built = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
     snprintf(path, sizeof path, "%shookshot_options.ini", dir);
     FILE *f = fopen(path, "r");
     if (f) {
@@ -78,13 +110,7 @@ static int choose_face(const char *dir) {
         hos_sdl_pad_first_name(name, sizeof name);
         if (!name[0]) Sleep(50);
     }
-    int face;
-    if (!name[0]) face = HOS_PROMPT_SWITCH;   /* (no controller: the keyboard, the game's own icons; or XInput without SDL) */
-    else if (contains(name, "dualsense") || contains(name, "ps5")) face = HOS_PROMPT_PS5;
-    else if (contains(name, "dualshock") || contains(name, "ps4") || contains(name, "playstation")) face = HOS_PROMPT_PS4;
-    else if (contains(name, "steam deck")) face = HOS_PROMPT_STEAMDECK;
-    else if (contains(name, "nintendo") || contains(name, "switch") || contains(name, "joy-con")) face = HOS_PROMPT_SWITCH;
-    else face = HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
+    const int face = auto_face(name);
     hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : "(none)", faces[face]);
     return face;
 }
@@ -113,29 +139,74 @@ static unsigned cmap4_glyph(const uint8_t *st, size_t n, unsigned code) {
     return 0;
 }
 
-/* each Switch button's segment pointed at its pad input's icon; how many */
-static int cmap4_bind(uint8_t *st, size_t n) {
-    const unsigned segs = rd16(st + 6) / 2;
-    if (14 + 8 * (size_t)segs > n) return 0;
+/* a code point's own segment (one code, by idDelta alone) pointed at glyph gid; 0 when it has none */
+static int cmap4_point(uint8_t *st, unsigned segs, unsigned code, unsigned gid) {
     uint8_t *ends = st + 14, *starts = ends + 2 * segs + 2, *deltas = starts + 2 * segs, *ranges = deltas + 2 * segs;
+    for (unsigned i = 0; i < segs; i++)
+        if (rd16(starts + 2 * i) == code && rd16(ends + 2 * i) == code && !rd16(ranges + 2 * i)) {
+            wr16(deltas + 2 * i, (gid - code) & 0xFFFF);
+            return 1;
+        }
+    return 0;
+}
+
+/* the first key bound to control b (a Windows key code; the second slot's when the first is clear), 0 none */
+static int first_key(int b) {
+    int k = hos_binding(HOS_BIND_KEY, b, 0);
+    if (k <= 0 || k > 0xFF) k = hos_binding(HOS_BIND_KEY, b, 1);
+    return k > 0 && k <= 0xFF ? k : 0;
+}
+
+/* the ways each of L's icons means (a bit each, in HOS_KEY_MOVE_*'s order: up, down, left, right), and the keys the build drew
+   on the icons of more than one way (nx2/prompt_keys.py MOVE: host/nn_hid.c's default movement keys) */
+static const unsigned char stick_ways[7] = {2, 1, 12, 8, 4, 3, 15};
+static const unsigned char move_default[4] = {0x57, 0x53, 0x41, 0x44};
+
+/* the code whose icon the keyboard face shows for stick icon i (stick_code's order) with these movement keys (move: the first
+   key of up, down, left, right, 0 none). R's: the mouse's, as built. L's: the keys drawn on it at the build (W A S D) while
+   its ways are on those keys. On others, one way shows its key's icon; several ways, or a way on no key, the game's own stick
+   icon, since the font has no picture of other keys together */
+static unsigned stick_shows(int i, const int *move) {
+    if (i >= 7) return STICK_KEYS + (unsigned)i;
+    const unsigned ways = stick_ways[i];
+    for (int m = 0; m < 4; m++)
+        if ((ways >> m & 1) && move[m] != move_default[m])
+            return ways == 1u << m && move[m] ? KEY_BASE + (unsigned)move[m] : STICK_GAME + (unsigned)i;
+    return STICK_KEYS + (unsigned)i;
+}
+
+/* each Switch button's segment pointed at its pad input's icon; how many (the keyboard face: at the icon of the first key bound
+   to it, and the sticks at the keys that move and the mouse) */
+static int cmap4_bind(uint8_t *st, size_t n, int face) {
+    const unsigned segs = rd16(st + 6) / 2;
+    if (14 + 8 * (size_t)segs + 2 > n) return 0;
+    const int keys = face == HOS_PROMPT_KEYBOARD;
     int done = 0;
     for (int b = 0; b < HOS_SW_N; b++) {
+        const int k = keys ? first_key(b) : 0;
+        const unsigned kid = k ? cmap4_glyph(st, n, KEY_BASE + (unsigned)k) : 0;
+        if (kid && cmap4_point(st, segs, switch_code[b], kid)) {
+            done++;
+            continue;
+        }
         const int pad = hos_binding(HOS_BIND_PAD, b, 0);
         if (pad < 0 || pad >= HOS_PAD_N) continue;   /* (unbound: the default icon stays) */
         const unsigned gid = cmap4_glyph(st, n, PAD_BASE + (unsigned)pad);
-        if (!gid) continue;
-        for (unsigned i = 0; i < segs; i++)
-            if (rd16(starts + 2 * i) == switch_code[b] && rd16(ends + 2 * i) == switch_code[b] && !rd16(ranges + 2 * i)) {
-                wr16(deltas + 2 * i, (gid - switch_code[b]) & 0xFFFF);
-                done++;
-                break;
-            }
+        if (gid && cmap4_point(st, segs, switch_code[b], gid) && !keys)   /* (on the keyboard face, a pad icon is no key) */
+            done++;
+    }
+    int move[4];
+    for (int m = 0; m < 4; m++) move[m] = keys ? first_key(HOS_KEY_MOVE_UP + m) : 0;
+    for (int i = 0; i < 15; i++) {   /* (a font built without the keyboard face has none of these: nothing changes) */
+        unsigned gid = keys ? cmap4_glyph(st, n, stick_shows(i, move)) : 0;
+        if (!gid) gid = cmap4_glyph(st, n, STICK_GAME + (unsigned)i);
+        if (gid) cmap4_point(st, segs, stick_code[i], gid);
     }
     return done;
 }
 
 /* the controls into the decrypted font's format 4 subtables; how many buttons */
-static int bind_font(uint8_t *otf, size_t n) {
+static int bind_font(uint8_t *otf, size_t n, int face) {
     if (n < 12) return 0;
     const unsigned tables = rd16(otf + 4);
     for (unsigned t = 0; t < tables && 12 + 16 * (size_t)(t + 1) <= n; t++) {
@@ -155,7 +226,7 @@ static int bind_font(uint8_t *otf, size_t n) {
             if (dup) continue;
             if (nseen < 8) seen[nseen++] = so;
             const unsigned sl = rd16(cmap + so + 2);
-            done = cmap4_bind(cmap + so, sl <= len - so ? sl : len - so);
+            done = cmap4_bind(cmap + so, sl <= len - so ? sl : len - so, face);
         }
         return done;
     }
@@ -317,16 +388,30 @@ static int write_patched(const char *game, const char *out, const char *keypath,
     return ok;
 }
 
+/* hookshot's default pad input for each Switch button (host/nn_hid.c pad_default), in HOS_SW_* order: the keyboard face's
+   textures and its Talk ring use them, the game's pictures as they are */
+static const unsigned char switch_pad[HOS_SW_N] = {
+    HOS_PAD_EAST, HOS_PAD_SOUTH, HOS_PAD_NORTH, HOS_PAD_WEST, HOS_PAD_LSTICK, HOS_PAD_RSTICK, HOS_PAD_LSHOULDER,
+    HOS_PAD_RSHOULDER, HOS_PAD_LTRIGGER, HOS_PAD_RTRIGGER, HOS_PAD_START, HOS_PAD_BACK, HOS_PAD_LEFT, HOS_PAD_UP,
+    HOS_PAD_RIGHT, HOS_PAD_DOWN};
+
+/* the face whose textures a face shows (the keyboard's: the Switch's), and the pad inputs they follow (the keyboard face: the
+   Switch's own) */
+static int texture_face(int face) { return face == HOS_PROMPT_KEYBOARD ? HOS_PROMPT_SWITCH : face; }
+static void texture_binds(int face, int *bind) {
+    for (int b = 0; b < HOS_SW_N; b++) bind[b] = face == HOS_PROMPT_KEYBOARD ? switch_pad[b] : hos_binding(HOS_BIND_PAD, b, 0);
+}
+
 static int build_textures(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    snprintf(path, sizeof path, "%sprompts/%s/textures.bin", dir, faces[face]);
+    snprintf(path, sizeof path, "%sprompts/%s/textures.bin", dir, faces[texture_face(face)]);
     long tn;
     uint8_t *t = read_all(path, "HPTX", &tn);
     if (!t) return 0;   /* (built without the textures: the game's) */
     int bind[HOS_SW_N];
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
+    texture_binds(face, bind);
     uint64_t h = fnv(fnv(fnv(0xcbf29ce484222325ull, &face, sizeof face), bind, sizeof bind), t, (size_t)tn);
     /* the runs these controls choose */
     const uint32_t count = rd32le(t + 4);
@@ -349,8 +434,8 @@ static int build_textures(char *out, size_t cap) {
     char keypath[MAX_PATH];
     snprintf(keypath, sizeof keypath, "%sprompts/Common.key", dir);
     const int ok = write_patched(path, out, keypath, h, runs, nruns);
-    hos_log("prompts: %s textures, %zu runs for this pad's controls%s", faces[face], nruns,
-            ok ? "" : ": could not be written");
+    hos_log("prompts: %s textures, %zu runs for these %s%s", faces[texture_face(face)], nruns,
+            face == HOS_PROMPT_KEYBOARD ? "keys (the Switch's pictures)" : "controls", ok ? "" : ": could not be written");
     free(runs);
     free(t);
     return ok;
@@ -395,8 +480,9 @@ static int build_layouts(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
+    const int keys = face == HOS_PROMPT_KEYBOARD;
     int bind[HOS_SW_N], place[4];
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
+    texture_binds(face, bind);   /* (the keyboard face: no pad input, the Switch's faces and ring places) */
     ring_places(bind, place);
     const int ring_moved = !(place[0] == 0 && place[1] == 1 && place[2] == 2 && place[3] == 3);
     size_t nruns = 0, cap_runs = 64;
@@ -433,7 +519,7 @@ static int build_layouts(char *out, size_t cap) {
         const size_t panes_at = 8 + 4 * (size_t)npads;
         float extra[5], shift[6] = {0};
         for (int i = 0; i < 5; i++) {
-            const int p = bind[notes[i]];
+            const int p = keys ? first_key(notes[i]) : bind[notes[i]];   /* (the keyboard face: by the keys bound) */
             extra[i] = 0;
             if (p >= 0 && (uint32_t)p < npads && panes_at <= (size_t)hn) memcpy(&extra[i], hint + 8 + 4 * p, 4);
         }
@@ -489,12 +575,13 @@ static int build(char *out, size_t cap) {
     }
     const uint32_t key = rd32le(b) ^ MAGIC;
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
-    const int bound = bind_font(b + 8, (size_t)n - 8);
+    const int bound = bind_font(b + 8, (size_t)n - 8, face);
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
     snprintf(out, cap, "%sprompts/External.bfotf.zs", dir);
     const int ok = write_zstd_raw(out, b, (size_t)n);
     free(b);
-    hos_log("prompts: %s icons, %d buttons on this pad's controls%s", faces[face], bound, ok ? "" : ": could not be written");
+    hos_log("prompts: %s icons, %d buttons on these %s%s", faces[face], bound,
+            face == HOS_PROMPT_KEYBOARD ? "keys" : "pad's controls", ok ? "" : ": could not be written");
     return ok;
 }
 

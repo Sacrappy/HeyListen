@@ -68,16 +68,35 @@ typedef struct Table {   /* (stride 1: the slots, then the keys, cap of each; st
 static uint64_t *table_keys_of(const Table *t) {
     return t->stride == 2 ? (uint64_t *)(void *)t->slot + 1 : (uint64_t *)(void *)(t->slot + t->cap);
 }
+/* (hookshot f0fab2a1, ported by hand) and after the slots and keys, a byte a slot (both strides): its object live (1) or a
+   tombstone (0), kept under table_lock wherever an object in the table changes kind (alive_set). The rehash and the locked
+   probes read it instead of each object: OoT holds ~130 000 live objects from its start and ~8 000 more each area it loads,
+   scattered over the heap, and a rehash that visited every one held the lock 106 ms at 524 288 slots, every game thread's next
+   new object waiting behind it. HOS_SYNC_REHASH_OLD=1: liveness read from each object, as before */
+static uint8_t *table_alive_of(const Table *t) {
+    return (uint8_t *)(void *)t->slot + t->cap * (sizeof(Obj *) + sizeof(uint64_t));
+}
+static uint8_t *table_alive;
 static Table *live;
 
 static uint64_t slot_of(uint64_t key, uint64_t c) { return (key * 0x9E3779B97F4A7C15ULL >> 20) & (c - 1); }
 
-static Obj *find_locked(uint64_t key) {
-    if (!table) return NULL;
+/* the slot of key's live object (alive 1) or of its tombstone (alive 0), ~0 when none */
+static uint64_t find_slot_locked(uint64_t key, uint8_t alive) {
+    if (!table) return ~0ull;
     for (uint64_t i = slot_of(key, cap);; i = (i + 1) & (cap - 1)) {
-        if (!table[i * tstride]) return NULL;
-        if (table_keys[i * tstride] == key && table[i * tstride]->kind) return table[i * tstride];
+        if (!table[i * tstride]) return ~0ull;
+        if (table_keys[i * tstride] == key && table_alive[i] == alive) return i;
     }
+}
+static Obj *find_locked(uint64_t key) {
+    const uint64_t i = find_slot_locked(key, 1);
+    return i == ~0ull ? NULL : table[i * tstride];
+}
+/* an object of the table made a tombstone (kind 0) or brought back (kind k), with its slot's byte */
+static void alive_set(uint64_t i, int kind, int order) {
+    __atomic_store_n(&table[i * tstride]->kind, kind, order);
+    table_alive[i] = kind != 0;
 }
 
 /* An object finalized (or initialized again) is a tombstone (kind 0). The same address initialized again reuses it in
@@ -138,46 +157,54 @@ static void bury_locked(Obj *o) {
     grave_count++;
 }
 
-/* the tombstone of this address, if it still has its slot */
-static Obj *find_dead_locked(uint64_t key) {
-    if (!table) return NULL;
-    for (uint64_t i = slot_of(key, cap);; i = (i + 1) & (cap - 1)) {
-        if (!table[i * tstride]) return NULL;
-        if (table_keys[i * tstride] == key && !table[i * tstride]->kind) return table[i * tstride];
-    }
-}
-
 static void insert_locked(Obj *o) {
     if (!table || used * 2 >= cap) {
+        const int64_t rh_t0 = hos_now_ns();
+        static int by_object = -1;
+        /* HOS_SYNC_REHASH_OLD=1: the rehash reads each object's kind to tell live from tombstone, as before the live bytes */
+        if (by_object < 0) by_object = getenv("HOS_SYNC_REHASH_OLD") != NULL;
         uint64_t ncap = cap ? cap * 2 : 1 << 16;
         if (!cap) tstride = getenv("HOS_OBJ_PACK") ? 2 : 1;
         const uint64_t ns = tstride;
-        Table *t = (Table *)calloc(1, sizeof(Table) + ncap * (sizeof(Obj *) + sizeof(uint64_t)));
+        Table *t = (Table *)calloc(1, sizeof(Table) + ncap * (sizeof(Obj *) + sizeof(uint64_t) + 1));
         Obj **nt = t->slot;
         t->cap = ncap;
         t->stride = ns;
         uint64_t *nk = table_keys_of(t);
-        for (uint64_t i = 0; i < cap; i++)
-            if (table[i * tstride] && table[i * tstride]->kind) {
-                uint64_t j = slot_of(table[i * tstride]->key, ncap);
+        uint8_t *na = table_alive_of(t);
+        uint64_t kept = 0;
+        for (uint64_t i = 0; i < cap; i++) {
+            if (!table[i * tstride]) continue;
+            if (by_object ? table[i * tstride]->kind != 0 : table_alive[i] != 0) {
+                uint64_t j = slot_of(table_keys[i * tstride], ncap);
                 while (nt[j * ns]) j = (j + 1) & (ncap - 1);
                 nt[j * ns] = table[i * tstride];
-                nk[j * ns] = table[i * tstride]->key;
-            } else if (table[i * tstride]) {
+                nk[j * ns] = table_keys[i * tstride];
+                na[j] = 1;
+                kept++;
+            } else {
                 bury_locked(table[i * tstride]);
             }
+        }
+        const uint64_t old_used = used;
         table = nt;
         table_keys = nk;
+        table_alive = na;
         cap = ncap;
-        used = 0;
-        for (uint64_t i = 0; i < cap; i++) used += table[i * tstride] != NULL;
+        used = kept;
         __atomic_store_n(&live, t, __ATOMIC_RELEASE);
+        /* (each rehash past the first in the log: the sizes, the live objects kept, the tombstones dropped, the lock's time) */
+        if (cap > (1u << 16))
+            hos_log("sync objects: table %llu -> %llu slots (%llu live kept, %llu tombstones dropped) in %.2f ms",
+                    (unsigned long long)(cap / 2), (unsigned long long)cap, (unsigned long long)kept,
+                    (unsigned long long)(old_used - kept), (hos_now_ns() - rh_t0) / 1e6);
     }
     uint64_t i = slot_of(o->key, cap);
-    while (table[i * tstride] && table[i * tstride]->kind) i = (i + 1) & (cap - 1);
+    while (table[i * tstride] && table_alive[i]) i = (i + 1) & (cap - 1);
     if (!table[i * tstride]) used++;
     else bury_locked(table[i * tstride]);   /* (a tombstone of another address) */
     __atomic_store_n(&table_keys[i * tstride], o->key, __ATOMIC_RELAXED);   /* (before the object: see find_unlocked) */
+    table_alive[i] = 1;
     __atomic_store_n(&table[i * tstride], o, __ATOMIC_RELEASE);
 }
 
@@ -294,15 +321,17 @@ static Obj *obj_lookup(uint64_t key, int kind) {
         if (o && o->kind == kind) return o;
     }
     AcquireSRWLockExclusive(&table_lock);
-    o = find_locked(key);
-    if (o && o->kind != kind) { __atomic_store_n(&o->kind, 0, __ATOMIC_RELEASE); o = NULL; }   /* memory reused for another kind of object */
-    if (!o && (o = find_dead_locked(key))) {
+    uint64_t at = find_slot_locked(key, 1);
+    o = at == ~0ull ? NULL : table[at * tstride];
+    if (o && o->kind != kind) { alive_set(at, 0, __ATOMIC_RELEASE); o = NULL; }   /* memory reused for another kind of object */
+    if (!o && (at = find_slot_locked(key, 0)) != ~0ull) {
+        o = table[at * tstride];
         /* the same address initialized again (an object on a stack, every frame): its own tombstone, as new (the
            lock and condition variable stay as they are: nothing holds them now) */
         free(o->q);
         free(o->links);
         memset(&o->owner, 0, sizeof *o - offsetof(Obj, owner));
-        __atomic_store_n(&o->kind, kind, __ATOMIC_RELEASE);
+        alive_set(at, kind, __ATOMIC_RELEASE);
     }
     if (!o) {
         if ((o = spares)) {   /* (its old address's caches see the new key: see spares) */
@@ -324,16 +353,16 @@ static Obj *obj_lookup(uint64_t key, int kind) {
 
 static Obj *fresh(uint64_t key, int kind) {
     AcquireSRWLockExclusive(&table_lock);
-    Obj *o = find_locked(key);
-    if (o) __atomic_store_n(&o->kind, 0, __ATOMIC_RELEASE);   /* re-initialized: forget the old one */
+    const uint64_t at = find_slot_locked(key, 1);
+    if (at != ~0ull) alive_set(at, 0, __ATOMIC_RELEASE);   /* re-initialized: forget the old one */
     ReleaseSRWLockExclusive(&table_lock);
     return obj(key, kind);
 }
 
 static void drop(uint64_t key) {
     AcquireSRWLockExclusive(&table_lock);
-    Obj *o = find_locked(key);
-    if (o) __atomic_store_n(&o->kind, 0, __ATOMIC_RELEASE);   /* tombstone (see bury_locked) */
+    const uint64_t at = find_slot_locked(key, 1);
+    if (at != ~0ull) alive_set(at, 0, __ATOMIC_RELEASE);   /* tombstone (see bury_locked) */
     ReleaseSRWLockExclusive(&table_lock);
 }
 

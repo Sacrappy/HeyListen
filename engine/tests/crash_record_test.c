@@ -12,6 +12,7 @@
 #include <string.h>
 #include <wchar.h>
 #include "hos_report_prefixes.h"
+#include "hos_crash_names.h"
 #include <windows.h>
 #ifndef _WIN32
 #include <signal.h>
@@ -24,6 +25,7 @@
 
 static _Thread_local int poison_alloc;
 static int fail_storage, io_mode, fail_prune;
+void hos_log(const char *fmt, ...);
 #ifndef _WIN32
 static int interruptions;
 #endif
@@ -134,10 +136,31 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 /* REPORT_FATAL */
+#ifdef _WIN32
+/* CRASH_WALK */
+/* The log's walker and stack line, real, on a jump into code with no unwind data (an int3 in a page nothing registered, as in
+   SDL3's padding: 0x80000003): the caller must still show */
+static LONG WINAPI walk_filter(EXCEPTION_POINTERS *info) {
+    char backtrace[1024], stack[320];
+    crash_backtrace(*info->ContextRecord, backtrace, sizeof backtrace);
+    crash_stack(info->ContextRecord, stack, sizeof stack);
+    printf("%s\n%s\n", backtrace, stack);
+    fflush(stdout);
+    hos_crash_clean_end();
+    ExitProcess(0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static __attribute__((noinline)) void walk_call(void (*code)(void)) {
+    code();
+    __asm__ volatile("");
+}
+#endif
 static int log_queue(const char *line) { (void)line; return 0; }
 volatile int hos_control_on;
 void hos_control_log(const char *line) { (void)line; }
 void hos_log_flush(void) {}
+const char *hos_version(void) { return "fixture-v1-g1234"; }
+const char *hos_lift_key(void) { return "testlift01"; }
 static void log_flush(void) {}
 void hos_backtrace(void) {}
 void hl_trace_on_crash(Ctx *c, uint64_t a) { (void)c; (void)a; }
@@ -193,10 +216,11 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "module-offsets")) {
         const uintptr_t pcs[] = {(uintptr_t)authored_context, (uintptr_t)malloc};
         for (unsigned i = 0; i < sizeof pcs / sizeof pcs[0]; ++i) {
-            Dl_info info; char name[160]; uint64_t offset = 0;
+            Dl_info info; char name[160]; uint64_t offset = 0; uintptr_t base = 0;
             assert(dladdr((const void *)pcs[i], &info));
-            assert(module_at(pcs[i], name, sizeof name, &offset));
+            assert(module_at(pcs[i], name, sizeof name, &offset, &base));
             assert(offset == pcs[i] - (uintptr_t)info.dli_fbase);
+            assert(base == (uintptr_t)info.dli_fbase);
         }
         /* Executable virtual offsets differ from file offsets by one page.
            Same basename/different path and a second instance must not alias. */
@@ -212,13 +236,14 @@ int main(int argc, char **argv) {
         File file = open_file(path, 1, 0); assert(file != NO_FILE);
         assert(write_file(file, maps, sizeof maps - 1));
         const int original = maps_fd; maps_fd = file;
-        char name[160]; uint64_t offset = 0;
+        char name[160]; uint64_t offset = 0; uintptr_t base = 0;
         poison_alloc = 1;
-        assert(module_at(0x102020, name, sizeof name, &offset) && offset == 0x2020 && !strcmp(name, "libgap.so"));
-        assert(module_at(0x202020, name, sizeof name, &offset) && offset == 0x2020);
-        assert(module_at(0x403020, name, sizeof name, &offset) && offset == 0x3020);
-        assert(!module_at(0x302020, name, sizeof name, &offset)); /* no offset-zero mapping: unknown, not a guessed base */
-        assert(!module_at(0x100020, name, sizeof name, &offset)); /* not executable */
+        assert(module_at(0x102020, name, sizeof name, &offset, &base) && offset == 0x2020 && base == 0x100000 &&
+               !strcmp(name, "libgap.so"));
+        assert(module_at(0x202020, name, sizeof name, &offset, &base) && offset == 0x2020 && base == 0x200000);
+        assert(module_at(0x403020, name, sizeof name, &offset, &base) && offset == 0x3020 && base == 0x400000);
+        assert(!module_at(0x302020, name, sizeof name, &offset, &base)); /* no offset-zero mapping: unknown, not a guessed base */
+        assert(!module_at(0x100020, name, sizeof name, &offset, &base)); /* not executable */
         poison_alloc = 0;
         maps_fd = original; close_file(file);
         hos_crash_clean_end(); return 0;
@@ -274,6 +299,16 @@ int main(int argc, char **argv) {
         /* Deliberately imitate termination between the durable record and cleanup. */
         ExitProcess(3);
     }
+#ifdef _WIN32
+    if (!strcmp(mode, "leaf-walk")) {
+        unsigned char *page = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        assert(page);
+        memset(page, 0xCC, 64);
+        SetUnhandledExceptionFilter(walk_filter);
+        walk_call((void (*)(void))page);
+        return 91;
+    }
+#endif
     if (!strcmp(mode, "crash") || !strcmp(mode, "signal") || !strcmp(mode, "abort") || !strcmp(mode, "heap")) {
         SetUnhandledExceptionFilter(report_crash);
         AddVectoredExceptionHandler(0, report_fatal);

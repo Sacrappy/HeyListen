@@ -2,7 +2,9 @@
 """How task and mesh programs run: the default by driver and OS, and the switch's precedence (gpu/vk/mesh_mode.h, vk_main.cpp).
 
 Issue 51 (an RX 6800 on Linux with RADV loses the GPU in native task/mesh draws, upstream Hookshot issue 2245): on Linux with
-an RDNA 2 AMD GPU (vendor 0x1002, RADV; Navi 21 to 24 and the RDNA 2 APUs by device ID) Automatic is the compute path; RDNA 3 and 4 keep the native path. RX_VK_MESH_SHADERS=native keeps the GPU's own mesh shaders
+an RDNA 2 AMD GPU (vendor 0x1002, RADV; Navi 21 to 24 and the RDNA 2 APUs by device ID) Automatic is the compute path; other
+RDNA 3 and 4 keep the native path. Issue 81 (white foliage and glows with RADV's native path on RDNA 3.5): the Strix Point,
+Krackan Point and Strix Halo APUs take the compute path too. RX_VK_MESH_SHADERS=native keeps the GPU's own mesh shaders
 there, compute forces the compute path on any GPU, and RX_VK_FORCE_MESH_FALLBACK=1 is Compute over both (as before). The rule is
 compiled and run alone; the source checks read vk_main.cpp. No game or GPU is needed.
 
@@ -37,6 +39,18 @@ int main() {
         CHECK(run(nullptr, nullptr, true, nvidia, rdna2).mode == 0);
         CHECK(run(nullptr, nullptr, true, intel, rdna2).mode == 0);
     }
+    // (RDNA 3.5 APUs on Linux, RADV: their native mesh shaders draw foliage and glows white, issue 81. 0x150e Strix Point
+    // (Radeon 880M, 890M), 0x1114 Krackan Point (840M, 860M), 0x1586 Strix Halo (8040S, 8050S, 8060S); Windows and other
+    // vendors stay Automatic, and native overrides)
+    for (uint32_t rdna35 : {0x150eu, 0x1114u, 0x1586u}) {
+        CHECK(run(nullptr, nullptr, true, amd, rdna35).mode == 2);
+        CHECK(strstr(run(nullptr, nullptr, true, amd, rdna35).why, "issue 81") != nullptr);
+        CHECK(strstr(run(nullptr, nullptr, true, amd, rdna35).why, "issue 2245") == nullptr);
+        CHECK(run(nullptr, nullptr, false, amd, rdna35).mode == 0);        // Windows: Automatic (the task + mesh rule is separate)
+        CHECK(run(nullptr, nullptr, true, nvidia, rdna35).mode == 0);
+        CHECK(run("native", nullptr, true, amd, rdna35).mode == 1);
+        CHECK(run("compute", nullptr, true, amd, rdna35).mode == 2);
+    }
     // (RDNA 3 and 4 on RADV run the native path: 0x744c Navi 31 (RX 7900 XT), 0x7480 Navi 33, 0x7550 and 0x7551 Navi 48 (RX 9070 XT),
     // 0x15bf Phoenix; RDNA 1: 0x731f, 0x7340)
     for (uint32_t other : {0x744cu, 0x7480u, 0x7550u, 0x7551u, 0x15bfu, 0x731fu, 0x7340u, 0u}) {
@@ -62,7 +76,7 @@ int main() {
     CHECK(run("native", "1", false, nvidia).mode == 2 && run(nullptr, "1", false, nvidia).mode == 2);
     CHECK(run("native", "7", true, amd).mode == 2);
     CHECK(run("native", "0", true, amd).mode == 1 && run(nullptr, "0", true, amd).mode == 2 && run(nullptr, "0", true, nvidia).mode == 0);
-    puts("mesh mode: Linux AMD RDNA 2 is Compute by default, RX_VK_MESH_SHADERS chooses, RX_VK_FORCE_MESH_FALLBACK is over it");
+    puts("mesh mode: Linux AMD RDNA 2 and RDNA 3.5 are Compute by default, RX_VK_MESH_SHADERS chooses, RX_VK_FORCE_MESH_FALLBACK is over it");
     return 0;
 }
 '''

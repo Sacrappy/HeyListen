@@ -80,6 +80,13 @@ the frame rate limit, the next frame's due time with no burst to catch up, the d
 rate) and the frame pacer in `engine/host/nvn_native.c`. This engine already owns the pacing there; a native loop that
 calls the present step leaves it as it is.
 
+The Frame rate limit is the rate presented, the game's frames and the frame generation's made ones. `fps_plan` in `nn_vi.c` asks the
+renderer for the limit (`HL_OPT_FPS_LIMIT`, 0 for Unlimited) and the fixed multiplier m that runs (`HL_OPT_FRAMEGEN_MULT`, 1 when
+none): the game's rate, which the display queue, the limiter and the real-time step all follow, is the limit over m, its period exact
+(165 over 4 is 24.24 ms), and the renderer has already lowered m where the game would run under 20 frames a second
+(`framegen_rows.h` `limited`). Unlimited paces nothing and puts the game's own limiter out of the way; Game speed Per frame ignores
+the limit (the game's steps are whole frames of 1/60 s).
+
 One OS-layer hook is keyed to a return address inside the frame function: the system tick read before the present (`lr
 0x8348c770`) tells `engine/host/hos_thread.c` the framework object (`hos_gfx_module`), which the real-time step needs
 (its nominal rate `+0x2c8`). A native loop reads that tick from elsewhere, so it tells the OS layer the object itself;
@@ -224,5 +231,16 @@ sites, each added once it was seen to misbehave in game:
 |---|---|---|---|
 | `0x80a87e50` | the pick-up indicator's shown count (`+864`) moves toward the wallet's by `(int)(step x max(distance / 50, 1))` (upstream #2006) | `x19 + 864` | the indicator above Link's head never fades |
 | `0x803edf70` | the time of day adds `(int)(2 x step)` game seconds (`+60`) a frame to the seconds of the day (upstream #2093); the function's second such cut, in the branch that sets the time from another source, stays the game's | `x19 + 60` | the day runs slow below 120 fps (83% at 100) and stops above it, the sun swinging over a frozen hour |
-| `0x800672e0` | the water renderer runs its ripple simulation `(int)step x substeps` (`+76` of the pass) times a frame (upstream #2409, found for Lichii and Fritchii) | `x21`, the water object (64 remainders: a scene's surfaces each take one) | the rings Link and actors make in water stand still |
+| `0x800672e0` | the water renderer runs its ripple simulation `(int)step x substeps` (`+76` of the pass) times a frame (upstream #2409, found for Lichii and Fritchii). The substeps are handed out too (`"t8"` mode of the hook, `hos_frame_whole_times`; Longshot 01d0263d, issue 1199): a frame above 60 fps ran all of them or none, and the rings stood still for a frame and then jumped; now 2 or 3 of 4 a frame at 108 fps (`HOS_FPS_WATER=0`: the whole frames carried and multiplied, as before) | `x21`, the water object (64 remainders: a scene's surfaces each take one) | the rings Link and actors make in water stand still |
 | `0x80652cb0` | the floor web's simulation steps, the elapsed time over 1/60 cut, then clamped to 0..3 (upstream #2929) | `x19 + 2296`, the web object (before the clamp, which stays) | the Deku Tree's floor web does not react when Link jumps on it |
+
+**Four more places that break above a 60 cap (Longshot d30b9479, 6aa5d653, 01d0263d and 10010630).** Lift hooks like the
+others (`nx2/hl_gates.py` puts lines in after anchors in each function's text when it hashes as recorded; the host side is
+in `host/hl_high_fps.c` and `host/hl_step.c`; every one acts only while the host publishes the frame's seconds, a cap above
+60, and has an off switch):
+
+| Hook | Function | What it does | Switch |
+|---|---|---|---|
+| `HL_DRIVE_HOOK` | `0x804f5030`, a rigid body's update before the physics step (the driven path, twice) | Link's pull-up onto a ledge: his animation drives his body to a target each update, Havok delivers only part of each move above 60 fps (86% at 120) and the shortfall was never made up, so he slid back on the lip. Link's driven body's target carries last update's shortfall, at most three moves (`host/oot_high_fps.h` `oot_drive_carry`; Link's body is found from `hos_oot_lift_player`, `hos_oot_note_link`) | `HOS_FPS_LEDGE` (1) |
+| `HL_LOOP_HOOK`, `HL_POSE_HOOK` | `0x802cfca0` (the clock of an animation entry, two advances), `0x80944aa0` (the time a skeleton is drawn at) | the frozen Zoras of adult Zora's Domain: a loop of one frame or less is one pose, but the frame's step under 1 moved its phase each frame and the pose twitched. The loop takes whole frames of the step (carried per entry) and is drawn at its start (`host/loop_step.h`) | `HOS_FPS_LOOP` (1) |
+| `HL_SONG_HOOK` | `0x832b2af0`, `0x832b2dc0` (the ocarina's melody playbacks) | the note flag the sound engine sets for one run of the 60 Hz sound job stayed set for two or three updates and each one went on a note: a set flag read again before the job ran again reads clear (`oot_song_cue`) | `HOS_FPS_SONG` (1) |

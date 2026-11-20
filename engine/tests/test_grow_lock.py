@@ -144,6 +144,11 @@ int main() {
                         if (updates[k] != k * 7) bad++;
                 }
                 reads++;
+                /* (the plain switch's baseline: glibc's rwlock prefers a waiting reader, so with four readers on four CPUs
+                   every shared hold is taken again before the writer can, and its append waits forever. The game's workers
+                   read at their draws, not in a tight loop: a short sleep after each read leaves the writer the gaps it
+                   would have. The default path is left at full pressure) */
+                if (grow_lock_plain()) std::this_thread::sleep_for(std::chrono::microseconds(20));
             }
         });
     while (ready.load() < 4) std::this_thread::yield();

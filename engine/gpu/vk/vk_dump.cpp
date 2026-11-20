@@ -11,6 +11,7 @@
 #include <direct.h>
 
 #include "vk_dump.h"
+#include "vk_menu.h"   // (opts.hdr_white: the PQ preview's white)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -30,6 +31,7 @@ struct Item {
     int depth_bytes = 0;   // (a depth image: copied as it is, w x h = the level's; 2 = D16, 4 = D32F or D24 in 32 bits)
     bool depth_float = false;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    bool pq = false;   // (an RGB10A2 picture: HDR10's PQ code values (Rec. 2020). Logged in nits, previewed as SDR: write_item)
     uint64_t gpu = 0;
     int seq = 0;
     std::string what;
@@ -84,6 +86,18 @@ uint8_t unit(float v) {
     return (uint8_t)std::clamp((int)std::lround(v * 255.0f), 0, 255);
 }
 
+/// ST 2084 (PQ) code value to nits (the inverse EOTF of SMPTE ST 2084)
+float pq_to_nits(float e) {
+    constexpr float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    const float p = std::pow(std::clamp(e, 0.0f, 1.0f), 1.0f / m2);
+    return 10000.0f * std::pow(std::max(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);
+}
+
+float srgb_encode(float v) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+}
+
 /// A depth item's texels as RGBA32F, scaled to at most dump_width() wide: depth in red, green and blue
 void depth_to_float(Item& it, std::vector<float>& out) {
     const uint32_t w = std::min(it.src_w, dump_width());
@@ -116,6 +130,13 @@ void write_item(Item& it) {
     const size_t n = (size_t)it.w * it.h;
     std::vector<uint8_t> rgba(n * 4, 255);
     char line[1024];
+    std::vector<float> nits;   // (a PQ picture: its colour in nits, so the statistics below are of the light, not of its code values)
+    if (it.kind == KIND_FLOAT && it.pq && !it.depth_bytes) {
+        nits.assign((const float*)it.map, (const float*)it.map + n * 4);
+        for (size_t i = 0; i < n * 4; i++)
+            if (i % 4 != 3) nits[i] = pq_to_nits(nits[i]);
+        it.map = nits.data();
+    }
     if (it.kind == KIND_FLOAT) {
         const float* p = (const float*)it.map;
         int64_t nan = 0, inf = 0;
@@ -143,6 +164,11 @@ void write_item(Item& it) {
             if (bad_inf) { o[0] = 0, o[1] = 255, o[2] = 0; continue; }
             for (int c = 0; c < 3; c++) {
                 const float v = std::max(q[c], 0.0f);
+                if (it.pq) {   // (paper white at 1, an extended Reinhard that reaches 1 at three times the paper white, sRGB coded)
+                    const float x = v / (float)std::clamp(opts.hdr_white, 80, 500);
+                    o[c] = unit(srgb_encode(x * (1.0f + x / 9.0f) / (1.0f + x)));
+                    continue;
+                }
                 o[c] = unit(hdr ? v / (1.0f + v) : v);
             }
         }
@@ -151,9 +177,10 @@ void write_item(Item& it) {
         if (it.depth_bytes)
             for (size_t i = 0; i < n; i++) ones += p[i * 4] >= 1.0f;
         int ln = snprintf(line, sizeof line,
-                 "vk: dump %03d %s: tex %#llx format %d %ux%u: NaN %lld, Inf %lld of %lld; mean %.4g %.4g %.4g %.4g, "
+                 "vk: dump %03d %s: tex %#llx format %d %ux%u%s: NaN %lld, Inf %lld of %lld; mean %.4g %.4g %.4g %.4g, "
                  "min %.4g %.4g %.4g %.4g, max %.4g %.4g %.4g %.4g",
-                 it.seq, it.what.c_str(), (unsigned long long)it.gpu, (int)it.format, it.src_w, it.src_h, (long long)nan,
+                 it.seq, it.what.c_str(), (unsigned long long)it.gpu, (int)it.format, it.src_w, it.src_h,
+                 it.pq ? " (PQ, shown in nits, Rec. 2020)" : "", (long long)nan,
                  (long long)inf, (long long)n, sum[0] * f, sum[1] * f, sum[2] * f, sum[3] * f, mn[0], mn[1], mn[2], mn[3],
                  mx[0], mx[1], mx[2], mx[3]);
         if (it.depth_bytes && ln > 0 && ln < (int)sizeof line)
@@ -356,6 +383,9 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
     Item it;
     it.kind = kind_of(tex->format);
     it.format = tex->format;
+    // (RX_VK_DUMP_PQ=0: the code values as they are)
+    static const bool pq_off = getenv("RX_VK_DUMP_PQ") && atoi(getenv("RX_VK_DUMP_PQ")) == 0;
+    it.pq = tex->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && !pq_off;
     it.gpu = tex->gpu;
     it.seq = seq++;
     it.what = std::string(what) + " #" + std::to_string(tex->id);

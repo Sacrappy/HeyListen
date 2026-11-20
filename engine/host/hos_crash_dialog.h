@@ -24,6 +24,8 @@
 /* (GitHub's new-issue page: the repository has no bug form, so the link carries a title and the report's body, trimmed to fit, hos_crash_issue_url) */
 #define HOS_CRASH_ISSUE_FORM "https://github.com/Sacrappy/HeyListen/issues/new"
 #define HOS_CRASH_ISSUES "https://github.com/Sacrappy/HeyListen/issues/new"
+/* (what the crash window and the menu's row say before a report is sent: it is public, not private to the team) */
+#define HOS_CRASH_PUBLIC_TEXT "Your report is published on the project's GitHub (issue #55) and Discord, without your user name or folders."
 enum { HOS_CRASH_LINK_MAX = 7500, HOS_CRASH_LOG_LINES = 200 };
 
 /* ---- the helper's command line ---- */
@@ -198,6 +200,59 @@ static inline void hos_crash_summary(char *out, size_t cap, const char *line) {
     for (const char *p = place; plus && p < plus; p++)
         if (*p == '/' || *p == '\\') name = p + 1;
     snprintf(out, cap, "%.*s (%s) at %.*s", (int)nc, code, kind, (int)(place + np - name), name);
+}
+/* The function the game resolved for a frame of the crash, "" when it named none:
+   "CRASH: host frame 0: HeyListen.exe+0x12f44593 f_80580b38+0x1c4" -> "f_80580b38+0x1c4";
+   "CRASH: guest frame 1: 0x80580b38 f_80580b38+0x1c4" -> "f_80580b38+0x1c4". A system DLL's frame has one token
+   (module+offset) and so names none. The signature and the report's frame lists are made from these. */
+static inline void hos_crash_frame_name(const char *line, char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    const char *c = !strncmp(line, "CRASH: ", 7) ? line : strstr(line, "] CRASH: ");
+    if (!c || !cap) return;
+    const char *at = strstr(c, "host frame ");
+    if (!at) at = strstr(c, "guest frame ");
+    if (!at) return;
+    const char *colon = strchr(at, ':');
+    if (!colon) return;
+    const char *p = colon + 1;
+    while (*p == ' ') p++;
+    while (*p && *p != ' ') p++;   /* (the address, or module+offset) */
+    while (*p == ' ') p++;
+    if (!*p) return;
+    size_t n = 0;
+    while (p[n] && p[n] != ' ' && p[n] != '\r' && p[n] != '\n' && n + 1 < cap) {
+        out[n] = p[n];
+        n++;
+    }
+    out[n] = 0;
+    for (size_t i = 0; out[i]; i++) if (out[i] == ' ') out[i] = '_';
+}
+/* The crash's grouping signature from its own lines: the top host frame's resolved function ("f_80580b38+0x1c4",
+   "hos_crash_helper_main+0x10"), the same on every PC that built the same sources; else the exception's module+offset
+   (what the relay reads today). 0 and "" when neither is there. */
+static inline int hos_crash_signature(char *out, size_t cap, const char *const *lines, int n) {
+    if (cap) out[0] = 0;
+    char frame[200];
+    for (int i = 0; i < n; i++) {
+        if (!lines[i] || !strstr(lines[i], "host frame 0:")) continue;
+        hos_crash_frame_name(lines[i], frame, sizeof frame);
+        if (frame[0]) {
+            snprintf(out, cap, "%s", frame);
+            return 1;
+        }
+    }
+    for (int i = 0; i < n; i++) {   /* (no resolved frame: the place the exception line gives, as before) */
+        char summary[240];
+        if (!lines[i]) continue;
+        hos_crash_summary(summary, sizeof summary, lines[i]);
+        if (!summary[0]) continue;
+        const char *at = strstr(summary, " at ");
+        if (at) {
+            snprintf(out, cap, "%s", at + 4);
+            return 1;
+        }
+    }
+    return 0;
 }
 /* The log's first line's version, "v3.0.0 (source 47395392)": the version alone into version, its source fingerprint into source
    ("" for none) */
@@ -518,7 +573,47 @@ static inline int hos_crash_matches_at(const char *s, size_t n, size_t at, const
     }
     return 1;
 }
-/* A log line with the home folder written ~ (%USERPROFILE% on Windows) and the user's name as a folder <user>. The length
+/* Whether a path may start at s[at]: not after a letter, a digit, '.', ':', '/', '~' or '<' (the bytes of a UTF-8 letter
+   count as a letter too), so a URL's "//" and a ratio's "60/120" are not taken for paths */
+static inline int hos_crash_path_start(const char *s, size_t at) {
+    if (!at) return 1;
+    const unsigned char c = (unsigned char)s[at - 1];
+    return !(isalnum(c) || c >= 0x80 || c == '.' || c == ':' || c == '/' || c == '~' || c == '<');
+}
+/* A character a path's folder may hold: anything but ':' and the bytes a path never has (spaces stay, for "Program Files" and
+   "C:\Users\Private User\...") */
+static inline int hos_crash_path_char(unsigned char c) {
+    return c && c != ':' && c != '"' && c != '<' && c != '>' && c != '|' && c != '?' && c != '*';
+}
+/* The length of the absolute folder path at s[at], which a report writes <path> and its separator (kept in *sep) in place of,
+   keeping the file name after it: Windows "X:\any\folders\" (a drive, then one or more folders) and POSIX "/a/b/..." (two or
+   more folders), each folder followed by a separator. 0 when there is no such path. hos_crash_path_start says where one may
+   start */
+static inline size_t hos_crash_path_prefix(const char *s, size_t n, size_t at, char *sep) {
+    if (at >= n || !hos_crash_path_start(s, at)) return 0;
+    size_t p = at, boundary = 0, folders = 0;
+    int drive = 0;
+    if (isalpha((unsigned char)s[p]) && p + 2 < n && s[p + 1] == ':' && hos_crash_sep(s[p + 2])) drive = 1, p += 3;
+    else if (s[p] == '/') p += 1;
+    else return 0;
+    while (p < n) {
+        size_t q = p;
+        while (q < n && !hos_crash_sep(s[q]) && hos_crash_path_char((unsigned char)s[q]) &&
+               s[q] != '\n' && s[q] != '\r' && s[q] != '\t')
+            q++;
+        /* (a folder: a whole component, then a separator; a file name has none after it) */
+        if (q >= n || !hos_crash_sep(s[q]) || q == p || isspace((unsigned char)s[p]) || isspace((unsigned char)s[q - 1]))
+            break;
+        folders++;
+        boundary = q + 1;
+        p = q + 1;
+    }
+    if (!boundary || folders < (drive ? 1u : 2u)) return 0;
+    *sep = s[boundary - 1];
+    return boundary - at;
+}
+/* A log line with every absolute folder path <path>, the home folder written ~ (%USERPROFILE% on Windows) and the user's name
+   as a folder <user>. The paths first (so a path's file name is all that is kept of it, even in the home folder); the length
    written (cut to cap) */
 static inline size_t hos_crash_redact_line(char *out, size_t cap, const char *line, size_t n, const char *home, const char *user,
                                            int windows) {
@@ -528,6 +623,14 @@ static inline size_t hos_crash_redact_line(char *out, size_t cap, const char *li
     if (!cap) return 0;
 #define HOS_CRASH_OUT(s, k) do { for (size_t j_ = 0; j_ < (k) && o + 1 < cap; j_++) out[o++] = (s)[j_]; } while (0)
     for (size_t i = 0; i < n;) {
+        char sep = 0;
+        const size_t path = hos_crash_path_prefix(line, n, i, &sep);
+        if (path) {
+            HOS_CRASH_OUT("<path>", 6);
+            HOS_CRASH_OUT(&sep, 1);
+            i += path;
+            continue;
+        }
         if (with_home && (i == 0 || (!hos_crash_name_char(line[i - 1]) && !hos_crash_sep(line[i - 1]))) &&
             hos_crash_matches_at(line, n, i, home, hn, windows) && (i + hn >= n || !hos_crash_name_char(line[i + hn]))) {
             const char *w = windows ? "%USERPROFILE%" : "~";

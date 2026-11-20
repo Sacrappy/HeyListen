@@ -172,9 +172,23 @@ def movie_site(s, addr, off):
 #   when it failed (host/hl_heap_retry.c). Upstream replaces those lines; here the game's own line stays, between a line
 #   before it (which saves the arguments and may refuse the call, for the test switch: "if (pre) x0 = 0; else {") and a line
 #   after it ("}" and the retry), so that taking the hook out leaves the lift as it was.
+# - HL_DRIVE_HOOK(804f5030, "<hash>"): (Longshot d30b9479 / Hookshot 72f2a07c, CraftyCorvid; Link's pull-up onto a ledge) a rigid
+#   body's update before the physics step, on its path for a body driven to a target, in the function twice (the body loaded into
+#   x23 or x24 from the controller's +240): a call hos_oot_drive_target(controller x20, body, the time object's slot) between the
+#   body's load and the reads of the target (+0x3c), which may carry last update's shortfall into it (host/hl_high_fps.c).
+# - HL_LOOP_HOOK(802cfca0, "<hash>"): (Longshot 6aa5d653 / Hookshot f02132ec, cuecuemoar; the frozen Zoras) an animation entry's
+#   clock (x20: flags +0, time +4, speed +12, start +16, end +20): its two advances multiply the step (vreg 8) by the entry's
+#   speed; a line before each puts hos_loop_step's step (whole frames for a loop of one frame or less) in vreg 8 and a line after
+#   the multiply puts the game's back (host/hl_step.c).
+# - HL_POSE_HOOK(80944aa0, "<hash>"): (the same) the one store of the time a skeleton is drawn at (x22 +0, its range +4, +8): a
+#   line after it stores hos_loop_pose's time over it (a loop of one frame or less is drawn at its start).
+# - HL_SONG_HOOK(832b2af0, "<hash>"): (Longshot 10010630 / Hookshot 23777491, CraftyCorvid; the ocarina's notes) a song's
+#   playback's call to f_832b7b50 (is the note flag set), found by its return address: a line after it makes the result
+#   hos_oot_song_cue(site, x0): a set flag read again before the sound job ran again reads clear (host/hl_high_fps.c). The
+#   two playbacks, f_832b2af0 (site 0) and f_832b2dc0 (site 1), have their own hooks.
 # Each goes in only where its function's text hashes as recorded, both lines of a kind or none. The marker is the address
 # plus one, as a step hook's (one hook a function), so a tree that does not ask for it takes it out as a stale gate.
-WANT_LIFT = re.compile(r'^HL_(SOUND|SOLVER|WHOLE|HEAP|BGM|TURN|HORSE|FLOOR)_HOOK\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f]*)"((?:\s*,\s*(?:\d+|"[^"\n]*"))*)\s*\)',
+WANT_LIFT = re.compile(r'^HL_(SOUND|SOLVER|WHOLE|HEAP|BGM|TURN|HORSE|FLOOR|DRIVE|LOOP|POSE|SONG)_HOOK\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f]*)"((?:\s*,\s*(?:\d+|"[^"\n]*"))*)\s*\)',
                        re.M)
 CUT = "    c->x[%d]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);\n"
 SOUND_SLOT = "g_module_base + 0x80435000ULL + (int64_t)75927552"   # (the page of the step's pointer, whose +2192 holds it)
@@ -202,9 +216,26 @@ FLOOR_FCMP = "    { if (!a64_fcmp32(c,c->vreg[0],c->vreg[1])) "   # (its line go
 FLOOR_BRANCH = "if ((c->n == c->v) && !c->z) { goto %s; }\n"
 SOLVER_STORE = "    recomp_store32(c,c->x[0] + 712,c->x[1]);\n"
 WHOLE_STORE = "    recomp_store32(c,%s,c->x[%d]);\n"
+WHOLE_TIMES_LOAD = "    c->x[%d]=recomp_load32(c,c->x[19] + 76);\n"   # (the water's substeps, loaded right before the cut of the frame)
 # (the unsigned cut's addition of the elapsed counter: "u<N>" anchors on the cut followed by the addition to x<N>)
 WHOLE_ADD = ("    { uint64_t _a=c->x[%d],_b=((uint64_t)(uint32_t)(((uint32_t)(c->x[8])) << 0)),_r=_a+_b; _r&=0xFFFFFFFFULL; "
              "c->x[8]=_r; }\n")
+
+
+# (Link's driven body: the path's two copies, the body loaded into x23 or x24, then the target's reads: the line goes after the load)
+DRIVE_REGS = (23, 24)
+DRIVE_READ = ("    c->x[%d]=recomp_load64(c,c->x[20] + 240);\n"
+              "    { uint64_t _b=c->x[20]; int64_t _o=60; { uint64_t _p0,_p1; recomp_ldp32(c,(_b+_o),&_p0,&_p1); "
+              "a64_vset64(c->vreg[2],_p0); a64_vset64(c->vreg[1],_p1); }}\n"
+              "    { { uint64_t _v=recomp_load32(c,(c->x[20]+68ULL)); a64_vset64(c->vreg[0],_v); } }\n")
+# (the clocks of an animation entry: the branch past its flags test, then the multiply of the step (vreg 8) by the speed in vreg <r>)
+LOOP_SITES = (("if (((c->x[9] >> 3) & 1)) { goto L_802d077c; }\n", 1),
+              ("if (((c->x[9] >> 3) & 1)) { goto L_802d07f4; }\n", 0))
+LOOP_MUL = "    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[8],4);memcpy(&_b,c->vreg[%d],4);_z=(_a^_b)&0x80000000ULL;\n"
+LOOP_MUL_REST = re.compile(r"    _v=a64_fpx_(?:hot_)?mul32_fma32\(c,_a,_b,_z\);\n    a64_vset64\(c->vreg\[\d+\],_v\);\}\n")
+POSE_STORE = "    { { uint64_t _v=0; memcpy(&_v,&c->vreg[0][0],4); recomp_store32(c,(c->x[22]+0ULL),_v); } }\n"
+# (a song's playback: the call asking whether the note flag is set, by its return address)
+SONG_CALLS = {"832b2af0": "c->x[30] = 0x832b2c84ULL; f_832b7b50(c);\n", "832b2dc0": "c->x[30] = 0x832b2ed4ULL; f_832b7b50(c);\n"}
 
 
 HEAP_CPU = (0x80456910, 0x80456da4)   # (f_804566e0's tryAlloc calls, by their return addresses, and the GPU memory's)
@@ -248,8 +279,31 @@ def lift_lines(kind, addr, args):
                 "hos_oot_solver_steps((uint32_t)c->x[1], (uint32_t)c->vreg[0][0], (uint32_t)c->vreg[1][0]); }" + mark]
     if kind == "whole":
         reg, key = args[:2]
+        times = int(args[2][1:]) if len(args) > 2 and args[2][:1] == "t" else 0
+        if times:   # (the substeps' count in x<times> too: the whole substeps in x<reg>, x<times> made 1: the game multiplies them)
+            return ["    { extern uint32_t hos_frame_whole_times(uint64_t, uint32_t, uint32_t); c->x[%d] = hos_frame_whole_times(%s, "
+                    "(uint32_t)c->vreg[0][0], (uint32_t)c->x[%d]); c->x[%d] = 1; }%s" % (reg, key, times, times, mark)]
         return ["    { extern uint32_t hos_frame_whole(uint64_t, uint32_t, uint32_t); c->x[%d] = hos_frame_whole(%s, "
                 "(uint32_t)c->vreg[0][0], (uint32_t)c->x[%d]); }%s" % (reg, key, reg, mark)]
+    if kind == "drive":
+        return ["    { extern void hos_oot_drive_target(uint64_t, uint64_t, uint64_t); "
+                "hos_oot_drive_target(c->x[20], c->x[%d], " % reg + SOUND_SLOT + " + 2192); }" + mark for reg in DRIVE_REGS]
+    if kind == "loop":
+        out = []
+        for n in range(len(LOOP_SITES)):
+            out += ["    uint64_t _hl_ls%d_%s = c->vreg[8][0]; { extern uint32_t hos_loop_step(uint64_t, uint32_t, uint32_t, uint32_t); "
+                    "c->vreg[8][0] = (_hl_ls%d_%s & ~0xffffffffULL) | hos_loop_step(c->x[20], (uint32_t)_hl_ls%d_%s, "
+                    "(uint32_t)recomp_load32(c,c->x[20] + 16), (uint32_t)recomp_load32(c,c->x[20] + 20)); }" %
+                    (n, step_id(addr), n, step_id(addr), n, step_id(addr)) + mark,
+                    "    c->vreg[8][0] = _hl_ls%d_%s;" % (n, step_id(addr)) + mark]
+        return out
+    if kind == "pose":
+        return ["    { extern uint32_t hos_loop_pose(uint32_t, uint32_t, uint32_t); const uint32_t _t = (uint32_t)c->vreg[0][0], "
+                "_p = hos_loop_pose(_t, (uint32_t)recomp_load32(c,c->x[22] + 4), (uint32_t)recomp_load32(c,c->x[22] + 8)); "
+                "if (_p != _t) recomp_store32(c,(c->x[22]+0ULL),_p); }" + mark]
+    if kind == "song":
+        return ["    { extern uint64_t hos_oot_song_cue(uint32_t, uint64_t); c->x[0] = hos_oot_song_cue(%d, c->x[0]); }" %
+                (0 if addr == "832b2af0" else 1) + mark]
     if kind == "heap":
         lines = []
         for lr in HEAP_CPU:
@@ -310,6 +364,9 @@ def lift_places(body, addr, kind, args):
         reg, key = args[:2]
         cut = CUT % reg
         mode = args[2] if len(args) > 2 else ""
+        if mode[:1] == "t":   # (the substeps: the load of their count right before the cut, the water renderer's +76 of its pass)
+            cut = WHOLE_TIMES_LOAD % int(mode[1:]) + cut
+            return [body.index(cut) + len(cut)] if body.count(cut) == 1 else None
         if mode:
             cut = cut.replace(",32,32,1,3,", ",32,32,0,3,")
             if mode[1:]:
@@ -319,6 +376,31 @@ def lift_places(body, addr, kind, args):
             if body.count(anchor) == 1:
                 return [body.index(anchor) + len(cut)]
         return None
+    if kind == "drive":
+        places = []
+        for reg in DRIVE_REGS:
+            read = DRIVE_READ % reg
+            if body.count(read) != 1:
+                return None
+            places.append(body.index(read) + len(read.split("\n", 1)[0]) + 1)   # (after the body's load, before the target's reads)
+        return places
+    if kind == "loop":
+        places = []
+        for before, reg in LOOP_SITES:
+            mul = before + LOOP_MUL % reg
+            if body.count(mul) != 1:
+                return None
+            start = body.index(mul) + len(before)
+            rest = LOOP_MUL_REST.match(body, start + len(LOOP_MUL % reg))
+            if not rest:
+                return None
+            places += [start, rest.end()]
+        return places if places == sorted(places) else None
+    if kind == "pose":
+        return [body.index(POSE_STORE) + len(POSE_STORE)] if body.count(POSE_STORE) == 1 else None
+    if kind == "song":
+        call = SONG_CALLS.get(addr)
+        return [body.index(call) + len(call)] if call and body.count(call) == 1 else None
     if kind == "heap":
         places = []
         for lines in ((HEAP_CPU_LINE, HEAP_CPU), (HEAP_GPU_LINE, HEAP_GPU)):

@@ -50,7 +50,8 @@ import toolchain as _toolchain
 LINUX, CROSS = not _toolchain.windows(), _toolchain.windows() and os.name != "nt"
 # (SDL2.dll is sdl2-compat: it loads SDL3.dll from beside the exe. Left out of bin\ since v2.0.0, it said "Failed loading SDL3
 # library" three times and no controller worked: Discord #bug-reporting, 11-08)
-BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["HeyListen.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
+BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0", "hookshot.sym", "hookshot_vk.sym"] if LINUX else \
+    ["HeyListen.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll", "HeyListen.sym", "hookshot_vk.sym"]
 # (HeyListen: the Windows game and its launcher were hookshot.exe before; a folder built then has them, removed once the new ones are in)
 OLD_EXES = [] if LINUX else ["hookshot.exe", "hookshot.map"]
 # (Linux) the game folder's launcher script (builder/linux/hookshot-folder); the game itself is bin/hookshot, which the engine and the launcher both expect
@@ -1361,6 +1362,14 @@ def place_ngx_runtime(out):
         return None
     dst = ngx.install_runtime(sdk, platform, os.path.join(out, "ngx"))
     print("NVIDIA DLSS: %s (NVIDIA's, under NVIDIA's license: never share this game folder)" % dst, flush=True)
+    # (DLSS Frame Generation's runtime goes beside it when the SDK folder has it: without it NGX takes the driver's own,
+    # maybe older, copy. A folder fetched before it was in the table has not: scripts/ngx_sdk.py adds it)
+    fg = ngx.runtime_name(platform, "framegen")
+    if os.path.isfile(ngx.runtime(sdk, platform, "framegen")):
+        print("NVIDIA DLSS Frame Generation: %s (NVIDIA's too)" % os.path.join(out, "ngx", fg), flush=True)
+    else:
+        print("NVIDIA DLSS Frame Generation: %s has no %s yet (scripts/ngx_sdk.py fetches it): until then NGX takes the "
+              "driver's own, which may be older" % (sdk, fg), flush=True)
     return dst
 
 

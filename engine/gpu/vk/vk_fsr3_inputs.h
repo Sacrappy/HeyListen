@@ -29,10 +29,16 @@ namespace fsr3_inputs {
 struct Frame {
     VkImageView color = VK_NULL_HANDLE;    ///< RGBA16F: the network's input as it samples it, 0..1
     VkImageView depth = VK_NULL_HANDLE;    ///< R32F, reversed (fsr3_math.h Camera::flip_depth)
+    VkImage depth_image = VK_NULL_HANDLE, motion_image = VK_NULL_HANDLE;   ///< (the images of those two views: R32F, RG16F)
     VkImageView motion = VK_NULL_HANDLE;   ///< RG16F, render pixels toward the frame before, x right and y down, no jitter
     uint32_t width = 0, height = 0;
     float jitter[2]{};                      ///< this frame's, in render pixels as FSR takes it (x right, y down)
     fsr3_math::Camera camera;
+    /// The matrices as the game fills its views' uniform buffers (row major, clip = M * position), without the jitter: the scene's
+    /// projection and view-projection, and the frame before's view-projection (valid with have_prev: not a reset). NVIDIA DLSS
+    /// Frame Generation's camera (vk_dlss.cpp)
+    float projection[16]{}, view_projection[16]{}, prev_view_projection[16]{};
+    bool have_prev = false;
     bool reset = false;                     ///< no history: the first frame, a new size, or a gap of more than two frames
     float frame_ms = 16.667f;               ///< since the frame before's
     uint64_t frame = 0;                     ///< texture_frame_no() when prepared
@@ -41,6 +47,11 @@ struct Frame {
 /// FSR 3.1 is asked for at all: its upscaler (the Upscaler row) or its frame interpolation (the Frame generation row). The
 /// scene's camera is kept only then
 bool wanted();
+
+/// Matching scene/network formats for the independent input path. RGBA16F is limited to
+/// opt-in Native PsychoV35 frame interpolation; it does not enable the legacy upscaler.
+bool scene_format(VkFormat format);
+bool colour_pair(VkFormat input, VkFormat output);
 
 /// A draw into a scene-sized target with the vertex stage's uniform buffer 3 at `camera`: what vk_temporal.cpp's
 /// temporal_note_scene_draw is given, read the same way (the largest such target of the frame is the scene)

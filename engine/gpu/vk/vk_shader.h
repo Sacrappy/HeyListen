@@ -62,6 +62,7 @@ struct Program {
     bool uses_render_area = false;
     bool uses_push = true;   // (a stage reads the push constants: render area or rescaling)
     bool mesh = false;              // task / mesh stages (VK_EXT_mesh_shader)
+    bool scene_tonemap = false;     // (HeyListen, after Longshot ddb156df) its scene tone map is PsychoV35 (vk_shader.cpp scene_tonemap_for; in its key)
     // (hookshot) the GPU has no mesh shaders: the task and mesh stages are compute pipelines, and a generated vertex
     // stage reads the records they write. Its stages are (task,) mesh, vertex, fragment.
     bool fallback = false;

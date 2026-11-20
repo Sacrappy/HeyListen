@@ -2,9 +2,13 @@
 launcher requires, the build it checks for is the one make_game.py supports, every setting writes a key the in-game menu reads, the
 prepare step's arguments are ones make_game.py takes, and the Windows zip and the AppImage carry it.
 
-The launcher's JSON schema (https://recomplauncher.com/schema/recomplauncher.json) is not copied here: a test that needs the network is
-not a game-free check. With RECOMPLAUNCHER_SCHEMA=<a downloaded copy of it> the file is also validated against it (the subset of
-JSON Schema that file uses).
+RecompLauncher's PR 91 asked for two things beside the file: a --fullscreen start (a settings row for the window's mode exists; the
+flag is checked here against host/hos_main.c) and a .log crash log (host/hos_run_logs.h keeps one, checked in test_run_logs.py;
+here the folder it is declared in is). Neither a Title ID nor a hash of a game file is ever written into the file (checked).
+
+The launcher's JSON schema (https://recomplauncher.com/schema/recomplauncher.json) is not copied here: its repository is GPL v3,
+and a copy would age with the next launcher. With RECOMPLAUNCHER_SCHEMA=<a downloaded copy of it> the file is also validated
+against it (the subset of JSON Schema that file uses).
 
 Run with: python -I -B tests/test_recomplauncher_json.py
 """
@@ -41,7 +45,9 @@ def menu_rows():
     renamed = {  # (rows whose key is not their name)
         "Output resolution": "output_res", "Render resolution": "resolution", "Window scaling filter": "upscaling", "Upscaler": "dlss",
         "Send performance statistics": "send_performance_stats", "Send crash reports automatically": "send_crash_reports",
-        "Check for updates": "update_check"}
+        "Check for updates": "update_check", "V-Sync": "vsync", "V-Sync mode": "vsync_mode",
+        "VRR (G-Sync / FreeSync)": "vrr",
+        "DLAA before the bloom": "dlss_pre_bloom"}
     for key in re.findall(r'return "([a-z_0-9]+)";', ini_key):
         assert key in renamed.values(), key   # (a new special case: add it above)
     rows = {}
@@ -52,8 +58,9 @@ def menu_rows():
 
 
 def validate(value, schema, root, where="$"):
-    """The subset of JSON Schema recomplauncher.json's schema uses: type, enum, required, properties, additionalProperties, items,
-    minItems, uniqueItems, minimum, pattern, $ref. Returns the problems"""
+    """The subset of JSON Schema recomplauncher.json's schema uses: type, enum, const, required, properties,
+    additionalProperties, items, minItems, maxItems, uniqueItems, minimum, exclusiveMinimum, pattern, minLength,
+    maxLength, propertyNames, allOf, anyOf, if/then/else, not and $ref. Returns the problems"""
     if "$ref" in schema:
         node = root
         for part in schema["$ref"].lstrip("#/").split("/"):
@@ -65,16 +72,29 @@ def validate(value, schema, root, where="$"):
         ok = isinstance(value, kinds[schema["type"]]) and not (schema["type"] in ("integer", "number") and isinstance(value, bool))
         if not ok:
             return ["%s: not a %s" % (where, schema["type"])]
+    if "const" in schema and value != schema["const"]:
+        problems.append("%s: %r is not %r" % (where, value, schema["const"]))
     if "enum" in schema and value not in schema["enum"]:
         problems.append("%s: %r is not one of %s" % (where, value, schema["enum"]))
     if isinstance(value, str) and "pattern" in schema and not re.search(schema["pattern"], value):
         problems.append("%s: %r does not match %s" % (where, value, schema["pattern"]))
-    if isinstance(value, (int, float)) and "minimum" in schema and value < schema["minimum"]:
-        problems.append("%s: below %s" % (where, schema["minimum"]))
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            problems.append("%s: shorter than %s" % (where, schema["minLength"]))
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            problems.append("%s: longer than %s" % (where, schema["maxLength"]))
+    if isinstance(value, (int, float)):
+        if "minimum" in schema and value < schema["minimum"]:
+            problems.append("%s: below %s" % (where, schema["minimum"]))
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            problems.append("%s: not above %s" % (where, schema["exclusiveMinimum"]))
     if isinstance(value, dict):
         for name in schema.get("required", []):
             if name not in value:
                 problems.append("%s: no %s" % (where, name))
+        if "propertyNames" in schema:
+            for name in value:
+                problems += validate(name, schema["propertyNames"], root, "%s name %r" % (where, name))
         props = schema.get("properties", {})
         for name, item in value.items():
             if name in props:
@@ -86,11 +106,24 @@ def validate(value, schema, root, where="$"):
     if isinstance(value, list):
         if len(value) < schema.get("minItems", 0):
             problems.append("%s: fewer than %d items" % (where, schema["minItems"]))
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            problems.append("%s: more than %d items" % (where, schema["maxItems"]))
         if schema.get("uniqueItems") and len({json.dumps(v, sort_keys=True) for v in value}) != len(value):
             problems.append("%s: repeated items" % where)
         if "items" in schema:
             for i, item in enumerate(value):
                 problems += validate(item, schema["items"], root, "%s[%d]" % (where, i))
+    if "not" in schema and not validate(value, schema["not"], root, where):
+        problems.append("%s: matches a not" % where)
+    if "if" in schema:
+        branch = schema.get("then" if not validate(value, schema["if"], root, where) else "else")
+        if branch is not None:
+            problems += validate(value, branch, root, where)
+    if "allOf" in schema:
+        for part in schema["allOf"]:
+            problems += validate(value, part, root, where)
+    if "anyOf" in schema and all(validate(value, part, root, where) for part in schema["anyOf"]):
+        problems.append("%s: matches none of anyOf" % where)
     return problems
 
 
@@ -152,6 +185,50 @@ class RecompLauncherJsonTests(unittest.TestCase):
         # (no network: no question, the game starts; a folder that is not there or not built: an error and exit 1, no start)
         self.assertGreaterEqual(play.count("play_error("), 4)
 
+    def test_the_game_takes_a_fullscreen_flag(self):
+        """RecompLauncher's PR 91, first ask: a start in the display mode a launcher or a shortcut asks for. The launcher's own
+        way is the settings row, which writes the menu's Fullscreen key in hookshot_options.ini (the player's saved choice); the
+        flag is one run, written nowhere: it sets HOS_FULLSCREEN, which the window applies when it is made and the menu's row
+        then leaves alone (vk_menu.cpp fullscreen_tick)."""
+        main = (ENGINE / "host" / "hos_main.c").read_text(encoding="utf-8")
+        self.assertIn('"--fullscreen"', main)
+        self.assertLess(main.index('"--fullscreen"'), main.index("else if (!image) image = argv[i]"))
+        # (the parse consumes the flag, before the argument that is not one becomes the image's path)
+        self.assertIn('_putenv("HOS_FULLSCREEN=1")', main)   # (Windows: the window is made after the parse)
+        linux = main[main.index("int prepare_shaders = 0;"):main.index("const int window =")]
+        self.assertIn('setenv("HOS_FULLSCREEN", "1", 1)', linux)   # (Linux: before the display is made, on the one thread)
+        for path in (ENGINE / "host" / "display.c", ENGINE / "host" / "posix" / "display_sdl.c"):
+            src = path.read_text(encoding="utf-8")
+            self.assertRegex(src, r'getenv\("HOS_FULLSCREEN"\).*set_fullscreen', path.name)   # (the start applies it)
+        menu = (ENGINE / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
+        tick = menu[menu.index("void fullscreen_tick()"):menu.index("void menu_option_set(")]
+        self.assertIn("HOS_FULLSCREEN", tick)   # (while it is set the row leaves the window alone: the flag writes nothing)
+        by_key = {k: s for s in self.doc["settings"] for k in s["choices"][0]["set"]}
+        self.assertEqual([c["set"]["fullscreen"] for c in by_key["fullscreen"]["choices"]], ["0", "1"])   # (the launcher's row)
+
+    def test_the_crash_log_is_the_newest_log_of_the_declared_folder(self):
+        """RecompLauncher's PR 91, second ask: the crash report reads .log files, and the game keeps them. The manifest's
+        "logs" folder is where host/hos_run_logs.h puts logs/hookshot.log (this run, a hard link to hookshot_log.txt), on
+        Windows and Linux (test_run_logs.py checks the making of them)."""
+        self.assertEqual([f["path"] for f in self.doc["folders"]["logs"]], [GAME + "/logs"])
+        (action,) = [a for a in self.doc["actions"] if a.get("open") == "logs"]
+        self.assertIn("hookshot.log", action["help"])
+        header = (ENGINE / "host" / "hos_run_logs.h").read_text(encoding="utf-8")
+        self.assertIn('snprintf(from, sizeof from, "%s/hookshot.log", folder)', header)   # (this run's, the newest)
+
+    def test_no_title_id_and_no_dump_hashes(self):
+        """What the file does not say, on purpose. The launcher's "Checks your copy" tick is game.dumps, a CRC32 of a whole
+        known copy from Redump: that is a hash of a game file, and HeyListen publishes none (game.check's build ID, the one
+        build make_game.py supports, is read from the player's own copy and needs no key). A Title ID is not written either:
+        the launcher's own 64-line profile in PR 91 names one, ours names the version and the build. No top-level "mods": the
+        launcher's Mods tab needs a Thunderstore community or a GameBanana game with an nrm, otr or hmm loader, and ours is
+        a folder of file mods the actions open."""
+        text = MANIFEST.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"\b0[0-9A-Fa-f]{15}\b")   # (a Title ID, like 0400486024DEC000)
+        self.assertNotIn("dumps", self.doc)
+        self.assertNotIn("title_id", text)
+        self.assertNotIn("mods", self.doc)   # (folders.mods, the folder the action opens, is not the launcher's Mods tab)
+
     def test_prepare_takes_arguments_make_game_has(self):
         prepare = self.doc["prepare"]
         self.assertEqual(prepare["version"], "1")
@@ -201,7 +278,8 @@ class RecompLauncherJsonTests(unittest.TestCase):
         self.assertEqual((inp["role"], inp["shared"], inp["optional"]), ("runtime", "nvidia.dlss", True))
         self.assertEqual(inp["destination"], "HeyListen/ngx/nvngx_dlss.dll")   # (gpu/vk/vk_dlss.cpp: the game folder's ngx folder)
         src = (ENGINE / "gpu" / "vk" / "vk_dlss.cpp").read_text(encoding="utf-8")
-        self.assertIn('game_dir() / L"ngx"', src)
+        self.assertIn('game / L"ngx"', src)   # (runtime_dirs(game_dir()): the game folder's ngx folder first after RX_VK_DLSS_DIR)
+        self.assertIn('runtime_dirs(game_dir())', src)
 
     def test_set_option_keys_touches_only_its_keys(self):
         with tempfile.TemporaryDirectory() as d:
@@ -239,11 +317,14 @@ class RecompLauncherJsonTests(unittest.TestCase):
             lo, hi = rows[key]
             values = [c["set"][key] for c in setting["choices"]]
             self.assertEqual(len(set(values)), len(values), setting["id"])
-            for v in values + list(setting["defaults"].values()):
+            for v in values + list(setting.get("defaults", {}).values()):
                 self.assertRegex(v, r"^\d+$")
                 self.assertGreaterEqual(int(v), lo, setting["id"])
                 if hi is not None:
                     self.assertLessEqual(int(v), hi, setting["id"])
+            if key == "dlss_model":   # (no default: the game picks one for the GPU at the first run, vk_menu.cpp menu_first_run_model)
+                self.assertNotIn("defaults", setting)
+                continue
             self.assertEqual(set(setting["defaults"]), {key})
             self.assertIn(setting["defaults"][key], values)
         # (the main video and gameplay rows are there)
@@ -254,12 +335,24 @@ class RecompLauncherJsonTests(unittest.TestCase):
     def test_the_upscaler_and_frame_rate_rows_have_the_menu_values(self):
         by_key = {k: s for s in self.doc["settings"] for k in s["choices"][0]["set"]}
         up = {c["set"]["dlss"]: c["label"] for c in by_key["dlss"]["choices"]}
-        self.assertEqual(up, {"0": "The game's own", "1": "NVIDIA DLSS", "2": "NVIDIA DLAA", "3": "AMD FSR 3.1", "4": "AMD FSR 4",
-                              "5": "AMD FSR 4 Native AA", "6": "Off"})   # (gpu/vk/upscaler_rows.h: GAME DLSS DLAA FSR3 FSR4 FSR4_AA OFF)
+        # (DLAA (2) and FSR 4's Native AA (5) are not choices of the Upscaler row: they are the Render resolution's native choice (7) of
+        # DLSS and FSR 4; a saved dlss=2 or 5 is still read, and migrated, by the game: gpu/vk/upscaler_rows.h migrate)
+        self.assertEqual(up, {"0": "The game's own", "1": "NVIDIA DLSS", "3": "AMD FSR 3.1", "4": "AMD FSR 4", "6": "Off"})
+        res = {c["set"]["resolution"]: c["label"] for c in by_key["resolution"]["choices"]}
+        self.assertEqual(sorted(res), ["0", "1", "2", "3", "4", "5", "6", "7"])
+        self.assertIn("DLAA", res["7"])
+        self.assertIn("Native AA", res["7"])
         fps = [c["label"].split()[0] for c in by_key["frame_rate_limit"]["choices"]]
-        self.assertEqual(fps, ["60", "90", "120", "144", "165", "240"])   # (vk_menu.cpp tx_fps_limit)
+        self.assertEqual(fps, ["60", "90", "120", "144", "165", "240", "Unlimited"])   # (vk_menu.cpp tx_fps_limit)
+        # (the saved 0 to 5 keep their meaning: Unlimited is a new 6, in the row's range)
+        self.assertEqual([c["set"]["frame_rate_limit"] for c in by_key["frame_rate_limit"]["choices"]], [str(i) for i in range(7)])
         gen = [c["set"]["frame_generation"] for c in by_key["frame_generation"]["choices"]]
         self.assertEqual(gen, [str(i) for i in range(9)])
+        # (Frame generation by: the renderer's own and NVIDIA DLSS FG as saved before, AMD FSR 3.1 after them)
+        by = {c["set"]["frame_generation_by"]: c["label"] for c in by_key["frame_generation_by"]["choices"]}
+        self.assertEqual(sorted(by), ["0", "1", "2"])
+        self.assertIn("DLSS", by["1"])
+        self.assertIn("FSR 3.1", by["2"])
 
     def test_every_file_is_in_the_game_folder_prepare_makes(self):
         main = next(c for c in self.doc["config"] if c["id"] == "main")

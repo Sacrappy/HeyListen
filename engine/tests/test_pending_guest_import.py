@@ -19,7 +19,9 @@ def main():
     start = source.index("int memory_guest_imported(")
     function = source[start:source.index("\n}", start) + 2]
     fixture = r"""
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -31,6 +33,7 @@ struct Pool { uint64_t lo, hi, memory; };
 std::map<uint64_t, Pool> imported;
 import_reach::Reach live_reach;
 std::deque<decltype(imported)::node_type> retired_pools, evicted_pools;
+std::atomic<int64_t> st_retired_walk_ns{0};
 std::mutex pools_mu, bg_mu;
 std::map<uint64_t, uint64_t> bg_inflight;
 std::vector<std::pair<uint64_t, Pool>> bg_ready;

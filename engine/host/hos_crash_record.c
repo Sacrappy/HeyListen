@@ -7,6 +7,7 @@
 #endif
 #define _CRT_SECURE_NO_WARNINGS
 #include "hos_crash_record.h"
+#include "hos_crash_names.h"
 #include "hos_report_privacy.h"
 #include "hos_report_run.h"
 #include <stdio.h>
@@ -290,12 +291,13 @@ static int map_line(const char *line, CrashMap *map) {
     return 1;
 }
 #endif
-static int module_at(uintptr_t pc, char *name, size_t cap, uint64_t *offset) {
+static int module_at(uintptr_t pc, char *name, size_t cap, uint64_t *offset, uintptr_t *base_out) {
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery((const void *)pc, &mbi, sizeof mbi) || mbi.Type != MEM_IMAGE) return 0;
     const uintptr_t base = (uintptr_t)mbi.AllocationBase;
     *offset = pc - base;
+    if (base_out) *base_out = base;
     if (base == executable_base) { hos_crash_redact(name, cap, "HeyListen.exe", 13); return 1; }
     /* Read the image's export name, not its loader entry/full path. */
     IMAGE_DOS_HEADER dos; IMAGE_NT_HEADERS64 nt;
@@ -355,25 +357,39 @@ static int module_at(uintptr_t pc, char *name, size_t cap, uint64_t *offset) {
     const char *leaf = basename_of(path);
     hos_crash_redact(name, cap, leaf, length(leaf, 512));
     *offset = pc - base;
+    if (base_out) *base_out = (uintptr_t)base;
     return 1;
 #endif
 }
-static void module_field(Text *b, const char *key, uintptr_t pc) {
-    char name[160]; uint64_t offset;
+/* The function a frame is in: the build's own table (the lifted code f_<guest address>, the host's functions by
+   name), else the compiled-in lifted table for a host address in it. 0 when neither names it */
+static int function_at(const char *module, uint64_t offset, uintptr_t base, uintptr_t start, uintptr_t pc,
+                       char *out, size_t cap) {
+    if (hos_crash_name(module, offset, base, out, cap)) return 1;
+    if (!strstr(module, "hookshot_vk")) return hos_crash_lifted_name(start, pc, out, cap);
+    return 0;
+}
+/* "<module>+0x<offset> <function>": the place as it was, then the name that means the same in every build. The
+   module+offset stays first so older readers (nx2/samap.py's, engine/scripts/crash_groups.py's) still find it */
+static void frame_field(Text *b, const char *key, uintptr_t pc, uintptr_t start) {
+    char name[160], function[400]; uint64_t offset = 0; uintptr_t base = 0;
     put(b, key); put(b, ": ");
-    if (pc && module_at(pc, name, sizeof name, &offset)) { put(b, name); put(b, "+0x"); number(b, offset, 16); }
-    else put(b, "unknown"); /* never substitute an ASLR/heap address */
+    if (pc && module_at(pc, name, sizeof name, &offset, &base)) {
+        put(b, name); put(b, "+0x"); number(b, offset, 16);
+        if (function_at(name, offset, base, start, pc, function, sizeof function)) { put(b, " "); put(b, function); }
+    } else put(b, "unknown"); /* never substitute an ASLR/heap address */
     put(b, "\n");
 }
+static void module_field(Text *b, const char *key, uintptr_t pc) { frame_field(b, key, pc, 0); }
 static void host_stack(Text *b, const HosCrashContext *c) {
 #ifdef _WIN32
     CONTEXT ctx;
     if (c->native_context && safe_read((uintptr_t)c->native_context, &ctx, sizeof ctx)) {
         field(b, "host_backtrace_method", "Windows unwind");
         for (unsigned i = 0; i < FRAME_CAP && ctx.Rip; ++i) {
-            module_field(b, "host_backtrace", (uintptr_t)ctx.Rip);
             DWORD64 image = 0;
             PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
+            frame_field(b, "host_backtrace", (uintptr_t)ctx.Rip, f ? (uintptr_t)(image + f->BeginAddress) : 0);
             if (f) {
                 void *data; DWORD64 frame;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &data, &frame, NULL);
@@ -387,15 +403,21 @@ static void host_stack(Text *b, const HosCrashContext *c) {
     }
 #endif
     field(b, "host_backtrace_method", "frame pointer; may be partial");
-    module_field(b, "host_backtrace", c->pc);
+    frame_field(b, "host_backtrace", c->pc, 0);
     uintptr_t fp = c->fp;
     for (unsigned i = 1; i < FRAME_CAP && fp >= c->sp && fp - c->sp <= (64u << 20) && !(fp & 7); ++i) {
         uintptr_t words[2];
         if (!safe_read(fp, words, sizeof words) || !words[1]) break;
-        module_field(b, "host_backtrace", words[1]);
+        frame_field(b, "host_backtrace", words[1], 0);
         if (words[0] <= fp) break;
         fp = words[0];
     }
+}
+static void guest_address(Text *b, const char *key, uint64_t address) {
+    char function[96];
+    put(b, key); put(b, ": 0x"); number(b, address, 16);
+    if (hos_crash_guest_name(address, function, sizeof function)) { put(b, " "); put(b, function); }
+    put(b, "\n");
 }
 static void guest_stack(Text *b, const HosCrashContext *c) {
     uint64_t regs[32];
@@ -403,13 +425,13 @@ static void guest_stack(Text *b, const HosCrashContext *c) {
     for (unsigned i = 0; i < 32; ++i) {
         put(b, "guest_register: x"); number(b, i, 10); put(b, "=0x"); number(b, regs[i], 16); put(b, "\n");
     }
-    put(b, "guest_backtrace: 0x"); number(b, regs[30], 16); put(b, "\n");
+    guest_address(b, "guest_backtrace", regs[30]);
     uint64_t fp = regs[29];
     for (unsigned i = 0; i < 40 && fp && !(fp & 15); ++i) {
         uint64_t words[2];
         if (c->guest_size < sizeof words || fp > c->guest_size - sizeof words ||
             c->guest_base > UINTPTR_MAX - fp || !safe_read(c->guest_base + (uintptr_t)fp, words, sizeof words)) break;
-        put(b, "guest_backtrace: 0x"); number(b, words[1], 16); put(b, "\n");
+        guest_address(b, "guest_backtrace", words[1]);
         if (words[0] <= fp) break;
         fp = words[0];
     }
@@ -435,6 +457,10 @@ static void format_record(Text *b, const Session *s, const HosCrashContext *c, u
     b->n = 0; b->full = 0;
     put(b, c ? "HeyListen crash record 1\n" : "HeyListen unclean record 1\n");
     label_field(b, "version", s->version, sizeof s->version);
+    {   /* (which lifted code the game ran: nx2/build.py's key, the same for every PC built from these sources) */
+        const char *hos_lift_key(void);
+        label_field(b, "lifted_code", hos_lift_key(), 40);
+    }
     field(b, "run_id", s->run_id);
     char when[17]; timestamp(now, when); field(b, "when", when);
     if (c) {
@@ -795,6 +821,7 @@ void hos_crash_record_start(const char *dir, const char *version, const char *lo
     if (ready) return;
     char root[PATH_CAP], leaf[64];
     if (!setup(dir, root)) return;
+    hos_crash_names_start();   /* (before the handlers: the crash path only searches these; hos_crash_names.h) */
     recover();
     prune_pending();
     memcpy(session.magic, "HeyListen running 1", 19);

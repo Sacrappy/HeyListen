@@ -16,6 +16,10 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
   before any recompute. So the fixed path kept the dynamic path's last scale (0.75 docked: 1536x864 at every setting). Flag 1 now
   also asks for the recompute, and on the fixed path the flags +0xe20 bits 3/4 (a hardcoded 0.75 / 0.5 in place of the scale)
   are not looked at.
+- The Voice Language option kept after a restart (host/oot_voice.c): the voice resource's update (f_80a9ca30) asks
+  GameDataMgr whether the option was written (f_80a9d1c0) and applies it only then; option.sav's value replaces the
+  option without a write, so a saved choice was never applied (issue 430). The call goes through hos_oot_voice_option,
+  which also says yes when the option's value is not the one of the update before. The supported build only.
 """
 import glob
 import os
@@ -42,6 +46,26 @@ def fixed_scale(t):
     t = t.replace(APPLY_OLD, APPLY_NEW, 1).replace(FLAGS_OLD, FLAGS_NEW, 1)
     return t.replace('#include "a64.h"\n', '#include "a64.h"\n' + DECL2, 1), 1
 
+
+# The voice resource's update (f_80a9ca30) asks GameDataMgr whether OptionData.VoiceLanguage was written (f_80a9d1c0, its one
+# call there, by its return address) and reads and applies the option only then. Made through host/oot_voice.c
+# hos_oot_voice_option, which calls the game's own and also answers yes when the option's value changed without a write
+# (option.sav read after the start: issue 430). f_80a9d1c0's other callers stay as they are.
+VOICE_OPTION_OLD = "c->x[30] = 0x80a9ca9cULL; f_80a9d1c0(c);"
+VOICE_OPTION_NEW = "c->x[30] = 0x80a9ca9cULL; hos_oot_voice_option(c, f_80a9d1c0);   /* (nx2/oot_patches.py: host/oot_voice.c) */"
+VOICE_OPTION_DECL = "void hos_oot_voice_option(Ctx *A64_NOESC c, A64Fn game);\n"
+
+
+def patch_voice_option(s):
+    """The voice resource's question in one file's text: (text, 1 when made now or found made, else 0)"""
+    if VOICE_OPTION_NEW in s:
+        return s, 1
+    if s.count(VOICE_OPTION_OLD) != 1 or s.count('#include "a64.h"\n') != 1:
+        return s, 0
+    s = s.replace(VOICE_OPTION_OLD, VOICE_OPTION_NEW, 1)
+    return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + VOICE_OPTION_DECL, 1), 1
+
+
 TEXT_DECL = "extern volatile float hos_text_scale;\n"
 LIFE_BUILD_ID = "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348"
 LIFE_HEAD = "void f_804bd8c0(Ctx *__restrict A64_NOESC c) {\n"
@@ -63,8 +87,12 @@ def patch_life(source):
     start = source.find(LIFE_HEAD)
     if start < 0:
         return None
-    end = source.find("\n}", start)
-    if end < 0 or source[start:end].count(LIFE_CAS) != 2:
+    # (the function's end: the next head, not the first '}' alone on a line — the block lift's FPX regions (A64_FPX_BLOCK,
+    #  mkg.ps1 -Block) close with one inside the function, as patch_view below found the hard way)
+    end = source.find("\nvoid f_", start + len(LIFE_HEAD))
+    if end < 0:
+        end = len(source)
+    if source[start:end].count(LIFE_CAS) != 2:
         return None
     # x19 is the actor. Confirm its type and life pointer before protecting this write.
     guard = ("    if ((uint32_t)c->x[12] < (uint32_t)c->x[11] && hos_oot_hearts_enabled() &&\n"
@@ -81,8 +109,10 @@ def patch_movement(source):
     start = source.find(MOVE_HEAD)
     if start < 0:
         return None
-    end = source.find("\n}", start)
-    if end < 0 or source[start:end].count(MOVE_ANCHOR) != 1 or source[start:end].count(MOVE_MATRIX) != 1:
+    end = source.find("\nvoid f_", start + len(MOVE_HEAD))   # (the function's end: as in patch_life)
+    if end < 0:
+        end = len(source)
+    if source[start:end].count(MOVE_ANCHOR) != 1 or source[start:end].count(MOVE_MATRIX) != 1:
         return None
     bypass = ("    hos_oot_lift_player(c, c->x[19]);\n"
               + MOVE_ANCHOR)
@@ -98,9 +128,11 @@ def patch_flight_rotation(source):
     start = source.find(WARP_HEAD)
     if start < 0:
         return None
-    end = source.find("\n}", start)
+    end = source.find("\nvoid f_", start + len(WARP_HEAD))   # (the function's end: as in patch_life)
+    if end < 0:
+        end = len(source)
     body = source[start:end]
-    if end < 0 or body.count(WARP_ANCHOR) != 1:
+    if body.count(WARP_ANCHOR) != 1:
         return None
     body = body.replace(WARP_ANCHOR, "    hos_oot_flight_rotation(c, c->x[0], c->x[1]);\n" + WARP_ANCHOR)
     return (source[:start] + body + source[end:]).replace(
@@ -112,10 +144,12 @@ def patch_view(source):
     start = source.find(VIEW_HEAD)
     if start < 0:
         return None
-    end = source.find("\n}", start)
-    body = source[start:end]
+    # (the loop's head sits deep in the function, past whole FPX regions; the function's end is the next head — the first '}'
+    #  alone on a line is one of their closers, and the anchor lay beyond it, so the free camera was found 0 times on -Block lifts)
+    end = source.find("\nvoid f_", start + len(VIEW_HEAD))
     if end < 0:
-        return None
+        end = len(source)
+    body = source[start:end]
     if "hos_oot_free_view(c, c->x[20])" in body:   # (fork: nx2/oot_view.py put the call in at lift time: found, not twice)
         return source
     for anchor in VIEW_ANCHORS:
@@ -153,6 +187,37 @@ TEXT_OLD_POLLED = TEXT_OLD.replace("{ goto L_80b1e18c; }", "{ { A64_POLL(c); got
 TEXT_ADD = ("    if (hos_text_scale != 1.0f) { float _t; uint32_t _u; memcpy(&_t,c->vreg[0],4); _t *= hos_text_scale; "
             "memcpy(&_u,&_t,4); a64_vset64(c->vreg[0],_u); }   /* (nx2/oot_patches.py: text speed) */\n")
 TEXT_NEW = TEXT_OLD + TEXT_ADD
+
+
+# (HeyListen, after Longshot ddb156df, #2481) Scene format (host/nn_vi.c hos_scene_rgba16f: the Insert menu's HDR set to Native with
+# the PsychoV35 tone mapper). f_80672260 picks the format of the scene buffer the game tone maps into (main+0x652340: RGBA16F, 44,
+# under two of its flags, else R11G11B10F, 26) and makes the buffer again when the one it has differs (+440). R11G11B10F has no sign
+# and 6 bits of mantissa, so the native HDR banded; with the switch on both choices are RGBA16F (RenoDX's zelda-oot-oz patch of
+# main+0x65234C, github.com/clshortfuse/renodx, MIT).
+SCENE_FORMAT_HEAD = "void f_80672260(Ctx *__restrict A64_NOESC c) {\n"
+SCENE_FORMAT_OLD = "    c->x[10] = 0x2cULL;\n    c->x[10] &= 0xFFFFFFFFULL;\n"
+SCENE_FORMAT_PICK = "    c->x[9] = 0x1aULL;\n    c->x[9] &= 0xFFFFFFFFULL;\n    { uint64_t _r = (!c->z) ? c->x[10] : c->x[9];"
+SCENE_FORMAT_NEW = ("    c->x[9] = hos_scene_rgba16f ? 0x2cULL : 0x1aULL;\n    c->x[9] &= 0xFFFFFFFFULL;\n"
+                    "    { uint64_t _r = (!c->z) ? c->x[10] : c->x[9];")
+SCENE_FORMAT_DECL = "extern volatile int hos_scene_rgba16f;\n"
+
+
+def patch_scene_format(s):
+    """The scene buffer's format by hos_scene_rgba16f in f_80672260; None when the file has no such function, s unchanged when the
+    function is there but its code differs (another game version)."""
+    head = s.find(SCENE_FORMAT_HEAD)
+    if head < 0:
+        return None
+    end = s.find("\nvoid f_", head + len(SCENE_FORMAT_HEAD))
+    end = end if end >= 0 else len(s)
+    body = s[head:end]
+    if SCENE_FORMAT_NEW in body:   # (applied already: a second run)
+        return s
+    if body.count(SCENE_FORMAT_OLD) != 1 or body.count(SCENE_FORMAT_PICK) != 1 or \
+            body.index(SCENE_FORMAT_OLD) > body.index(SCENE_FORMAT_PICK):
+        return s
+    s = s[:head] + body.replace(SCENE_FORMAT_PICK, SCENE_FORMAT_NEW, 1) + s[end:]
+    return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SCENE_FORMAT_DECL, 1)
 
 
 def patch_dynres(s):
@@ -276,6 +341,8 @@ def apply(gen, *, protect_hearts=False, required=False):
         done["player flight rotation"] = 0
         done["free camera"] = 0
         done["mouse camera"] = 0
+        done["voice option check"] = 0
+        done["scene format"] = 0
     for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -294,6 +361,12 @@ def apply(gen, *, protect_hearts=False, required=False):
         if n:
             done["fixed path's scale"] += 1
             print("oot_patches: the fixed path's scale in", os.path.basename(path))
+        if protect_hearts:
+            voice, found = patch_voice_option(out)
+            done["voice option check"] += found
+            if voice != out:
+                print("oot_patches: the Voice Language option followed after option.sav is read in", os.path.basename(path))
+            out = voice
         life = patch_life(out) if protect_hearts else None
         if life is not None:
             out = life
@@ -324,6 +397,12 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = view
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
+        scene = patch_scene_format(out) if protect_hearts else None   # (found by name alone: the supported build's lift only)
+        if scene is not None and SCENE_FORMAT_NEW in scene:
+            done["scene format"] += 1
+            if scene != out:
+                print("oot_patches: the scene buffer's format for native HDR in", os.path.basename(path))
+            out = scene
         if out != s:
             whole_write.write_whole(path, out, newline="")
     for what, n in done.items():

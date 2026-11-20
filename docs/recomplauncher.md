@@ -16,7 +16,7 @@ in [USER_GUIDE.md](USER_GUIDE.md#install-with-recomplauncher).
 | On Linux | `HeyListen.AppImage --cli <the same arguments>` (`AppRun`) |
 | The Windows asset | `HeyListen-<tag>-Windows-x64.zip`: the whole builder (its Python, the compiler, the sources), `recomplauncher.json` at the top (`tools/release/make_launcher_zip.py`, called by `make_release.py`) |
 | The Linux asset | `HeyListen-<tag>-Linux-x64.AppImage`, with `recomplauncher.json` inside it, at `/recomplauncher.json` (`engine/scripts/linux/appimage.sh`) |
-| The tests | `engine/tests/test_recomplauncher_json.py`, `engine/tests/test_progress_lines.py`, `engine/tests/test_update_offer.py`, `engine/tests/test_update_order.py` |
+| The tests | `engine/tests/test_recomplauncher_json.py`, `engine/tests/test_progress_lines.py`, `engine/tests/test_update_offer.py`, `engine/tests/test_update_order.py`. The first also validates the file against a copy of the launcher's schema when `RECOMPLAUNCHER_SCHEMA` names one: the launcher's repository is GPL v3, so its schema is not copied into ours |
 
 ## What the file says
 
@@ -68,21 +68,60 @@ in [USER_GUIDE.md](USER_GUIDE.md#install-with-recomplauncher).
     (`scripts/ngx_sdk.py`, `scripts/ffx_sdk.py`; a test keeps them equal). Without a tick nothing is downloaded.
 - `config`: `HeyListen/hookshot_options.ini`, the file the in-game menu (`gpu/vk/vk_menu.cpp`) keeps. The launcher writes only the
   keys of the choices; the menu writes the whole file again when the player changes a row, so the two agree.
+- **Fullscreen** is one of the settings rows (the menu's `fullscreen` key), and the game also takes a `--fullscreen` command-line
+  switch (PR 91's first ask), for a shortcut or another launcher: one run, written nowhere. `hos_main.c`'s parse sets
+  `HOS_FULLSCREEN=1` (on Windows before the window is made, on Linux in `main`, before the display), `host/display.c` and
+  `host/posix/display_sdl.c` apply it when the window is made, and `vk_menu.cpp`'s Fullscreen row leaves the window alone while it
+  is set (`fullscreen_tick`). RecompLauncher itself uses the settings row, which saves the player's choice.
 - `settings`: one row per menu row, with the menu's own values. A test (`test_recomplauncher_json.py`) checks that every key is a
   row of the menu and every value is one the row takes. The keys are the rows' names with `_` (`frame_rate_limit`,
-  `frame_generation`, `skip_title_screen`); `dlss` is the Upscaler (0 the game's own, 1 DLSS, 2 DLAA, 3 FSR 3.1, 4 FSR 4, 5 FSR 4 Native AA, 6 Off: no upscaling network; `gpu/vk/upscaler_rows.h`), `resolution` the Render resolution, `upscaling` the Window
+  `frame_generation`, `skip_title_screen`); `dlss` is the Upscaler (0 the game's own, 1 DLSS, 3 FSR 3.1, 4 FSR 4, 6 Off: no upscaling network; 2 DLAA and 5 FSR 4 Native AA are not choices any more, and a file that saves them is read as 1 or 4 with the native Render resolution, `migrate` in `gpu/vk/upscaler_rows.h`), `resolution` the Render resolution (7: native, DLAA with DLSS and Native AA with FSR 4), `frame_rate_limit` the Frame rate limit (0 to 5 the rates from 60 to 240, 6 Unlimited), `frame_generation_by` Frame generation by (0 built-in, 1 NVIDIA DLSS FG, 2 AMD FSR 3.1 FG), `upscaling` the Window
   scaling filter, `output_res` the Output resolution (see `ini_key` in `vk_menu.cpp`).
+  `dlss_model` has no `defaults` on purpose: the schema calls them the game's values for keys the file does not have yet, which a
+  launcher may write before the first run, and the game picks that one for the GPU (`menu_first_run_model`).
 - `saves`, `folders`, `actions`: saves are `HeyListen/user/save` on Windows and `~/.local/share/heylisten/save` on Linux. The
-  launcher attaches the newest `.log` of the `logs` folder to a crash report: on Windows the game (`host/hos_run_logs.h`, called
-  from `hos_main.c` once `hookshot_log.txt` is open) keeps `HeyListen/logs/hookshot.log` (this run) and `hookshot.1.log` to
-  `hookshot.4.log` (the runs before), hard links to the same files as `hookshot_log.txt` and `hookshot_log.1.txt` to `.4.txt`,
-  which stay for players. On Linux the game logs to the terminal and the folder is not made (a follow-up).
+  launcher attaches the newest `.log` of the `logs` folder to a crash report (PR 91's second ask): on both systems the game
+  (`host/hos_run_logs.h`, called from `hos_main.c` once it opens `hookshot_log.txt`, which it does whenever it is started with no
+  terminal, as the launcher starts it) keeps `HeyListen/logs/hookshot.log` (this run) and `hookshot.1.log` to `hookshot.4.log`
+  (the runs before), hard links to the same files as `hookshot_log.txt` and `hookshot_log.1.txt` to `.4.txt`, which stay for
+  players. Started from a terminal the game logs to the terminal, as before. On Linux `host/posix/windows.h` gives the header
+  the same file calls (`CreateHardLinkA` in `win32_posix.c`).
+
+## The launcher's game page and its six ticks
+
+recomplauncher.com/game/heylisten showed "Launcher features 2 of 6" (Easy Setup, Settings) "set up by RecompLauncher for now"
+because its catalog snapshot still used the launcher's own profile, made before our file reached the releases. The page does not
+read the repo on each visit: the launcher reads the file from the AppImage and the release zip first (their DEVELOPERS.md, "Where
+the file goes"; a GitHub repo's root is read only for Gitea and Forgejo servers, not GitHub), and the page's ticks come from their
+catalog. Their own check (the "Check my repo" button of the submit form) says of ours today: found in the repo, reads fine, Easy
+Setup and Settings. What makes the page ours is claiming the recomp — the free developer account at recomplauncher.com/dev PR 91
+points at ("where the file comes from doesn't decide it"): then the ticks the file supports show, four of the six:
+
+| Tick | How |
+|---|---|
+| Easy Setup | `game` (the player's own copy, checked by build ID), `inputs` (NVIDIA's own DLSS runtime), `prepare.options` (the two licenses and the two reports) |
+| Settings | `config` and `settings`, the menu's rows in `hookshot_options.ini` |
+| Save backups | `saves`: `HeyListen/user/save`, `~/.local/share/heylisten/save` and the options file |
+| Setup step | `prepare`: the builder's `--cli --prepare`, `done` the built `image.bin` |
+
+The two the file does not claim:
+
+- **Checks your copy**: the page's tick is `game.dumps`, a CRC32 of a whole known copy from Redump, for a "verified" badge. That is
+  a hash of a game file, and we publish none (Switch 2 `.nup` packages are not on Redump either). The launcher checks the
+  player's copy without it: `game.check.nup_build_id`, the one build `make_game.py` supports, read from the player's own
+  `exefs/main` with no keys, refuses a wrong build on the setup screen.
+- **Mods**: the launcher's Mods tab needs a Thunderstore community or a GameBanana game read by an `nrm`, `otr` or `hmm` loader.
+  Ours is a folder of file mods (`folders.mods`, the action opens it; code mods are the builder's `--code-mods`, and exefs mods
+  have issue #36), so there is nothing to point the tab at.
+
+PR 91's third ask, achievements through Recomp Achievements, is for later; its own two asks are done: the `.log` crash log above,
+and the `--fullscreen` switch above.
 
 ## When you add or rename a menu row
 
 Add it to `settings` (or leave it out on purpose) with the row's ini key and values. `test_recomplauncher_json.py` fails when a
-key is not a row, so a rename in `vk_menu.cpp` cannot leave the file behind. The Presentation row on `feat/present-mode`
-(`presentation`, three values) is not in the file until that branch is on `main`.
+key is not a row, so a rename in `vk_menu.cpp` cannot leave the file behind. The V-Sync (`vsync`) and VRR (`vrr`) rows are in
+the file, both Off by default.
 
 ## When players must build again: `prepare.version`
 

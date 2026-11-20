@@ -51,7 +51,7 @@ PREFIX = r'''
 using VkCommandBuffer = int;
 using VkImageView = int;
 using VkFormat = int;
-constexpr int VK_IMAGE_VIEW_TYPE_2D = 2, VK_FORMAT_UNDEFINED = 0, VK_FORMAT_B10G11R11_UFLOAT_PACK32 = 7, VK_FORMAT_R8G8B8A8_UNORM = 37;
+constexpr int VK_IMAGE_VIEW_TYPE_2D = 2, VK_FORMAT_UNDEFINED = 0, VK_FORMAT_B10G11R11_UFLOAT_PACK32 = 7, VK_FORMAT_R8G8B8A8_UNORM = 37, VK_FORMAT_R16G16B16A16_SFLOAT = 97;
 enum class ViewUse { Storage, Sample };
 struct Desc { unsigned count = 1; int format = 23; };
 struct Info { std::vector<Desc> texture_descriptors, image_descriptors; bool uses_cooperative_matrix = false; };
@@ -67,6 +67,8 @@ static struct DrawWork { std::vector<ImageInfo> imgs; } draw_work;
 static DrawWork& dw() { return draw_work; }
 static bool off_now = true, upscale_result = true;
 static bool upscaler_off() { return off_now; }
+static bool tone = false;   // (the PsychoV35 tone mapper: its RGBA16F scene, HeyListen after Longshot b80a68f1)
+static bool scene_tonemap_on() { return tone; }
 static int upscale_calls, logs;
 static VkCommandBuffer forwarded_cmd;
 static VkImageView forwarded_input, forwarded_output;
@@ -77,8 +79,9 @@ static std::string forwarded_text;
 static bool forwarded_fxaa;
 static uint32_t handle_of(const NvnState&, const Stage&, const Desc&, uint32_t index) { return index == 0 ? 5 : 0; }
 static int image_format(int f) { return f + 100; }
-static VkImageView texture_view_of(uint32_t handle, int type, ViewUse use, int format, Texture** out, uint32_t* level = nullptr) {
+static VkImageView texture_view_of(uint32_t handle, int type, ViewUse use, int format, Texture** out = nullptr, uint32_t* level = nullptr) {
     if (handle != 5 || type != VK_IMAGE_VIEW_TYPE_2D) return 0;
+    if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return use == ViewUse::Sample ? 51 : 52;   // (the RGBA16F views)
     if (use == ViewUse::Storage) { if (format != 123) return 0; *out = &out_tex; *level = 1; return 99; }
     *out = &in_tex;
     return 98;
@@ -151,6 +154,20 @@ int main() {
     check(!run(taau, stage), "a typed upscale that fails is not taken for drawn");
     upscale_result = true;
     // (the row not on Off, or a switch over it: nothing is touched at all)
+    // (PsychoV35: an RGBA16F pair through the RGBA16F views, plain; never mixed with the packed format, never without it)
+    in_tex.format = out_tex.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    before = upscale_calls;
+    check(!run(taau, stage) && upscale_calls == before, "RGBA16F without the PsychoV35 tone mapper is left to run");
+    tone = true;
+    check(run(taau, stage) && upscale_calls == before + 1 && forwarded_input == 51 && forwarded_output == 52 && !forwarded_fxaa,
+          "PsychoV35's RGBA16F pair is drawn through its RGBA16F views");
+    check(run(fixed_share, stage) && upscale_calls == before + 2, "a fixed share's RGBA16F network of the shape is drawn");
+    in_tex.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    check(!run(taau, stage) && upscale_calls == before + 2, "a packed input into an RGBA16F output is left to run");
+    in_tex.format = VK_FORMAT_R16G16B16A16_SFLOAT, out_tex.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    check(run(taau, stage) && forwarded_input == 11, "a known network's packed output keeps its own views, whatever its input");
+    in_tex.format = out_tex.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    tone = false;
     off_now = false;
     before = upscale_calls;
     check(!run(taau, stage) && !run(same, stage) && !run(fixed_share, stage) && upscale_calls == before, "not Off: no network is taken");
@@ -180,7 +197,8 @@ def check_source():
     need("std::min(std::max(v, r.lo), r.hi)" in menu, "load: a row's value is no longer kept to its range")
     available = function(menu, "unsigned upscalers_available() {")
     need("ur::bit(ur::OFF)" in available, "upscalers_available: Off is not available on every GPU")
-    need("upscaler_off()" in function(menu, "int upscaler() {") and "ur::OFF" in function(menu, "int upscaler() {"),
+    need("upscaler_off()" in function(menu, "int upscaler_mode() {") and "ur::OFF" in function(menu, "int upscaler_mode() {") and
+         "upscaler_mode()" in function(menu, "int upscaler() {"),
          "upscaler(): the row does not show Off while it draws")
     need('"Off"}' in function(menu, "const char* tx_upscaler(int) {") or '"Off"};' in function(menu, "const char* tx_upscaler(int) {"),
          "tx_upscaler: no name for Off")

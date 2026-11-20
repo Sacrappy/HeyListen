@@ -1,4 +1,5 @@
-"""Linux Vulkan startup uses only surface-supported swapchain settings (four images, or the surface's maximum when lower).
+"""Linux Vulkan startup uses only surface-supported swapchain settings (the V-Sync mode's images, clamped to the surface's
+minimum and maximum).
 
 Run with: python -I -B tests/test_vk_swapchain_compat.py
 """
@@ -25,8 +26,8 @@ def check_swapchain(source):
     required = (
         "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
         "if (result != VK_SUCCESS)",
-        "ci.minImageCount = std::max(caps.minImageCount, 4u)",
-        "ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount)",
+        "present_mode::image_plan(pin, picked, framegen_on(), caps.minImageCount, caps.maxImageCount)",
+        "ci.minImageCount = (uint32_t)plan.count;",
         "ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT",
         "caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT",
         "ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT",
@@ -37,10 +38,9 @@ def check_swapchain(source):
     for item in required:
         if item not in body:
             raise SystemExit("create_swapchain no longer handles %s" % item)
-    floor = body.index("ci.minImageCount = std::max(caps.minImageCount, 4u)")
-    cap = body.index("ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount)")
-    if cap < floor or "if (caps.maxImageCount)" not in body[floor:cap]:
-        raise SystemExit("create_swapchain's four-image floor is not capped by the surface's maximum")
+    # (image_plan takes the surface's own minimum and maximum: the row cannot ask past either)
+    if "dev.swap_min_images = caps.minImageCount;" not in body or "dev.swap_max_images = caps.maxImageCount;" not in body:
+        raise SystemExit("create_swapchain no longer keeps the surface's image limits for the V-Sync mode row")
 
 
 def check_linux_start(source):

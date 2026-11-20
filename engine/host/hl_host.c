@@ -145,6 +145,12 @@ A64Fn hl_translated(uint64_t guest) {
     }
     return lo < a64_fn_count && a64_fn_addr[lo] == (uint32_t)guest ? a64_fn_ptr[lo] : NULL;
 }
+/* (the crash report, hos_crash_names.h: the table itself, to name a host frame f_<guest address>) */
+void hl_lifted_table(const uint32_t **addrs, void *const **fns, uint32_t *count) {
+    *addrs = a64_fn_addr;
+    *fns = (void *const *)a64_fn_ptr;
+    *count = a64_fn_count;
+}
 
 /* ---- what the native side is given ---- */
 static void *cb_ptr(void *user, uint64_t guest) { (void)user; return GP(guest); }

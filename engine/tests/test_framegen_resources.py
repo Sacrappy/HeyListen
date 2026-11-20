@@ -31,7 +31,8 @@ def main():
     structs = source[source.index("struct Img {"):source.index("// Used only by present_image")]
     structs += source[source.index("struct ScaleState {"):source.index("int64_t now_ns()")]
     signatures = ["void drop_pipe(", "bool make_pipe(", "void drop_setup(", "bool init()", "bool init_scale()",
-                  "bool make_img(", "void drop_img(", "void drop_size(", "bool ensure_size(",
+                  "bool make_img(", "void drop_img(", "void drop_size(", "VkFormat frame_format(", "bool init_pq(",
+                  "bool ensure_size(",
                   "bool framegen_wanted(", "bool framegen_on()"]
     functions = "\n".join(function(source, x) for x in signatures if x in source)
     template = (ROOT / "tests/framegen_resources_test.cpp").read_text(encoding="utf-8")

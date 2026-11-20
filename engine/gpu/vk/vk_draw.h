@@ -63,6 +63,9 @@ void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* 
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
 double draw_shader_wait_ms();   // (the part of draw_stats3's wait_ms spent on programs still being translated, not pipelines)
+/// HOOKSHOT_STATE_STAMP (nx2/build.py: the hash of the renderer's state headers), 0 in a build that does not say; the pipeline state
+/// telemetry (state_report.h) sends it with the records
+uint64_t pipeline_state_stamp();
 int64_t draw_pipe_fresh_skips();   // (TICK-008) draws left out for a pipeline in the building, into targets made this frame
 /// (hookshot) pipelines linked from stage libraries in the draw, and the libraries asked of the driver for them: had, and cold;
 /// of the cold, those a worker has built since, and the workers' time in them. False: no stage libraries (RX_VK_GPL)

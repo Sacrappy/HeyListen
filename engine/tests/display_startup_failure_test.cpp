@@ -113,6 +113,11 @@ static void load_hookshot_env() { ++env_loads; }
     require(submit_decisions == 1, "driver environment chosen before the submit thread's decision");
     require(!loads && !inits && !windows && !threads, "driver environment chosen after display or thread start");
 }
+#ifdef _WIN32
+// (Linux) the --fullscreen switch of POSIX main (host/hos_main.c): its cut is compiled here on Windows too, where
+// setenv is _putenv_s; applying it keeps the child's environment what the harness asked for.
+static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+#endif
 
 #include "display_startup_actual.inc"
 

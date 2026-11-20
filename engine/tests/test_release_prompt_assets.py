@@ -80,7 +80,7 @@ def main():
     faces = re.search(r"faces\[HOS_PROMPT_N\] = \{([^}]*)\}", src)
     check(faces is not None, "host/prompts.c has no faces[]")
     face_names = re.findall(r'"([a-z0-9]+)"', faces.group(1))
-    check(face_names[1:] == list(prompt_faces.FACES), "faces[] is not the Switch then prompt_faces.FACES")
+    check(face_names[1:] == list(prompt_faces.FACES) + ["keyboard"], "faces[] is not the Switch, prompt_faces.FACES, then the keyboard")
     per_face = set(re.findall(r'"%sprompts/%s/([A-Za-z.]+)"', src))
     per_face |= set(re.findall(r'prompts/%s/([A-Za-z.]+)"', src))
     check({"External.bfotf", "textures.bin", "hint.bin"} <= per_face, "prompts.c reads %s under prompts/<face>/" % sorted(per_face))
@@ -107,6 +107,13 @@ def main():
     check("Creative Commons Zero" in (kenney / "License.txt").read_text(encoding="utf-8"), "Kenney's license is not CC0")
     for f in ("kenney_input_xbox_series.otf", "kenney_input_playstation_series.otf", "kenney_input_steam_deck.otf"):
         check((kenney / f).is_file(), "third_party/kenney_input/%s is missing" % f)
+    # (the keyboard face's: nx2/prompt_keys.py FONT, in its own folder with the same release's license)
+    import prompt_keys
+    keys = ENGINE / "third_party" / "kenney_input_keyboard"
+    check("Creative Commons Zero" in (keys / "License.txt").read_text(encoding="utf-8"),
+          "the keyboard face's Kenney license is not CC0")
+    check((keys / prompt_keys.FONT).is_file(), "third_party/kenney_input_keyboard/%s is missing" % prompt_keys.FONT)
+    check((keys / "PROVENANCE.md").is_file(), "third_party/kenney_input_keyboard/PROVENANCE.md is missing")
     check("Kenney" in (ROOT / "README.md").read_text(encoding="utf-8"), "the README does not credit Kenney")
     check("Kenney" in (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8"), "THIRD_PARTY_NOTICES.md has no Kenney")
     print("ok: the release packages the prompt packages, prompts.c and prompt_assets.py agree on the files, Kenney is credited")

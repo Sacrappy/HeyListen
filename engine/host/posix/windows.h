@@ -426,6 +426,7 @@ BOOL RemoveDirectoryA(LPCSTR path);
 BOOL DeleteFileA(LPCSTR path);
 BOOL MoveFileA(LPCSTR from, LPCSTR to);
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags);
+BOOL CreateHardLinkA(LPCSTR link, LPCSTR target, void *attr);   /* (the same argument order as Windows: the link first) */
 BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists);
 HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd);
 BOOL FindNextFileA(HANDLE h, WIN32_FIND_DATAA *fd);

@@ -94,7 +94,7 @@
       {
         "id": "send_crash_reports",
         "label": "Send crash reports automatically",
-        "note": "If the game crashes, its report (what failed, the PC's parts, the log) is sent without asking. Off, the crash window asks each time. Change it later in Settings, Privacy.",
+        "note": "If the game crashes, its report (what failed, the PC's parts, the log) is sent without asking. Off, the crash window asks each time. Change it later in Settings, Privacy. Your report is published on the project's GitHub (issue #55) and Discord, without your user name or folders.",
         "args": [
           "--send-crash-reports"
         ],
@@ -263,9 +263,32 @@
       }
     },
     {
+      "id": "hud_layout",
+      "label": "HUD layout",
+      "help": "On a screen that is not 16:9: the hearts, buttons and minimap at the screen's own edges, or in the middle 16:9.",
+      "group": "Video",
+      "choices": [
+        {
+          "label": "Screen's edges",
+          "set": {
+            "hud_layout": "0"
+          }
+        },
+        {
+          "label": "Middle 16:9",
+          "set": {
+            "hud_layout": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "hud_layout": "0"
+      }
+    },
+    {
       "id": "fps_limit",
-      "label": "Frame rate",
-      "help": "The game's own frame rate. Above 60 it needs Game speed on Real time, and a screen that runs that fast.",
+      "label": "Frame rate limit",
+      "help": "The most frames a second shown: the game's own and, with frame generation on, the frames made between them. With a fixed Frame generation multiplier the game runs at the limit over it (120 at 3x: the game at 40). Unlimited holds nothing back. Above 60 it needs Game speed on Real time, and a screen that runs that fast.",
       "group": "Video",
       "choices": [
         {
@@ -303,10 +326,97 @@
           "set": {
             "frame_rate_limit": "5"
           }
+        },
+        {
+          "label": "Unlimited",
+          "set": {
+            "frame_rate_limit": "6"
+          }
         }
       ],
       "defaults": {
         "frame_rate_limit": "0"
+      }
+    },
+    {
+      "id": "vsync",
+      "label": "V-Sync",
+      "help": "Whether frames wait for the screen's refresh. Off is the game's own way (the latest frame at once, the least delay, can tear); On waits for the refresh. V-Sync mode, below, chooses how many images it keeps.",
+      "group": "Video",
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "vsync": "0"
+          }
+        },
+        {
+          "label": "On",
+          "set": {
+            "vsync": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "vsync": "0"
+      }
+    },
+    {
+      "id": "vsync_mode",
+      "label": "V-Sync mode",
+      "help": "With V-Sync On: FIFO (double buffering) keeps 2 images, the least delay, but a missed refresh waits a whole one (below 60 fps at 60 Hz the frame rate falls to 30); FIFO (triple buffering) keeps 3, the default; Mailbox keeps 3 or more and shows the newest frame without waiting, where the display lists it (AMD's Windows driver does not: FIFO (triple buffering) is used).",
+      "group": "Video",
+      "choices": [
+        {
+          "label": "FIFO (double buffering)",
+          "set": {
+            "vsync_mode": "0"
+          }
+        },
+        {
+          "label": "FIFO (triple buffering)",
+          "set": {
+            "vsync_mode": "1"
+          }
+        },
+        {
+          "label": "Mailbox (triple buffering)",
+          "set": {
+            "vsync_mode": "2"
+          }
+        }
+      ],
+      "defaults": {
+        "vsync_mode": "1"
+      }
+    },
+    {
+      "id": "vrr",
+      "label": "VRR (G-Sync / FreeSync)",
+      "help": "New: for a variable refresh rate screen, in fullscreen. On: V-Sync On, a borderless window Windows can show directly, and the frame rate limit above 60 held 3 fps under the refresh. Please report on the issue tracker whether it works for you.",
+      "group": "Video",
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "vrr": "0"
+          }
+        },
+        {
+          "label": "On",
+          "set": {
+            "vrr": "1"
+          }
+        },
+        {
+          "label": "Auto",
+          "set": {
+            "vrr": "2"
+          }
+        }
+      ],
+      "defaults": {
+        "vrr": "0"
       }
     },
     {
@@ -335,7 +445,7 @@
     {
       "id": "framegen",
       "label": "Frame generation",
-      "help": "Makes frames between the game's own for smoother motion, at a little input delay. Fast motion can show artifacts.",
+      "help": "Makes frames between the game's own for smoother motion, at a little input delay. Fast motion can show artifacts. What Frame generation by makes: a higher value is kept within it (NVIDIA DLSS FG up to its runtime's top, AMD FSR 3.1 2x). The Frame rate limit is the rate shown.",
       "group": "Video",
       "choices": [
         {
@@ -398,6 +508,35 @@
       }
     },
     {
+      "id": "framegen_by",
+      "label": "Frame generation by",
+      "help": "Who makes the made frames, and so how many Frame generation offers. NVIDIA DLSS Frame Generation needs an RTX 40 or newer and NVIDIA's own runtime files (the Builder's DLSS tick fetches them), makes 2x up to what its runtime makes on your GPU (6x on an RTX 50, 2x on an RTX 40) and has no Auto; where it cannot run, the built-in frame generation makes them. AMD FSR 3.1 makes 2x only. Built-in has Auto and 2x to 8x. Off unless chosen.",
+      "group": "Video",
+      "choices": [
+        {
+          "label": "Built-in / AMD FSR 3.1",
+          "set": {
+            "frame_generation_by": "0"
+          }
+        },
+        {
+          "label": "NVIDIA DLSS Frame Generation",
+          "set": {
+            "frame_generation_by": "1"
+          }
+        },
+        {
+          "label": "AMD FSR 3.1 FG (2x only)",
+          "set": {
+            "frame_generation_by": "2"
+          }
+        }
+      ],
+      "defaults": {
+        "frame_generation_by": "0"
+      }
+    },
+    {
       "id": "hdr",
       "label": "HDR",
       "help": "HDR10 output on an HDR screen (Windows: turn on Use HDR in the display settings).",
@@ -427,9 +566,32 @@
       }
     },
     {
+      "id": "hdr_tone_mapper",
+      "label": "HDR tone mapper",
+      "help": "With HDR set to The game's own: the game's curve, or PsychoV35 (RenoDX's tone mapper for this game, with highlights that roll off into your screen's peak and keep their colour, and its own grading rows in the game's menu). Every upscaler takes it.",
+      "group": "Video",
+      "choices": [
+        {
+          "label": "The game's own",
+          "set": {
+            "hdr_tone_mapper": "0"
+          }
+        },
+        {
+          "label": "PsychoV35",
+          "set": {
+            "hdr_tone_mapper": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "hdr_tone_mapper": "0"
+      }
+    },
+    {
       "id": "upscaler",
       "label": "Upscaler",
-      "help": "What scales the 3D picture up to the output. DLSS needs an NVIDIA RTX card and its tick at setup; FSR 4 needs an AMD card with FSR 4 and its tick at setup; FSR 3.1 works on any card. Off runs no upscaling network at all (the 3D stretched to the output, no anti-aliasing), for a GPU where the game's own network shows glitches.",
+      "help": "What scales the 3D picture up to the output. DLSS needs an NVIDIA RTX card and its tick at setup; FSR 4 needs an AMD card with FSR 4 and its tick at setup; FSR 3.1 works on any card. Off runs no upscaling network at all (the 3D stretched to the output, no anti-aliasing), for a GPU where the game's own network shows glitches. DLAA (DLSS) and Native AA (FSR 4) are choices of Render resolution, with DLSS or FSR 4.",
       "group": "Upscaling",
       "choices": [
         {
@@ -445,12 +607,6 @@
           }
         },
         {
-          "label": "NVIDIA DLAA",
-          "set": {
-            "dlss": "2"
-          }
-        },
-        {
           "label": "AMD FSR 3.1",
           "set": {
             "dlss": "3"
@@ -460,12 +616,6 @@
           "label": "AMD FSR 4",
           "set": {
             "dlss": "4"
-          }
-        },
-        {
-          "label": "AMD FSR 4 Native AA",
-          "set": {
-            "dlss": "5"
           }
         },
         {
@@ -482,13 +632,19 @@
     {
       "id": "render_res",
       "label": "Render resolution",
-      "help": "The share of the output the 3D is drawn at; the upscaler fills in the rest. Auto follows the game's own dynamic resolution.",
+      "help": "The share of the output the 3D is drawn at; the upscaler fills in the rest. Auto follows the game's own dynamic resolution. Native is DLAA with DLSS and Native AA with FSR 4: the 3D at full size with the upscaler's anti-aliasing (with another upscaler it is 100%).",
       "group": "Upscaling",
       "choices": [
         {
           "label": "Auto",
           "set": {
             "resolution": "0"
+          }
+        },
+        {
+          "label": "Native (DLAA with DLSS, Native AA with FSR 4)",
+          "set": {
+            "resolution": "7"
           }
         },
         {
@@ -535,23 +691,23 @@
     {
       "id": "dlss_model",
       "label": "DLSS model",
-      "help": "Which of NVIDIA's DLSS networks draws the picture. Used with DLSS and DLAA.",
+      "help": "Which of NVIDIA's DLSS networks draws the picture, in every mode. Used with DLSS and DLAA. DLSS 4.5 costs more GPU time on RTX 20 and 30 (no FP8), but you can use it. DLSS 3 (CNN) is older and lighter on video memory. The first time the game runs it picks one for your GPU (DLSS 3 under 7 GB of video memory, else DLSS 4 on RTX 20 and 30, DLSS 4.5 on RTX 40 and 50) and keeps your changes.",
       "group": "Upscaling",
       "choices": [
         {
-          "label": "Transformer (K)",
+          "label": "DLSS 4 (Transformer, preset K)",
           "set": {
             "dlss_model": "0"
           }
         },
         {
-          "label": "Transformer 2 (M)",
+          "label": "DLSS 4.5 (Transformer 2, preset M)",
           "set": {
             "dlss_model": "1"
           }
         },
         {
-          "label": "Transformer 2 (L)",
+          "label": "DLSS 4.5 (Transformer 2, preset L)",
           "set": {
             "dlss_model": "2"
           }
@@ -561,11 +717,14 @@
           "set": {
             "dlss_model": "3"
           }
+        },
+        {
+          "label": "DLSS 3 (CNN, preset E)",
+          "set": {
+            "dlss_model": "4"
+          }
         }
-      ],
-      "defaults": {
-        "dlss_model": "0"
-      }
+      ]
     },
     {
       "id": "filter",
@@ -844,7 +1003,7 @@
     {
       "id": "send_crash",
       "label": "Send crash reports automatically",
-      "help": "Sends a crash's report without asking. Off, the crash window asks first. Off by default.",
+      "help": "Sends a crash's report without asking. Off, the crash window asks first. Off by default. Your report is published on the project's GitHub (issue #55) and Discord, without your user name or folders.",
       "group": "Privacy",
       "choices": [
         {

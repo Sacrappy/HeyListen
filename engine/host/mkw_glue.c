@@ -4,6 +4,7 @@
 #include "hos.h"
 #include "hos_guestpages.h"
 #include "hos_crash_record.h"
+#include "hos_crash_names.h"
 #include "hos_paths.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -428,6 +429,96 @@ void hos_crash_record_prepare(const char *log_path) {
     hos_crash_record_start(path, hos_version(), log_path);
 }
 
+#ifdef _WIN32
+/* The module (its name without the folder: no user name in it), the offset in it and its load base of an address;
+   0 for none */
+static int crash_module(uint64_t pc, char *name, size_t cap, uint64_t *offset, uintptr_t *base) {
+    HMODULE m = NULL;
+    char path[MAX_PATH];
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &m) ||
+        !GetModuleFileNameA(m, path, MAX_PATH))
+        return 0;
+    const char *leaf = strrchr(path, '\\');
+    snprintf(name, cap, "%s", leaf ? leaf + 1 : path);
+    *offset = pc - (uint64_t)m;
+    if (base) *base = (uintptr_t)m;
+    return 1;
+}
+static int crash_readable(uint64_t address, size_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (address < 0x10000 || address > UINT64_MAX - size || !VirtualQuery((LPCVOID)address, &mbi, sizeof mbi) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return 0;
+    return address + size <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+}
+/* The host stack from the faulting frame, as module+offset (nx2/samap.py maps mkw.exe's): x64 unwind data, and a frame with
+   none (a jump into padding, or code with no table) is a leaf, its return address at rsp: the caller still shows */
+static void crash_backtrace(CONTEXT ctx, char *out, size_t cap) {
+    int n = snprintf(out, cap, "CRASH: host backtrace:");
+    for (int i = 0; i < 20 && ctx.Rip && n < (int)cap - 48; i++) {
+        char name[MAX_PATH] = "?";
+        uint64_t offset = ctx.Rip;
+        crash_module(ctx.Rip, name, sizeof name, &offset, NULL);
+        n += snprintf(out + n, cap - n, " %s+%#llx", name, (unsigned long long)offset);
+        DWORD64 image = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
+        if (f) {
+            void *handler_data;
+            DWORD64 frame;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &handler_data, &frame, NULL);
+        } else {
+            if (!crash_readable(ctx.Rsp, 8)) break;
+            ctx.Rip = *(const uint64_t *)ctx.Rsp;
+            ctx.Rsp += 8;
+        }
+    }
+}
+/* Each frame named from the build's own tables (hos_crash_names.h), one CRASH line each: the lifted code
+   f_<guest address>, the same in every build, and the host's functions by name. A frame the tables do not know
+   (a system DLL, or a game folder without the tables) keeps its module+offset above and gets no name. */
+static void crash_frames(CONTEXT ctx) {
+    for (int i = 0; i < 20 && ctx.Rip; i++) {
+        char name[MAX_PATH] = "?";
+        uint64_t offset = ctx.Rip;
+        uintptr_t base = 0;
+        crash_module(ctx.Rip, name, sizeof name, &offset, &base);
+        DWORD64 image = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
+        const uintptr_t start = f ? (uintptr_t)(image + f->BeginAddress) : 0;
+        char function[400];
+        int named = hos_crash_name(name, offset, base, function, sizeof function);
+        if (!named && base && !strstr(name, "hookshot_vk"))
+            named = hos_crash_lifted_name(start, (uintptr_t)ctx.Rip, function, sizeof function);   /* (no table: f_ names only) */
+        hos_log("CRASH: host frame %d: %s+%#llx%s%s", i, name, (unsigned long long)offset,
+                named ? " " : "", named ? function : "");
+        if (f) {
+            void *handler_data;
+            DWORD64 frame;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &handler_data, &frame, NULL);
+        } else {
+            if (!crash_readable(ctx.Rsp, 8)) break;
+            ctx.Rip = *(const uint64_t *)ctx.Rsp;
+            ctx.Rsp += 8;
+        }
+    }
+}
+/* rsp and the first 8 words at it, short: a word in a module is module+offset, a small value or a pointer into readable
+   memory is its hex (no more of the memory than that), anything else "-": a stack word can hold text, a name's bytes */
+static void crash_stack(const CONTEXT *ctx, char *out, size_t cap) {
+    int n = snprintf(out, cap, "CRASH: stack rsp %#llx:", (unsigned long long)ctx->Rsp);
+    for (int i = 0; i < 8 && n < (int)cap - 40; i++) {
+        uint64_t word, offset;
+        char name[MAX_PATH];
+        if (!crash_readable(ctx->Rsp + 8u * (unsigned)i, 8)) break;
+        word = ((const uint64_t *)ctx->Rsp)[i];
+        if (word >= 0x10000 && crash_module(word, name, sizeof name, &offset, NULL))
+            n += snprintf(out + n, cap - n, " %.20s+%#llx", name, (unsigned long long)offset);
+        else if (word < 0x10000 || crash_readable(word, 1)) n += snprintf(out + n, cap - n, " %#llx", (unsigned long long)word);
+        else n += snprintf(out + n, cap - n, " -");
+    }
+}
+#endif
+
 static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     record_exception(info);
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
@@ -439,31 +530,30 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
         GetModuleFileNameA(mod, name, MAX_PATH);
     const char *base = strrchr(name, '\\');
     const uint64_t addr = rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0;
-    hos_log("CRASH: exception %#lx (%s %#llx, guest %#llx) at %s+%#llx", rec->ExceptionCode,
+    char where[400];
+    DWORD64 image = 0;
+    PRUNTIME_FUNCTION fault_entry = RtlLookupFunctionEntry(rip, &image, NULL);
+    int named = hos_crash_name(base ? base + 1 : name, rip - (uint64_t)mod, (uintptr_t)mod, where, sizeof where);
+    if (!named && mod && (!strstr(base ? base + 1 : name, "hookshot_vk")))
+        named = hos_crash_lifted_name(fault_entry ? (uintptr_t)(image + fault_entry->BeginAddress) : 0,
+                                      (uintptr_t)rip, where, sizeof where);
+    hos_log("CRASH: exception %#lx (%s %#llx, guest %#llx) at %s+%#llx%s%s", rec->ExceptionCode,
             rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1 ? "write" : "read",
             (unsigned long long)addr, (unsigned long long)(addr - (uint64_t)A64_MEM), base ? base + 1 : name,
-            (unsigned long long)(rip - (uint64_t)mod));
+            (unsigned long long)(rip - (uint64_t)mod), named ? " " : "", named ? where : "");
+    {   /* (which build's code the report is about: its source, and the lifted code's key, nx2/build.py) */
+        const char *hos_version(void);
+        const char *hos_lift_key(void);
+        hos_log("CRASH: build %s, lifted code %s", hos_version(), hos_lift_key());
+    }
 #ifdef _WIN32
-    {   /* the host stack from the faulting frame (x64 unwind data), as module+offset (nx2/samap.py maps mkw.exe's) */
-        CONTEXT ctx = *info->ContextRecord;
-        char hb[1024];
-        int n = snprintf(hb, sizeof hb, "CRASH: host backtrace:");
-        for (int i = 0; i < 20 && ctx.Rip && n < (int)sizeof hb - 48; i++) {
-            HMODULE m = NULL;
-            char mn[MAX_PATH] = "?";
-            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCSTR)ctx.Rip, &m))
-                GetModuleFileNameA(m, mn, MAX_PATH);
-            const char *mb = strrchr(mn, '\\');
-            n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)(ctx.Rip - (uint64_t)m));
-            DWORD64 image = 0;
-            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
-            if (!f) break;
-            void *handler_data;
-            DWORD64 frame;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &handler_data, &frame, NULL);
-        }
+    {
+        char hb[1024], sk[320];
+        crash_backtrace(*info->ContextRecord, hb, sizeof hb);
         hos_log("%s", hb);
+        crash_frames(*info->ContextRecord);
+        crash_stack(info->ContextRecord, sk, sizeof sk);
+        hos_log("%s", sk);
     }
 #else
     {   /* (hookshot) Linux: the host stack as module+offset, from glibc (the frames above the signal's included): the
@@ -500,9 +590,25 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
             fp = next;
         }
         hos_log("%s", bt);
-        /* the memory x0, x1 and x19 point to (the object a crash is usually about) */
-        static const int dumped[] = {0, 1, 19};
-        for (int k = 0; k < 3; k++) {
+        /* (each return address's function too: f_<guest address> is the same in every build, so a report can be
+           followed in the lifted code wherever it was built) */
+        {
+            char function[64];
+            if (hos_crash_guest_name(c->x[30], function, sizeof function))
+                hos_log("CRASH: guest frame 0: %#llx %s", (unsigned long long)c->x[30], function);
+            fp = c->x[29];
+            for (int i = 0, g = 1; i < 40 && fp && !(fp & 15) && g < 20; i++, g++) {
+                const uint64_t lr = peek_guest(fp + 8), next = peek_guest(fp);
+                if (hos_crash_guest_name(lr, function, sizeof function))
+                    hos_log("CRASH: guest frame %d: %#llx %s", g, (unsigned long long)lr, function);
+                if (next <= fp) break;
+                fp = next;
+            }
+        }
+        /* the memory x0, x1, x19, x20, x21, x22 and x24 point to (the object a crash is usually about, its
+           manager and the next array entry: the review of #67's report) */
+        static const int dumped[] = {0, 1, 19, 20, 21, 22, 24};
+        for (int k = 0; k < (int)(sizeof dumped / sizeof dumped[0]); k++) {
             const int r = dumped[k];
             const uint64_t base = c->x[r];
             if (base < 0x100000 || !peek_guest(base) && !peek_guest(base + 8) && !peek_guest(base + 0x100)) continue;
@@ -526,12 +632,16 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
 void hos_backtrace(void) {
     Ctx *c = hos_ctx();
     if (!c) return;
-    char bt[1024];
+    char bt[1024], function[64];
     int n = snprintf(bt, sizeof bt, "guest backtrace: lr %#llx", (unsigned long long)c->x[30]);
+    if (hos_crash_guest_name(c->x[30], function, sizeof function))
+        n += snprintf(bt + n, sizeof bt - n, " %s", function);
     uint64_t fp = c->x[29];
-    for (int i = 0; i < 40 && fp && !(fp & 15) && n < (int)sizeof bt - 24; i++) {
+    for (int i = 0; i < 40 && fp && !(fp & 15) && n < (int)sizeof bt - 40; i++) {
         const uint64_t lr = peek_guest(fp + 8), next = peek_guest(fp);
         n += snprintf(bt + n, sizeof bt - n, " %#llx", (unsigned long long)lr);
+        if (hos_crash_guest_name(lr, function, sizeof function))
+            n += snprintf(bt + n, sizeof bt - n, " %s", function);
         if (next <= fp) break;
         fp = next;
     }
@@ -564,6 +674,14 @@ void hos_commit_init(void) {
     AddVectoredExceptionHandler(1, commit_on_touch);
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
+    {   /* (the lifted table, so a host frame in it is named f_<guest address> even with no .sym beside the game) */
+        void hl_lifted_table(const uint32_t **, void *const **, uint32_t *);
+        const uint32_t *addrs;
+        void *const *fns;
+        uint32_t count;
+        hl_lifted_table(&addrs, &fns, &count);
+        hos_crash_names_lifted(addrs, fns, count);
+    }
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
     { void hos_memsplit_init(void); hos_memsplit_init(); }   /* (HOS_MEM_SPLIT, hos_memsplit.c) */

@@ -19,8 +19,10 @@ A group is named by three things, none of which changes from one build to the ne
 
 Inside a group, the reports that share a build and a faulting module+offset are listed together: an offset means the
 same code only within one build. A fault in the game's lifted code is listed by the game's own address of its caller
-(the record's first guest_backtrace), which is the same in every build. A report with several records counts once in each group one of them falls in. It
-counts reports, not players, and nothing is sent anywhere. Standard library only.
+(the record's first guest_backtrace), which is the same in every build; newer records also name each frame
+(f_<guest address>, or the host function), and the crash report's "signature" field is the top frame's resolved
+name, the key the telemetry relay groups on. A report with several records counts once in each group one of them
+falls in. It counts reports, not players, and nothing is sent anywhere. Standard library only.
 """
 import argparse
 import collections
@@ -136,8 +138,10 @@ def stage_of(title: str) -> str:
 
 
 def module_of(module_offset: str) -> str:
-    """The module's name from "name+0xoffset" ("" for "unknown")"""
-    name = (module_offset or "").rsplit("+0x", 1)[0].strip()
+    """The module's name from "name+0xoffset", of a record line that may now end with the resolved function
+    ("HeyListen.exe+0x12f44593 f_80580b38+0x1c4") ("" for "unknown")"""
+    token = (module_offset or "").split()[0] if (module_offset or "").strip() else ""
+    name = token.rsplit("+0x", 1)[0].strip()
     return "" if name in ("", "unknown") else name
 
 
@@ -227,7 +231,7 @@ def events(title: str, text: str):
         if end.startswith("GPU "):
             frame = "unknown"   # (the address is the renderer's own report of the loss, not where it was lost)
         elif where == "game code" and r["guest_backtrace"]:
-            frame = "the game's " + r["guest_backtrace"][0]   # (the lifted code's caller: the same in every build)
+            frame = "the game's " + r["guest_backtrace"][0].split()[0]   # (the lifted code's caller: the same in every build)
         out.append({"end": end, "where": where, "module": module, "memory": memory,
                     "build": "" if frame.startswith("the game's ") else r.get("version", "") or version, "frame": frame})
     if not out:
