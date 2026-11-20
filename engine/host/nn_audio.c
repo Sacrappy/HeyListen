@@ -871,16 +871,23 @@ static void output_error(const char *operation, MMRESULT result) {
    device in turn. Players had no sound at all while every other program played ("no sound in 2.0.5"): the log now
    names the device; one that takes no block for 1.5 s (an unplugged headset, a default bound to a dead output) is
    closed and the next candidate opened (at most 6 times a run); 10 s after opening the log says how many blocks the
-   device took and how loud the game's sound was, which tells a silent game from a deaf device. */
-static int out_next;           /* the next candidate: 0 = HOS_AUDIO_DEVICE, 1 = the default, 2.. = device n-2 */
+   device took and how loud the game's sound was, which tells a silent game from a deaf device.
+   Issue 99: when HOS_AUDIO_DEVICE is unset, device 0 is tried first (not skipped to WAVE_MAPPER). */
+static int out_next;           /* the next candidate: 0 = device 0 (or HOS_AUDIO_DEVICE), 1 = the default, 2.. = device n-2 */
 static uint64_t out_opened, out_stall_since;
 static unsigned out_played, out_peak, out_reported;
 static int output_try(int candidate, const WAVEFORMATEX *f) {
     const char *want = getenv("HOS_AUDIO_DEVICE");
     unsigned device;
     if (candidate == 0) {
-        if (!want || !*want) return 0;
-        device = (unsigned)atoi(want);
+        if (!want || !*want) {
+#ifndef _WIN32
+            device = 0;   /* Issue 99: try device 0 when HOS_AUDIO_DEVICE is unset (Linux only — Windows device 0 isn't always default) */
+#else
+            device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
+#endif
+        }
+        else device = (unsigned)atoi(want);
     } else device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
     const MMRESULT result = waveOutOpen(&wout, device, au_format(f), 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
