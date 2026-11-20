@@ -11,7 +11,7 @@
 
 static int version;   /* 3, 2, or 0 none */
 static struct {
-    void *InitSubSystem, *SetHint, *GetError;
+    void *InitSubSystem, *SetHint, *GetError, *GetCurrentAudioDriver;
     /* window */
     void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
@@ -72,6 +72,7 @@ static int get_all(HMODULE m, int three) {
     GET(InitSubSystem, "SDL_InitSubSystem");
     GET(SetHint, "SDL_SetHint");
     GET(GetError, "SDL_GetError");
+    GET(GetCurrentAudioDriver, "SDL_GetCurrentAudioDriver");
     GET(CreateWindow, "SDL_CreateWindow");
     GET(SetWindowFullscreen, "SDL_SetWindowFullscreen");
     GET2(SetRelativeMouseMode, "SDL_SetWindowRelativeMouseMode", "SDL_SetRelativeMouseMode");
@@ -373,8 +374,15 @@ void *hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *use
     const uint16_t format = s16 ? 0x8010 /* S16LE */ : 0x8120 /* F32LE */;   /* (both's numbers) */
     const char *env_samples = getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES");
     if (version == 3 && !env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480");   /* (SDL2's device buffer below) */
-    if (!hos_sdl_init(HOS_SDL_AUDIO)) return NULL;
+    if (!hos_sdl_init(HOS_SDL_AUDIO)) {
+        hos_log("audio: SDL audio init failed (%s)", hos_sdl_error());
+        return NULL;
+    }
     Pull *p = (Pull *)calloc(1, sizeof *p);
+    if (f.GetCurrentAudioDriver) {
+        const char *driver = CALL(const char *(*)(void), GetCurrentAudioDriver)();
+        if (driver) hos_log("audio: SDL driver %s", driver);
+    }
     p->pull = pull, p->user = user, p->frame = channels * (s16 ? 2 : 4);
     if (version == 3) {
         const struct { uint32_t format; int channels, freq; } spec = {format, channels, freq};
@@ -383,6 +391,7 @@ void *hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *use
         if (stream && CALL(_Bool (*)(void *), ResumeAudioStreamDevice)(stream)) return p->stream = stream, p;
         if (stream) CALL(void (*)(void *), DestroyAudioStream)(stream);
         free(p);
+        hos_log("audio: SDL open failed (%s): %d Hz, %d ch, %s", hos_sdl_error(), freq, channels, s16 ? "S16LE" : "F32LE");
         return NULL;
     }
     struct {
@@ -401,6 +410,7 @@ void *hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *use
     /* (no changes allowed: SDL converts to what the device wants) */
     const uint32_t dev = CALL(uint32_t (*)(const char *, int, const void *, void *, int), OpenAudioDevice)(NULL, 0, &want, &have, 0);
     if (!dev) {
+        hos_log("audio: SDL open failed (%s): %d Hz, %d ch, %s", hos_sdl_error(), freq, channels, s16 ? "S16LE" : "F32LE");
         free(p);
         return NULL;
     }
