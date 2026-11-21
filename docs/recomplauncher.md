@@ -125,18 +125,15 @@ the file, both Off by default.
 
 ## When players must build again: `prepare.version`
 
-Players set up once: a new release never asks them to build again. The launcher asks again only when
-`prepare.version` is different from the one their setup ran with. Change it (any text; it is `"1"` now) in the same commit as a
-change that makes an old game folder wrong for the new release, for example:
+The launcher builds the game again only when `prepare.version` is different from the one the player's setup ran with, and the
+game folder is built from the release's own engine. So each release carries its own tag there: `tools/release/launcher_manifest.py`
+writes the repository's file with `prepare.version` set to the tag into the Windows zip (`make_launcher_zip.py`) and the AppImage
+(`appimage.sh`), and `check_release_linux.py` refuses an AppImage whose copy is not that. The repository's own file keeps `"1"`
+(it is not a release; a test checks it). After the launcher installs a newer release, the player's next Play builds the game
+again from their copy, with a note that it is built again. Without it they kept playing the game the first release built, while
+the launcher showed the new release and `--play` offered an update the launcher had already installed.
 
-- a release the game folder must be rebuilt for (the lifter, the profile, the pipeline cache or `image.bin` changed in a way an
-  old folder cannot take, which the builder window's Update does too),
-- a change of the game folder's layout (where the game, `image.bin` or the options file is),
-- a new `--prepare` default that changes what is built.
-
-Do not change it for a release that only changes the builder window, the docs or the settings rows. The old folder keeps working
-until the player sets up again, and `make_game.py --update` (the builder window's Update) is still the cheaper way for a player
-who also uses the builder. Bump `version`, keep `done`, say so in the release notes.
+There is nothing to bump by hand: keep `done`, and say in the release notes that players of RecompLauncher build the game again.
 
 ## Making a release
 

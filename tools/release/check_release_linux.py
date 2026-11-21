@@ -29,6 +29,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "engine", "builder", "linux"))
 import make_release  # noqa: E402  (its refusals: FORBIDDEN, ALLOWED, forbidden())
 import linux_update  # noqa: E402  (the parser the builder reads the list with)
+import launcher_manifest  # noqa: E402  (recomplauncher.json as a release carries it)
 
 REPO = make_release.REPO
 PARTS_RELEASE = "https://github.com/%s/releases/download/linux-parts/" % REPO
@@ -157,13 +158,19 @@ def main():
                 bad("the AppImage's %s is not the release's list" % name)
         if not os.path.isfile(os.path.join(root, "heylisten-builder.desktop")) or not os.path.isfile(os.path.join(root, "heylisten.png")):
             bad("the AppImage has no heylisten-builder.desktop or heylisten.png")
-        # (RecompLauncher reads it from inside the AppImage: docs/recomplauncher.md)
+        # (RecompLauncher reads it from inside the AppImage: docs/recomplauncher.md. It is the repository's file with prepare.version
+        # the tag, so the launcher builds the game again for this release: launcher_manifest.py)
         manifest_in = os.path.join(root, "recomplauncher.json")
         manifest_repo = os.path.join(ROOT, "recomplauncher.json")
         if not os.path.isfile(manifest_in):
             bad("the AppImage has no recomplauncher.json (RecompLauncher reads it from inside)")
-        elif os.path.isfile(manifest_repo) and sha256(manifest_in) != sha256(manifest_repo):
-            bad("the AppImage's recomplauncher.json is not the repository's")
+        elif os.path.isfile(manifest_repo):
+            with open(manifest_repo, "rb") as handle:
+                expected = launcher_manifest.for_release(handle.read(), tag)
+            with open(manifest_in, "rb") as handle:
+                shipped = handle.read()
+            if shipped != expected:
+                bad("the AppImage's recomplauncher.json is not the repository's with prepare.version %s" % tag)
 
     if problems:
         sys.exit("refusing:\n  " + "\n  ".join(problems))
