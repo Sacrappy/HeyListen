@@ -229,6 +229,20 @@ bool remade_skip_old() {
     static const bool on = getenv("RX_VK_REMADE_SKIP") && atoi(getenv("RX_VK_REMADE_SKIP")) != 0;
     return on;
 }
+// (RX_VK_BLOCK_RECLAIM, block_reclaim below) the textures it evicted, by evicted_key, and when: one uploaded again later is counted,
+// the cost of the blocks given back
+std::mutex reclaimed_mu;
+std::unordered_map<uint64_t, uint64_t> reclaimed_at;   // (evicted_key -> frame)
+std::atomic<uint64_t> st_reclaim_remade{0}, st_reclaim_remade_soon{0};
+void reclaim_note_upload(const Texture& tex) {   // (a texture's first upload)
+    std::lock_guard lk(reclaimed_mu);
+    if (reclaimed_at.empty()) return;
+    const auto it = reclaimed_at.find(evicted_key(tex.gpu, tex.width, tex.height, tex.nvn_format));
+    if (it == reclaimed_at.end()) return;
+    st_reclaim_remade++;
+    if (frame_no - it->second < 3600) st_reclaim_remade_soon++;
+    reclaimed_at.erase(it);
+}
 
 struct Dead {
     uint64_t value;
@@ -4423,6 +4437,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
                      tex->nvn_format, (unsigned long long)n);
         }
     }
+    if (!tex->uploaded && block_reclaim_on()) reclaim_note_upload(*tex);   // (RX_VK_BLOCK_RECLAIM: made again after it?)
     watch_tex(tex, owned ? "sampled, over rendered storage" : "sampled, uploaded");
     if (owned && !texture_dirty(*tex, owned, dirty)) {
         tex->uploaded = true;
@@ -6104,6 +6119,143 @@ void texture_complete_writes(uint64_t completed) {
     std::lock_guard lk(gpu_wrote_mu);
     gpu_hist.complete(completed);
 }
+
+// ---- (HeyListen, 2026-11-16) RX_VK_BLOCK_RECLAIM=1 (default 0): the textures' image blocks given back ----
+// VMA gives a 128 MB block of the textures' pool back only when its last image goes, and the texture budget evicts by age, not by
+// block: over the owner's 45-minute session (play8, 17 zones) the pool's blocks went 128 MB -> 4,096 MB while the images in them
+// moved between 0.3 and 2.2 GB (676 MB in 32 blocks at the end), "free in VMA blocks" 0.2 -> 3.6 GB of the 9.6 GB the driver
+// counted (89% of what it allows), and the driver's system-memory commit beside VRAM follows the blocks (memory-boundary.md 20 (b)).
+// Here, every 60 presents while the pool's blocks hold RX_VK_BLOCK_RECLAIM_FREE_MB (512) or more free: a block every image of which
+// is a texture uploaded from the game's memory (never drawn by the GPU, so made again from that memory if it is wanted again, as
+// any evicted one is), unused for RX_VK_BLOCK_RECLAIM_UNUSED presents (1800) and done on the GPU, has those textures evicted, the
+// least filled blocks first, RX_VK_BLOCK_RECLAIM_MB (256) of textures a pass at most. Their images are not kept as spares, and
+// they do not start the BC cache's storing (bcc_evicting): they are not the budget's. A block holding any other image (one used
+// lately, one the GPU drew, the upscaler's) stays. The line "vk: image blocks given back" says what is held and why
+// (small cards, 2026-11-21, issue 118: on the cards the driver allows 6.5 GB or less of, a 3050 Ti Laptop allowed 3370 MB held
+// 415 MB free in the blocks beside 1.8 GB of textures and was paged, so it is on by default there with RX_VK_BLOCK_RECLAIM_FREE_MB
+// 128; RX_VK_BLOCK_RECLAIM=0 turns it off, =1 forces it on any card)
+bool block_reclaim_small_card() {
+    static const bool v = [] {
+        uint64_t used = 0, allowed = 0;
+        return vram_usage(&used, &allowed) && allowed && allowed <= (6ull << 30) + (512ull << 20);
+    }();
+    return v;
+}
+bool block_reclaim_on() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_BLOCK_RECLAIM");
+        if (e && *e) return atoi(e) != 0;
+        return block_reclaim_small_card();
+    }();
+    return v;
+}
+namespace {
+int64_t st_reclaim_blocks = 0, st_reclaim_textures = 0;
+uint64_t st_reclaim_bytes = 0;
+void block_reclaim(uint64_t completed) {
+    static const uint64_t min_unused = getenv("RX_VK_BLOCK_RECLAIM_UNUSED")
+                                           ? (uint64_t)std::max(120, atoi(getenv("RX_VK_BLOCK_RECLAIM_UNUSED"))) : 1800;
+    static const uint64_t free_min = (uint64_t)(getenv("RX_VK_BLOCK_RECLAIM_FREE_MB")
+                                                    ? std::max(0, atoi(getenv("RX_VK_BLOCK_RECLAIM_FREE_MB"))) : block_reclaim_small_card() ? 128 : 512) << 20;
+    static const uint64_t pass_max = (uint64_t)(getenv("RX_VK_BLOCK_RECLAIM_MB")
+                                                    ? std::max(16, atoi(getenv("RX_VK_BLOCK_RECLAIM_MB"))) : 256) << 20;
+    static bool told = false;
+    if (!told) {
+        told = true;
+        logf("vk: the textures' image blocks given back (RX_VK_BLOCK_RECLAIM, on by default on a card of 6.5 GB or less): a block whose images are all textures uploaded "
+             "from memory, unused %llu presents, evicted while the blocks hold %llu MB free or more (%llu MB a pass at most)",
+             (unsigned long long)min_unused, (unsigned long long)(free_min >> 20), (unsigned long long)(pass_max >> 20));
+    }
+    const bool report = frame_no % 600 == 0;
+    static uint64_t next_look = 0;   // (after a look that found no block to give back: the next in 600 presents)
+    if (frame_no < next_look && !report) return;
+    std::unordered_map<VkDeviceMemory, uint32_t> images;
+    uint64_t block_bytes = 0, alloc_bytes = 0;
+    image_blocks_now(images, &block_bytes, &alloc_bytes);
+    const uint64_t free_bytes = block_bytes - std::min(block_bytes, alloc_bytes);
+    if (free_bytes < free_min && !report) return;
+    // (each block's textures: those that may go, and how many images of the block are not such a texture)
+    struct Block { uint32_t may = 0; uint64_t bytes = 0; std::vector<Texture*> texs; };
+    std::unordered_map<VkDeviceMemory, Block> by;
+    uint32_t used_lately = 0, drawn = 0;   // (images keeping a block: a texture used within min_unused, one the GPU drew)
+    std::unordered_map<VkDeviceMemory, bool> held_by_use;
+    for (auto& kv : textures) {
+        Texture* t = kv.second.get();
+        if (!t->allocation || t->sparse || t->pool_key) continue;
+        const VkDeviceMemory m = image_block_of(t->allocation);
+        if (!m) continue;
+        const bool lately = frame_no - t->last_frame < min_unused || t->last_value > completed;
+        if (t->gpu_written || lately || t->remake) {
+            (t->gpu_written ? drawn : used_lately)++;
+            held_by_use[m] = true;
+            continue;
+        }
+        Block& b = by[m];
+        b.may++, b.bytes += t->bytes + t->pad, b.texs.push_back(t);
+    }
+    std::vector<std::pair<uint64_t, VkDeviceMemory>> ready;   // (bytes, block): every image of it a texture that may go
+    uint64_t ready_bytes = 0;
+    for (auto& [m, b] : by) {
+        const auto n = images.find(m);
+        if (n == images.end() || n->second != b.may || held_by_use.count(m)) continue;
+        ready.push_back({b.bytes, m});
+        ready_bytes += b.bytes;
+    }
+    if (report) {
+        uint32_t other = 0;   // (blocks held by images no texture owns: the upscaler's, scratch, spares)
+        for (const auto& [m, n] : images) {
+            const auto b = by.find(m);
+            if (!held_by_use.count(m) && (b == by.end() || b->second.may != n)) other++;
+        }
+        logf("vk: image blocks given back (RX_VK_BLOCK_RECLAIM): the textures' blocks %llu MB, images in them %llu MB (%llu MB free); "
+             "%zu blocks with images, %zu could go now (their textures %llu MB), held by a texture used lately or the GPU drew %zu "
+             "(%u used lately, %u drawn), by other images %u; so far %lld blocks emptied, %lld textures (%llu MB) evicted, %llu of "
+             "them made again (%llu within 3600 presents)", (unsigned long long)(block_bytes >> 20),
+             (unsigned long long)(alloc_bytes >> 20), (unsigned long long)(free_bytes >> 20), images.size(), ready.size(),
+             (unsigned long long)(ready_bytes >> 20), held_by_use.size(), used_lately, drawn, other, (long long)st_reclaim_blocks,
+             (long long)st_reclaim_textures, (unsigned long long)(st_reclaim_bytes >> 20),
+             (unsigned long long)st_reclaim_remade.load(), (unsigned long long)st_reclaim_remade_soon.load());
+    }
+    if (free_bytes < free_min) return;
+    if (ready.empty()) {
+        next_look = frame_no + 600;
+        return;
+    }
+    std::sort(ready.begin(), ready.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::unordered_set<const Texture*> gone;
+    uint64_t taken = 0;
+    for (const auto& [bytes, m] : ready) {
+        if (taken && taken + bytes > pass_max) break;
+        taken += bytes;
+        st_reclaim_blocks++;
+        for (Texture* tex : by[m].texs) {
+            st_reclaim_textures++, st_reclaim_bytes += tex->bytes + tex->pad;
+            watch_tex(tex, "evicted (its image block given back)");
+            if (tex->uploaded && !remade_skip_old()) {   // (made again, it is uploaded from memory: as the budget's eviction)
+                std::lock_guard lk(from_memory_mu);
+                if (evicted_from_memory.size() > 50000) evicted_from_memory.clear();   // (a bound)
+                evicted_from_memory[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = tex->guest_size;
+            }
+            {
+                std::lock_guard lk(reclaimed_mu);
+                if (reclaimed_at.size() > 50000) reclaimed_at.clear();   // (a bound)
+                reclaimed_at[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = frame_no;
+            }
+            if (remade_log_on()) {
+                std::lock_guard lk(evicted_mu);
+                remade.erase(tex);
+            }
+            tex->ci_key = 0;   // (not kept as a spare image: it would hold the block)
+            destroy_later(*tex);
+            forget_gpu(tex);
+            gone.insert(tex);
+        }
+    }
+    for (auto it = textures.begin(); it != textures.end();)
+        it = gone.count(it->second.get()) ? textures.erase(it) : std::next(it);
+}
+}  // namespace
+
 void texture_frame(uint64_t completed) {
     ledger_frame();   // (RX_VK_LEDGER)
     upload_frame_report();
@@ -6325,6 +6477,7 @@ void texture_frame(uint64_t completed) {
     }
     pool_trim();
     if (frame_no > spare_frames()) spares_free(frame_no - spare_frames());   // (TICK-031: spare images kept that long)
+    if (block_reclaim_on() && frame_no % 60 == 0) block_reclaim(completed);   // (RX_VK_BLOCK_RECLAIM, above)
     // A budget: RX_VK_VRAM_MB of textures (default 4096), and less when the driver says the process is near what it
     // may have (other programs use the GPU too). The least recently used go first, down to 7/8 of it; nothing the
     // last 8 presents used, nothing recorded work may still read.

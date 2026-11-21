@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vk_loader.h"
@@ -659,6 +660,13 @@ void reap(std::function<void()> fn);
 bool reap_drain();
 int64_t reap_queued();
 void reap_report(char* out, size_t n);
+/// (RX_VK_BLOCK_RECLAIM, vk_texture.cpp) whether the image pools' blocks are counted and given back by evicting what holds them
+bool block_reclaim_on();
+/// (RX_VK_BLOCK_RECLAIM) the block of the textures' image pool (generations included) an allocation is in; null for any other
+VkDeviceMemory image_block_of(VmaAllocation allocation);
+/// (RX_VK_BLOCK_RECLAIM) the images in each block of the textures' pool now (any image: the upscaler's and the scratch ones too),
+/// and those blocks' bytes and the bytes allocated in them
+void image_blocks_now(std::unordered_map<VkDeviceMemory, uint32_t>& images, uint64_t* block_bytes, uint64_t* alloc_bytes);
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
 uint64_t allocation_size(VmaAllocation allocation);
 /// (TICK-023/030) the size from which an image gets memory of its own (RX_VK_BIG_IMAGE_MB, 16 MB; 0: none)

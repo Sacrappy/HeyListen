@@ -356,6 +356,57 @@ VmaPool gen_current(int family, uint32_t type, uint64_t* number) {
 }
 }  // namespace
 
+// ---- (HeyListen, RX_VK_BLOCK_RECLAIM, vk_texture.cpp) the blocks of the textures' image pool and how many images each holds ----
+// VMA gives back a block only when its last allocation goes; the texture eviction needs to know which evictions empty one. Kept
+// only while the switch is on: an image made in the textures' pool (or a generation's) is noted with its block, and forgotten
+// when destroyed
+namespace {
+std::mutex blk_mu;
+std::unordered_map<VmaAllocation, VkDeviceMemory> blk_of;   // (blk_mu)
+std::unordered_map<VkDeviceMemory, uint32_t> blk_images;    // (blk_mu: no entry for a block with none)
+void blk_note(VmaAllocation a) {
+    if (!block_reclaim_on() || !a) return;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, a, &info);
+    std::lock_guard lk(blk_mu);
+    blk_of[a] = info.deviceMemory;
+    blk_images[info.deviceMemory]++;
+}
+void blk_forget(VmaAllocation a) {
+    if (!block_reclaim_on() || !a) return;
+    std::lock_guard lk(blk_mu);
+    const auto it = blk_of.find(a);
+    if (it == blk_of.end()) return;
+    const auto b = blk_images.find(it->second);
+    if (b != blk_images.end() && --b->second == 0) blk_images.erase(b);
+    blk_of.erase(it);
+}
+}  // namespace
+VkDeviceMemory image_block_of(VmaAllocation allocation) {
+    std::lock_guard lk(blk_mu);
+    const auto it = blk_of.find(allocation);
+    return it == blk_of.end() ? VK_NULL_HANDLE : it->second;
+}
+void image_blocks_now(std::unordered_map<VkDeviceMemory, uint32_t>& images, uint64_t* block_bytes, uint64_t* alloc_bytes) {
+    {
+        std::lock_guard lk(blk_mu);
+        images = blk_images;
+    }
+    uint64_t b = 0, a = 0;
+    if (image_pool) {
+        VmaDetailedStatistics d{};
+        vmaCalculatePoolStatistics(vma, image_pool, &d);
+        b += d.statistics.blockBytes, a += d.statistics.allocationBytes;
+    }
+    std::lock_guard lk(gen_mu);
+    for (const auto& [n, g] : gens[0]) {
+        VmaDetailedStatistics d{};
+        vmaCalculatePoolStatistics(vma, g.pool, &d);
+        b += d.statistics.blockBytes, a += d.statistics.allocationBytes;
+    }
+    *block_bytes = b, *alloc_bytes = a;
+}
+
 uint64_t big_image_bytes() {   // (TICK-023: RX_VK_BIG_IMAGE_MB, 16 by default; 0: none forced dedicated)
     static const uint64_t big = (uint64_t)(getenv("RX_VK_BIG_IMAGE_MB") ? std::max(0, atoi(getenv("RX_VK_BIG_IMAGE_MB"))) : 16) << 20;
     return big;
@@ -407,6 +458,7 @@ static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAlloca
                 ImageGen& g = gens[family][number];
                 g.live++, g.made_bytes += info.size;
                 gen_of[allocation] = {family, number};
+                blk_note(allocation);
                 return true;
             }
         }
@@ -415,7 +467,10 @@ static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAlloca
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
-        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) {
+            if (pool == image_pool) blk_note(allocation);
+            return true;
+        }
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     if (reap_drain() && vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;   // (RX_VK_REAP: what was queued is freed now)
@@ -523,6 +578,7 @@ void destroy_image(VkImage image, VmaAllocation allocation) {
 namespace {
 void destroy_image_now(VkImage image, VmaAllocation allocation) {
     note_free(allocation);
+    blk_forget(allocation);
     if (image_generations_on() && allocation) {
         std::lock_guard lk(gen_mu);
         const auto it = gen_of.find(allocation);
