@@ -167,6 +167,8 @@ def main():
         oot_occlusion.install(L, img)
         import oot_view   # (fork: the gameplay view's hook, which oot_patches.py's patch_view no longer finds; host/hos_main.c)
         oot_view.install(L, img)
+        import oot_near   # (first person's near plane, host/hos_main.c hos_oot_near)
+        oot_near.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     total = coverage(L, img, img_dir)

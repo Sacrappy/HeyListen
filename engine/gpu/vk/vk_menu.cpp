@@ -968,6 +968,9 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Skip title screen", &opts.skip_title, 0, 1, 1, tx_onoff,   // (HL_OPT_SKIP_TITLE, vk_opt_ids.h, host/oot_autoload.c)
      "Starts a launch with the most recent saved game: presses through the title screen and its file list. Does nothing "
      "until the game has a save. Applies after a restart.", nullptr, true, true},
+    {TAB_GAMEPLAY, "First person", &opts.first_person, 0, 1, 1, tx_onoff,   // (HL_OPT_FIRST_PERSON, vk_opt_ids.h, host/hos_main.c)
+     "Plays from Link's eyes: the right stick looks around, Link walks the way you look, and his head is hidden. The free "
+     "camera, while on, takes its place.", nullptr, false, true},
     {TAB_GAMEPLAY, "Send performance statistics", &opts.send_perf, 0, 1, 1, tx_telemetry,
      "Off by default. On: the game counts how its frames go (frame times, stutters and what they waited on, per map) and sends "
      "a summary of the counts, without your name or any ID; what is kept of it is totals for all players. Every 5 minutes of play "

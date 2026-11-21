@@ -36,3 +36,7 @@
    row on Vanilla keeps the game's R11G11B10F and the temporal upscalers, which take only that scene. 47, Longshot's id for it in
    its vk_api.h, so the two agree. */
 #define HL_OPT_HDR_TONEMAP 47
+
+/* The Gameplay page's First person row (host/hos_main.c and host/nn_hid.c ask, gpu/vk/vk_replay.cpp answers 0 or 1). 120: well clear
+   of the 90s, which the frame rate rows use (90 to 93) */
+#define HL_OPT_FIRST_PERSON 120

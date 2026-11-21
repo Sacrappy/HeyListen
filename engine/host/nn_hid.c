@@ -34,6 +34,7 @@
 #include <windows.h>
 #include <xinput.h>
 #include "../gpu/vk/vk_api.h"   /* (the controls' names: HOS_SW_*, HOS_PAD_*) */
+#include "../gpu/vk/vk_opt_ids.h"   /* (HL_OPT_FIRST_PERSON) */
 #include "hos_motion.h"
 #include "hos_atomic_file.h"   /* (the sensitivity is written whole or not at all) */
 
@@ -808,7 +809,9 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     static const char *native_env;
     static int native_looked;
     if (!native_looked) native_looked = 1, native_env = getenv("HOS_MOUSE_NATIVE");
-    const int native = native_env ? atoi(native_env) != 0 : rx_option(6, 0);
+    /* first person: always the native path, the view taking the mouse one to one (host/mouse_native.c) */
+    const int native = (rx_option(HL_OPT_FIRST_PERSON, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) ||
+                       (native_env ? atoi(native_env) != 0 : rx_option(6, 0));
     int hos_mouse_native(void);
     int captured = 0, as_stick = !native;
     if (native) {
@@ -869,8 +872,12 @@ static void npad_states(Ctx *c) {
         int height = 0;
         const int menu_open = rx_option(1, 0);
         const int free_camera = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+        const int first_person = !free_camera && rx_option(HL_OPT_FIRST_PERSON, 0);
         const int flying = flight_jump_shortcut(&buttons, rx_option(HOS_OPT_CHEAT_FLIGHT, -1), menu_open, free_camera);
-        if (free_camera && !menu_open) {
+        if (first_person && !menu_open) {   /* (first person: the right stick turns the view, host/hos_main.c; Link walks as ever) */
+            for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
+            stick[2] = stick[3] = 0;
+        } else if (free_camera && !menu_open) {
             for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
             height = (int)(buttons >> B_R & 1) - (int)(buttons >> B_L & 1);
             memset(stick, 0, sizeof stick);
