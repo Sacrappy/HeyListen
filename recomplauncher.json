@@ -177,20 +177,26 @@
     },
     {
       "id": "fullscreen",
-      "label": "Fullscreen",
-      "help": "Fills the screen with the game, without the window's border. F11 does the same in the game.",
+      "label": "Display mode",
+      "help": "How the game window fills the screen. F11 does the same in the game.",
       "group": "Video",
       "choices": [
         {
-          "label": "Off",
+          "label": "Windowed",
           "set": {
             "fullscreen": "0"
           }
         },
         {
-          "label": "On",
+          "label": "Borderless",
           "set": {
             "fullscreen": "1"
+          }
+        },
+        {
+          "label": "Fullscreen",
+          "set": {
+            "fullscreen": "2"
           }
         }
       ],

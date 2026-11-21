@@ -103,6 +103,48 @@ static void keys_update(void) {
 static volatile int renderer;   /* the renderer presents into the window */
 static HANDLE renderer_up;   /* (set once rx_start has returned, ready or not: hos_renderer_wait) */
 static int fullscreen;
+static int screen_choice;
+
+enum { MAX_DISPLAYS = 16 };
+typedef struct { char name[96]; int x, y, w, h; } SdlDisplay;
+static CRITICAL_SECTION display_cs = PTHREAD_MUTEX_INITIALIZER;
+static SdlDisplay display_list[MAX_DISPLAYS];
+static int display_count;
+
+static void refresh_displays(void) {
+    int n = hos_sdl_display_count();
+    if (n > MAX_DISPLAYS) n = MAX_DISPLAYS;
+    SdlDisplay tmp[MAX_DISPLAYS];
+    int got = 0;
+    for (int i = 0; i < n; i++) {
+        if (hos_sdl_display_info(i, tmp[got].name, sizeof tmp[got].name,
+                                 &tmp[got].x, &tmp[got].y, &tmp[got].w, &tmp[got].h))
+            got++;
+    }
+    EnterCriticalSection(&display_cs);
+    display_count = got;
+    if (got > 0) memcpy(display_list, tmp, (size_t)got * sizeof tmp[0]);
+    LeaveCriticalSection(&display_cs);
+}
+
+__attribute__((visibility("default"))) int hos_posix_display_count(void) {
+    EnterCriticalSection(&display_cs);
+    const int n = display_count;
+    LeaveCriticalSection(&display_cs);
+    return n;
+}
+
+__attribute__((visibility("default"))) const char *hos_posix_display_name(int index, char *buf, int cap) {
+    if (!buf || cap <= 0) return "";
+    buf[0] = 0;
+    EnterCriticalSection(&display_cs);
+    if (index >= 0 && index < display_count) {
+        const SdlDisplay *d = &display_list[index];
+        snprintf(buf, (size_t)cap, "%s (%dx%d)", d->name, d->w, d->h);
+    }
+    LeaveCriticalSection(&display_cs);
+    return buf;
+}
 
 static int create_surface(void *w, void *instance, void *surface) { return hos_sdl_vulkan_surface(w, instance, surface); }
 static void drawable_size(void *w, int *width, int *height) { hos_sdl_pixel_size(w, width, height); }
@@ -119,11 +161,35 @@ static void mouse_capture(int on) {
     hos_sdl_relative_mouse(window, on);
 }
 static void set_fullscreen(int on) {
+    if (on < 0) on = 0;
+    if (on > 2) on = 2;
     if (on == fullscreen) return;
     fullscreen = on;
     hos_posix_window[3] = on;
     hos_sdl_fullscreen(window, on);
-    hos_log("display: %s", on ? "fullscreen (F11 for a window)" : "windowed");
+    hos_log("display: %s", on == 2 ? "fullscreen (F11 for a window)" : on ? "borderless (F11 for a window)" : "windowed");
+}
+
+static void set_screen(int screen) {
+    if (screen < 0) screen = 0;
+    if (screen == screen_choice) return;
+    screen_choice = screen;
+    if (!screen) {
+        hos_log("display: screen auto");
+        return;
+    }
+    char name[96];
+    int dx = 0, dy = 0, dw = 0, dh = 0;
+    if (!hos_sdl_display_info(screen - 1, name, sizeof name, &dx, &dy, &dw, &dh)) return;
+    int ww = 0, wh = 0;
+    hos_sdl_window_size(window, &ww, &wh);
+    const int nx = dx + (dw > ww ? (dw - ww) / 2 : 0);
+    const int ny = dy + (dh > wh ? (dh - wh) / 2 : 0);
+    const int was_fs = fullscreen;
+    if (was_fs) hos_sdl_fullscreen(window, 0);
+    hos_sdl_move_window(window, nx, ny);
+    if (was_fs) hos_sdl_fullscreen(window, was_fs);
+    hos_log("display: screen %d (%s, %dx%d)", screen, name, dw, dh);
 }
 
 static DWORD WINAPI renderer_main(void *p) {
@@ -149,17 +215,19 @@ void hos_renderer_wait(void) {
 
 static volatile int start_asked;
 static volatile int fullscreen_asked = -1;   /* (the Insert menu's row, from the renderer's thread: applied on this one) */
+static volatile int screen_asked = -1;       /* (the Insert/F1 menu's Screen row, likewise) */
 static volatile int menu_asked = -1;         /* (the Insert menu opened or closed, likewise) */
 static volatile int restart_asked;           /* (the Insert menu's Restart now: the window closes as by the player) */
 static volatile int close_asked;             /* (the Insert menu's Quit: likewise, without the relaunch) */
 
 /* PostMessageA to the window (host/posix/win32_posix.c): WM_APP + 7, the Insert menu's Fullscreen row, WM_APP + 8 the
-   menu opened or closed, WM_APP + 9 its Restart now, WM_CLOSE its Quit (host/display.c's) */
+   menu opened or closed, WM_APP + 9 its Restart now, WM_APP + 11 its Screen row, WM_CLOSE its Quit (host/display.c's) */
 __attribute__((visibility("default"))) void hos_posix_post_message(uint32_t msg, uintptr_t wp, intptr_t lp) {
     (void)lp;
-    if (msg == WM_APP + 7) __atomic_store_n(&fullscreen_asked, wp ? 1 : 0, __ATOMIC_RELEASE);
+    if (msg == WM_APP + 7) __atomic_store_n(&fullscreen_asked, (int)(wp > 2 ? 2 : wp), __ATOMIC_RELEASE);
     if (msg == WM_APP + 8) __atomic_store_n(&menu_asked, wp ? 1 : 0, __ATOMIC_RELEASE);
     if (msg == WM_APP + 9) __atomic_store_n(&restart_asked, 1, __ATOMIC_RELEASE);
+    if (msg == WM_APP + 11) __atomic_store_n(&screen_asked, (int)wp, __ATOMIC_RELEASE);
     if (msg == WM_CLOSE) __atomic_store_n(&close_asked, 1, __ATOMIC_RELEASE);
 }
 /* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
@@ -253,6 +321,7 @@ void hos_display_loop(void) {
         hos_sdl_icon(window, png);
     }
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(1);
+    refresh_displays();
     __atomic_store_n(&refresh_now, hos_sdl_refresh_mhz(window), __ATOMIC_RELAXED);
     CloseHandle(CreateThread(NULL, 0, renderer_main, NULL, 0, NULL));
     DWORD refresh_asked = GetTickCount();
@@ -260,6 +329,7 @@ void hos_display_loop(void) {
         hos_sdl_pads_pump();
         if (GetTickCount() - refresh_asked >= 1000) {   /* (the window may have moved to another display) */
             refresh_asked = GetTickCount();
+            refresh_displays();
             __atomic_store_n(&refresh_now, hos_sdl_refresh_mhz(window), __ATOMIC_RELAXED);
         }
         if (hos_sdl_wait_event(&e, 4)) {
@@ -327,6 +397,8 @@ void hos_display_loop(void) {
                 }
             } while (hos_sdl_poll_event(&e));
         }
+        const int scr = __atomic_exchange_n(&screen_asked, -1, __ATOMIC_ACQ_REL);
+        if (scr >= 0) set_screen(scr);
         const int asked = __atomic_exchange_n(&fullscreen_asked, -1, __ATOMIC_ACQ_REL);
         if (asked >= 0) set_fullscreen(asked);
         const int menu = __atomic_exchange_n(&menu_asked, -1, __ATOMIC_ACQ_REL);

@@ -47,7 +47,8 @@ def menu_rows():
         "Send performance statistics": "send_performance_stats", "Send crash reports automatically": "send_crash_reports",
         "Check for updates": "update_check", "V-Sync": "vsync", "V-Sync mode": "vsync_mode",
         "VRR (G-Sync / FreeSync)": "vrr",
-        "DLAA before the bloom": "dlss_pre_bloom"}
+        "DLAA before the bloom": "dlss_pre_bloom",
+        "Display mode": "fullscreen"}
     for key in re.findall(r'return "([a-z_0-9]+)";', ini_key):
         assert key in renamed.values(), key   # (a new special case: add it above)
     rows = {}
@@ -204,7 +205,7 @@ class RecompLauncherJsonTests(unittest.TestCase):
         tick = menu[menu.index("void fullscreen_tick()"):menu.index("void menu_option_set(")]
         self.assertIn("HOS_FULLSCREEN", tick)   # (while it is set the row leaves the window alone: the flag writes nothing)
         by_key = {k: s for s in self.doc["settings"] for k in s["choices"][0]["set"]}
-        self.assertEqual([c["set"]["fullscreen"] for c in by_key["fullscreen"]["choices"]], ["0", "1"])   # (the launcher's row)
+        self.assertEqual([c["set"]["fullscreen"] for c in by_key["fullscreen"]["choices"]], ["0", "1", "2"])   # (the launcher's row)
 
     def test_the_crash_log_is_the_newest_log_of_the_declared_folder(self):
         """RecompLauncher's PR 91, second ask: the crash report reads .log files, and the game keeps them. The manifest's

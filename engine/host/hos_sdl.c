@@ -15,7 +15,8 @@ static struct {
     /* window */
     void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
-        *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode;
+        *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode,
+        *GetDisplays, *GetNumVideoDisplays, *GetDisplayName, *GetDisplayBounds;
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
     void *CloseAudioDevice, *DestroyAudioStream;
@@ -117,9 +118,16 @@ static int get_all(HMODULE m, int three) {
         *(FARPROC *)&f.DestroySurface = GetProcAddress(m, "SDL_DestroySurface");
         *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetDisplayForWindow");   /* (the refresh: hos_sdl_refresh_mhz) */
         *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
+        *(FARPROC *)&f.GetDisplays = GetProcAddress(m, "SDL_GetDisplays");
+        *(FARPROC *)&f.GetDisplayName = GetProcAddress(m, "SDL_GetDisplayName");
+        *(FARPROC *)&f.GetDisplayBounds = GetProcAddress(m, "SDL_GetDisplayBounds");
     } else {
+        *(FARPROC *)&f.SetWindowPosition = GetProcAddress(m, "SDL_SetWindowPosition");
         *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetWindowDisplayIndex");   /* (the refresh: hos_sdl_refresh_mhz) */
         *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
+        *(FARPROC *)&f.GetNumVideoDisplays = GetProcAddress(m, "SDL_GetNumVideoDisplays");
+        *(FARPROC *)&f.GetDisplayName = GetProcAddress(m, "SDL_GetDisplayName");
+        *(FARPROC *)&f.GetDisplayBounds = GetProcAddress(m, "SDL_GetDisplayBounds");
         GET(OpenAudioDevice, "SDL_OpenAudioDevice");
         GET(PauseAudioDevice, "SDL_PauseAudioDevice");
         GET(CloseAudioDevice, "SDL_CloseAudioDevice");
@@ -193,7 +201,48 @@ void *hos_sdl_window(const char *title, int width, int height) {
 }
 void hos_sdl_fullscreen(void *window, int on) {
     if (version == 3) CALL(_Bool (*)(void *, _Bool), SetWindowFullscreen)(window, on != 0);
-    else CALL(int (*)(void *, uint32_t), SetWindowFullscreen)(window, on ? 0x1001 /* FULLSCREEN_DESKTOP */ : 0);
+    else CALL(int (*)(void *, uint32_t), SetWindowFullscreen)(window, on == 2 ? 0x0001u : on ? 0x1001u /* FULLSCREEN_DESKTOP */ : 0u);
+}
+void hos_sdl_move_window(void *window, int x, int y) {
+    if (!window || !f.SetWindowPosition) return;
+    if (version == 3) CALL(_Bool (*)(void *, int, int), SetWindowPosition)(window, x, y);
+    else CALL(void (*)(void *, int, int), SetWindowPosition)(window, x, y);
+}
+int hos_sdl_display_count(void) {
+    if (version == 3) {
+        if (!f.GetDisplays || !f.Free) return 0;
+        int n = 0;
+        uint32_t *ids = CALL(uint32_t *(*)(int *), GetDisplays)(&n);
+        if (ids) CALL(void (*)(void *), Free)(ids);
+        return n > 0 ? n : 0;
+    }
+    return f.GetNumVideoDisplays ? CALL(int (*)(void), GetNumVideoDisplays)() : 0;
+}
+int hos_sdl_display_info(int index, char *name, size_t cap, int *x, int *y, int *w, int *h) {
+    if (index < 0) return 0;
+    struct { int x, y, w, h; } r = {0, 0, 0, 0};
+    const char *n = NULL;
+    if (version == 3) {
+        if (!f.GetDisplays || !f.Free || !f.GetDisplayBounds) return 0;
+        int count = 0;
+        uint32_t *ids = CALL(uint32_t *(*)(int *), GetDisplays)(&count);
+        if (!ids || index >= count) { if (ids) CALL(void (*)(void *), Free)(ids); return 0; }
+        const uint32_t id = ids[index];
+        CALL(void (*)(void *), Free)(ids);
+        if (!CALL(_Bool (*)(uint32_t, void *), GetDisplayBounds)(id, &r)) return 0;
+        n = f.GetDisplayName ? CALL(const char *(*)(uint32_t), GetDisplayName)(id) : NULL;
+    } else {
+        if (!f.GetNumVideoDisplays || !f.GetDisplayBounds) return 0;
+        if (index >= CALL(int (*)(void), GetNumVideoDisplays)()) return 0;
+        if (CALL(int (*)(int, void *), GetDisplayBounds)(index, &r) != 0) return 0;
+        n = f.GetDisplayName ? CALL(const char *(*)(int), GetDisplayName)(index) : NULL;
+    }
+    if (name && cap) snprintf(name, cap, "%s", n && *n ? n : "Display");
+    if (x) *x = r.x;
+    if (y) *y = r.y;
+    if (w) *w = r.w;
+    if (h) *h = r.h;
+    return 1;
 }
 void hos_sdl_relative_mouse(void *window, int on) {
     if (version == 3) CALL(_Bool (*)(void *, _Bool), SetRelativeMouseMode)(window, on != 0);
