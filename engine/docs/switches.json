@@ -4075,7 +4075,7 @@
    "files": [
     {
      "path": "host/display.c",
-     "line": 111
+     "line": 179
     },
     {
      "path": "host/hos_main.c",
@@ -4084,7 +4084,7 @@
    ],
    "default": "off (unset)",
    "values": "on or off (0, false, off, no and empty are off)",
-   "explanation": "undocumented: host/display.c:111 (in `dpi_aware_thread()`) reads it as an on/off switch: `if (getenv(\"HOS_DPI_UNAWARE\")) return;`. No comment in the source says what it changes.",
+   "explanation": "undocumented: host/display.c:179 (in `dpi_aware_thread()`) reads it as an on/off switch: `if (getenv(\"HOS_DPI_UNAWARE\")) return;`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -4100,7 +4100,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2515
+     "line": 2592
     }
    ],
    "default": "0 (unset)",
@@ -4226,7 +4226,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2523
+     "line": 2601
     },
     {
      "path": "host/nn_vi.c",
@@ -4301,7 +4301,7 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2523
+     "line": 2601
     },
     {
      "path": "host/nn_vi.c",
@@ -4624,15 +4624,15 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2606
+     "line": 2694
     },
     {
      "path": "host/display.c",
-     "line": 356
+     "line": 427
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 255
+     "line": 323
     }
    ],
    "default": "off (unset)",
@@ -4888,7 +4888,7 @@
     },
     {
      "path": "host/display.c",
-     "line": 380
+     "line": 451
     },
     {
      "path": "host/hos_crash_dialog.c",
@@ -4924,11 +4924,11 @@
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 185
+     "line": 253
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 214
+     "line": 282
     },
     {
      "path": "host/rx_backend.c",
@@ -5418,7 +5418,7 @@
    "files": [
     {
      "path": "host/display.c",
-     "line": 197
+     "line": 265
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -6210,11 +6210,11 @@
    "files": [
     {
      "path": "host/display.c",
-     "line": 375
+     "line": 446
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 146
+     "line": 212
     }
    ],
    "default": "0 (unset)",
@@ -6785,7 +6785,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2432
+     "line": 2509
     }
    ],
    "default": "unset",
@@ -6806,7 +6806,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2435
+     "line": 2512
     },
     {
      "path": "host/hos_main.c",
@@ -6894,7 +6894,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2516
+     "line": 2593
     },
     {
      "path": "host/nn_applet.c",
@@ -7443,7 +7443,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2514
+     "line": 2591
     }
    ],
    "default": "0 (unset)",
@@ -7803,7 +7803,7 @@
     },
     {
      "path": "host/hos_sdl.c",
-     "line": 139
+     "line": 147
     }
    ],
    "default": "unset",
@@ -8822,11 +8822,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 448
+     "line": 459
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 483
+     "line": 494
     },
     {
      "path": "host/hos_wide_ui.c",
@@ -8872,7 +8872,7 @@
    "files": [
     {
      "path": "host/display.c",
-     "line": 341
+     "line": 412
     }
    ],
    "default": "off (unset)",
@@ -8893,19 +8893,19 @@
    "files": [
     {
      "path": "host/display.c",
-     "line": 335
+     "line": 406
     },
     {
      "path": "host/display.c",
-     "line": 337
+     "line": 408
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 232
+     "line": 300
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 234
+     "line": 302
     }
    ],
    "default": "unset",
@@ -16964,7 +16964,7 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 286
+     "line": 297
     }
    ],
    "default": "unset",
@@ -17006,11 +17006,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 322
+     "line": 333
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2510
+     "line": 2587
     }
    ],
    "default": "unset",
@@ -18117,15 +18117,15 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 440
+     "line": 451
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 507
+     "line": 575
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 537
+     "line": 605
     }
    ],
    "default": "off (unset)",
@@ -18607,7 +18607,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2504
+     "line": 2581
     }
    ],
    "default": "0 (unset)",
@@ -19395,7 +19395,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2506
+     "line": 2583
     }
    ],
    "default": "unset",
@@ -19617,15 +19617,15 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 440
+     "line": 451
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 507
+     "line": 575
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 537
+     "line": 605
     }
    ],
    "default": "off (unset)",
@@ -21172,7 +21172,7 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2498
+     "line": 2575
     }
    ],
    "default": "2",
@@ -21256,7 +21256,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2803
+     "line": 2892
     }
    ],
    "default": "unset",
@@ -23543,7 +23543,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2505
+     "line": 2582
     }
    ],
    "default": "0 (unset)",
@@ -23564,7 +23564,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 327
+     "line": 338
     },
     {
      "path": "gpu/vk/vk_replay.cpp",
@@ -28162,7 +28162,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2775
+     "line": 2864
     }
    ],
    "default": "unset",
@@ -28330,7 +28330,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2511
+     "line": 2588
     }
    ],
    "default": "0 (unset)",
@@ -29376,7 +29376,7 @@
    "files": [
     {
      "path": "host/hos_sdl.c",
-     "line": 375
+     "line": 424
     }
    ],
    "default": "unset",
@@ -29397,7 +29397,7 @@
    "files": [
     {
      "path": "host/posix/display_sdl.c",
-     "line": 199
+     "line": 267
     }
    ],
    "default": "unset",
@@ -29418,7 +29418,7 @@
    "files": [
     {
      "path": "host/posix/display_sdl.c",
-     "line": 199
+     "line": 267
     }
    ],
    "default": "unset",
@@ -29744,7 +29744,7 @@
     },
     {
      "path": "host/posix/display_sdl.c",
-     "line": 197
+     "line": 265
     }
    ],
    "default": "unset",

@@ -95,7 +95,8 @@ def check_source():
     need("popup_wanted" in style and "WS_POPUP" in style and "WS_OVERLAPPEDWINDOW" in style, "fullscreen_style: WS_POPUP only when asked")
     need("mi.rcMonitor.left" in style and "mi.rcMonitor.right - mi.rcMonitor.left" in style, "fullscreen_style: the monitor's rect")
     need("HWND_TOP" in style, "fullscreen_style: on top")
-    need("popup_wanted ? SWP_SHOWWINDOW : 0" in style, "fullscreen_style: nothing added to the flags when VRR is off")
+    need("(popup ? SWP_SHOWWINDOW : 0)" in style and "fullscreen == 2" in style,
+         "fullscreen_style: nothing added to the flags when VRR is off in Borderless")
     need("CreateWindowExA" not in disp, "display.c: a window with no extended styles (layered ones block flip)")
     fs = body(disp, "static void set_fullscreen(HWND w, int on) {")
     off = fs[fs.index("} else {"):]

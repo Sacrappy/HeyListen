@@ -25,6 +25,9 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 #include "vk_paths.h"
 #include "../../host/hos_atomic_file.h"   // (the options file is written whole or not at all)
@@ -109,6 +112,14 @@ const char* tx_framegen(int v) {
     return t[std::clamp(fgr::clamp(framegen_by_now(), dlss_fg_most(), std::clamp(v, 0, 8)), 0, 8)];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_display_mode(int v) {
+    static const char* const t[] = {"Windowed", "Borderless", "Fullscreen"};
+    return t[std::clamp(v, 0, 2)];
+}
+MENU_HINTS(hn_display_mode, 0,
+           "A normal window with a title bar and border.",
+           "Fills the whole screen without the window's border. Easy to switch away from; F11 toggles between Windowed and Borderless.",
+           "Fills the whole screen as a borderless popup that Windows can show directly (independent flip). F11 toggles to Windowed.")
 const char* tx_framegen_by(int v) {
     static const char* t[fgr::kBy] = {"Built-in / AMD FSR 3.1", "NVIDIA DLSS FG", "AMD FSR 3.1 FG"};
     return t[std::clamp(v, 0, fgr::kBy - 1)];
@@ -498,6 +509,63 @@ const char* tx_gpu(int v) {
     // (the whole name shows: the selected row slides through it, see marquee_pos)
     return buf;
 }
+constexpr int kMaxScreens = 16;
+std::vector<std::string> screen_names;
+#ifdef _WIN32
+BOOL CALLBACK enum_screen_cb(HMONITOR h, HDC, LPRECT, LPARAM lp) {
+    auto* list = (std::vector<std::string>*)lp;
+    if ((int)list->size() >= kMaxScreens) return FALSE;
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(h, &mi)) return TRUE;
+    const int w = (int)(mi.rcMonitor.right - mi.rcMonitor.left);
+    const int hpx = (int)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof dd;
+    char name[128] = "";
+    if (EnumDisplayDevicesW(mi.szDevice, 0, &dd, 0) && dd.DeviceString[0])
+        WideCharToMultiByte(CP_UTF8, 0, dd.DeviceString, -1, name, sizeof name, nullptr, nullptr);
+    char label[192];
+    const char* pri = (mi.dwFlags & MONITORINFOF_PRIMARY) ? ", primary" : "";
+    if (name[0]) snprintf(label, sizeof label, "%s (%dx%d%s)", name, w, hpx, pri);
+    else snprintf(label, sizeof label, "Display %d (%dx%d%s)", (int)list->size() + 1, w, hpx, pri);
+    list->emplace_back(label);
+    return TRUE;
+}
+#endif
+void refresh_screens() {
+    screen_names.clear();
+#ifdef _WIN32
+    EnumDisplayMonitors(nullptr, nullptr, enum_screen_cb, (LPARAM)&screen_names);
+#else
+    using CountFn = int (*)(void);
+    using NameFn = const char* (*)(int, char*, int);
+    static const CountFn cnt = (CountFn)dlsym(RTLD_DEFAULT, "hos_posix_display_count");
+    static const NameFn nm = (NameFn)dlsym(RTLD_DEFAULT, "hos_posix_display_name");
+    if (cnt && nm) {
+        const int n = std::min(cnt(), kMaxScreens);
+        for (int i = 0; i < n; i++) {
+            char buf[160] = "";
+            nm(i, buf, (int)sizeof buf);
+            screen_names.emplace_back(buf[0] ? buf : "Display");
+        }
+    }
+#endif
+}
+const char* tx_screen(int v) {
+    static char buf[256];
+    if (v <= 0) return "Auto";
+    const int idx = v - 1;
+    if (idx < (int)screen_names.size()) snprintf(buf, sizeof buf, "%d: %s", v, screen_names[idx].c_str());
+    else snprintf(buf, sizeof buf, "%d: Screen %d (not connected)", v, v);
+    return buf;
+}
+const char* hn_screen(int v, int variant) {
+    if (variant > 0) return nullptr;
+    if (v <= 0) return "Stays on the screen the window is currently on.";
+    if (v > (int)screen_names.size()) return "This screen is not connected right now; using the current screen.";
+    return "Moves the game window and fullscreen mode to this screen. Applies at once.";
+}
 /// V-Sync: Off is the game's own way (mailbox, else immediate: no waiting for the refresh), On is FIFO with the mode row's images
 const char* tx_vsync(int v) { return v ? "On" : "Off"; }
 const char* hn_vsync(int v, int variant) {
@@ -837,8 +905,10 @@ Row rows[] = {
     {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
      "Sets the scaling rows and memory limits for a GPU with that much memory. The Upscaler and Frame generation stay yours.",
      hn_preset},
-    {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
-     "Fills the whole screen with the game, without the window's border. The same as F11.", nullptr, false, true},
+    {TAB_GRAPHICS, "Display mode", &opts.fullscreen, 0, 2, 1, tx_display_mode,
+     "How the game window fills the screen. The same toggle as F11 / Alt+Enter.", hn_display_mode, false, true},
+    {TAB_GRAPHICS, "Screen", &opts.screen, 0, kMaxScreens, 1, tx_screen,
+     "Which monitor the game window and fullscreen mode use.", hn_screen, false, true},
     {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
     {TAB_GRAPHICS, "V-Sync", &opts.vsync, 0, 1, 1, tx_vsync,
@@ -1330,6 +1400,7 @@ std::string ini_path() {
 const char* ini_key(const Row& r) {
     if (r.value == &opts.output_res) return "output_res";   // (host/nn_applet.c reads it at the start)
     // (rows renamed since their values were first saved keep their keys: an options file from before still loads)
+    if (r.value == &opts.fullscreen) return "fullscreen";   // (Display mode: 0 Windowed, 1 Borderless, 2 Fullscreen)
     if (r.value == &opts.resolution) return "resolution";
     if (r.value == &opts.upscale) return "upscaling";
     if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
@@ -1490,6 +1561,12 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     if (r.value == &opts.output_res) {   // (smallest to largest: kOutputOrder)
         v = step_output_choice(*r.value, dir);
         if (v == *r.value) return;
+    }
+    if (r.value == &opts.screen) {
+        const int n = (int)screen_names.size();
+        if (n <= 0) return;
+        if (v > n) v = dir < 0 ? n : 0;
+        if (v < 0) v = n;
     }
     // (Frame generation: the arrows step over what the mode that makes the frames offers (framegen_rows.h): Off, Auto where it has
     // one, 2x to its top (NVIDIA DLSS FG: its runtime's most + 1, AMD FSR 3.1: 2x). A saved value past it shows as the top
@@ -2514,6 +2591,7 @@ void menu_init() {
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = output_choice_text(e);
+    refresh_screens();
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
 }
 
@@ -2598,7 +2676,17 @@ void menu_note_frame(bool game_frame, int shown) {
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
-// The Fullscreen row and F11 are one setting: the row asks the window's thread (host/display.c), F11 shows in the row
+void screen_tick() {
+    static int applied = 0;
+    const HWND main_window = app_window();
+    if (!main_window) return;
+    if (opts.screen != applied) {
+        applied = opts.screen;
+        PostMessageA(main_window, WM_APP + 11, (WPARAM)applied, 0);
+    }
+}
+
+// The Display mode row and F11 are one setting: the row asks the window's thread (host/display.c), F11 shows in the row
 void fullscreen_tick() {
     static int applied = 0, settle = 0;
     const HWND main_window = app_window();
@@ -2613,7 +2701,7 @@ void fullscreen_tick() {
     }
     if (settle > 0) { settle--; return; }
     const int now = !(GetWindowLongA(main_window, GWL_STYLE) & WS_CAPTION);
-    if (now != applied) {
+    if (now != (applied != 0)) {
         opts.fullscreen = applied = now;
         menu_refresh = true;
         save();
@@ -2729,6 +2817,7 @@ void cheat_press(int i, const bool* press, bool& changed) {
 }
 
 void menu_tick() {
+    screen_tick();
     fullscreen_tick();
     {   // (the lists keep the choice in view when the drawing fits another number of lines: a resize, Menu size)
         static int seen = list_lines;
@@ -2863,7 +2952,7 @@ void menu_tick() {
         if (open_now.load()) auto_pad = pad_last;   // (Menu size Auto: by what opened the menu)
         if (open_now.load()) opts.pad_layout = detect_pad_layout();
         if (open_now.load()) dlss_probe(), dlss_fg_probe(), fsr4_probe();   // (whether the Upscaler row can offer DLSS and FSR here: asked once)
-        if (open_now.load()) refresh_mics();   // (the microphones as they are now)
+        if (open_now.load()) refresh_mics(), refresh_screens();   // (the microphones and screens as they are now)
     }
     if (open_now.load() && page == 5) {   // (hookshot) the restart question: Later (the default) or Restart now
         if (mouse) {   // (a button under the cursor chosen, a click on it pressed, a right click is Later; no list: the wheel does nothing)

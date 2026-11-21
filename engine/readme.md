@@ -234,7 +234,8 @@ they apply at once, with no new translation.
 | Tab | Option | Choices | Default |
 |---|---|---|---|
 | Graphics | Quality preset | Custom, Minimum (4GB), Low (6GB), Balanced (8GB), High (12GB), Ultra (16GB+) | Custom |
-| | Fullscreen | Off, On (the same as <kbd>F11</kbd>) | Off |
+| | Display mode | Windowed, Borderless, Fullscreen (<kbd>F11</kbd> toggles between Windowed and Borderless) | Windowed |
+| | Screen | Auto (current monitor), or each monitor by name and size | Auto |
 | | GPU device | Auto, or each graphics card by name (after a restart) | Auto |
 | | Upscaler | Game's own, NVIDIA DLSS (only in builds with NVIDIA's DLSS SDK, below; on RTX GPUs), AMD FSR 3.1 (every build, on GPUs it runs on, below), AMD FSR 4 (only in builds with FSR 4, below), Off (every build and GPU, `dlss=6`: no upscaling network, the 3D at the Render resolution stretched to the output, no anti-aliasing; Render resolution steps as for the game's own, Sharpness applies) | Game's own |
 | | Render resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size). With DLSS, FSR 3.1 or FSR 4: Auto, Quality (67%), Balanced (58%), Performance (50%), Ultra Performance (33%). With DLSS also **DLAA (native)** and with FSR 4 **Native AA (FSR 4)**, after Auto: the 3D at 100% with the upscaler's anti-aliasing (saved as `resolution=7`; they were Upscaler choices before, and an options file that saved them as the Upscaler is read as DLSS or FSR 4 with this) | Auto |

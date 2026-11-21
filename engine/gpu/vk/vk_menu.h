@@ -48,7 +48,8 @@ struct Options {
     int show_fps = 0;
     int menu_shortcut = 0;   // 0 Insert or F1, 1 Insert only, 2 F1 only
     int menu_size = 0;   // (hookshot) the overlays' size: 0 Auto, 1 Small, 2 Medium, 3 Large (gpu/vk/vk_ui.h unit)
-    int fullscreen = 0;   // borderless, at the monitor's size: F11 is the same setting
+    int fullscreen = 0;   // Display mode: 0 Windowed, 1 Borderless (at the monitor's size), 2 Fullscreen (borderless popup that Windows can flip); F11 is the same toggle
+    int screen = 0;       // Screen / monitor: 0 Auto (current monitor), 1..N monitor index (saved as screen=)
     int gpu_device = 0;   // graphics card index: 0 Auto, 1..N device 0..N-1 (gpu/vk/vk_main.cpp; RX_VK_DEVICE)
     int vsync = 0;   // V-Sync (present_mode.h): 0 Off (mailbox, else immediate: as before), 1 On (FIFO, the count below); the swapchain made again at once (RX_VK_FIFO, RX_VK_IMMEDIATE over it)
     int vsync_mode = 1;   // V-Sync mode (present_mode.h), with V-Sync On: 0 FIFO (double buffering) (2 images: less delay, a missed refresh waits a whole one), 1 FIFO (triple buffering) (3: the default, today's On), 2 Mailbox (triple buffering) (MAILBOX, 3 or 4 with frame generation, where the surface lists it); saved as vsync_mode

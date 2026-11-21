@@ -65,37 +65,62 @@ int hos_mouse_pointer(MkwVkPointer *out) {
 
 static HANDLE renderer_up;
 static int fullscreen;
+static int screen_choice;   /* 0 Auto (current monitor), 1..N monitor index */
 static WINDOWPLACEMENT windowed_place;
+
+typedef struct { int target, count, found; MONITORINFO mi; } MonFind;
+static BOOL CALLBACK mon_find_cb(HMONITOR h, HDC dc, LPRECT rc, LPARAM lp) {
+    (void)dc, (void)rc;
+    MonFind *f = (MonFind *)lp;
+    f->count++;
+    if (f->count == f->target) {
+        f->mi.cbSize = sizeof f->mi;
+        f->found = GetMonitorInfoA(h, &f->mi);
+        return FALSE;
+    }
+    return TRUE;
+}
+static int monitor_info_for(HWND w, int screen, MONITORINFO *mi) {
+    mi->cbSize = sizeof *mi;
+    if (screen > 0) {
+        MonFind f = {screen, 0, 0, {0}};
+        EnumDisplayMonitors(NULL, NULL, mon_find_cb, (LPARAM)&f);
+        if (f.found) { *mi = f.mi; return 1; }
+    }
+    return GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), mi);
+}
 
 /* (the VRR row, gpu/vk/vk_main.cpp vrr_resolved) The fullscreen window as a WS_POPUP that covers the monitor, which Windows can show
    directly (independent flip) instead of composing it through the desktop window manager: G-Sync and FreeSync only work on that
    path. Off (every other player): the window's style is what it always was, the overlapped style stripped. */
 static volatile LONG popup_wanted;
 
-/* the monitor's whole rectangle in the style asked (the window as fullscreen) */
+/* the monitor's whole rectangle in the style asked (the window as borderless or fullscreen) */
 static void fullscreen_style(HWND w) {
     MONITORINFO mi;
-    mi.cbSize = sizeof mi;
-    if (!GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    if (!monitor_info_for(w, screen_choice, &mi)) return;
+    const int popup = popup_wanted || fullscreen == 2;
     LONG style = GetWindowLongA(w, GWL_STYLE) & ~(LONG)(WS_OVERLAPPEDWINDOW | WS_POPUP);
-    if (popup_wanted) style |= (LONG)WS_POPUP | WS_VISIBLE;
+    if (popup) style |= (LONG)WS_POPUP | WS_VISIBLE;
     SetWindowLongA(w, GWL_STYLE, style);
     SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                  mi.rcMonitor.bottom - mi.rcMonitor.top,
-                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (popup_wanted ? SWP_SHOWWINDOW : 0));
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (popup ? SWP_SHOWWINDOW : 0));
 }
 
 static void set_fullscreen(HWND w, int on) {
+    if (on < 0) on = 0;
+    if (on > 2) on = 2;
     if (on == fullscreen) return;
     const LONG style = GetWindowLongA(w, GWL_STYLE);
     if (on) {
-        MONITORINFO mi;
-        mi.cbSize = sizeof mi;
-        windowed_place.length = sizeof windowed_place;
-        if (!GetWindowPlacement(w, &windowed_place) ||
-            !GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi))
-            return;
-        fullscreen = 1;
+        if (!fullscreen) {
+            MONITORINFO mi;
+            windowed_place.length = sizeof windowed_place;
+            if (!GetWindowPlacement(w, &windowed_place) || !monitor_info_for(w, screen_choice, &mi))
+                return;
+        }
+        fullscreen = on;
         fullscreen_style(w);
     } else {
         fullscreen = 0;
@@ -104,7 +129,50 @@ static void set_fullscreen(HWND w, int on) {
         SetWindowPos(w, NULL, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     }
-    hos_log("display: %s%s", on ? "fullscreen (F11 for a window)" : "windowed", on && popup_wanted ? ", as a popup window that can flip (VRR)" : "");
+    hos_log("display: %s%s", on == 2 ? "fullscreen (F11 for a window)" : on ? "borderless (F11 for a window)" : "windowed",
+            on == 1 && popup_wanted ? ", as a popup window that can flip (VRR)" : "");
+}
+
+static void center_rect_in_work(const RECT *work, int ww, int wh, int *x, int *y, int *cw, int *ch) {
+    const int mw = work->right - work->left, mh = work->bottom - work->top;
+    *cw = ww > 0 && ww < mw ? ww : mw;
+    *ch = wh > 0 && wh < mh ? wh : mh;
+    *x = work->left + (mw - *cw) / 2;
+    *y = work->top + (mh - *ch) / 2;
+}
+
+static void set_screen(HWND w, int screen) {
+    if (screen < 0) screen = 0;
+    if (screen == screen_choice) return;
+    screen_choice = screen;
+    if (!screen) {
+        hos_log("display: screen auto");
+        return;
+    }
+    MONITORINFO mi;
+    if (!monitor_info_for(w, screen, &mi)) return;
+    if (fullscreen) {
+        const int ww = windowed_place.rcNormalPosition.right - windowed_place.rcNormalPosition.left;
+        const int wh = windowed_place.rcNormalPosition.bottom - windowed_place.rcNormalPosition.top;
+        int nx, ny, cw, ch;
+        if (ww > 0 && wh > 0) {
+            center_rect_in_work(&mi.rcWork, ww, wh, &nx, &ny, &cw, &ch);
+            windowed_place.rcNormalPosition.left = nx;
+            windowed_place.rcNormalPosition.top = ny;
+            windowed_place.rcNormalPosition.right = nx + cw;
+            windowed_place.rcNormalPosition.bottom = ny + ch;
+        }
+        fullscreen_style(w);
+    } else {
+        RECT r;
+        if (GetWindowRect(w, &r)) {
+            int nx, ny, cw, ch;
+            center_rect_in_work(&mi.rcWork, r.right - r.left, r.bottom - r.top, &nx, &ny, &cw, &ch);
+            SetWindowPos(w, NULL, nx, ny, cw, ch, SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        }
+    }
+    hos_log("display: screen %d (%dx%d)", screen,
+            (int)(mi.rcMonitor.right - mi.rcMonitor.left), (int)(mi.rcMonitor.bottom - mi.rcMonitor.top));
 }
 
 static void dpi_aware_thread(void) {
@@ -250,10 +318,13 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP + 7:   /* (the Insert menu's row) */
         set_fullscreen(w, (int)wp);
         return 0;
+    case WM_APP + 11:   /* (the Insert/F1 menu's Screen row) */
+        set_screen(w, (int)wp);
+        return 0;
     case WM_APP + 10:   /* (the VRR row, gpu/vk/vk_main.cpp: wp 1 the fullscreen window as a popup that can flip, 0 as it was) */
         if ((int)(wp != 0) == popup_wanted) return 0;
         popup_wanted = wp != 0;
-        if (fullscreen) {
+        if (fullscreen == 1) {
             fullscreen_style(w);
             hos_log("display: fullscreen window as %s", popup_wanted ? "a popup that can flip (VRR)" : "it was before VRR");
         }

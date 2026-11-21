@@ -83,6 +83,7 @@ static LONG InterlockedExchangeAdd(volatile LONG *target, LONG value) {
 }
 static void mouse_capture(HWND w, int on) { (void)w; (void)on; unexpected(); }
 static void set_fullscreen(HWND w, int on) { (void)w; (void)on; unexpected(); }
+static void set_screen(HWND w, int screen) { (void)w; (void)screen; unexpected(); }
 static volatile LONG popup_wanted;   /* (the VRR row's window style, WM_APP + 10: never sent here) */
 static void fullscreen_style(HWND w) { (void)w; unexpected(); }
 static void hos_log(const char *fmt, ...) { (void)fmt; }
