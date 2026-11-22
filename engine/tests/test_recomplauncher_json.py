@@ -231,7 +231,7 @@ class RecompLauncherJsonTests(unittest.TestCase):
 
     def test_prepare_takes_arguments_make_game_has(self):
         prepare = self.doc["prepare"]
-        self.assertEqual(prepare["version"], "1")   # (a release carries its tag instead: launcher_manifest.py)
+        self.assertEqual(prepare["version"], "1")
         self.assertIn("HeyListenBuilder.exe", prepare["program"])   # (the window-less builder: HeadlessCli.cs)
         self.assertIn("HeyListen.AppImage", prepare["program"])      # (AppRun --cli: the same arguments, make_game.py)
         args = prepare["args"]
@@ -370,21 +370,8 @@ class RecompLauncherJsonTests(unittest.TestCase):
 
     def test_the_appimage_carries_it(self):
         script = (ENGINE / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
-        stamp = 'python3 -I ../tools/release/launcher_manifest.py ../recomplauncher.json "$VERSION" "$APPDIR/recomplauncher.json"'
-        self.assertIn(stamp, script)
+        self.assertIn('cp ../recomplauncher.json "$APPDIR/recomplauncher.json"', script)
         self.assertIn("OUT=$B/HeyListen-$VERSION-Linux-x64.AppImage", script)
-
-    def test_a_release_carries_its_tag_as_prepare_version(self):
-        # (the launcher builds the game again only when prepare.version changes, and each release builds a new game)
-        stamper = load("launcher_manifest_under_test", REPO / "tools" / "release" / "launcher_manifest.py")
-        stamped = json.loads(stamper.for_release(MANIFEST.read_bytes(), "v0.4.4"))
-        self.assertEqual(stamped["prepare"]["version"], "v0.4.4")
-
-    def test_a_release_changes_nothing_else_in_the_file(self):
-        stamper = load("launcher_manifest_under_test", REPO / "tools" / "release" / "launcher_manifest.py")
-        stamped = json.loads(stamper.for_release(MANIFEST.read_bytes(), "v0.4.4"))
-        stamped["prepare"]["version"] = self.doc["prepare"]["version"]
-        self.assertEqual(stamped, self.doc)
 
     def test_the_windows_zip_carries_it_at_the_top(self):
         zipper = load("make_launcher_zip_under_test", REPO / "tools" / "release" / "make_launcher_zip.py")
@@ -417,10 +404,7 @@ class RecompLauncherJsonTests(unittest.TestCase):
                 self.assertEqual(sorted(z.namelist()), sorted([
                     "recomplauncher.json", "HeyListenBuilder.exe", "HeyListenBuilder-Setup.exe", "tools/nx2/make_game.py", "tools/version.txt",
                     "tools/python/python.exe", "tools/llvm-mingw/bin/clang.exe"]))
-                shipped = json.loads(z.read("recomplauncher.json"))
-            self.assertEqual(shipped["prepare"]["version"], "v0.4.1")
-            shipped["prepare"]["version"] = self.doc["prepare"]["version"]
-            self.assertEqual(shipped, self.doc)
+                self.assertEqual(z.read("recomplauncher.json"), MANIFEST.read_bytes())
             self.assertEqual(sorted(names), sorted(zipfile.ZipFile(out).namelist()))
             # (the program the launcher starts, and the one it prepares with, are at the top, where the file says)
             self.assertIn(self.doc["prepare"]["program"][0], names)

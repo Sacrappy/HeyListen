@@ -161,9 +161,8 @@ EOF
 cp builder/linux/AppRun "$APPDIR/AppRun"
 cp builder/linux/heylisten-builder.desktop "$APPDIR/"
 cp assets/heylisten.png "$APPDIR/heylisten.png"
-# (RecompLauncher reads this from inside the AppImage, at /recomplauncher.json: docs/recomplauncher.md; its prepare.version is
-# $VERSION, so the launcher builds the game again for each release: tools/release/launcher_manifest.py)
-python3 -I ../tools/release/launcher_manifest.py ../recomplauncher.json "$VERSION" "$APPDIR/recomplauncher.json"
+# (RecompLauncher reads this from inside the AppImage, at /recomplauncher.json: docs/recomplauncher.md)
+cp ../recomplauncher.json "$APPDIR/recomplauncher.json"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 cp assets/heylisten.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/heylisten.png"
 

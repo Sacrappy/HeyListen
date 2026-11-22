@@ -2,7 +2,7 @@
 
 The zip holds the whole HeyListen Builder, ready to run where it is unpacked: HeyListenBuilder.exe and its .NET files, tools\\
 with its own Python, the compiler (llvm-mingw), emsdk, CPM and the engine's sources, and recomplauncher.json at the top, next
-to the program (its prepare.version the tag: launcher_manifest.py). RecompLauncher unpacks it, asks for the player's copy of the game, and runs the builder without a window
+to the program. RecompLauncher unpacks it, asks for the player's copy of the game, and runs the builder without a window
 (recomplauncher.json "prepare": HeyListenBuilder.exe --cli --prepare ...) to make the game in <install>\\HeyListen. Nothing of
 the game is in it.
 
@@ -80,13 +80,6 @@ def entries(release, lines, fetch):
                 yield name, path, m.filename
 
 
-def manifest_module():
-    spec = importlib.util.spec_from_file_location("launcher_manifest", os.path.join(HERE, "launcher_manifest.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def make_zip(release, tag, out, manifest=None, fetch=None, forbidden=None):
     """The zip at `out`. forbidden: a function of a name, true for one that must not be in a release (make_release.FORBIDDEN)"""
     manifest = manifest or os.path.join(ROOT, MANIFEST)
@@ -98,9 +91,8 @@ def make_zip(release, tag, out, manifest=None, fetch=None, forbidden=None):
         lines = [l.split() for l in f.read().splitlines() if l.startswith("part ")]
     if not lines:
         raise SystemExit("%s names no part" % list_path)
-    # (prepare.version is the tag, so the launcher builds the game again for this release: launcher_manifest.py)
     with open(manifest, "rb") as f:
-        manifest_bytes = manifest_module().for_release(f.read(), tag)
+        manifest_bytes = f.read()
     names = []
     open_zips = {}
     tmp = out + ".new"
