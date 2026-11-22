@@ -74,7 +74,7 @@ def main():
     def bad(message):
         problems.append(message)
 
-    if not re.fullmatch(r"v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?", tag):
+    if not re.fullmatch(r"v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?", tag):
         sys.exit("%s is not a release tag (v0.3.2)" % tag)
     image = os.path.join(dist, "HeyListen-%s-Linux-x64.AppImage" % tag)
     parts_dir = os.path.join(dist, "parts")
