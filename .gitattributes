@@ -1,2 +1,5 @@
 # (TICK-045) the play profile: byte for byte as built and installed (dev-build.ps1 compares hashes)
 profile/** -text
+
+# the RecompLauncher manifest goes into the Windows zip and the AppImage as is: the same bytes whatever checks it out (tools/release/collect_release.py)
+recomplauncher.json text eol=lf
