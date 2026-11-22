@@ -78,6 +78,9 @@ def prompt_pins():
     return [tuple(l.split("==")) for l in lines if l]
 
 
+CACHE = os.path.join(ROOT, "build", "release", "cache")   # (main() sets it to <out>/cache, where release_parts.py caches the parts)
+
+
 def python_part_dist_infos(list_path):
     """The dist-info folder names inside the parts list's Python part, read from the parts cache (release_parts.py downloads it
     there). Empty when the list names no Python part or the file is not cached."""
@@ -87,7 +90,7 @@ def python_part_dist_infos(list_path):
     with open(list_path, encoding="utf-8") as f:
         urls = [l.split()[-1] for l in f.read().splitlines() if l.startswith("part ") and "-python-" in l]
     for url in urls:
-        cached = os.path.join(ROOT, "build", "release", "cache", "release-parts", url.rsplit("/", 1)[-1])
+        cached = os.path.join(CACHE, "release-parts", url.rsplit("/", 1)[-1])
         if os.path.isfile(cached):
             with zipfile.ZipFile(cached) as z:
                 return {m.split("/")[-2].lower() for m in z.namelist() if m.count("/") >= 1 and m.split("/")[-2].endswith(".dist-info")}
@@ -181,6 +184,8 @@ def main():
     work = os.path.join(out, "work-" + tag)
     dist = os.path.join(out, tag)
     cache = os.path.join(out, "cache")
+    global CACHE
+    CACHE = cache
     for d in (work, dist):
         if os.path.exists(d):
             shutil.rmtree(d)

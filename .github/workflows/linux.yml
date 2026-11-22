@@ -55,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || inputs.ref || '' }}
+          ref: ${{ inputs.ref || github.event.release.tag_name || inputs.tag || '' }}
           persist-credentials: false
       # (the versions scripts/linux/deps.sh builds the Vulkan back end with)
       - name: Check out pinned SPIR-V headers
@@ -129,7 +129,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || inputs.ref || '' }}
+          ref: ${{ inputs.ref || github.event.release.tag_name || inputs.tag || '' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -196,7 +196,8 @@ jobs:
   # go to the tag's release, which has to exist: the Windows files and the notes are put there by hand.
   release:
     name: Release files
-    if: ${{ startsWith(github.event.release.tag_name || inputs.tag, 'v') }}
+    # (not when called by release.yml, whose own job makes the draft; a called workflow sees the caller's inputs too)
+    if: ${{ !inputs.version && startsWith(github.event.release.tag_name || inputs.tag, 'v') }}
     needs: [tests, appimage]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
