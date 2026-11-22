@@ -4972,7 +4972,10 @@ bool import_in_background(uint64_t guest, uint64_t size) {
 } // namespace
 uint64_t test_vram_bytes(uint64_t heap) {
     static const uint64_t cap = getenv("RX_VK_TEST_VRAM_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_TEST_VRAM_MB"))) << 20 : 0;
-    return cap && heap > cap ? cap : heap;
+    // (HeyListen: RX_VK_VRAM_BUDGET_MB=<n>, vk_vma.cpp: a card whose driver allows n MB holds a fifth more)
+    const uint64_t budget = forced_budget_bytes() ? forced_budget_bytes() + forced_budget_bytes() / 5 : 0;
+    const uint64_t c = cap && budget ? std::min(cap, budget) : cap ? cap : budget;
+    return c && heap > c ? c : heap;
 }
 uint64_t device_vram_bytes() {
     uint64_t vram = 0;

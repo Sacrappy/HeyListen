@@ -412,7 +412,41 @@ uint64_t big_image_bytes() {   // (TICK-023: RX_VK_BIG_IMAGE_MB, 16 by default; 
     return big;
 }
 std::atomic<int> vram_alloc_failures{0};   // (TICK-023: images VRAM refused, read by the texture budget)
+// (HeyListen, 2026-11-22, a measurement) RX_VK_VRAM_BUDGET_MB=<n>: this card has n MB of video memory the driver lets the process
+// use, as a small card does (a 4 GB RX 580 is allowed 3.4 GB at the start and 2.9 later, issue 124). The reported allowance is n
+// (vram_usage), the card's size n + n/5 where the renderer sizes by it (test_vram_bytes), and an image made while the process's
+// device-local use is at n or more is refused as a full card refuses it: counted in vram_alloc_failures (the budget answers it and
+// the VRAM breakdown prints it) and made in system memory, as below. Unset: nothing changes
+uint64_t forced_budget_bytes() {
+    static const uint64_t v = getenv("RX_VK_VRAM_BUDGET_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_VRAM_BUDGET_MB"))) << 20 : 0;
+    return v;
+}
+static bool forced_budget_full() {
+    const uint64_t cap = forced_budget_bytes();
+    if (!cap) return false;
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    uint64_t used = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) used += b[h].usage;
+    return used >= cap;
+}
+static bool create_image_refused(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation) {
+    // (TICK-023) noted for the texture budget: the next check (texture_end_frame, every 10 presents) evicts the least recently
+    // used before the next image is refused too, instead of waiting for the driver's count
+    vram_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+    // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
+    // to system memory instead, slow but drawn
+    if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
+    VmaAllocationCreateInfo sai{};
+    sai.usage = VMA_MEMORY_USAGE_AUTO;
+    if (vmaCreateImage(vma, &ci, &sai, &image, &allocation, nullptr) != VK_SUCCESS) return false;
+    static std::atomic<int> told{0};
+    if (told++ < 4) logf("vk: VRAM full: a %ux%u image (format %d) in system memory", ci.extent.width, ci.extent.height, (int)ci.format);
+    return true;
+}
 static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target) {
+    if (forced_budget_full()) return create_image_refused(ci, image, allocation);   // (RX_VK_VRAM_BUDGET_MB, above)
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
@@ -474,18 +508,7 @@ static bool create_image_(const VkImageCreateInfo& ci, VkImage& image, VmaAlloca
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     if (reap_drain() && vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;   // (RX_VK_REAP: what was queued is freed now)
-    // (TICK-023) noted for the texture budget: the next check (texture_end_frame, every 10 presents) evicts the least recently
-    // used before the next image is refused too, instead of waiting for the driver's count
-    vram_alloc_failures.fetch_add(1, std::memory_order_relaxed);
-    // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
-    // to system memory instead, slow but drawn
-    if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
-    VmaAllocationCreateInfo sai{};
-    sai.usage = VMA_MEMORY_USAGE_AUTO;
-    if (vmaCreateImage(vma, &ci, &sai, &image, &allocation, nullptr) != VK_SUCCESS) return false;
-    static std::atomic<int> told{0};
-    if (told++ < 4) logf("vk: VRAM full: a %ux%u image (format %d) in system memory", ci.extent.width, ci.extent.height, (int)ci.format);
-    return true;
+    return create_image_refused(ci, image, allocation);
 }
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target) {
     if (!create_image_(ci, image, allocation, dedicated, target)) return false;
@@ -772,6 +795,7 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     // keep-rendered paths an 8 GB card takes when its VRAM fills (the rainbow textures of issue 993 were never seen here otherwise))
     static const uint64_t test_allowed = getenv("RX_VK_TEST_ALLOWED_MB") ? (uint64_t)atoi(getenv("RX_VK_TEST_ALLOWED_MB")) << 20 : 0;
     if (test_allowed && t > test_allowed) t = test_allowed;
+    if (forced_budget_bytes() && t > forced_budget_bytes()) t = forced_budget_bytes();   // (RX_VK_VRAM_BUDGET_MB, above)
     // (longshot #1091) an allowance the driver gives as the count itself is past: AMD's Windows driver, once a process is over what it
     // allows, reports the allowance as what the process uses, so every rule saw the count within it while the driver paged (frames of
     // 1-15 s on 8 GB cards). vram_allowance::past_allowance makes it a tenth under the count: the rules give back until the driver

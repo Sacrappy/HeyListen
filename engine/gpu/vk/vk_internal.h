@@ -669,6 +669,8 @@ VkDeviceMemory image_block_of(VmaAllocation allocation);
 void image_blocks_now(std::unordered_map<VkDeviceMemory, uint32_t>& images, uint64_t* block_bytes, uint64_t* alloc_bytes);
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
 uint64_t allocation_size(VmaAllocation allocation);
+/// (RX_VK_VRAM_BUDGET_MB, vk_vma.cpp) the video memory the driver lets the process use, as a measurement forces it on a big card; 0 when not set
+uint64_t forced_budget_bytes();
 /// (TICK-023/030) the size from which an image gets memory of its own (RX_VK_BIG_IMAGE_MB, 16 MB; 0: none)
 uint64_t big_image_bytes();
 /// (dedicated: its own memory object, not a share of a 64 MB block: for the 16 to 32 MB ones that fit two to a block and leave
