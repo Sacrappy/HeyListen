@@ -45,7 +45,7 @@ jobs:
           IN_TAG: ${{ inputs.tag }}
         run: |
           if [ "$EVENT" = push ]; then tag=$REF_NAME draft=true; else tag=$IN_TAG draft=false; fi
-          re='^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$'
+          re='^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?$'
           if ! [[ $tag =~ $re ]]; then
             echo "::error::'$tag' is not a release version (v0.4.0, v0.4.1-rc.1)"; exit 1
           fi
