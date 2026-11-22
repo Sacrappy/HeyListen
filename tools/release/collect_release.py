@@ -9,7 +9,7 @@ USER_GUIDE.md, HeyListen-<tag>-Windows-x64.zip, parts/). <linux dir>: the AppIma
 parts/ (heylisten-linux.txt, HeyListenLinux-*.zip), already accepted by tools/release/make_release_linux.sh. Writes:
 
     <out>/assets/          the tag's release: HeyListenBuilder.exe, heylisten-setup.txt, USER_GUIDE.md, HeyListen-<tag>-Windows-x64.zip,
-                           HeyListen-<tag>-x86_64.AppImage, heylisten-linux.txt, SHA256SUMS.txt
+                           HeyListen-<tag>-Linux-x64.AppImage, heylisten-linux.txt, SHA256SUMS.txt
     <out>/RELEASE_NOTES.md the release's body
     <out>/builder-parts/   the new Windows parts (the builder-parts release; a name already there is the same file)
     <out>/linux-parts/     the new Linux parts (the linux-parts release)
@@ -38,7 +38,7 @@ def main():
         sys.exit(__doc__)
     tag, win, lin, out = sys.argv[1], *(os.path.abspath(x) for x in sys.argv[2:])
     problems = []
-    image = "HeyListen-%s-x86_64.AppImage" % tag
+    image = "HeyListen-%s-Linux-x64.AppImage" % tag
     launcher = make_release.load_launcher_zip().asset_name(tag)
     need = [os.path.join(win, n) for n in WINDOWS + (launcher,)] + [os.path.join(lin, image), os.path.join(lin, "parts", "heylisten-linux.txt")]
     problems += ["missing: %s" % p for p in need if not os.path.isfile(p)]
