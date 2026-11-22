@@ -241,6 +241,12 @@ bool probe_serial();
 void probe_dump_all(const char* why);
 void probe_log(uint64_t frame);
 void memory_end_submission(VkCommandBuffer cmd);
+/// (RX_VK_WB_PIECE) Per-piece write-back tracking and emission: 0 off, 1 on (default), 2 also flushes a recording right
+/// after a segmented command buffer when it queued write-backs
+int wb_piece_mode();
+inline bool wb_piece_on() { return wb_piece_mode() > 0; }
+bool memory_has_writebacks();
+void memory_flush_writebacks(VkCommandBuffer cmd);
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
@@ -404,6 +410,9 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
+/// (RX_VK_WB_PIECE) the highest rec_timeline sequence number among pages in [guest, guest + size) whose write-back submission
+/// value is above `done` (0: none pending, or any pending page has no piece sequence recorded)
+uint64_t memory_writeback_rec(uint64_t guest, uint64_t size, uint64_t done);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 bool memory_rb_refresh(VkCommandBuffer up);
 void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its thread: the submission it joins (memory_rb_refresh)
@@ -453,6 +462,11 @@ uint64_t memory_late_fix_pending();
 void memory_late_fix_apply(uint64_t done);
 void memory_late_fix_wait_range(uint64_t guest, uint64_t n);   // (TICK-060m: before a CPU upload reads guest memory: a pending late page's value)
 uint64_t vk_timeline_signal_sent();
+/// (RX_VK_WB_PIECE) the next rec_timeline sequence number submit_recording will assign (replay_mu held), the highest
+/// rec_timeline value reached on the GPU, and the highest rec_timeline value sent to vkQueueSubmit2
+uint64_t vk_next_rec_seq();
+uint64_t vk_rec_timeline_completed();
+uint64_t vk_rec_signal_sent();
 void vk_timeline_wait_sent(uint64_t v);   // (TICK-060: a wait for a value already sent: no flush, safe under any lock)
 bool late_fix_wait_unlocked();   // (TICK-060, vk_replay.cpp: a pending late fix's value waited for before the queue's lock; false: a poll)
 void late_fix_wake(uint64_t v);
