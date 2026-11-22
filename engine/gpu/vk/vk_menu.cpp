@@ -718,6 +718,11 @@ const char* tx_robust(int v) {
     static const char* t[] = {"Auto", "Off", "On"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
+const char* tx_tex_res(int v) { return v ? "Low" : "High"; }
+MENU_HINTS(hn_tex_res, 0,
+           "Every level of the game's textures: the sharpest picture, and the most video memory.",
+           "The largest textures lose their top level, a quarter of their size: about 30-40% less video memory in Hyrule Field and "
+           "the Market, for cards of 6 GB and less that run out of it (missing icons and text, noise). Rendered images are not touched.")
 const char* tx_preset(int v) {
     static const char* t[] = {"Custom", "Lowest (integrated GPU)", "Minimum (4GB)", "Low (6GB)", "Balanced (8GB)", "High (12GB)", "Ultra (16GB+)"};
     return t[std::min(std::max(v, 0), 6)];
@@ -1090,6 +1095,9 @@ Row rows[] = {
     {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
      "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Applies after a "
      "restart.", hn_robust, true},
+    {TAB_GRAPHICS, "Texture resolution", &opts.tex_low, 0, 1, 1, tx_tex_res,
+     "How sharp the game's large textures are. Low keeps cards with little video memory inside it. Applies after a restart.",
+     hn_tex_res, true, true},
 
     // Gameplay
     {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,
@@ -2754,6 +2762,18 @@ static void lowend_probe_frame() {
                  fps, lowend_probe.window_s, lowend_probe.threshold);
     }
 }
+static bool options_file_found;   // (hookshot_options.ini existed when the menu started: menu_first_run_textures)
+void menu_first_run_textures() {
+    static const bool on = getenv("RX_VK_TEX_LOW_FIRST_RUN") && atoi(getenv("RX_VK_TEX_LOW_FIRST_RUN")) != 0;
+    if (!on || options_file_found || getenv("RX_VK_TEX_LOW")) return;
+    options_file_found = true;
+    const uint64_t vram = device_vram_bytes();
+    if (!vram || vram > (6ull << 30) + (512ull << 20)) return;
+    opts.tex_low = 1;
+    save();
+    logf("vk: Texture resolution: first run on a card of %llu MB, started at Low (saved to the options file; the player's choice from now on)",
+         (unsigned long long)(vram >> 20));
+}
 static bool dlss_model_saved;   // (hookshot_options.ini has a dlss_model line)
 void menu_first_run_model(uint32_t vendor_id, uint32_t device_id) {
     if (dlss_model_saved || vendor_id != 0x10de) return;   // (only NVIDIA GPUs run DLSS; a saved value is never changed)
@@ -2777,7 +2797,7 @@ void menu_init() {
         protect_hearts.store(hearts && !strcmp(hearts, "1"));
     }
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
-        has_options = true;
+        has_options = options_file_found = true;
         char line[80];
         bool has_resolution = false;
         bool v2 = false;
@@ -2870,6 +2890,9 @@ void menu_init() {
         if (opts.hdr == 3) opts.hdr = 2, opts.hdr_tonemap = 1;
     }
     if (const char* e = getenv("RX_VK_DLSS_PRE_BLOOM"); e && *e) opts.dlss_pre_bloom = atoi(e) != 0;   // (after Longshot 83b161e3)
+    if (const char* e = getenv("RX_VK_TEX_LOW"); e && *e) opts.tex_low = atoi(e) != 0;   // (HeyListen: for one run, tex_low.h)
+    if (const char* e = getenv("RX_VK_RENDER_RES"); e && *e)   // (HeyListen, a measurement: the Render resolution's value for one run, upscaler_rows.h kPercent)
+        opts.resolution = std::min(std::max(atoi(e), 0), ur::kValues - 1);
     if (const char* e = getenv("RX_VK_UPSCALE"))
         for (Row& r : rows)
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);

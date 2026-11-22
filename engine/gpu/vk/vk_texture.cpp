@@ -64,6 +64,7 @@
 #include "msync_diff.h"   // (TICK-051: the BC cache's content hash)
 #include "astc_bc_policy.h"
 #include "astc_cpu_policy.h"
+#include "tex_low.h"   // (HeyListen: the Texture resolution option's Low)
 #include "drawn_writeback.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
@@ -243,6 +244,21 @@ void reclaim_note_upload(const Texture& tex) {   // (a texture's first upload)
     if (frame_no - it->second < 3600) st_reclaim_remade_soon++;
     reclaimed_at.erase(it);
 }
+
+// ---- (HeyListen, 2026-11-22) the Texture resolution option: Low leaves out the top level of large decoded ASTC textures ----
+// A 4 GB card (an RX 580, issue 124) held 1.4-1.5 GB of decoded ASTC beside 650 MB of render targets and went over what the driver
+// allows. Each top level left out is a quarter of the texture (tex_low.h). Applies from the start (a Graphics row that takes a
+// restart; RX_VK_TEX_LOW=1 or 0 for one run), to the textures made after it; RX_VK_TEX_LOW_DIM=<texels> moves the size from which a
+// texture is large (1024)
+bool texture_low_on() {
+    static const bool on = opts.tex_low != 0;
+    return on;
+}
+uint32_t texture_low_min_dim() {
+    static const uint32_t dim = getenv("RX_VK_TEX_LOW_DIM") ? (uint32_t)std::max(0, atoi(getenv("RX_VK_TEX_LOW_DIM"))) : tex_low::kDefaultMinDim;
+    return dim;
+}
+std::atomic<uint64_t> st_low_textures{0}, st_low_saved{0};   // (textures that lost levels, the bytes their kept format would have taken)
 
 struct Dead {
     uint64_t value;
@@ -3144,6 +3160,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     const uint32_t max_dim = std::max({x.width, x.height, x.depth});
     const uint32_t max_levels = 1 + (uint32_t)std::floor(std::log2((double)max_dim));
     x.levels = nvn_tex_is_linear(&d) ? 1 : std::clamp<uint32_t>(d.levels, 1, max_levels);
+    uint64_t low_px = 0;   // (the texels the Texture resolution option's Low left out, all layers: the bytes it saves)
     {   // huge textures leave out their top levels: wider than RX_VK_TEX_MAX_DIM (default 2048) once they would take
         // 64 MB, and down to RX_VK_TEX_MAX_MB (default 512) whatever their size (MKW's terrain material arrays are
         // 8192 x 8192 x 68 ASTC: 24 GB as RGBA8)
@@ -3184,6 +3201,19 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             x.width = std::max(1u, x.width >> x.skip), x.height = std::max(1u, x.height >> x.skip);
             x.depth = std::max(1u, x.depth >> x.skip);
             x.levels -= x.skip;
+        }
+        // (HeyListen, the Texture resolution option: Low leaves out the top level of a large decoded ASTC texture that has a mip
+        // chain (two from 4096 texels), tex_low.h. The upload, the views and the copies already follow `skip` as they do for the
+        // huge ones above; what the GPU renders into, and any texture that is not ASTC, keeps every level)
+        if (astc && !x.sparse && x.type == VK_IMAGE_TYPE_2D && d.samples <= 1 && texture_low_on()) {
+            const uint32_t n = tex_low::levels_dropped(x.width, x.height, x.levels, 0, texture_low_min_dim());
+            for (uint32_t l = 0; l < n; l++)
+                low_px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * x.layers;
+            if (n) {
+                x.low_skip = n, x.skip += n;
+                x.width = std::max(1u, x.width >> n), x.height = std::max(1u, x.height >> n);
+                x.levels -= n;
+            }
         }
     }
     if (!texture_size_ok(x.type, x.width, x.height, x.depth, x.layers, d.samples)) {
@@ -3240,7 +3270,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             return false;
         }();
         static const bool rgba8_instead = getenv("RX_VK_UNEVEN_RGBA8") != nullptr;
-        const bool bc_candidate = astc && !(x.skip && x.layers == 1) && x.type == VK_IMAGE_TYPE_2D &&
+        const bool bc_candidate = astc && !(x.skip > x.low_skip && x.layers == 1) && x.type == VK_IMAGE_TYPE_2D &&
                                   x.samples == VK_SAMPLE_COUNT_1_BIT && x.width <= kBcDim && x.height <= kBcDim &&
                                   px * x.layers * 4 >= min_bytes;
         if (bc_candidate && uneven && amd_fix) {
@@ -3449,6 +3479,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
     if (half_byte_bc(x.format)) x.bytes /= 2;   // (TICK-031: BC1 and BC4, 8 bytes a block)
+    if (x.low_skip) {   // (Texture resolution Low: what the levels left out would have taken in this format)
+        const uint64_t saved = low_px * texel / (half_byte_bc(x.format) ? 2 : 1);
+        st_low_textures++, st_low_saved += saved;
+    }
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
     // MB held, and a budget of 4035 MB took 4300. RX_VK_COUNT_BY_ESTIMATE=1: the texels)
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
@@ -6850,6 +6884,29 @@ void texture_frame(uint64_t completed) {
              "used in the last 8 presents %llu MB", (unsigned long long)(astc_b >> 20), (unsigned long long)(rt_b >> 20),
              baked_n, (unsigned long long)(baked_b >> 10), (unsigned long long)(other_b >> 20),
              (unsigned long long)(recent_b >> 20));
+        {   // (HeyListen, issue 124) the largest rendered images, and whether they follow the Render resolution: the same list at 100%
+            // and at 50% says which do (RX_VK_RENDER_RES=1 and 4 for a run). Sizes are the images' own, after any pool padding
+            std::vector<const Texture*> rts;
+            uint64_t rt_total = 0, rt_listed = 0;
+            for (auto& kv : textures)
+                if (kv.second->gpu_written) rts.push_back(kv.second.get()), rt_total += kv.second->bytes + kv.second->pad;
+            std::sort(rts.begin(), rts.end(), [](const Texture* a, const Texture* b) { return a->bytes > b->bytes; });
+            std::string row;
+            for (size_t i = 0; i < rts.size() && i < 16; i++) {
+                const Texture* t = rts[i];
+                char r[128];
+                snprintf(r, sizeof r, " %ux%ux%u%s vk %d %llu MB%s;", t->width, t->height, t->layers > 1 ? t->layers : t->depth,
+                         t->levels > 1 ? "+mips" : "", (int)t->format, (unsigned long long)((t->bytes + t->pad) >> 20),
+                         frame_no - t->last_frame >= 8 ? " idle" : "");
+                row += r, rt_listed += t->bytes + t->pad;
+            }
+            logf("vk: render targets (Render resolution %s, drawn at %d of 10000 twelfths of the output): %zu images, %llu MB; the largest "
+                 "%llu MB:%s", resolution_auto() ? "Auto" : "fixed", resolution_scale(), rts.size(),
+                 (unsigned long long)(rt_total >> 20), (unsigned long long)(rt_listed >> 20), row.c_str());
+            if (st_low_textures.load())
+                logf("vk: Texture resolution Low: %llu textures lost their top level(s), %llu MB less than kept whole",
+                     (unsigned long long)st_low_textures.load(), (unsigned long long)(st_low_saved.load() >> 20));
+        }
         for (size_t i = 0; i < big.size() && i < 8; i++)
             logf("vk:   %llu MB: %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, last used %llu presents ago",
                  (unsigned long long)(big[i]->bytes >> 20), (unsigned long long)big[i]->gpu, big[i]->width, big[i]->height,

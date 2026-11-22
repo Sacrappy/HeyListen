@@ -31,7 +31,8 @@ struct Texture {
     VkImageUsageFlags usage = 0;
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
     uint32_t shrink = 0;      // (RX_VK_SHADOW_SHIFT) a huge depth-only shadow map made 2^shrink times smaller than the guest's: its draws' viewport and scissor shrink with it, nothing is uploaded into it
-    uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB)
+    uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB; the Texture resolution Low)
+    uint32_t low_skip = 0;    // (of skip, the levels the Texture resolution option's Low left out: tex_low.h)
     // (a huge array kept whole as a sparse resident image instead: each layer gets device memory when it is first
     // written, so only what the game streams in costs VRAM. MKW's terrain arrays, 8192 x 8192 x 68 BC6H: 5.8 GB
     // each, written by the GPU's copies into level 0, which a texture with its top level left out lost)

@@ -78,6 +78,7 @@ struct Options {
     int gyro_inv_y = 0;   // the motion aim's vertical turned around
     int gyro_deadzone = 1;   // the motion's deadzone: 0 tight, 1 standard (the console's default), 2 loose
     int prompts = 0;      // the button icons: 0 Auto (the controller), 1 Switch, 2 Xbox, 3 PS4, 4 PS5, 5 Steam Deck, 6 Keyboard (host/prompts.c)
+    int tex_low = 0;      // (HeyListen) Texture resolution: 0 High (every level of the game's textures), 1 Low (large ones lose their top level, 4x smaller; vk_texture.cpp, tex_low.h). Read once, at the start; saved as texture_resolution; RX_VK_TEX_LOW over it
     int robust = 0;       // bounds-checked buffer access: 0 Auto (on), 1 Off, 2 On (gpu/vk/vk_main.cpp; RX_VK_ROBUST)
     int descriptor_reuse = 0;  // a draw keeps its descriptors through other slots' registrations (gpu/vk/vk_draw.cpp; RX_VK_DESC_SLOTGEN)
     int sampler_cache = 0;     // sampler ids answer their parameters without the registrations' lock (gpu/vk/vk_draw.cpp; RX_VK_SAMPLER_CACHE)
@@ -109,6 +110,9 @@ uint64_t device_vram_bytes();
 /// A first run (no dlss_model in hookshot_options.ini): the DLSS model row starts at the GPU's default (upscaler_rows.h
 /// default_model) and is written to the ini at once. NVIDIA GPUs only; a saved value is never changed
 void menu_first_run_model(uint32_t vendor_id, uint32_t device_id);
+/// (HeyListen, a proposal: RX_VK_TEX_LOW_FIRST_RUN=1, off by default) A first run, with no options file at all: the Texture resolution row starts on
+/// Low when the card's video memory is 6 GB or less (device_vram_bytes), saved to the file at once; a saved file's choice is never changed
+void menu_first_run_textures();
 /// (a test: RX_VK_TEST_VRAM_MB=<n> takes the card's VRAM as at most n MB wherever the renderer sizes something by it: the
 /// mirrors' budget, the DLSS model row's small-card preset. With RX_VK_TEST_ALLOWED_MB a large card plays a small one's whole
 /// policy. Unset: the card's own)

@@ -279,6 +279,7 @@ ARGS = {
     "tests/test_astc_bc_policy.py": ["--cxx", "g++"],
     "tests/test_pseudo_fold_semantics.py": ["--cxx", "{cxx}"],
     "tests/test_dce_convergent_ops.py": ["--cxx", "{cxx}"],
+    "tests/test_tex_low.py": ["--cxx", "{cxx}"],
     "tests/test_drawn_page_map.py": ["--cxx", "{cxx}"],
     "tests/test_evict_reason.py": ["--cxx", "{cxx}"],
     "tests/test_tl_time_domain.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
