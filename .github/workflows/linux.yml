@@ -3,17 +3,18 @@
 # appimage.sh expect: its glibc is the oldest the game supports). GitHub runs only the repository root's workflows, so engine/.github/workflows (Hookshot's) never ran here
 # and nothing told when the Linux build broke. No game data is involved.
 #
-# The Linux files of a release come from here and from nowhere else (tools/release/make_release_linux.sh): publishing a
-# release on GitHub (the Windows files are attached by hand, as tools/release/make_release.py prints) starts this workflow
-# on that tag; it builds the AppImage, checks it and the update parts, puts the parts on the linux-parts release and
-# attaches the AppImage and heylisten-linux.txt to the tag's release. A pushed tag, a branch or a pull request builds and
-# checks the same and publishes nothing. Run by hand with a tag to attach the files of a release again.
+# The Linux files of a release come from here and from nowhere else (tools/release/make_release_linux.sh). A pushed v* tag
+# starts .github/workflows/release.yml, which calls this workflow (workflow_call: the checks and the AppImage, nothing
+# published) and puts the Linux files on the tag's draft release beside the Windows ones. A release made by hand without
+# them (the Windows files attached as tools/release/make_release.py prints) still gets them here when it is published:
+# this workflow builds the AppImage, checks it and the update parts, puts the parts on the linux-parts release and
+# attaches the AppImage and heylisten-linux.txt to the tag's release (not when release.yml has attached them already). A
+# branch or a pull request builds and checks the same and publishes nothing. Run by hand with a tag to attach the files of
+# a release again.
 name: Linux
 on:
   push:
     branches: [main, 'release/**']
-    # (v*: not linux-parts or builder-parts, the parts' own releases, whose tags publishing creates)
-    tags: ['v*']
   pull_request:
   release:
     types: [published]
@@ -23,10 +24,21 @@ on:
         description: 'A release tag (v0.3.2) whose Linux files are built and attached to its release; empty: only build and check'
         required: false
         default: ''
+  # (.github/workflows/release.yml: built as a release, from ref, named version; nothing published, no release job)
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The commit, branch or tag to build'
+        type: string
+        required: true
+      version:
+        description: 'The version the AppImage carries (v0.4.0)'
+        type: string
+        required: true
 permissions:
   contents: read
 concurrency:
-  group: linux-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  group: linux-${{ inputs.version && format('call-{0}', inputs.version) || github.event.release.tag_name || inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 defaults:
   run:
@@ -35,14 +47,15 @@ defaults:
 jobs:
   tests:
     name: Game-free checks
-    # (not for the parts' own releases, builder-parts and linux-parts, whose publishing is also a release event)
-    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
+    # (not for the parts' own releases, builder-parts and linux-parts, whose publishing is also a release event, nor for a
+    # release that .github/workflows/release.yml made with its Linux files)
+    if: ${{ github.event_name != 'release' || (startsWith(github.event.release.tag_name, 'v') && !contains(github.event.release.assets.*.name, 'heylisten-linux.txt')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || '' }}
+          ref: ${{ github.event.release.tag_name || inputs.tag || inputs.ref || '' }}
           persist-credentials: false
       # (the versions scripts/linux/deps.sh builds the Vulkan back end with)
       - name: Check out pinned SPIR-V headers
@@ -84,8 +97,9 @@ jobs:
 
   appimage:
     name: AppImage
-    # (not for the parts' own releases, builder-parts and linux-parts, whose publishing is also a release event)
-    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
+    # (not for the parts' own releases, builder-parts and linux-parts, whose publishing is also a release event, nor for a
+    # release that .github/workflows/release.yml made with its Linux files)
+    if: ${{ github.event_name != 'release' || (startsWith(github.event.release.tag_name, 'v') && !contains(github.event.release.assets.*.name, 'heylisten-linux.txt')) }}
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     timeout-minutes: 90
@@ -115,7 +129,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || '' }}
+          ref: ${{ github.event.release.tag_name || inputs.tag || inputs.ref || '' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -125,12 +139,12 @@ jobs:
 
       # (a release builds what the AppImage carries from the checked downloads: no built dependencies from a cache, which other
       # runs write. Other runs take the built ones)
-      - if: ${{ !(github.event.release.tag_name || inputs.tag || startsWith(github.ref, 'refs/tags/')) }}
+      - if: ${{ !(github.event.release.tag_name || inputs.tag || inputs.version || startsWith(github.ref, 'refs/tags/')) }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: engine/build-linux/deps
           key: linux-deps-${{ hashFiles('engine/scripts/linux/deps.sh', 'engine/nx2/prompt_requirements.txt') }}
-      - if: ${{ github.event.release.tag_name || inputs.tag || startsWith(github.ref, 'refs/tags/') }}
+      - if: ${{ github.event.release.tag_name || inputs.tag || inputs.version || startsWith(github.ref, 'refs/tags/') }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: engine/build-linux/deps/downloads
@@ -151,7 +165,10 @@ jobs:
           cp ../profile/hookshot_pieces.prof ../profile/hot_funcs.txt ../profile/hot_order.txt ../profile/pipeline_states.bin work/
           ls -l work
 
+      # (called by release.yml: the version it is told, also for a dry run from a branch; otherwise git describe's)
       - name: AppImage
+        env:
+          HOOKSHOT_VERSION: ${{ inputs.version || '' }}
         run: scripts/linux/appimage.sh
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -165,7 +182,7 @@ jobs:
         run: scripts/linux/check_player_build.sh
 
       # (the update parts and their list, for the release job. Not on branches and pull requests: about 240 MB)
-      - if: ${{ github.event.release.tag_name || inputs.tag || startsWith(github.ref, 'refs/tags/') }}
+      - if: ${{ github.event.release.tag_name || inputs.tag || inputs.version || startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: HeyListen-linux-parts

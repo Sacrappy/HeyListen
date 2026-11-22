@@ -1,0 +1,178 @@
+# Copyright (C) 2026 Sacrappy
+
+# A HeyListen release made on GitHub's runners, from the tag and nothing else: the Windows setup, builder, parts and
+# RecompLauncher zip, the Linux AppImage and its parts, and a DRAFT release for the tag holding them with SHA256SUMS.txt.
+# Nothing is published: the maintainer reads the draft and publishes it by hand. No game data is involved anywhere: the
+# builder is built from engine/, the tools come from their official releases (SHA-256 checked) and from earlier HeyListen
+# releases, and every file is checked against make_release.py's FORBIDDEN rules before the draft. docs/release.md says more.
+#
+#   windows  make_release.py: setup, builder, parts, heylisten-setup.txt, notes, guide, RecompLauncher zip (artifact windows-release)
+#   linux    linux.yml, called: the game-free checks and the AppImage with its parts (publishes nothing when called)
+#   release  the checks over both (make_release_linux.sh, collect_release.py), then, for a pushed tag only, the draft release
+#
+# A pushed v* tag makes the draft. Run by hand (Actions, Release, Run workflow, from any branch, with a version that is not a
+# release such as v0.4.5-dry.1): the same checks, the files stay workflow artifacts (release-files), no draft, no tag.
+name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The version the files are named after (v0.4.5-dry.1). Nothing is released: the files are workflow artifacts'
+        type: string
+        required: true
+permissions: {}
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: Version and mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      draft: ${{ steps.meta.outputs.draft }}
+    steps:
+      # (inputs reach the script through the environment, never pasted into it)
+      - id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT" = push ]; then tag=$REF_NAME draft=true; else tag=$IN_TAG draft=false; fi
+          re='^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$'
+          if ! [[ $tag =~ $re ]]; then
+            echo "::error::'$tag' is not a release version (v0.4.0, v0.4.1-rc.1)"; exit 1
+          fi
+          { echo "tag=$tag"; echo "draft=$draft"; } >> "$GITHUB_OUTPUT"
+          echo "::notice::$tag from $GITHUB_REF ($GITHUB_SHA): draft release $draft"
+
+  windows:
+    name: Windows files
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}   # (release_parts.py reads the releases list with it: no anonymous rate limit)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '8.0.x'
+      # (llvm-mingw, the version scripts/make_setup_parts.py names, SHA-256 checked by release_parts.py whether cached or not;
+      # nothing else is cached: the parts are downloaded and checked each time)
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release/cache/llvm
+          key: llvm-mingw-${{ hashFiles('engine/scripts/make_setup_parts.py') }}
+      - name: The release files
+        run: python -I tools/release/make_release.py --tag "$TAG" --out "$RUNNER_TEMP/release"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-release
+          path: ${{ runner.temp }}/release/${{ needs.meta.outputs.tag }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0   # (the zips are compressed already)
+
+  linux:
+    name: Linux
+    needs: meta
+    # (GitHub checks every job of a called workflow against this ceiling, linux.yml's release job, which asks for
+    # contents: write, included; that job does not run when called, and the jobs that run keep linux.yml's contents: read)
+    permissions:
+      contents: write
+    uses: ./.github/workflows/linux.yml
+    with:
+      ref: ${{ github.sha }}
+      version: ${{ needs.meta.outputs.tag }}
+
+  release:
+    name: Checks and draft release
+    needs: [meta, windows, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-release
+          path: dist/windows
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: HeyListen-linux-x86_64
+          path: dist/linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: HeyListen-linux-parts
+          path: dist/linux/parts
+      # (the Linux gate: the list's links, each part, the AppImage's content, version, profile, licences, recomplauncher.json)
+      - name: Linux files
+        run: bash tools/release/make_release_linux.sh "$TAG" dist/linux
+      # (both platforms together: FORBIDDEN again, the Windows list against its parts, the zip's recomplauncher.json,
+      # SHA256SUMS.txt over everything)
+      - name: Release files and SHA256SUMS.txt
+        run: python3 -I tools/release/collect_release.py "$TAG" dist/windows dist/linux dist/release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      # (parts named by their checksum: one already there is the same file and is left. Off unless
+      # vars.RELEASE_UPLOAD_PARTS is 'true': they are public as soon as uploaded; docs/release.md has the commands)
+      - name: New parts to builder-parts and linux-parts
+        if: needs.meta.outputs.draft == 'true' && vars.RELEASE_UPLOAD_PARTS == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          have=$(gh release view builder-parts --json assets --jq '.assets[].name')
+          for f in dist/release/builder-parts/*.zip; do
+            [ -f "$f" ] || continue
+            if grep -qxF "$(basename "$f")" <<<"$have"; then
+              echo "$(basename "$f"): already on builder-parts"
+            else
+              gh release upload builder-parts "$f"
+            fi
+          done
+          engine/scripts/linux/publish_parts.sh "$PWD/dist/release/linux-parts"
+      - name: Draft release
+        if: needs.meta.outputs.draft == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # (an existing release or draft for the tag is never replaced: delete it by hand to make it again)
+          if gh api "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' | grep -qxF "$TAG"; then
+            echo "::error::a release or draft for $TAG exists already: delete it by hand, then run this job again"; exit 1
+          fi
+          url=$(gh release create "$TAG" --draft --verify-tag --title "HeyListen $TAG" \
+            --notes-file dist/release/RELEASE_NOTES.md dist/release/assets/*)
+          echo "Draft release: $url (not published: read it, then publish it by hand)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::draft release $TAG made; nothing published"

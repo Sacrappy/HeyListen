@@ -19,7 +19,9 @@ at this repository's builder-parts release for them (it mirrors the ones first m
 is gone), and at llvm-mingw's official release. No link of the list leads anywhere else: the build fails otherwise.
                                      HeyListen-<tag>-Windows-x64.zip (the whole builder with recomplauncher.json at its top: what
                                      RecompLauncher installs; tools/release/make_launcher_zip.py)
-Nothing is uploaded or tagged here: the maintainer does that (see the printed commands).
+Nothing is uploaded or tagged here: the maintainer does that (see the printed commands). The notes (docs/release/RELEASE_NOTES.md)
+get {TAG} and {SINCE} filled in: the tag, and the previous full release's tag (or --since). On GitHub's runners the same script
+runs in .github/workflows/release.yml, which makes the draft release (docs/release.md).
 """
 import argparse
 import hashlib
@@ -157,6 +159,8 @@ def main():
     p.add_argument("--tag", help="the release's tag, e.g. v0.1.0 (required unless --allow-dirty)")
     p.add_argument("--out", default=os.path.join(ROOT, "build", "release"))
     p.add_argument("--dotnet", help="dotnet.exe to use (default: the one on PATH)")
+    p.add_argument("--since", help="the version the notes say the release is new since (default: the previous full release, "
+                                   "the one heylisten-setup.txt's parts are reused from)")
     p.add_argument("--allow-dirty", action="store_true", help="build with uncommitted changes (a test, not a release)")
     a = p.parse_args()
     if os.name != "nt":
@@ -191,7 +195,8 @@ def main():
     # 1. the previous release's setup list: the Python, emsdk, CPM, wgpu-native and
     #    third_party parts and the play profile come from it
     previous = os.path.join(work, "previous-setup.txt")
-    run(py + [parts_py, "previous", previous, "--repo", REPO, "--skip-tag", tag], env=env)
+    since = out_of(py + [parts_py, "previous", previous, "--repo", REPO, "--skip-tag", tag], env=env).splitlines()[-1]
+    since = a.since or since
 
     # 2. llvm-mingw (official release, SHA-256 checked) and the setup exe
     llvm = out_of(py + [parts_py, "llvm-mingw", os.path.join(cache, "llvm")], env=env).splitlines()[-1]
@@ -245,7 +250,7 @@ def main():
 
     # 6. notes, guide, checksums
     with open(os.path.join(ROOT, "docs", "release", "RELEASE_NOTES.md"), encoding="utf-8") as f:
-        notes = f.read().replace("{TAG}", tag)
+        notes = f.read().replace("{TAG}", tag).replace("{SINCE}", since)
     with open(os.path.join(dist, "RELEASE_NOTES.md"), "w", encoding="utf-8", newline="\n") as f:
         f.write(notes)
     shutil.copyfile(os.path.join(ROOT, "docs", "USER_GUIDE.md"), os.path.join(dist, "USER_GUIDE.md"))

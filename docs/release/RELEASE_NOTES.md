@@ -18,7 +18,7 @@ Also on [RecompLauncher](https://recomplauncher.com), if you use it: HeyListen i
 **Shaders are prepared again once** with this release: the first start takes a few minutes longer, and the first session
 builds the driver's pipelines as you play, so it stutters more than usual. The second start is smooth again.
 
-{TAG}, new since v0.4.2
+{TAG}, new since {SINCE}
 -----
 
 ## New options

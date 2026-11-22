@@ -146,9 +146,7 @@ downloaded and checked, as for the setup). It is about 460 MB. Upload it with th
 workflow names the AppImage `HeyListen-<tag>-Linux-x64.AppImage` and checks that `recomplauncher.json` inside it is the
 repository's (`tools/release/check_release_linux.py`).
 
-On the `ci/release-workflow` branch (the draft release workflow, not on `main` yet), the Windows job needs the same step after the
-parts are made: `python -I tools/release/make_launcher_zip.py <release folder> <tag>` and the zip added to the files that
-`collect_release.py` checks and the draft uploads.
+The release workflow (`.github/workflows/release.yml`, docs/release.md) runs the same script and attaches the zip to the draft; `collect_release.py` checks the zip's `recomplauncher.json` against the repository's.
 
 ## Checking the file with the launcher
 
