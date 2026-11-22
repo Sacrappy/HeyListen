@@ -153,10 +153,14 @@ class RecompLauncherJsonTests(unittest.TestCase):
         self.assertEqual(validate(self.doc, schema, schema), [])
 
     def test_the_game_is_the_one_make_game_supports(self):
-        game = self.doc["game"]
+        # (the player's copy is the first input, `game`: the launcher's one way to ask for files; the old `game` field is gone)
+        self.assertNotIn("game", self.doc)
+        game = self.doc["inputs"][0]
+        self.assertEqual((game["id"], game["role"]), ("game", "game"))
         self.assertEqual(game["check"], {"nup_build_id": make_game.BUILD_ID})
         self.assertIn(make_game.BUILD_ID, game["label"])
-        self.assertEqual(game["kind"], "iso_or_folder")   # (the .nup, or its romfs and exefs: make_game.py --game takes both)
+        # (the .nup, or its romfs and exefs: make_game.py --game takes both)
+        self.assertEqual(game["formats"], [{"type": "file"}, {"type": "folder"}])
 
     def test_start_plays_through_the_builder(self):
         # (like Longshot's: the program that starts the game is the builder's own, so updates are looked for before each launch.
@@ -231,13 +235,15 @@ class RecompLauncherJsonTests(unittest.TestCase):
 
     def test_prepare_takes_arguments_make_game_has(self):
         prepare = self.doc["prepare"]
-        self.assertEqual(prepare["version"], "1")
+        # (every new release builds again by itself, and only an hour without output stops the step: nothing to bump or time out)
+        self.assertNotIn("version", prepare)
+        self.assertNotIn("timeout", prepare)
         self.assertIn("HeyListenBuilder.exe", prepare["program"])   # (the window-less builder: HeadlessCli.cs)
         self.assertIn("HeyListen.AppImage", prepare["program"])      # (AppRun --cli: the same arguments, make_game.py)
         args = prepare["args"]
         self.assertEqual(args[0], "--cli")
         self.assertIn(GAME + "/image.bin", prepare["done"])           # (a folder the builder made counts as prepared)
-        asked = [a.replace("{game}", "X").replace("{install}", "Y") for a in args[1:]]
+        asked = [a.replace("{input:game}", "X").replace("{install}", "Y") for a in args[1:]]
         for option in prepare["options"]:
             asked += option["args"]
         old = sys.argv
@@ -274,7 +280,7 @@ class RecompLauncherJsonTests(unittest.TestCase):
         self.assertIn("Privacy", [g["id"] for g in self.doc["groups"]])
 
     def test_dlss_runtime_is_the_launchers_optional_shared_input(self):
-        (inp,) = self.doc["inputs"]
+        (inp,) = [i for i in self.doc["inputs"] if i["id"] == "dlss"]   # (the other input is the player's copy)
         self.assertEqual((inp["role"], inp["shared"], inp["optional"]), ("runtime", "nvidia.dlss", True))
         self.assertEqual(inp["destination"], "HeyListen/ngx/nvngx_dlss.dll")   # (gpu/vk/vk_dlss.cpp: the game folder's ngx folder)
         src = (ENGINE / "gpu" / "vk" / "vk_dlss.cpp").read_text(encoding="utf-8")

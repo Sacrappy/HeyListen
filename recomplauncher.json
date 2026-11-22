@@ -3,14 +3,19 @@
   "format": 1,
   "name": "HeyListen",
   "repo": "Sacrappy/HeyListen",
-  "game": {
-    "kind": "iso_or_folder",
-    "label": "Your copy of The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, version 131072 (build e0f3ccfa): the .nup file, or the folder that holds its romfs and exefs.",
-    "check": {
-      "nup_build_id": "e0f3ccfa"
-    }
-  },
   "inputs": [
+    {
+      "id": "game",
+      "label": "Your copy of The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, version 131072 (build e0f3ccfa): the .nup file, or the folder that holds its romfs and exefs.",
+      "role": "game",
+      "formats": [
+        { "type": "file" },
+        { "type": "folder" }
+      ],
+      "check": {
+        "nup_build_id": "e0f3ccfa"
+      }
+    },
     {
       "id": "dlss",
       "label": "NVIDIA DLSS runtime",
@@ -39,13 +44,11 @@
       "--cli",
       "--prepare",
       "--game",
-      "{game}",
+      "{input:game}",
       "--out",
       "{install}/HeyListen"
     ],
     "label": "Building the game from your copy (30 to 60 minutes)",
-    "timeout": 14400,
-    "version": "1",
     "done": [
       "{install}/HeyListen/image.bin"
     ],

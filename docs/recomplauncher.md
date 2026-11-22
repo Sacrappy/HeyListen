@@ -34,7 +34,7 @@ in [USER_GUIDE.md](USER_GUIDE.md#install-with-recomplauncher).
       nothing is said and the game starts. **A newer release** than the folder's `hookshot_version.txt` (the same order as the game's
       offer, `host/hos_update_ver.h`): a window asks whether to play the folder's version now, open the download page (the game does
       not start), or keep the version and stop asking (this release only, or for good). It never installs: the launcher unpacked this
-      builder, and the launcher is what installs a newer release (it asks again for the setup when `prepare.version` changes).
+      builder, and the launcher is what installs a newer release (and builds the game again for it, see below).
       Skipped releases and "never ask again" are the files the game's own offer uses (`user\hookshot_update_skip.txt`,
       `update_check=0` in `hookshot_options.ini`), so the two agree, and the in-game Settings row **Check for updates** turns it back on.
     - The game is started with `HOOKSHOT_NO_UPDATE_CHECK=1`: the question was asked here (or turned off), so the game does not ask a
@@ -46,9 +46,10 @@ in [USER_GUIDE.md](USER_GUIDE.md#install-with-recomplauncher).
     3 s at most, then zenity) does it, with the same four answers.
   - The game's own offer is on by default for a game started without the launcher, off when the builder or the launcher started
     it. See `docs/USER_GUIDE.md` (Updates).
-- `prepare`: `--cli --prepare --game {game} --out {install}/HeyListen`. The game folder is inside the install folder, so the
+- `prepare`: `--cli --prepare --game {input:game} --out {install}/HeyListen`. The game folder is inside the install folder, so the
   program paths of `start` are inside the release as the launcher wants. `done` lists `HeyListen/image.bin`, so a folder
-  made by the builder window in the same place counts as prepared. `timeout` is 4 hours.
+  made by the builder window in the same place counts as prepared. There's no time limit: the launcher gives up on the step
+  only after an hour without a line of output.
   - `--prepare` is `--progress-lines` (lines `progress <0..1> <text>`, one per step of the bar; the builder window's `@@` lines
     are not printed), the shaders left to the game's first start (the step must not open a window), the package's `emsdk`,
     `cpm` and `wgpu-native` found beside the tools, the builder's own work folder (`%LOCALAPPDATA%\HeyListenBuilder`, or the
@@ -99,16 +100,16 @@ points at ("where the file comes from doesn't decide it"): then the ticks the fi
 
 | Tick | How |
 |---|---|
-| Easy Setup | `game` (the player's own copy, checked by build ID), `inputs` (NVIDIA's own DLSS runtime), `prepare.options` (the two licenses and the two reports) |
+| Easy Setup | `inputs`: `game` (the player's own copy, checked by build ID) and NVIDIA's own DLSS runtime; `prepare.options` (the two licenses and the two reports) |
 | Settings | `config` and `settings`, the menu's rows in `hookshot_options.ini` |
 | Save backups | `saves`: `HeyListen/user/save`, `~/.local/share/heylisten/save` and the options file |
 | Setup step | `prepare`: the builder's `--cli --prepare`, `done` the built `image.bin` |
 
 The two the file does not claim:
 
-- **Checks your copy**: the page's tick is `game.dumps`, a CRC32 of a whole known copy from Redump, for a "verified" badge. That is
-  a hash of a game file, and we publish none (Switch 2 `.nup` packages are not on Redump either). The launcher checks the
-  player's copy without it: `game.check.nup_build_id`, the one build `make_game.py` supports, read from the player's own
+- **Checks your copy**: the page's tick is `dumps` on the input, a CRC32 of a whole known copy from Redump, for a "verified"
+  badge. That is a hash of a game file, and we publish none (Switch 2 `.nup` packages are not on Redump either). The launcher
+  checks the player's copy without it: the input's `check.nup_build_id`, the one build `make_game.py` supports, read from the player's own
   `exefs/main` with no keys, refuses a wrong build on the setup screen.
 - **Mods**: the launcher's Mods tab needs a Thunderstore community or a GameBanana game read by an `nrm`, `otr` or `hmm` loader.
   Ours is a folder of file mods (`folders.mods`, the action opens it; code mods are the builder's `--code-mods`, and exefs mods
@@ -123,20 +124,16 @@ Add it to `settings` (or leave it out on purpose) with the row's ini key and val
 key is not a row, so a rename in `vk_menu.cpp` cannot leave the file behind. The V-Sync (`vsync`) and VRR (`vrr`) rows are in
 the file, both Off by default.
 
-## When players must build again: `prepare.version`
+## When players build again
 
-Players set up once: a new release never asks them to build again. The launcher asks again only when
-`prepare.version` is different from the one their setup ran with. Change it (any text; it is `"1"` now) in the same commit as a
-change that makes an old game folder wrong for the new release, for example:
+Every release builds again by itself: when the launcher installs a new release (or the player goes back to an older one), it
+runs `prepare` again from the player's copy before the game starts, in its Finish the Update window, or right after the
+update downloads when the player turned on Build Again After Updates for the game. There's nothing to bump: `prepare.version`
+is gone, and the launcher ignores one in an older file. Reinstalling the same release doesn't build again.
 
-- a release the game folder must be rebuilt for (the lifter, the profile, the pipeline cache or `image.bin` changed in a way an
-  old folder cannot take, which the builder window's Update does too),
-- a change of the game folder's layout (where the game, `image.bin` or the options file is),
-- a new `--prepare` default that changes what is built.
-
-Do not change it for a release that only changes the builder window, the docs or the settings rows. The old folder keeps working
-until the player sets up again, and `make_game.py --update` (the builder window's Update) is still the cheaper way for a player
-who also uses the builder. Bump `version`, keep `done`, say so in the release notes.
+So the game a player plays is always the one their installed release builds, and a release never leaves them on an older game
+folder. Keep `done` pointing at the built `image.bin`. `make_game.py --update` (the builder window's Update) is still the cheaper
+way for a player who also uses the builder.
 
 ## Making a release
 
