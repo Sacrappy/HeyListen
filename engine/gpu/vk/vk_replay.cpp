@@ -372,6 +372,9 @@ bool readback_strict_wanted(uint64_t size) {
 // (TICK-060, RX_VK_LATE_DEFER) the highest timeline value a submit sent to the queue signals: a capture's late value at or below it
 // is reached with nothing more submitted, so its wait can move to the queue (vk_memory.cpp take_capture)
 std::atomic<uint64_t> tl_signal_sent{0};
+// (RX_VK_WB_PIECE) the highest rec_timeline sequence number sent to vkQueueSubmit2 (note_rec_sent at both vkQueueSubmit2
+// paths that signal rec_timeline), and the highest value seen completed on rec_timeline.
+std::atomic<uint64_t> rec_signal_sent{0}, rec_done_max{0};
 // (w1, white flashes under load) RX_VK_STRICT_SLOW_MS (default 22, 0: off): while the presents run slower than that (the machine is
 // loaded: other games, a busy CPU), the light meter's ranges wait for their write-back whatever RX_VK_READBACK_STRICT says. The
 // recordings' timeline a read waits for is signalled by the heavy submission's FIRST recording; with the GPU or the replay late
@@ -388,6 +391,10 @@ bool readback_strict_slow(uint64_t size) {
 void note_signal_sent(uint64_t v) {
     uint64_t cur = tl_signal_sent.load(std::memory_order_relaxed);
     while (v > cur && !tl_signal_sent.compare_exchange_weak(cur, v, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+void note_rec_sent(uint64_t s) {
+    uint64_t cur = rec_signal_sent.load(std::memory_order_relaxed);
+    while (s > cur && !rec_signal_sent.compare_exchange_weak(cur, s, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 int64_t st_lf_thread, st_lf_blocked, st_lf_held_cbs;   // (dev.present_mu: fixes applied by the fix thread, by a flush that waited)
 double st_lf_blocked_ms;
@@ -416,6 +423,17 @@ void late_fix_flush_locked() {
 } // namespace
 void vk_tl_note(const char* what, uint64_t a, uint64_t b) { tl_ev(what, a, b); }
 uint64_t vk_timeline_signal_sent() { return tl_signal_sent.load(std::memory_order_acquire); }
+uint64_t vk_next_rec_seq() { return rec_timeline ? rec_seq + 1 : 0; }
+uint64_t vk_rec_signal_sent() { return rec_signal_sent.load(std::memory_order_acquire); }
+uint64_t vk_rec_timeline_completed() {
+    if (!rec_timeline) return 0;
+    uint64_t v = 0;
+    if (vkGetSemaphoreCounterValue(dev.device, rec_timeline, &v) != VK_SUCCESS)
+        return rec_done_max.load(std::memory_order_acquire);
+    uint64_t prev = rec_done_max.load(std::memory_order_relaxed);
+    while (v > prev && !rec_done_max.compare_exchange_weak(prev, v, std::memory_order_release, std::memory_order_relaxed)) {}
+    return std::max(v, prev);
+}
 void vk_timeline_wait_sent(uint64_t v) {
     if (!timeline || completed() >= v) return;
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
@@ -465,6 +483,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     tl_ev("flush-submit", pend.cbs.size(), pend.signal, pend.rec);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
     if (res == VK_SUCCESS && pend.any_signal) note_signal_sent(pend.signal);
+    if (res == VK_SUCCESS && pend.rec) note_rec_sent(pend.rec);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -1142,6 +1161,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     probe_submit(seq, 1);
     r.submitted = res == VK_SUCCESS;
     if (r.submitted && signal_value) note_signal_sent(signal.value);
+    if (r.submitted && seq) note_rec_sent(seq);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -2981,6 +3001,25 @@ void seg_early_count(int kind) {
         logf("vk: early segments (RX_VK_SEG_EARLY): plans used %lld, used but no boundary reached (recorded whole) %lld, rejected "
              "(the old path) %lld", (long long)n[0], (long long)n[1], (long long)n[2]);
 }
+/// (RX_VK_WB_PIECE) Flushes pending write-backs from earlier command buffers before starting a parallel command buffer's segments,
+/// and optionally (mode >= 2) immediately submits a write-back flush right after a segmented command buffer completes.
+void wb_flush_before_segments(VkCommandBuffer cmd) {
+    if (!wb_piece_on() || !memory_has_writebacks()) return;
+    memory_flush_writebacks(cmd);
+    full_barrier(cmd);
+}
+void wb_flush_after_segments(VkCommandBuffer& cmd) {
+    if (wb_piece_mode() < 2 || !memory_has_writebacks()) return;
+    Recording& nr = *rec_cur;
+    memory_flush_writebacks(nr.cmd);
+    full_barrier(nr.cmd);
+    submit_recording(nr, false);
+    Recording& after = begin_recording(rec_cur_value);
+    full_barrier(after.cmd);
+    rec_cur = &after;
+    cmd = after.cmd;
+    rec_parts++;
+}
 const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop, int nplan, const int64_t* plan,
                                    bool self_help, mkwvk::segment_plan::Profile& profile, int64_t* total_out, bool* cut) {
     NvnState& state = *cur_state;
@@ -3050,6 +3089,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     // pass, ahead of every segment not submitted by then). A segment is submitted early only while the dry pass has recorded no
     // upload (dry_uploaded): an image the dry pass makes is made under ParLock, as the segments' lookups are, and the watch is set
     // before its first command is recorded, so no segment that could see it goes ahead of rd
+    wb_flush_before_segments(r.cmd);
     const int egpu = early ? early_gpu_mode() : 0;
     std::atomic<bool> dry_uploaded{false};
     Recording* rd = nullptr;
@@ -3287,6 +3327,7 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
     rec_cur = &nr;
     cmd = nr.cmd;
     rec_parts += (int)used + 1;
+    wb_flush_after_segments(cmd);
     return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, jobs[used - 1]->r) : stop;
 }
 // (TICK-061) RX_VK_DRY_LEAN: see replay_handle
@@ -3533,6 +3574,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     full_barrier(r.cmd);
     memory_sync_mirrors_before_segments();   // (in r's uploads, ahead of every segment)
     jt_mark(19, 0);
+    wb_flush_before_segments(r.cmd);
     submit_recording(r, false);
     jt_mark(20, 0);
     uint64_t& seq = par_seq;   // (the segments' order, across submissions: a recording's uploads precede it)
@@ -3775,6 +3817,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     rec_cur = &nr;
     cmd = nr.cmd;
     rec_parts += (int)seg.size() + 1;
+    wb_flush_after_segments(cmd);
     return occ_stop ? occ_go_on(cmd, occ_stop, may_stop, jobs.back()->r) : stop;
 }
 
@@ -4433,6 +4476,29 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     (void)completed();   // (RX_VK_POOL_MIRROR: the staged write-backs of what is done applied)
     return true;
 }
+/// (RX_VK_WB_PIECE) Waits on rec_timeline for the exact piece recording `seq` that emitted a range's write-back.
+/// When `seq` has already been sent to vkQueueSubmit2 (seq <= vk_rec_signal_sent()), later frames held behind a late fix
+/// need not be flushed first.
+bool wait_recorded_seq(uint64_t seq, uint64_t timeout_ns, int* ok) {
+    if (!rec_timeline || !seq || per_queue_fences_off()) return false;
+    if (vk_rec_timeline_completed() >= seq) {
+        *ok = 1;
+        (void)completed();   // (RX_VK_POOL_MIRROR: the staged write-backs of this piece applied)
+        return true;
+    }
+    const int64_t wr0 = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (seq > vk_rec_signal_sent()) queue_flush_for(FR_WAIT);
+    const int64_t wr1 = std::chrono::steady_clock::now().time_since_epoch().count();
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &rec_timeline;
+    wi.pValues = &seq;
+    *ok = vkWaitSemaphores(dev.device, &wi, timeout_ns) == VK_SUCCESS;
+    if (*ok) (void)vk_rec_timeline_completed();
+    rb_wr_ns[0] += wr1 - wr0, rb_wr_ns[1] += std::chrono::steady_clock::now().time_since_epoch().count() - wr1;
+    (void)completed();
+    return true;
+}
 uint64_t fence();
 /// (hookshot) A fence of one queue (nvnQueueFenceSync): the value of that queue's last submission
 uint64_t fence_q(uint64_t queue) {
@@ -4901,6 +4967,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
             rbs.mark(1);
             const auto w1 = std::chrono::steady_clock::now();
             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
+            const uint64_t wb_rec = wb_piece_on() ? memory_writeback_rec(host->gpu_guest(gpu), size, c0) : 0;
             rbs.value = v, rbs.fence_at = f0;
             rbs.skip();
             // (RX_VK_READBACK_LATE: a range a rule names is read as guest memory holds it, with no wait at all)
@@ -4917,7 +4984,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
             if (pend && !late) {
                 int ok = 0;
                 const auto p0 = steady();
-                if (!(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
+                if (!(unforced && (wb_rec ? wait_recorded_seq(wb_rec, UINT64_MAX, &ok) : wait_recorded(v, UINT64_MAX, &ok)))) {
                     rbs.mark(2);
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
                     rbs.mark(1);
@@ -4931,7 +4998,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 }
                 // (sprint 5, RX_VK_READBACK_STRICT: the value itself reached on the GPU's timeline before the CPU reads)
                 static std::atomic<int64_t> st_strict{0}, st_cut{0};
-                if ((readback_strict_wanted(size) || readback_strict_slow(size)) && v > completed()) {
+                if (!(wb_rec && vk_rec_timeline_completed() >= wb_rec) && (readback_strict_wanted(size) || readback_strict_slow(size)) && v > completed()) {
                     const auto s0 = steady();
                     if (strict_bounded_for(size, gpu)) {   // (v0.4.4: the light meter's page, zeroed and held on the GPU's side: a bounded wait)
                         if (!wait_value_bounded(v)) {
