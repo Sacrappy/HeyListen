@@ -97,7 +97,8 @@ BLOCK_ARITH = re.compile(r"\ba64_bk_(vadd|vsub|vmul|vfma|sadd|ssub|smul|sdiv|sfm
 FPCR_SET = re.compile(r"(c->fpcr = \([^;]*? & 0xffffffffULL\) \| \(c->fpcr & RECOMP_FPX_INHIBIT\);)")
 FPCR_SYNC = r"\1 { extern void hos_fpcr_sync(Ctx *A64_NOESC); hos_fpcr_sync(c); }"
 HEAD = re.compile(r"^(?:/\*[^\n]*\*/\n)?void f_([0-9a-f]+)\(")
-STATS = {"hot": 0, "scalar": 0, "vector": 0, "conv": 0, "blocks": 0, "block_ops": 0, "fpcr": 0}
+STATS = {"hot": 0, "scalar": 0, "vector": 0, "conv": 0, "blocks": 0, "block_ops": 0, "fpcr": 0,
+         "cold": 0, "cold_scalar": 0, "cold_vector": 0, "cold_conv": 0}
 
 NATIVE_HEAD = r"""
 /* ---- (ProjectReLink, pixl27; nx2/nativefp.py) A64_NATIVE_FP: the hot functions' floating point on the host's
@@ -289,6 +290,30 @@ def native_text(text):
         text = text.replace(BLOCK_GATE, BLOCK_GATE_NAT)
         text, n = BLOCK_ARITH.subn(r"a64_bk_n\1(&_bad, _fzm,", text)
         STATS["block_ops"] += n
+    return text
+
+
+def native_fp_cold():
+    # (LIFT3) A64_NATIVE_FP_COLD (lift time, off unless =1; with A64_NATIVE_FP): the same native helpers in every other function
+    # (the cold ones, not in A64_HOT_FUNCS), except those the text edits and the gates read (fastvec.PLAIN0)
+    return native_fp() and on(os.environ.get("A64_NATIVE_FP_COLD"))
+
+
+# (a cold function's FPX helper calls as outline_fpx writes them: a64_fpx_<fast>_<exact>(c, ...), noinline, gate and range tests)
+COLD_SCALAR = re.compile(r"\ba64_fpx_([a-z]+(?:32|64)_[a-z]+(?:32|64))\(c,")
+
+
+def cold_text(text):
+    """(LIFT3, A64_NATIVE_FP_COLD) a cold function's text with the native helpers' names: the scalar FPX shapes (a64_fpx_<shape> ->
+    a64_fpx_nat_<shape>, inline: one host instruction, the exact helper for a NaN), the 2/4-lane add / sub / mul and the
+    integer conversions, as native_text does for the hot ones. The values are the hot functions' (tests/test_native_fp.py)"""
+    STATS["cold"] += 1
+    text, n = COLD_SCALAR.subn(r"a64_fpx_nat_\1(c,", text)
+    STATS["cold_scalar"] += n
+    text, n = HOT_VFPX.subn(r"a64_vfpx_nat_\1(c,", text)
+    STATS["cold_vector"] += n
+    text, n = HOT_CONV.subn(r"a64_nat_\1(", text)
+    STATS["cold_conv"] += n
     return text
 
 
@@ -588,8 +613,15 @@ def install():
         return native_text(text)
     a64_lift.hot_text = hot_text
     base_emit = a64_lift.Lifter.emit_function
+    cold = native_fp_cold()
+    hot = []   # (the kit's hot list, read once)
 
     def emit_function(self, e, texts):
         text, refs = base_emit(self, e, texts)
+        if cold:
+            if not hot:
+                hot.append(a64_lift.hot_functions())
+            if self.fname(e) not in hot[0] and e not in fastvec.PLAIN0:
+                text = cold_text(text)
         return fpcr_text(text), refs
     a64_lift.Lifter.emit_function = emit_function

@@ -137,6 +137,17 @@ def check_text(nativefp):
             raise SystemExit("nativefp: a function the text edits read (PLAIN0) was given the native names")
     finally:
         fastvec.PLAIN0.discard(0x80001000)
+    # (LIFT3, A64_NATIVE_FP_COLD) a cold function's text: its outlined exact helpers take the native names; nothing else changes
+    cold = ("void f_80002000(Ctx *__restrict A64_NOESC c) {\n"
+            "    { uint64_t _a=0,_b=0,_z=0,_v; _v=a64_fpx_mul32_fma32(c,_a,_b,_z); _v=a64_fpx_fma64_fma64(c,_a,_b,_z); }\n"
+            "    a64_vfpx_add32(c,c->vreg[1],c->vreg[2],c->vreg[3],2); a64_fpx_sticky32(c,0,0,0,1,&_v);\n"
+            "    c->x[8]=recomp_fixed_to_fp(c->x[9],32,32,0,1,c->fpcr,&c->fpsr);\n}\n")
+    want = (cold.replace("a64_fpx_mul32_fma32(c,", "a64_fpx_nat_mul32_fma32(c,").replace("a64_fpx_fma64_fma64(c,", "a64_fpx_nat_fma64_fma64(c,")
+            .replace("a64_vfpx_add32(c,", "a64_vfpx_nat_add32(c,").replace("recomp_fixed_to_fp(", "a64_nat_fixed_to_fp("))
+    if nativefp.cold_text(cold) != want:
+        raise SystemExit("nativefp: the cold text's rewrite:\n%s\nwanted:\n%s" % (nativefp.cold_text(cold), want))
+    if nativefp.cold_text(text) != text.replace("a64_vfpx_mul32(c,", "a64_vfpx_nat_mul32(c,").replace("recomp_fp_to_int(", "a64_nat_fp_to_int("):
+        raise SystemExit("nativefp: the cold rewrite touched a hot helper's name or a block")
     msr = "    c->fpcr = (x5_ & 0xffffffffULL) | (c->fpcr & RECOMP_FPX_INHIBIT);\n"
     if nativefp.fpcr_text(msr) != msr.rstrip("\n") + " { extern void hos_fpcr_sync(Ctx *A64_NOESC); hos_fpcr_sync(c); }\n":
         raise SystemExit("nativefp: MSR FPCR not followed by hos_fpcr_sync: %r" % nativefp.fpcr_text(msr))
