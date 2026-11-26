@@ -8527,6 +8527,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     // ~15% to submit. With a queue of their own (dev.present_queue, a compute family's: vk_main.cpp create_device) the presents go
     // out with the submits' lock let go: the blit above signals swap_rendered on the replay's queue (submitted already, as a binary
     // semaphore's wait needs). (Waiting for the blit's fence before the present, with the lock let go, was worse.)
+    hdr_metadata_refresh();   // (the HDR peak row changed in the menu: no new swapchain for it)
     {   // (the present call itself, which can hold the presenting thread: the summary's present cause)
         perf_parts::Scope perf_wait(perf_parts::t_present);
         if (dev.present_queue) {

@@ -90,6 +90,8 @@ struct Device {
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool swapchain_colorspace = false;   // (hookshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
     bool hdr = false;                    // (hookshot) the swapchain is HDR10 (ST 2084, Rec. 2020): framegen_hdr writes it
+    bool hdr_metadata = false;           // VK_EXT_hdr_metadata: HDR10 static metadata on the HDR10 swapchain (hdr_metadata_refresh)
+    int hdr_metadata_peak = 0;           // the clamped HDR peak the swapchain's metadata was last set with; 0 none yet
     bool hdr_listed = false;             // (HeyListen) the display lists an HDR10 surface (Windows' "Use HDR" on), found at each swapchain whatever the HDR row says: the menu's HDR rows
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
     // (hookshot, issue 996, d1d6caa7) the GPU has mesh shaders but the draws that have a task stage run through the compute fallback
@@ -684,6 +686,8 @@ void vma_log_image_blocks();   // (the image pools' blocks: what they hold, and 
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);
+/// HDR10 static metadata on the HDR10 swapchain, sent again when the clamped HDR peak row changes (on the presenting thread)
+void hdr_metadata_refresh();
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 bool precompile_blocking();                   // vk_draw.cpp: RX_VK_PRECOMPILE_WAIT=1 (else the pipelines are built while the game runs)

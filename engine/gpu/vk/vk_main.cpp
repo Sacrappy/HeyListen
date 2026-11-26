@@ -453,6 +453,7 @@ bool create_device() {
     optional(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME, dev.stencil_export);
     optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, dev.memory_budget);
     optional(VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME, dev.view_2d_of_3d);
+    optional(VK_EXT_HDR_METADATA_EXTENSION_NAME, dev.hdr_metadata);
     if (vrs::wanted()) optional(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, dev.frag_shading_rate);   // (RX_VK_VRS: off by default, nothing asked of the driver)
     dev.pci_bus_info = has_extension(exts, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);   // (properties only: nothing to enable)
     // (hookshot) on by default: with a marker before each draw and dispatch the device has not been lost (five
@@ -900,6 +901,30 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
     }
 }
 
+void hdr_metadata_refresh() {
+    if (!dev.hdr || !dev.hdr_metadata || !vkSetHdrMetadataEXT || !dev.swapchain) return;
+    // (the peak as the tone mappers take it: vk_framegen.cpp, vk_replay.cpp HOS_OPT_HDR_PEAK, psychov35_bank)
+    const int peak = std::clamp(opts.hdr_peak, 400, 10000);
+    if (peak == dev.hdr_metadata_peak) return;   // (sent already for this swapchain: one compare a present)
+    // HDR10 static metadata (SMPTE ST 2086 + CTA-861.3) for the signal the swapchain carries, PQ BT.2020 whatever the
+    // grading gamut (output_encode_pass.h converts BT.709 and DCI-P3 to BT.2020). Windows with "Use Dolby Vision mode" on
+    // keeps the display in Dolby Vision for an HDR10 swapchain without it, and switches to HDR10 with it, as DX12 games
+    // do through SetHDRMetaData (measured: RTX 5070 Ti, Alienware AW3426DW). Mastering max and MaxCLL are the HDR peak
+    // row (the tone mapper's ceiling); MaxFALL 0 is "unknown" (CTA-861.3)
+    VkHdrMetadataEXT md{VK_STRUCTURE_TYPE_HDR_METADATA_EXT};
+    md.displayPrimaryRed = {0.708f, 0.292f};
+    md.displayPrimaryGreen = {0.170f, 0.797f};
+    md.displayPrimaryBlue = {0.131f, 0.046f};
+    md.whitePoint = {0.3127f, 0.3290f};
+    md.maxLuminance = (float)peak;
+    md.minLuminance = 0.0001f;
+    md.maxContentLightLevel = (float)peak;
+    md.maxFrameAverageLightLevel = 0.0f;
+    vkSetHdrMetadataEXT(dev.device, 1, &dev.swapchain, &md);
+    dev.hdr_metadata_peak = peak;
+    logf("vk: HDR: HDR10 metadata set (BT.2020, D65, max %d nits, MaxCLL %d, MaxFALL unknown)", peak, peak);
+}
+
 bool create_swapchain(uint32_t width, uint32_t height) {
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
@@ -1120,6 +1145,8 @@ bool create_swapchain(uint32_t width, uint32_t height) {
          opts.vsync == present_mode::kOn ? "On" : "Off",
          opts.vsync == present_mode::kOn ? present_mode::buffering_name(opts.vsync_mode) : "no mode",
          dev.vrr_active ? ", VRR" : "");
+    dev.hdr_metadata_peak = 0;   // (a new swapchain has none yet)
+    hdr_metadata_refresh();
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     return true;
