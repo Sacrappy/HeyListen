@@ -7495,6 +7495,7 @@ std::shared_ptr<std::vector<uint8_t>> shot_pixels(uint64_t at_value, int64_t at_
     const uint8_t* const sm = (const uint8_t*)shot_maps[at_present & 1];
     return std::make_shared<std::vector<uint8_t>>(sm, sm + (size_t)kShotW * kShotH * 4);
 }
+void list_trace_present();   // (MAP1, HL_LIST_TRACE)
 void do_present(const nvn_tex* t, const int crop[4]) {
     static PendingShot pending;
     // (hookshot) The storm hold's one tick a present (storm_hold.h), before this frame is drawn or shown: the present's
@@ -7594,6 +7595,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         full_barrier(r.cmd);
         presents++;
         presents_now = presents;
+        list_trace_present();
         {   // (w1, white flashes under load) the smoothed interval of the presents, for readback_strict_slow
             const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
             const int64_t before = present_last_ns.exchange(now, std::memory_order_relaxed);
@@ -9350,6 +9352,45 @@ void ot_join_all(int site) {
 // (MAP1) RX_VK_ORDER_RB_JOIN_MASK=<hex> (0: off): the join per class of the read's size: bit 0 the meter's 0x1040 / 0xc0, 1 the 0x40 slots, 2 the 0x2000 blocks, 3 the 0x3980 block,
 // 4 the big lists (0x9b040, 0x8b040, 0x44b040), 5 the 0x1b580 state, 6 the 0x80 site, 7 any other size. A class in the mask takes the join of RX_VK_ORDER_RB_JOIN=3 (every job handed over, for a
 // range that ever had a write-back), a class outside it the join of 5. Only reads that reach this function (the ring and the early copy answer the others without it)
+// (MAP1, HL_LIST_TRACE=1) the big list's header words (the first 16 bytes) at each CPU read, and at each present for every range the CPU read: the read sees the count the writer job made,
+// the CPU then zeroes it; a header that is non-zero at the present is a write-back that landed after the zero. With the order thread's progress (done / pushed / the newest present's last submission)
+std::mutex lt_mu;
+std::set<uint64_t> lt_ranges;
+bool list_trace_on() {
+    static const bool v = getenv("HL_LIST_TRACE") != nullptr;
+    return v;
+}
+void list_trace_read(uint64_t gpu, uint64_t size) {
+    if (!list_trace_on() || size != 0x9b040) return;
+    uint32_t h[4] = {};
+    host->gpu_read(gpu, h, sizeof h);
+    uint64_t pushed, psub;
+    {
+        std::lock_guard lk(ot_mu);
+        pushed = ot_seq_pushed, psub = ot_present_sub;
+    }
+    {
+        std::lock_guard lk(lt_mu);
+        lt_ranges.insert(gpu);
+    }
+    logf("vk: lt read f %lld p %lld %#llx hdr %u %u %u %u wb %llu done %llu pushed %llu psub %llu completed %llu", (long long)rb_frame_now(), (long long)presents_now,
+         (unsigned long long)host->gpu_guest(gpu), h[0], h[1], h[2], h[3], (unsigned long long)memory_writeback_value(host->gpu_guest(gpu), size, nullptr),
+         (unsigned long long)ot_seq_done.load(), (unsigned long long)pushed, (unsigned long long)psub, (unsigned long long)completed());
+}
+void list_trace_present() {
+    if (!list_trace_on()) return;
+    std::vector<uint64_t> r;
+    {
+        std::lock_guard lk(lt_mu);
+        r.assign(lt_ranges.begin(), lt_ranges.end());
+    }
+    for (uint64_t gpu : r) {
+        uint32_t h[4] = {};
+        host->gpu_read(gpu, h, sizeof h);
+        logf("vk: lt present p %lld f %lld %#llx hdr %u %u %u %u wb %llu done %llu completed %llu", (long long)presents_now, (long long)rb_frame_now(), (unsigned long long)host->gpu_guest(gpu), h[0], h[1], h[2],
+             h[3], (unsigned long long)memory_writeback_value(host->gpu_guest(gpu), 0x9b040, nullptr), (unsigned long long)ot_seq_done.load(), (unsigned long long)completed());
+    }
+}
 int join_class(uint64_t size) {
     return size == 0x1040 || size == 0xc0 ? 0 : size == 0x40 ? 1 : size == 0x2000 ? 2 : size == 0x3980 ? 3 : size == 0x9b040 || size == 0x8b040 || size == 0x44b040 ? 4 : size == 0x1b580 ? 5 : size == 0x80 ? 6 : 7;
 }
@@ -9373,6 +9414,7 @@ void ot_join_readback(uint64_t gpu, uint64_t size) {
         return;
     }
     ot_join_readback_impl(gpu, size, mask ? ((mask >> join_class(size) & 1) ? 3 : 5) : -1);
+    list_trace_read(gpu, size);
     // (MAP1, RX_VK_ORDER_JOIN_STATS=1) per read size: reads that reached the join, those that waited (over 20 us), the mean and the worst wait; a table every 3000 such reads
     static const bool stats_on = getenv("RX_VK_ORDER_JOIN_STATS") && atoi(getenv("RX_VK_ORDER_JOIN_STATS")) != 0;
     if (!stats_on || ot_self) return;
