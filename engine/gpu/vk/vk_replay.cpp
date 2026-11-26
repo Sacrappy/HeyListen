@@ -9357,6 +9357,21 @@ void ot_join_readback_impl(uint64_t gpu, uint64_t size, int class_mode);
 void ot_join_readback(uint64_t gpu, uint64_t size) {
     static const unsigned mask = getenv("RX_VK_ORDER_RB_JOIN_MASK") ? (unsigned)strtoul(getenv("RX_VK_ORDER_RB_JOIN_MASK"), nullptr, 16) : 0;
     const int64_t t0 = ot_now();
+    // (MAP1) RX_VK_ORDER_RB_SLEEP_MASK=<hex> (class bits as the join mask), RX_VK_ORDER_RB_SLEEP_US=<us> (1500): INSTEAD of the join, a plain sleep for a class, taken only when the order thread is behind (the
+    // reads a join would have waited for): the same pacing of the reading thread with no dependency on the order thread's progress. A class in both masks sleeps.
+    static const unsigned smask = getenv("RX_VK_ORDER_RB_SLEEP_MASK") ? (unsigned)strtoul(getenv("RX_VK_ORDER_RB_SLEEP_MASK"), nullptr, 16) : 0;
+    static const int sleep_us = getenv("RX_VK_ORDER_RB_SLEEP_US") ? atoi(getenv("RX_VK_ORDER_RB_SLEEP_US")) : 1500;
+    if (smask && (smask >> join_class(size) & 1) && !ot_self) {
+        static std::atomic<int64_t> n_sleep{0}, n_all{0};
+        n_all++;
+        if (ot_behind()) {
+            n_sleep++;
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+        }
+        if (n_all % 3000 == 0)
+            logf("vk: RB sleep instead of join: %lld reads of the class, %lld slept %d us", (long long)n_all.load(), (long long)n_sleep.load(), sleep_us);
+        return;
+    }
     ot_join_readback_impl(gpu, size, mask ? ((mask >> join_class(size) & 1) ? 3 : 5) : -1);
     // (MAP1, RX_VK_ORDER_JOIN_STATS=1) per read size: reads that reached the join, those that waited (over 20 us), the mean and the worst wait; a table every 3000 such reads
     static const bool stats_on = getenv("RX_VK_ORDER_JOIN_STATS") && atoi(getenv("RX_VK_ORDER_JOIN_STATS")) != 0;
