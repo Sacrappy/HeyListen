@@ -9347,9 +9347,41 @@ void ot_join_all(int site) {
 /// (on it), while the other threads' were being replayed beside it (OoT's main thread reads while the PT replays the frame before):
 /// so it waits for the submissions this thread handed over (RX_VK_ORDER_RB_JOIN=1; the default 5 is that, and the last whole frame's jobs for the 0x3980 culling results); =2: every job handed over (all threads'),
 /// =0: none. RX_VK_ORDER_LOG=1: the first 60 reads that waited, by range
+// (MAP1) RX_VK_ORDER_RB_JOIN_MASK=<hex> (0: off): the join per class of the read's size: bit 0 the meter's 0x1040 / 0xc0, 1 the 0x40 slots, 2 the 0x2000 blocks, 3 the 0x3980 block,
+// 4 the big lists (0x9b040, 0x8b040, 0x44b040), 5 the 0x1b580 state, 6 the 0x80 site, 7 any other size. A class in the mask takes the join of RX_VK_ORDER_RB_JOIN=3 (every job handed over, for a
+// range that ever had a write-back), a class outside it the join of 5. Only reads that reach this function (the ring and the early copy answer the others without it)
+int join_class(uint64_t size) {
+    return size == 0x1040 || size == 0xc0 ? 0 : size == 0x40 ? 1 : size == 0x2000 ? 2 : size == 0x3980 ? 3 : size == 0x9b040 || size == 0x8b040 || size == 0x44b040 ? 4 : size == 0x1b580 ? 5 : size == 0x80 ? 6 : 7;
+}
+void ot_join_readback_impl(uint64_t gpu, uint64_t size, int class_mode);
 void ot_join_readback(uint64_t gpu, uint64_t size) {
+    static const unsigned mask = getenv("RX_VK_ORDER_RB_JOIN_MASK") ? (unsigned)strtoul(getenv("RX_VK_ORDER_RB_JOIN_MASK"), nullptr, 16) : 0;
+    const int64_t t0 = ot_now();
+    ot_join_readback_impl(gpu, size, mask ? ((mask >> join_class(size) & 1) ? 3 : 5) : -1);
+    // (MAP1, RX_VK_ORDER_JOIN_STATS=1) per read size: reads that reached the join, those that waited (over 20 us), the mean and the worst wait; a table every 3000 such reads
+    static const bool stats_on = getenv("RX_VK_ORDER_JOIN_STATS") && atoi(getenv("RX_VK_ORDER_JOIN_STATS")) != 0;
+    if (!stats_on || ot_self) return;
+    struct J { int64_t asked = 0, waited = 0, ns = 0, worst = 0; };
+    static std::mutex mu;
+    static std::map<uint64_t, J> tab;
+    static int64_t total = 0;
+    const int64_t d = ot_now() - t0;
+    std::lock_guard lk(mu);
+    J& j = tab[size];
+    j.asked++;
+    if (d > 20000) j.waited++, j.ns += d, j.worst = std::max(j.worst, d);
+    if (++total % 3000 == 0) {
+        for (auto& [sz, x] : tab) {
+            logf("vk: join stats size %#llx: %lld reads, %lld waited, mean %.3f ms, worst %.3f ms (class %d)", (unsigned long long)sz, (long long)x.asked, (long long)x.waited,
+                 x.waited ? x.ns / (double)x.waited / 1e6 : 0.0, x.worst / 1e6, join_class(sz));
+            x = J{};
+        }
+    }
+}
+void ot_join_readback_impl(uint64_t gpu, uint64_t size, int class_mode) {
     // (PIPE2) RX_VK_ORDER_RB_JOIN=<0..5> (5): what a CPU readback waits for with the order thread: nothing, this thread's jobs, all jobs, all jobs for a range with write-backs (3), this thread's jobs and all jobs for the 0x3980 culling results (4), this thread's jobs and the last whole frame's jobs for them (5)
-    static const int mode = getenv("RX_VK_ORDER_RB_JOIN") ? atoi(getenv("RX_VK_ORDER_RB_JOIN")) : 5;
+    static const int mode_env = getenv("RX_VK_ORDER_RB_JOIN") ? atoi(getenv("RX_VK_ORDER_RB_JOIN")) : 5;
+    const int mode = class_mode >= 0 ? class_mode : mode_env;
     // (PIPE2) RX_VK_ORDER_LOG=1: the order thread's joins one by one (the first 60 readbacks that waited)
     static const bool log_each = getenv("RX_VK_ORDER_LOG") && atoi(getenv("RX_VK_ORDER_LOG")) != 0;
     if (ot_self || !mode) return;
@@ -9539,9 +9571,30 @@ uint64_t ot_audit_begin(uint64_t gpu, uint64_t size, uint64_t* v0) {
 }
 void ot_audit_end(uint64_t want, uint64_t v0, uint64_t gpu, uint64_t size) {
     if (ot_self) return;
+    const uint64_t cmp_n = std::min<uint64_t>(size, 0x10000);   // (MAP1) the bytes the game got, before the order thread catches up (the first 64 K of the range)
+    std::vector<uint8_t> used0(cmp_n), used1(cmp_n);
+    host->gpu_read(gpu, used0.data(), cmp_n);
     const bool behind = ot_seq_done.load(std::memory_order_acquire) < want;
     if (behind) ot_wait_until([want] { return ot_seq_done.load(std::memory_order_acquire) >= want; }, UINT64_MAX);
     const uint64_t v1 = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
+    host->gpu_read(gpu, used1.data(), cmp_n);
+    {   // (MAP1) per read size: reads, behind, flagged stale, and whose USED bytes differ (the first 64 bytes; the first 64 K)
+        struct B { int64_t reads = 0, behind = 0, stale = 0, d64 = 0, dn = 0; };
+        static std::mutex bmu;
+        static std::map<uint64_t, B> bt;
+        static int64_t btotal = 0;
+        std::lock_guard bl(bmu);
+        B& b = bt[size];
+        b.reads++, b.behind += behind, b.stale += v1 != v0;
+        b.d64 += std::memcmp(used0.data(), used1.data(), std::min<uint64_t>(64, cmp_n)) != 0;
+        b.dn += std::memcmp(used0.data(), used1.data(), cmp_n) != 0;
+        if (++btotal % 3000 == 0)
+            for (auto& [sz, x] : bt) {
+                logf("vk: rb audit bytes size %#llx: %lld reads, %lld behind, %lld flagged stale, used bytes differ: first 64 B %lld, first 64 KB %lld", (unsigned long long)sz, (long long)x.reads,
+                     (long long)x.behind, (long long)x.stale, (long long)x.d64, (long long)x.dn);
+                x = B{};
+            }
+    }
     struct Row { int64_t reads = 0, behind = 0, stale = 0; };
     static std::mutex mu;
     static std::map<std::pair<uint64_t, uint64_t>, Row> rows;   // (guest address, size)
