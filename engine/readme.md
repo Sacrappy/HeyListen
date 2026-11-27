@@ -273,6 +273,7 @@ they apply at once, with no new translation.
 | | Audio output | Auto, Stereo, 5.1 (after a restart) | Auto |
 | | Skip title screen | Off, On (after a restart) | Off |
 | | Microphone | Off, Default, or each microphone by name | Default |
+| | Ocarina pitch help | Off, On | Off |
 | | Output device | Default, or each audio output by name | Default |
 | Controls | Controller in background | Off, On | Off |
 | | Sprint with L3 | Off, Hold, Toggle | Off |
@@ -364,6 +365,9 @@ they apply at once, with no new translation.
   once. A chosen microphone that is unplugged stays chosen (shown as not connected): Default stands in until it is
   back. On Linux (SDL2) two microphones with the same name cannot be told apart: the first is used. Windows must allow desktop apps to use the microphone
   (Settings, Privacy & security, Microphone). `HOS_MIC_LOG=1` logs what the game reads, a line a second.
+- **Ocarina pitch help** (Off by default) turns what the microphone hears into a clean ocarina note: the nearest of the
+  five, in any octave, so a song sung a little off key still plays. Silence or an unclear pitch gives silence.
+  `HOS_MIC_PITCH_HELP=0` or `1` overrides the row for one run.
 - **Output device** is where the game's sound plays. Default follows Windows' default output device; the list shows each
   active output by its name, and a change applies at once, with no restart. The choice is kept by the device's id
   (`output_device_id`, with its name beside it, in `hookshot_options.ini`). A chosen device that is unplugged stays chosen

@@ -35,6 +35,8 @@ WINDOWS_H = r'''
 #pragma once
 typedef int SRWLOCK;
 #define SRWLOCK_INIT 0
+#define near   /* (as windows.h has them: names the host code must not use) */
+#define far
 static inline void AcquireSRWLockExclusive(SRWLOCK *l) { (void)l; }
 static inline void ReleaseSRWLockExclusive(SRWLOCK *l) { (void)l; }
 static inline void AcquireSRWLockShared(SRWLOCK *l) { (void)l; }
@@ -43,12 +45,16 @@ static inline void ReleaseSRWLockShared(SRWLOCK *l) { (void)l; }
 FIXTURE = r'''
 #include <stdarg.h>
 #include <stdlib.h>
+#include <math.h>
 #include "nn_audio_in.c"
 
 static int64_t clock_ns = 1000000000;
 int64_t hos_now_ns(void) { return clock_ns; }
 static int game_fps = 60;   /* (host/nn_vi.c's frame rate: the Frame rate limit above 60) */
 int hos_vi_game_fps(void) { return game_fps; }
+static int help_on;   /* (the Insert menu's Ocarina pitch help) */
+int rx_option(int id, int otherwise) { return id == HL_OPT_MIC_PITCH_HELP ? help_on : otherwise; }
+static double sing_hz, sing_phase;   /* (the microphone hears a voice at sing_hz, when set) */
 static int logged;
 void hos_log(const char *fmt, ...) { (void)fmt; logged++; }
 const char *hos_sdl_error(void) { return "no device"; }
@@ -73,7 +79,13 @@ int hos_sdl_mic_available(void *mic) { return mic ? mic_bytes : 0; }
 int hos_sdl_mic_read(void *mic, void *dst, int bytes) {
     (void)mic;
     if (bytes > mic_bytes) bytes = mic_bytes;
-    for (int i = 0; i < bytes / 2; i++) ((int16_t *)dst)[i] = (int16_t)(next_sample++);
+    for (int i = 0; i < bytes / 2; i++) {
+        if (sing_hz > 0) {   /* (a voice: a fundamental and two harmonics, as a hum has) */
+            const double ph = 6.283185307179586 * sing_phase;
+            ((int16_t *)dst)[i] = (int16_t)(9000 * sin(ph) + 4000 * sin(2 * ph) + 2000 * sin(3 * ph));
+            sing_phase += sing_hz / 48000, sing_phase -= (int)sing_phase;
+        } else ((int16_t *)dst)[i] = (int16_t)(next_sample++);
+    }
     mic_bytes -= bytes;
     return bytes;
 }
@@ -316,8 +328,47 @@ int main(void) {
     if (FILLED(stream) != 500 || READ(stream, buf, 500) != 500) FAIL(51, "HOS_MIC_PACE=0: what was recorded, as before");
     pace_mode = -1, game_fps = 60;
     cases += 9;
+    /* (HeyListen) Ocarina pitch help: a voice a little off and in another octave comes out as the nearest note's clean tone;
+       D is the high one above the singer's average */
+    CALL(imp__ZN2nn5audio16CloseInputStreamEPNS0_15InputStreamTypeE, U(stream));
+    OPEN(stream, names[0]);
+    START(stream);
+    help_on = 1;
+    static int16_t song[48000];
+    const struct { double sung, want; const char *what; } voice[] = {
+        {141.0, 293.66, "a low D, an octave down and a little flat: low D"},
+        {178.0, 349.23, "an F sung at 178 Hz (F3 is 174.6): F"},
+        {452.0, 440.00, "an A a little sharp: A"},
+        {600.0, 587.33, "a D above the average: high D"},
+        {1960.0 / 2, 493.88, "a B whistled an octave up (987.8): B"},
+    };
+    for (int v = 0; v < 5; v++) {
+        sing_hz = voice[v].sung;
+        int got = 0;
+        for (int k = 0; k < 30; k++) {   /* (300 ms of singing, read 10 ms at a time) */
+            MS(10), mic_bytes = 480 * 2;
+            (void)FILLED(stream);
+            got += READ(stream, song + got, 480);
+        }
+        int cross = 0;   /* (the last 100 ms: its pitch from its rising zero crossings) */
+        for (int i = got - 4800 + 1; i < got; i++) cross += song[i - 1] < 0 && song[i] >= 0;
+        const double hz = cross / 0.1;
+        if (fabs(hz - voice[v].want) > 15) FAIL(52 + v, "pitch help, %s: %.0f Hz, not %.1f", voice[v].what, hz, voice[v].want);
+    }
+    sing_hz = 0;
+    MS(10), mic_bytes = 480 * 2, (void)FILLED(stream);
+    int16_t quiet[480];
+    (void)READ(stream, song, 4800);
+    for (int k = 0; k < 10; k++) MS(10), mic_bytes = 480 * 2, (void)FILLED(stream), (void)READ(stream, quiet, 480);
+    for (int i = 0; i < 480; i++)   /* (a counting microphone has no clear pitch: silence) */
+        if (quiet[i]) FAIL(57, "pitch help: no clear pitch is silence, not %d", quiet[i]);
+    help_on = 0;
+    MS(10), mic_bytes = 4 * 2;
+    const int first_off = next_sample;
+    if (FILLED(stream) != 4 || READ(stream, quiet, 4) != 4 || quiet[0] != (int16_t)first_off) FAIL(58, "pitch help off: as heard");
+    cases += 7;
     printf("PASS: %d input stream cases (device list, open, start, silence, a shared microphone, capacity, a lost one and its"
-           " retries, a quiet one, named ones, a stand-in, stop, close, the pace above 60 fps)\n", cases);
+           " retries, a quiet one, named ones, a stand-in, stop, close, the pace above 60 fps, pitch help)\n", cases);
     return 0;
 }
 '''
@@ -416,14 +467,25 @@ def main():
           'the menu is not given the microphones')
     check('if (!mic_want.empty()) refresh_mics();' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
           'the start lists the microphones (and starts SDL audio) even with none chosen')
+    ids = (ROOT / 'gpu' / 'vk' / 'vk_opt_ids.h').read_text(encoding='utf-8')
+    api = (ROOT / 'gpu' / 'vk' / 'vk_api.h').read_text(encoding='utf-8')
+    check(re.search(r'#define HL_OPT_MIC_PITCH_HELP 45', ids) and '#include "../gpu/vk/vk_opt_ids.h"' in source,
+          'Ocarina pitch help: host/nn_audio_in.c does not take its id (45) from gpu/vk/vk_opt_ids.h')
+    check(not re.search(r'=\s*45', api), 'Ocarina pitch help: 45 is taken in gpu/vk/vk_api.h')
+    check('"Ocarina pitch help", &opts.pitch_help, 0, 1,' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8')
+          and 'HL_OPT_MIC_PITCH_HELP) return opts.pitch_help' in (ROOT / 'gpu' / 'vk' / 'vk_replay.cpp').read_text(encoding='utf-8'),
+          'the Insert menu has no Ocarina pitch help row, or does not answer it')
     with tempfile.TemporaryDirectory(prefix='audio-in-') as t:
         folder = Path(t)
+        (folder / 'gpu' / 'vk').mkdir(parents=True)   # (host/nn_audio_in.c reaches ../gpu/vk/vk_opt_ids.h as in the tree)
+        (folder / 'gpu' / 'vk' / 'vk_opt_ids.h').write_text(ids, encoding='utf-8')
+        (folder / 'host').mkdir()
         for name, text in (('hos.h', HOS_H), ('windows.h', WINDOWS_H), ('hos_sdl.h', sdl_h), ('nn_audio_in.c', source),
                            ('fixture.c', FIXTURE)):
-            (folder / name).write_text(text, encoding='utf-8')
+            (folder / 'host' / name).write_text(text, encoding='utf-8')
         exe = folder / 'fixture'
-        subprocess.run([a.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(folder), str(folder / 'fixture.c'),
-                        '-o', str(exe)], check=True)
+        subprocess.run([a.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(folder / 'host'), str(folder / 'host' / 'fixture.c'),
+                        '-o', str(exe), '-lm'], check=True)
         subprocess.run([str(exe)], check=True)
         # (the menu's side: the row's choice by name, gpu/vk/vk_menu.cpp)
         menu = (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8')

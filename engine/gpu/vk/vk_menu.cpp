@@ -1108,6 +1108,9 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
      "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
+    {TAB_GAMEPLAY, "Ocarina pitch help", &opts.pitch_help, 0, 1, 1, tx_onoff,   // (HL_OPT_MIC_PITCH_HELP, vk_opt_ids.h, host/nn_audio_in.c)
+     "Turns your voice into a clean ocarina note: the nearest of the five, in any octave, so a song that is a little off "
+     "key still plays. For the game's microphone option (humming).", nullptr, false, true},
     {TAB_GAMEPLAY, "Output device", &opts.out_dev, 0, 1 + kMaxOuts, 1, tx_out,
      "The device the game's sound plays on. Default follows the system's default output. A change applies at once.", hn_out,
      false, true},
