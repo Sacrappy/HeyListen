@@ -61,10 +61,12 @@
 #endif
 #include "shaders/wb_diff_comp_spv.h"
 #include "shaders/wb_guess_comp_spv.h"   // (FOLIAGE2: the guessed heads' checked write-back on the GPU)
+#include "shaders/sync_keep_comp_spv.h"   // (FLICK1: the GPU's newer words kept at a sync)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #include "linux_pressure.h"   // (Longshot f1b17d59: the idle imports under Linux memory pressure)
 
 namespace mkwvk {
+extern int64_t presents_now;   // (vk_replay.cpp; FLICK1's log)
 // (RX_VK_POOL_FINALIZE: the captures of the game's submits queued, and those the replay took: a finalize waits for the ones before it)
 std::atomic<uint64_t> submits_queued{0}, submits_taken{0};
 namespace { struct Pool; struct WriteBack { Pool* pool; uint64_t lo, hi; /* offsets in the pool */ bool guess = false; /* (CRASH3: a guessed range, a bare table entry's head: staged and checked, memory_staged_apply) */ }; }
@@ -1239,6 +1241,7 @@ struct Capture {
     std::vector<uint32_t> deferred;   // (TICK-017: pages left to the GPU's copy from guest memory, capture_make)
     std::vector<uint32_t> late;      // (indices into pages: copied again by the replay once late_value is done)
     uint64_t late_value = 0;
+    uint64_t wb_seen = 0;   // (FLICK1: the newest write-back value recorded at the late check: one recorded after it is not in the copy)
     // (TICK-060, RX_VK_CAPTURE_HASH) the chunk hashes of each slot's bytes, made by the copy itself (16 a slot), and which slots have
     // them (0: none, the mirror sync hashes the slot as before)
     std::vector<uint64_t> hashes;
@@ -1346,7 +1349,8 @@ struct CapHash { std::vector<uint64_t> h; std::vector<uint8_t> ok; };   // (TICK
 struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0;
                 std::shared_ptr<CapHash> hash = {};
                 std::shared_ptr<std::vector<uint8_t>> gmask = {};   // (sprint 5: see Capture::gmask; null: every slot whole)
-                uint64_t used = 0; };   // (the bytes its capture filled, for RX_VK_RES_LOG)
+                uint64_t used = 0;   // (the bytes its capture filled, for RX_VK_RES_LOG)
+                uint64_t wb_seen = 0; };   // (FLICK1: the newest write-back recorded when its pages were checked, Capture::wb_seen)
 // ---- (HeyListen, sprint 5) RX_VK_CAPTURE_GRAN=1, with a game built with A64_GRAN=1 (off): the capture by written granules ----
 // A capture copied every page the game wrote since the last submit, whole: ~11,900 pages a frame at the Market (46 MB, at the
 // memory bus's speed: 1.3-1.9 ms on the frame's loop), of which ~1 MB of words differs from their last copy. The lifted stores
@@ -2563,6 +2567,7 @@ struct WbPages {
     }
     bool empty() const { return !any; }
 } wb_pages;
+uint64_t wb_noted_max = 0;   // (FLICK1: the newest value wb_pages_note took; wb_pages_mu)
 void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, bool trace = true) {
     static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
     // (trace false: a checked staged write-back, traced where it lands, memory_staged_apply)
@@ -2570,6 +2575,7 @@ void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, bool tr
     if (off || !value || guest_hi <= guest_lo) return;
     std::lock_guard lk(wb_pages_mu);
     for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) wb_pages.set(p, value);
+    wb_noted_max = std::max(wb_noted_max, value);   // (FLICK1)
 }
 } // namespace
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever) {
@@ -3364,7 +3370,7 @@ std::unique_ptr<Capture> capture_make() {
         if (!spare.empty()) c = std::move(spare.back()), spare.pop_back();
     }
     if (!c) c = std::make_unique<Capture>();
-    c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->deferred.clear(), c->late.clear(), c->late_value = 0;
+    c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->deferred.clear(), c->late.clear(), c->late_value = 0, c->wb_seen = 0;
     c->hok.clear();   // (TICK-060: no slot hashes unless the copy below makes them)
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
@@ -3449,6 +3455,10 @@ std::unique_ptr<Capture> capture_make() {
         static const int cap_wait = getenv("RX_VK_CAPTURE_WAIT") ? atoi(getenv("RX_VK_CAPTURE_WAIT")) : 2;
         static const bool defer = getenv("RX_VK_CAPTURE_DEFER") && atoi(getenv("RX_VK_CAPTURE_DEFER")) != 0;   // (off: see TICK-017)
         uint64_t v = 0;
+        {
+            std::lock_guard lk(wb_pages_mu);
+            c->wb_seen = wb_noted_max;   // (FLICK1)
+        }
         if (cap_wait) {
             const uint64_t done = vk_timeline_completed();
             std::lock_guard lk(wb_pages_mu);
@@ -4338,6 +4348,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
         CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
         b.used = std::min<uint64_t>(c->nbytes, c->bsize);
+        b.wb_seen = c->wb_seen;   // (FLICK1)
         if (c->hok.size() == c->pages.size() && !c->hok.empty()) {   // (TICK-060: the copy's slot hashes kept with it)
             if (late_defer)
                 for (uint32_t i : c->late) c->hok[i] = 0;   // (copied again at its fix: hashed by the sync as before)
@@ -6256,6 +6267,28 @@ void shadow_sync_copies(Pool& p, const std::map<VkBuffer, std::vector<VkBufferCo
 namespace {
 
 /// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer)
+// ---- (FLICK1) the GPU's newer words kept at a sync ----
+// With the order thread the game's threads run a frame ahead of the replay: a submission's capture is taken when the game hands
+// it over, before the order thread has even recorded the submissions handed over just before it. A page the CPU wrote (any word
+// of it) is then copied with the GPU's words as guest memory had them before those submissions' write-backs; the existing late
+// rule (capture_make: a write-back still on the GPU when the page is copied) does not see them, as they are not recorded yet. The
+// sync of that page copied it whole over the mirror, which by then held the newer words of those write-backs: the GPU's state
+// went back a frame for the work after it (counters, per-object state the compute programs carry from frame to frame), and
+// the picture brightened for a frame. Here a page whose newest write-back was recorded after its capture's check (wb_pages
+// against CapBuf::wb_seen) is merged on the GPU (shaders/sync_keep.comp): the capture's word goes into the mirror unless guest
+// memory holds the mirror's own word and the capture's differs from it (the GPU's newer word, landed by that write-back).
+// Without the order thread no write-back is recorded between a capture and its sync: nothing changes.
+// RX_VK_SYNC_KEEP_GPU=0 (the default): off, as before; 1: such pages only counted (a line a present that had any, "vk: synckeep");
+// 2: merged and counted. Measured: such pages come in bursts a few times a minute and every write-back word FLICK1's HL_WB_CLOBBER
+// count found followed one; the one-frame flash turned out to be another thing (the meter pace, vk_rbring.cpp), and the merge did not
+// change the flash counts beyond their spread: off until something is shown to need it.
+struct SkChunk {   // (shaders/sync_keep.comp's Chunk)
+    uint64_t src, mirror, guest, shadow;
+    uint32_t count, pad;
+};
+int sync_keep_mode();
+bool sk_record(VkCommandBuffer cmd, const std::vector<SkChunk>& ch);
+void sk_note_page(int64_t pages_merged);
 int64_t mirror_sync(Pool& p) {
     const bool fast = msync_fast_on();
     static thread_local std::vector<uint32_t> lazy_pages;   // (fast: the dirty pages for lazy_cpu_pages)
@@ -6288,6 +6321,11 @@ int64_t mirror_sync(Pool& p) {
     const uint64_t page_end = (p.hi + 4095) >> kPageShift;
     static thread_local std::vector<uint64_t> wbl_sync_pages;   // (WBL1: pages put off that the CPU wrote, as pool offsets)
     wbl_sync_pages.clear();
+    static thread_local std::vector<SkChunk> sk_chunks;   // (FLICK1: the pages merged on the GPU, and their pages / pool offsets)
+    static thread_local std::vector<std::pair<uint64_t, uint32_t>> sk_pages_of;
+    sk_chunks.clear(), sk_pages_of.clear();
+    int64_t sk_pages = 0;
+    VkDeviceAddress sk_mirror = 0;
     for (uint64_t page = p.lo >> kPageShift; page < page_end;) {
         if (fast) {   // (TICK-056: straight to the next dirty page; the pages skipped are those the loop leaves alone)
             const auto sc0 = pstats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -6360,6 +6398,29 @@ int64_t mirror_sync(Pool& p) {
                     if (PageX* x = pagex(page, false)) x->syn = pg;
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
                     const uint64_t src0 = (uint64_t)e.slot * 4096 + (ga - (page << kPageShift));
+                    if (const int skm = sync_keep_mode(); skm && p.mirror && p.address) {   // (FLICK1)
+                        uint64_t pv;
+                        {
+                            std::lock_guard wl(wb_pages_mu);
+                            pv = wb_pages.get(page);
+                        }
+                        if (pv > b->second.wb_seen) {
+                            sk_pages++;
+                            if (skm >= 2 && !((ga | gb) & 3) && !par_active.load(std::memory_order_relaxed)) {
+                                if (!sk_mirror) sk_mirror = buffer_address(p.mirror);
+                                sk_chunks.push_back({buffer_address(b->second.buffer) + src0, sk_mirror + (ga - p.lo), p.address + (ga - p.lo),
+                                                     p.shadow && p.shadow_address ? p.shadow_address + (ga - p.lo) : 0, (uint32_t)((gb - ga) / 4), 0});
+                                sk_pages_of.push_back({page, (uint32_t)(ga - p.lo)});
+                                d_void(page);
+                                late_shadow_void(page);
+                                (e.gen == cur_cap_gen ? b_cap : b_old) += (int64_t)(gb - ga);
+                                b->second.last_use = std::max(b->second.last_use, cur_cap_value);
+                                (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
+                                page++;
+                                continue;
+                            }
+                        }
+                    }
                     // (TICK-053) a late page, merged: the words the CPU changed since the mirror's last sync of the page, from
                     // the capture; the GPU's words stay. The shadow then holds the capture's page. In a parallel segment
                     // (the uploads' order is not the records'), or with the page cut by the pool's end, the whole page as
@@ -6501,6 +6562,22 @@ int64_t mirror_sync(Pool& p) {
         (in_presync ? sst.pre : par_active.load(std::memory_order_relaxed) ? sst.seg : sst.bind) += b_all;
         PoolSync& ps = sync_by_pool[p.lo];
         ps.bytes += b_all, ps.same += b_same, ps.skipped += b_skip, ps.size = p.hi - p.lo;
+    }
+    if (sk_pages) sk_note_page(sk_pages);
+    if (!sk_chunks.empty()) {   // (FLICK1: ahead of the copies; its pages are none of theirs)
+        if (sk_record(upload_command_buffer(), sk_chunks)) {
+            for (const auto& [pg_, off] : sk_pages_of)   // (the pass wrote their shadow too)
+                if (p.shadow && !p.shadow_known.empty() && ((off >> kPageShift) >> 6) < p.shadow_known.size())
+                    p.shadow_known[(off >> kPageShift) >> 6] |= 1ull << ((off >> kPageShift) & 63);
+        } else {   // (no merge possible: copied whole from the capture, as before)
+            for (size_t k = 0; k < sk_chunks.size(); k++) {
+                const CapEntry e = cap_entry(sk_pages_of[k].first);
+                auto b = cap_bufs.find(e.gen);
+                if (b == cap_bufs.end()) continue;
+                const uint64_t a = sk_pages_of[k].second;
+                append_capture_copy(cap_runs[b->second.buffer], {(uint64_t)e.slot * 4096 + ((p.lo + a) & 4095), a, 4ull * sk_chunks[k].count});
+            }
+        }
     }
     if (p.shadow && wb_shadow_sync_on()) shadow_sync_copies(p, cap_runs, runs, late_runs);   // (issue 89: the shadow takes what the mirror takes)
     const VkDeviceAddress maddr = scatter_on() && (!cap_runs.empty() || !runs.empty()) ? buffer_address(p.mirror) : 0;
@@ -8833,7 +8910,36 @@ void shadows_forget_written() {
         p->shadow_known[i >> 6] &= ~(1ull << (i & 63));
     }
 }
-// (the pass's pipeline: 16 bytes of push constants and no descriptors, its buffers by address; made once)
+// (the pass's push constants, shaders/wb_diff.comp's P: the chunk table, its chunks, and FLICK1's mode and log)
+struct WbdPush {
+    uint64_t table;
+    uint32_t count, mode;
+    uint64_t log, per;
+    uint32_t ex_cap, pad;
+};
+static_assert(sizeof(WbdPush) == 40, "shaders/wb_diff.comp's push constants");
+// (FLICK1, a diagnostic) HL_WB_CLOBBER=1: the write-back's diff in its merge form (shaders/wb_diff.comp, pc.mode bit 0) counts the
+// words it writes that guest memory had changed since the mirror's sync took them (guest != shadow, != mirror): a word written there
+// by the CPU, or by an earlier submission's write-back that the sync's capture predates (what FLICK1 found: the sync had put the
+// GPU's older words back in the mirror, "the GPU's newer words kept at a sync" above). A line a submission that had any
+// ("vk: wbclob"), a table every 600. The words are written as by the plain diff (bit 1, which would leave them to guest memory, is
+// not set by any switch: untested in the game). Off: the plain pass, as before
+unsigned wbd_mode() {
+    static const unsigned v = [] {
+        unsigned m = 0;
+        if (const char* e = getenv("HL_WB_CLOBBER"); e && atoi(e) != 0) m |= 1u;
+        if (m) logf("vk: write-back diff, the merge form (FLICK1): the words guest memory changed since the sync counted (HL_WB_CLOBBER)");
+        return m;
+    }();
+    return v;
+}
+// (FLICK1, HL_WB_SHADOW_ALL=1) a shadow for every pool written back, not only those with 256 KB of runs a submission: the diff (and
+// its merge form) for all of them; without it the small ones are copied whole, over any CPU store since the sync
+bool wb_shadow_all() {
+    static const bool v = getenv("HL_WB_SHADOW_ALL") && atoi(getenv("HL_WB_SHADOW_ALL")) != 0;
+    return v;
+}
+// (the pass's pipeline: push constants (WbdPush) and no descriptors, its buffers by address; made once)
 struct WbdPipe {
     bool tried = false;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -8843,7 +8949,7 @@ bool wbd_pipe_ready() {
     if (wbd_pipe.tried) return wbd_pipe.pipe != VK_NULL_HANDLE;
     wbd_pipe.tried = true;
     // (issue 89: the pass no longer votes across a subgroup (shaders/wb_diff.comp), it writes the vectors that differ and no others)
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(WbdPush)};   // (FLICK1: the merge form's mode and log)
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     li.pushConstantRangeCount = 1;
     li.pPushConstantRanges = &pr;
@@ -8952,18 +9058,31 @@ struct WbdChunk {   // (shaders/wb_diff.comp's Chunk)
     uint32_t count, vecs;   // (16-byte vectors when vecs is 1, else words)
 };
 // (the pass's tables, mapped, a ring: one is taken again once the submission that read it is done)
+int64_t st_wbc_whole_bytes = 0, st_wbc_whole_runs = 0;   // (FLICK1: write-back runs copied whole, not through the diff; pools_mu)
+struct WbcMeta {   // (FLICK1, HL_WB_CLOBBER: a chunk's guest address and its run's)
+    uint64_t guest, run;
+    uint32_t len, run_size;
+};
 struct WbdTable {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
     uint8_t* map = nullptr;
     VkDeviceAddress address = 0;
     uint64_t bytes = 0, value = 0;
+    // (FLICK1, HL_WB_CLOBBER) the merge form's log in the same buffer, read once the submission is done (wbc_logs_read)
+    bool log_pending = false;
+    uint64_t log_at = 0, per_at = 0;
+    uint32_t ex_cap = 0;
+    int64_t present = 0;
+    std::vector<WbcMeta> meta;
 };
 WbdTable wbd_tables[64];
 int wbd_table_next = 0;
+void wbc_log_read(WbdTable& t);
 WbdTable* wbd_table_get(uint64_t bytes) {
     WbdTable& t = wbd_tables[wbd_table_next];
     if (t.value > mem_completed) return nullptr;   // (still read by a submission the GPU has not done)
+    if (t.log_pending) wbc_log_read(t);
     if (t.bytes < bytes) {
         if (t.buf) destroy_buffer(t.buf, t.alloc);
         t = {};
@@ -8985,6 +9104,167 @@ WbdTable* wbd_table_get(uint64_t bytes) {
     wbd_table_next = (wbd_table_next + 1) % 64;
     t.value = rec_value_of();
     return &t;
+}
+// (FLICK1, HL_WB_CLOBBER) a done submission's merge log: a line when the CPU had changed words the GPU wrote ("vk: wbclob"), by run,
+// with up to four examples, and every 600 logs a table of the runs
+void wbc_log_read(WbdTable& t) {
+    t.log_pending = false;
+    if (!t.map) return;
+    invalidate_mapped(t.alloc, t.bytes);
+    const uint32_t* h = (const uint32_t*)(t.map + t.log_at);
+    const uint32_t gpu = h[0], both = h[1], kept = h[2], n = h[3];
+    static int64_t logs, sum_gpu, sum_both, sum_kept, subs_with;
+    static std::map<std::pair<uint64_t, uint32_t>, std::pair<int64_t, int64_t>> by_run;   // (run, size) -> words, submissions
+    logs++, sum_gpu += gpu, sum_both += both, sum_kept += kept;
+    if (both) {
+        subs_with++;
+        const uint32_t* per = (const uint32_t*)(t.map + t.per_at);
+        std::map<std::pair<uint64_t, uint32_t>, int64_t> here;
+        for (size_t i = 0; i < t.meta.size(); i++)
+            if (per[i]) here[{t.meta[i].run, t.meta[i].run_size}] += per[i];
+        std::string s;
+        for (const auto& [k, c] : here) {
+            auto& e = by_run[k];
+            e.first += c, e.second++;
+            if (s.size() < 400) {
+                char b[80];
+                snprintf(b, sizeof b, " %#llx+%#x:%lld", (unsigned long long)k.first, k.second, (long long)c);
+                s += b;
+            }
+        }
+        std::string ex;
+        const uint32_t* x = h + 4;
+        for (uint32_t e = 0; e < std::min<uint32_t>({n, t.ex_cap, 4u}); e++) {
+            const uint32_t ci = x[8 * e], wi = x[8 * e + 1];
+            if (ci >= t.meta.size()) continue;
+            char b[120];
+            snprintf(b, sizeof b, " [%#llx shadow %#x guest %#x mirror %#x]", (unsigned long long)(t.meta[ci].guest + 4ull * wi), x[8 * e + 2],
+                     x[8 * e + 3], x[8 * e + 4]);
+            ex += b;
+        }
+        static int64_t lines;
+        if (lines++ < 40000)
+            logf("vk: wbclob v %llu present %lld now %lld: %u GPU words, %u the CPU changed too, %u kept;%s;%s", (unsigned long long)t.value,
+                 (long long)t.present, (long long)presents_now, gpu, both, kept, s.c_str(), ex.c_str());
+    }
+    if (logs % 600 == 0) {
+        std::vector<std::pair<int64_t, std::pair<uint64_t, uint32_t>>> top;
+        for (const auto& [k, e] : by_run) top.push_back({e.first, k});
+        std::sort(top.rbegin(), top.rend());
+        std::string s;
+        for (size_t i = 0; i < top.size() && i < 12; i++) {
+            char b[100];
+            snprintf(b, sizeof b, " %#llx+%#x: %lld words in %lld;", (unsigned long long)top[i].second.first, top[i].second.second,
+                     (long long)top[i].first, (long long)by_run[top[i].second].second);
+            s += b;
+        }
+        logf("vk: wbclob table (600 diff submissions): %lld GPU words written, %lld the CPU had changed too (in %lld submissions), %lld kept; "
+             "copied whole (not seen): %.1f MB in %lld runs; by run:%s", (long long)sum_gpu, (long long)sum_both, (long long)subs_with,
+             (long long)sum_kept, st_wbc_whole_bytes / 1048576.0, (long long)st_wbc_whole_runs, s.c_str());
+        st_wbc_whole_bytes = st_wbc_whole_runs = 0;
+        sum_gpu = sum_both = sum_kept = subs_with = 0;
+        by_run.clear();
+    }
+}
+namespace {   // (FLICK1: declared in mirror_sync's namespace)
+int sync_keep_mode() {
+    static const int v = [] {
+        const char* e = getenv("RX_VK_SYNC_KEEP_GPU");
+        const int m = e && *e ? atoi(e) : 0;   // (off by default: a real rollback, but not the flash's cause, see "the GPU's newer words kept")
+        logf("vk: a sync's page a later-recorded write-back reached (FLICK1, RX_VK_SYNC_KEEP_GPU=%d): %s", m,
+             m >= 2 ? "merged, the GPU's newer words kept" : m == 1 ? "counted only" : "copied whole, as before");
+        return m;
+    }();
+    return v;
+}
+struct SkPipe {
+    bool tried = false;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+} sk_pipe;
+struct SkLog { VkBuffer buf = VK_NULL_HANDLE; VmaAllocation alloc = nullptr; uint32_t* map = nullptr; VkDeviceAddress address = 0; } sk_log;
+bool sk_pipe_ready() {
+    if (sk_pipe.tried) return sk_pipe.pipe != VK_NULL_HANDLE;
+    sk_pipe.tried = true;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &pr;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(dev.device, &li, nullptr, &sk_pipe.layout) == VK_SUCCESS) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof SYNC_KEEP_COMP_SPV;
+        mi.pCode = SYNC_KEEP_COMP_SPV;
+        IntelDriverGate gate;
+        if (extern_guarded_shader_module(&mi, &m) == VK_SUCCESS) {
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = m;
+            ci.stage.pName = "main";
+            ci.layout = sk_pipe.layout;
+            if (extern_guarded_compute(VK_NULL_HANDLE, &ci, &sk_pipe.pipe) != VK_SUCCESS) sk_pipe.pipe = VK_NULL_HANDLE;
+            vkDestroyShaderModule(dev.device, m, nullptr);
+        }
+    }
+    void* map = nullptr;
+    if (sk_pipe.pipe && create_buffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, sk_log.buf,
+                                      sk_log.alloc, &map) && map) {
+        sk_log.map = (uint32_t*)map;
+        std::memset(map, 0, 16);
+        flush_mapped(sk_log.alloc, 16);
+        VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        da.buffer = sk_log.buf;
+        sk_log.address = vkGetBufferDeviceAddress(dev.device, &da);
+    } else if (sk_pipe.pipe) {
+        sk_pipe.pipe = VK_NULL_HANDLE;
+    }
+    logf("vk: the sync's GPU-word merge (FLICK1) %s", sk_pipe.pipe ? "ready" : "not made: such pages copied whole");
+    return sk_pipe.pipe != VK_NULL_HANDLE;
+}
+int64_t st_sk_pages = 0, st_sk_merged = 0, st_sk_syncs = 0, st_sk_whole = 0;
+void sk_note_page(int64_t pages) {   // (pools_mu held)
+    st_sk_pages += pages;
+    static int64_t cur = -1, n = 0, lines = 0;
+    if (presents_now != cur) {
+        if (n && lines++ < 60000) logf("vk: synckeep present %lld: %lld pages a later-recorded write-back reached", (long long)cur, (long long)n);
+        cur = presents_now, n = 0;
+    }
+    n += pages;
+}
+bool sk_record(VkCommandBuffer cmd, const std::vector<SkChunk>& ch) {   // (pools_mu held) false: not recorded, the caller copies them whole
+    WbdTable* t = sk_pipe_ready() ? wbd_table_get(ch.size() * sizeof(SkChunk)) : nullptr;
+    if (!t) {
+        st_sk_whole += (int64_t)ch.size();
+        return false;
+    }
+    memcpy(t->map, ch.data(), ch.size() * sizeof(SkChunk));
+    flush_mapped(t->alloc, ch.size() * sizeof(SkChunk));
+    full_barrier(cmd, "barrier (FLICK1: write-backs before the sync's merge)");
+    GprofSpan gp(cmd, "sync keep (a capture's page merged into the mirror, the GPU's newer words kept)");
+    gp.items = (int)ch.size();
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sk_pipe.pipe);
+    const struct { uint64_t table, log; uint32_t count, pad; } pc{t->address, sk_log.address, (uint32_t)ch.size(), 0};
+    vkCmdPushConstants(cmd, sk_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    const uint32_t n = (uint32_t)ch.size();
+    checkpoint_mark(cmd, n, 'k');
+    vkCmdDispatch(cmd, std::min<uint32_t>(n, 65535u), (n + 65534u) / 65535u, 1);
+    full_barrier(cmd, "barrier (FLICK1: the sync's merge before the work)");
+    st_sk_merged += (int64_t)ch.size();
+    if (++st_sk_syncs % 600 == 0) {
+        invalidate_mapped(sk_log.alloc, 16);
+        logf("vk: synckeep (600 merging syncs): %lld pages a later write-back reached, %lld merged on the GPU, %lld copied whole; "
+             "%u words kept (the GPU's newer) so far", (long long)st_sk_pages, (long long)st_sk_merged, (long long)st_sk_whole, sk_log.map[0]);
+        st_sk_pages = st_sk_merged = st_sk_whole = 0;
+    }
+    return true;
+}
+}   // namespace
+void wbc_logs_read() {   // (the done ones, oldest first)
+    for (int k = 0; k < 64; k++) {
+        WbdTable& t = wbd_tables[(wbd_table_next + k) % 64];
+        if (t.log_pending && t.value <= mem_completed) wbc_log_read(t);
+    }
 }
 
 // ---- (FOLIAGE2) the guessed heads' checked write-back on the GPU, at the part's end (shaders/wb_guess.comp) ----
@@ -9770,8 +10050,10 @@ void end_submission_impl(VkCommandBuffer cmd, MemSub& sub) {
         gg_chunks.clear(), gg_snap.clear();
         struct ChunkSrc { Pool* p; uint64_t at, len; };
         static thread_local std::vector<ChunkSrc> chunk_src;   // (for the whole copy, when no table is free)
+        static thread_local std::vector<WbcMeta> chunk_meta;   // (FLICK1, HL_WB_CLOBBER: for the log)
         static thread_local std::vector<VkBufferCopy> fills, odd;
-        chunks.clear(), chunk_src.clear();
+        chunks.clear(), chunk_src.clear(), chunk_meta.clear();
+        if (wbd_mode() & 1u) wbc_logs_read();
         bool filled = false;
         std::vector<std::pair<Pool*, std::vector<VkBufferCopy>>> staged_pools;   // (RX_VK_POOL_MIRROR)
         for (size_t i = 0; i < writebacks.size();) {
@@ -9801,7 +10083,7 @@ void end_submission_impl(VkCommandBuffer cmd, MemSub& sub) {
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
-            if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
+            if (diff && !p->shadow && (run_bytes >= (256u << 10) || wb_shadow_all())) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
             if (diff && p->shadow && p->address && p->mirror && !wbl_no_defer && p->mstate == Pool::MIRROR_ON && wbl_on()) {
                 // (WBL1, RX_VK_WB_LAZY) the whole pages that can wait for the frame's flush are left out of the runs
                 wbl_put_off(*p, runs);
@@ -9850,11 +10132,16 @@ void end_submission_impl(VkCommandBuffer cmd, MemSub& sub) {
                         chunks.push_back({mirror_address + at, p->shadow_address + at, p->address + at,
                                           (uint32_t)(len / (vecs ? 16 : 4)), vecs ? 1u : 0u});
                         chunk_src.push_back({p, at, len});
+                        if (wbd_mode() & 1u) chunk_meta.push_back({p->lo + at, p->lo + r.dstOffset, (uint32_t)len, (uint32_t)r.size});
                     });
                 }
                 st_wbd_runs += (int64_t)runs.size(), st_wbd_bytes += (int64_t)run_bytes;
             } else {
                 vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
+                if (wbd_mode() & 1u) {   // (FLICK1: what the merge log does not see, copied whole)
+                    for (const VkBufferCopy& r : runs) st_wbc_whole_bytes += (int64_t)r.size;
+                    st_wbc_whole_runs += (int64_t)runs.size();
+                }
             }
             for (const VkBufferCopy& r : runs) st_wb_bytes += (int64_t)r.size, gp.bytes += r.size;
             gp.items += (int)runs.size();
@@ -9960,7 +10247,11 @@ void end_submission_impl(VkCommandBuffer cmd, MemSub& sub) {
             }
         }
         if (!chunks.empty()) {
-            WbdTable* t = wbd_table_get(chunks.size() * sizeof(WbdChunk));
+            // (FLICK1, HL_WB_CLOBBER: the merge form's log after the chunks: 16 bytes of counts, the examples, a word a chunk)
+            const unsigned mode = wbd_mode();
+            constexpr uint32_t kExCap = 64;
+            const uint64_t log_at = (chunks.size() * sizeof(WbdChunk) + 15) & ~15ull, per_at = log_at + 16 + 32ull * kExCap;
+            WbdTable* t = wbd_table_get((mode & 1u) ? per_at + 4 * chunks.size() : chunks.size() * sizeof(WbdChunk));
             if (!t) {   // (no table free: the whole copies, the shadows forgotten for those pages)
                 for (const ChunkSrc& c : chunk_src) {
                     const VkBufferCopy r{c.at, c.at, c.len};
@@ -9973,11 +10264,20 @@ void end_submission_impl(VkCommandBuffer cmd, MemSub& sub) {
             if (filled) transfer_barrier(cmd);   // (the shadows' pages from guest memory before the pass reads them)
             if (t) {
                 memcpy(t->map, chunks.data(), chunks.size() * sizeof(WbdChunk));
-                flush_mapped(t->alloc, chunks.size() * sizeof(WbdChunk));
+                WbdPush pc{t->address, (uint32_t)chunks.size(), mode, 0, 0, 0, 0};
+                if (mode & 1u) {
+                    std::memset(t->map + log_at, 0, 16);
+                    std::memset(t->map + per_at, 0, 4 * chunks.size());
+                    pc.log = t->address + log_at, pc.per = t->address + per_at, pc.ex_cap = kExCap;
+                    t->log_pending = true, t->log_at = log_at, t->per_at = per_at, t->ex_cap = kExCap, t->present = presents_now;
+                    t->meta.assign(chunk_meta.begin(), chunk_meta.end());
+                    flush_mapped(t->alloc, per_at + 4 * chunks.size());
+                } else {
+                    flush_mapped(t->alloc, chunks.size() * sizeof(WbdChunk));
+                }
                 GprofSpan gd(cmd, "wb diff (mirror -> guest memory where it differs from the shadow)");
                 gd.items = (int)chunks.size();
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wbd_pipe.pipe);
-                const struct { uint64_t table; uint32_t count, pad; } pc{t->address, (uint32_t)chunks.size(), 0};
                 vkCmdPushConstants(cmd, wbd_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
                 const uint32_t n = (uint32_t)chunks.size();
                 // (its own marker: without one a fault in it read as the last pool's copy, "write-back of pool", in the

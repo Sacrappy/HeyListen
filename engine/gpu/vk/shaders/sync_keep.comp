@@ -1,0 +1,42 @@
+#version 460
+// Copyright (C) 2026 Sacrappy
+// (FLICK1) A mirror sync's page that a write-back reached after its capture was taken (vk_memory.cpp, "the GPU's newer words kept
+// at a sync"): the capture's word goes into the mirror unless guest memory holds the mirror's own word now and the capture's
+// differs from it: that word is the GPU's, written back by a submission handed over before this one but replayed after the
+// capture copied the page (the order thread), and the capture's is the GPU's older one. The shadow, when there is one, takes the
+// word the mirror ends with. One workgroup a chunk (a page); the log counts the words kept.
+// glslangValidator -V --target-env vulkan1.3 --vn SYNC_KEEP_COMP_SPV -o sync_keep_comp_spv.h sync_keep.comp
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+struct Chunk {
+    uvec2 src;      // (device addresses of the chunk's first word: the capture's slot, the mirror, guest memory's import, the shadow or 0)
+    uvec2 mirror;
+    uvec2 guest;
+    uvec2 shadow;
+    uint count;     // (words)
+    uint pad;
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Table { Chunk c[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Log { uint kept; uint copied; };
+layout(push_constant) uniform P {
+    Table table;
+    Log log;
+    uint count;
+    uint pad;
+} pc;
+void main() {
+    const uint ci = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    if (ci >= pc.count) return;
+    const Chunk c = pc.table.c[ci];
+    Words s = Words(c.src), m = Words(c.mirror), g = Words(c.guest), sh = Words(c.shadow);
+    const bool has_shadow = c.shadow.x != 0u || c.shadow.y != 0u;
+    for (uint i = gl_LocalInvocationID.x; i < c.count; i += 256u) {
+        const uint cv = s.w[i], mv = m.w[i];
+        const bool keep = cv != mv && g.w[i] == mv;
+        if (keep) atomicAdd(pc.log.kept, 1u);
+        else m.w[i] = cv;
+        if (has_shadow) sh.w[i] = keep ? mv : cv;
+    }
+}

@@ -4,6 +4,7 @@
 // the submission copies the range's bytes into an entry of an engine-owned ring, tagged with the frame count, and the game's next read
 // of it applies to guest memory the newest unapplied entry that is `lag` frames old, without a wait for the GPU (rb_ring.h has the rules).
 // HL_RB_LAG_CHECK=1: the old path runs unchanged and what the ring would have applied is compared with what the game read.
+#include <thread>   // (FLICK1: the meter pace's sleep)
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -296,6 +297,13 @@ void rbring_flush(VkCommandBuffer cmd, uint64_t value, RbPending& pend) {
             rb_ring::settle_at(a, value);   // (EXPO1: a range taken over again is answered once the GPU is past this submission)
             regions.push_back({r.offset, e.at, n});
             st_staged++, st_staged_bytes += (int64_t)n;
+            {   // (FLICK1, HL_RB_EVENT_LOG=2: every staging of a 0x1040 block, with its tag and the frame counts)
+                static const bool ev2 = getenv("HL_RB_EVENT_LOG") && atoi(getenv("HL_RB_EVENT_LOG")) >= 2;
+                static std::atomic<int> lines{0};
+                if (ev2 && r.size == 0x1040 && lines++ < 150000)
+                    logf("vk: rbstage present %lld clock %lld %#llx tag %lld seq %llu value %llu", (long long)presents_now, (long long)rb_frame_now(),
+                         (unsigned long long)r.guest, (long long)tag, (unsigned long long)e.seq, (unsigned long long)value);
+            }
         }
         vkCmdCopyBuffer(cmd, buffer, ring_buffer, (uint32_t)regions.size(), regions.data());
     }
@@ -349,9 +357,68 @@ RbApplyNote rbring_take_note() {
 }
 
 /// The read of a served range: the newest unapplied entry `lag` frames old into guest memory
+// ---- (FLICK1) the exposure meter's reads before the frame's present ----
+// The game's module job reads the meter's three blocks (0x1040) once a frame and turns them into the frame's exposure and light
+// parameters. With the order thread the game's present is not held by the replay, and when that job runs late (a hitch, a wait of
+// its own) the present is handed over while the job is still reading: the next frame is shown with the whole 3D picture brighter
+// (the HUD is not), the one-frame flash. Proven with HL_METER_DELAY_EVERY=60 HL_METER_DELAY_MS=12 (the frame's first meter read held
+// 12 ms every 60th frame, Kakariko standing still, 180 s): 131 delays, 132 strict flashes, each one frame after a delay; with this
+// wait: 132 delays, 1 flash (before it had learned the frame's reads). Here the hand-over waits, 20 ms at most, for as many meter
+// reads in the frame as the frames before had made by their own hand-over (the least of the last 16): a frame whose job is on time
+// waits for nothing (one wait in about 3600 presents, about 2 ms, in Kakariko). With the order thread only (without it the replay
+// holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).
+std::atomic<int64_t> mp_c{-1}, mp_n{0};
+void meter_read_note(int64_t c) {
+    int64_t cur = mp_c.load(std::memory_order_acquire);
+    if (c > cur) {
+        if (mp_c.compare_exchange_strong(cur, c, std::memory_order_acq_rel)) {
+            mp_n.store(1, std::memory_order_release);
+            return;
+        }
+    }
+    if (mp_c.load(std::memory_order_acquire) == c) mp_n.fetch_add(1, std::memory_order_acq_rel);
+}
+void rbring_meter_pace(int64_t clock) {
+    static const int ms = getenv("RX_VK_ORDER_METER_PACE_MS") ? atoi(getenv("RX_VK_ORDER_METER_PACE_MS")) : 20;
+    if (ms <= 0) return;
+    static int64_t hist[16], hi = 0, waits = 0, timeouts = 0, wait_ns = 0, ticks = 0;
+    auto seen = [&] { return mp_c.load(std::memory_order_acquire) == clock ? mp_n.load(std::memory_order_acquire) : 0; };
+    int64_t expect = INT64_MAX;
+    for (int i = 0; i < 16; i++) expect = std::min(expect, hist[i]);
+    if (hi < 16) expect = 0;   // (learning)
+    int64_t n = seen();
+    if (expect > 0 && n < expect) {
+        const auto t0 = std::chrono::steady_clock::now();
+        waits++;
+        while ((n = seen()) < expect) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) {
+                timeouts++;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+    hist[hi++ % 16] = n;
+    if (++ticks % 3600 == 0) {
+        logf("vk: meter pace (FLICK1, 3600 presents): %lld waited for the frame's meter reads (%.3f ms each), %lld gave up after %d ms; reads by a "
+             "present now %lld", (long long)waits, waits ? wait_ns / 1e6 / waits : 0.0, (long long)timeouts, ms, (long long)expect);
+        waits = timeouts = wait_ns = 0;
+    }
+}
 void rbring_apply(uint64_t gpu, uint64_t size) {
     const uint64_t guest = host->gpu_guest(gpu);
     const int64_t c = rb_frame_now();
+    if (size == 0x1040) {   // (FLICK1, a test: HL_METER_DELAY_EVERY=<frames> HL_METER_DELAY_MS=<ms> (10): the frame's first meter read held that long, every n-th frame)
+        static const int64_t every = getenv("HL_METER_DELAY_EVERY") ? atoll(getenv("HL_METER_DELAY_EVERY")) : 0;
+        static const int dms = getenv("HL_METER_DELAY_MS") ? atoi(getenv("HL_METER_DELAY_MS")) : 10;
+        static std::atomic<int64_t> last{-1};
+        if (every > 0 && c % every == 0 && last.exchange(c) != c) {
+            logf("vk: meter delay at f %lld (present %lld): %d ms", (long long)c, (long long)presents_now, dms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(dms));
+        }
+    }
+    if (size == 0x1040) meter_read_note(c);   // (FLICK1)
     tl_apply_note = RbApplyNote{};
     tl_apply_note.c = c;
     rb_wait_staged(c, config().lag);   // (frames in flight: the replay stages a frame's entries before it shows it)
@@ -382,6 +449,8 @@ void rbring_apply(uint64_t gpu, uint64_t size) {
             if (again < 0) {
                 stats[cls].none++;
                 tl_apply_note.kind = 3;
+                if (getenv("HL_RB_EVENT_LOG")) logf("vk: rbevent ring present %lld f %lld %#llx+%#llx class %d none", (long long)presents_now, (long long)c,
+                                                    (unsigned long long)guest, (unsigned long long)size, cls);
                 hash_add(c, cls, rb_ring::hash_read(cls, guest, nullptr, 0));
                 return;
             }
@@ -399,16 +468,35 @@ void rbring_apply(uint64_t gpu, uint64_t size) {
         if (!rbring_wait_value(e.value, config().wait_ms)) {
             stats[cls].late++;
             tl_apply_note.kind = 4, tl_apply_note.tag = e.tag, tl_apply_note.value = e.value;
+            if (getenv("HL_RB_EVENT_LOG")) logf("vk: rbevent ring present %lld f %lld %#llx+%#llx class %d late", (long long)presents_now, (long long)c,
+                                                (unsigned long long)guest, (unsigned long long)size, cls);
             return;
         }
     }
     uint8_t buf[rb_ring::kMaxCopy];
     std::memcpy(buf, ring_map + e.at, n);
     host->gpu_write(gpu, buf, n);
+    {   // (FLICK1, HL_RB_EVENT_LOG=2: every read of a 0x1040 block, its entry and its first words)
+        static const bool ev2 = getenv("HL_RB_EVENT_LOG") && atoi(getenv("HL_RB_EVENT_LOG")) >= 2;
+        static std::atomic<int> lines{0};
+        if (ev2 && size == 0x1040 && lines++ < 150000) {
+            uint32_t w[4];
+            std::memcpy(w, buf, 16);
+            logf("vk: rbread present %lld f %lld %#llx tag %lld seq %llu kind %d words %08x %08x %08x %08x", (long long)presents_now, (long long)c,
+                 (unsigned long long)guest, (long long)e.tag, (unsigned long long)e.seq, tl_apply_note.kind, w[0], w[1], w[2], w[3]);
+        }
+    }
     stats[cls].applied++;
     if (!tl_apply_note.kind) tl_apply_note.kind = 1;
     tl_apply_note.tag = e.tag, tl_apply_note.value = e.value;
     stats[cls].got[std::min<int64_t>(4, std::max<int64_t>(1, c - e.tag)) - 1]++;
+    {   // (FLICK1, HL_RB_EVENT_LOG=1) a read the ring answered other than with an entry exactly lag frames old: one line each
+        static const bool ev = getenv("HL_RB_EVENT_LOG") && atoi(getenv("HL_RB_EVENT_LOG")) != 0;
+        static std::atomic<int> lines{0};
+        if (ev && (tl_apply_note.kind != 1 || c - (int64_t)e.tag != (int64_t)config().lag) && lines++ < 20000)
+            logf("vk: rbevent ring present %lld f %lld %#llx+%#llx class %d kind %d age %lld", (long long)presents_now, (long long)c,
+                 (unsigned long long)guest, (unsigned long long)size, cls, tl_apply_note.kind, (long long)(c - (int64_t)e.tag));
+    }
     {
         std::lock_guard lk(mu);
         const auto it = table.find({guest, size});

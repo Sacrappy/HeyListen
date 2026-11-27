@@ -15,6 +15,9 @@
 #include "rb_early.h"
 
 namespace mkwvk {
+extern int64_t presents_now;   // (vk_replay.cpp; FLICK1)
+}
+namespace mkwvk {
 namespace {
 
 const rb_early::Config& config() {
@@ -309,6 +312,7 @@ bool rbearly_answer(uint64_t gpu, uint64_t size) {
     if (!ok && fetch((unsigned)ri, size, buf, false, &seq, 200.0)) ok = true, st.late_ok++;
     if (!ok) {
         st.stale++;
+        if (getenv("HL_RB_EVENT_LOG")) logf("vk: rbevent early present %lld %#llx stale", (long long)presents_now, (unsigned long long)host->gpu_guest(gpu));
         log_stats();
         return true;
     }
@@ -319,6 +323,8 @@ bool rbearly_answer(uint64_t gpu, uint64_t size) {
     }
     if (write) host->gpu_write(gpu, buf, (size_t)size);
     else st.repeats++;   // (the game's own writes since the last copy are kept)
+    if (getenv("HL_RB_EVENT_LOG") && !write)
+        logf("vk: rbevent early present %lld %#llx repeat seq %u", (long long)presents_now, (unsigned long long)host->gpu_guest(gpu), seq);
     log_stats();
     return true;
 }

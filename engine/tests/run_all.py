@@ -92,6 +92,8 @@ ARGS = {
     "tests/test_wb_pool_eager.py": ["--cxx", "{cxx}"],
     "tests/test_wb_guess.py": ["--cxx", "{cxx}"],
     "tests/test_wb_guess_gpu.py": [],   # (FOLIAGE2: the guessed heads checked on the GPU in their own part)
+    "tests/test_sync_keep_gpu.py": [],   # (FLICK1: the GPU's newer words kept at a sync)
+    "tests/test_meter_pace.py": [],   # (FLICK1: the meter's reads before the frame's present)
     "tests/test_wb_defer.py": ["--cxx", "{cxx}"],
     "tests/test_grow_lock.py": ["--cxx", "{cxx}"],
     "tests/test_readback_ticket.py": ["--cxx", "{cxx}"],

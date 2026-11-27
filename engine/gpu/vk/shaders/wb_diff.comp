@@ -8,6 +8,11 @@
 // unchanged vectors of the span then went back from the mirror too, over what the CPU had stored there since the mirror's sync: the
 // lock-on ring's pool holds 256-byte elements, a compute program updates the fields of element 0 and element 2 every frame, and the
 // CPU's one store of element 1's (and 3's) position went back to the game's 0x6f fill with them.
+// (FLICK1) pc.mode != 0: the merge form. A word the GPU changed (mirror != shadow) whose guest memory word ALSO changed since the
+// shadow was made (guest != shadow, and != the mirror's) is a word the CPU stored after the mirror's sync: with the order thread
+// the game runs a frame ahead and has stored there before this write-back runs. Bit 1 counts those words in the log (and keeps
+// the first examples); bit 2 leaves them to the CPU (the GPU's word is not written over the CPU's newer one, as on the console,
+// where the GPU's write came first and the CPU's store after it).
 // glslangValidator -V --target-env vulkan1.3 --vn WB_DIFF_COMP_SPV -o wb_diff_comp_spv.h wb_diff.comp
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
@@ -22,14 +27,76 @@ struct Chunk {
     uint vecs;      // (1: vectors, the three addresses 16-byte aligned; 0: words)
 };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Table { Chunk c[]; };
+// (FLICK1) the merge form's log: words the GPU changed, of them the CPU had changed too, of them left to the CPU; examples
+// (chunk, word of the chunk, shadow, guest; then the mirror's) and per chunk the CPU-changed words
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Log { uint gpu; uint both; uint kept; uint n; uvec4 ex[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer PerChunk { uint k[]; };
 layout(push_constant) uniform P {
     Table table;
     uint count;
+    uint mode;      // (FLICK1: 0 the plain diff; bit 0 count, bit 1 keep the CPU's words)
+    Log log;
+    PerChunk per;
+    uint ex_cap;
+    uint pad;
 } pc;
+// (FLICK1) one word of the merge form: the mirror's word mv against the shadow's sv and guest memory's gv; true: write it
+bool merge_word(uint ci, uint wi, uint mv, uint sv, uint gv) {
+    if (mv == sv) return false;
+    if ((pc.mode & 1u) != 0u) atomicAdd(pc.log.gpu, 1u);
+    if (gv == sv || gv == mv) return true;
+    if ((pc.mode & 1u) != 0u) {
+        atomicAdd(pc.log.both, 1u);
+        atomicAdd(pc.per.k[ci], 1u);
+        const uint e = atomicAdd(pc.log.n, 1u);
+        if (e < pc.ex_cap) {
+            pc.log.ex[2u * e] = uvec4(ci, wi, sv, gv);
+            pc.log.ex[2u * e + 1u] = uvec4(mv, 0u, 0u, 0u);
+        }
+    }
+    if ((pc.mode & 2u) != 0u) {
+        if ((pc.mode & 1u) != 0u) atomicAdd(pc.log.kept, 1u);
+        return false;
+    }
+    return true;
+}
+void merged(uint ci, Chunk c) {
+    // (the shadow takes the mirror's word in every case, a word left to the CPU included: the next sync brings the CPU's word into
+    // the mirror and the shadow both)
+    Words m = Words(c.mirror), s = Words(c.shadow), g = Words(c.guest);
+    if (c.vecs == 0u) {
+        for (uint i = gl_LocalInvocationID.x; i < c.count; i += 256u) {
+            const uint mv = m.w[i], sv = s.w[i];
+            if (mv == sv) continue;
+            if (merge_word(ci, i, mv, sv, g.w[i])) g.w[i] = mv;
+            s.w[i] = mv;
+        }
+        return;
+    }
+    Vecs mv4 = Vecs(c.mirror), sv4 = Vecs(c.shadow), gv4 = Vecs(c.guest);
+    for (uint i = gl_LocalInvocationID.x; i < c.count; i += 256u) {
+        const uvec4 v = mv4.v[i], o = sv4.v[i];
+        if (!any(notEqual(v, o))) continue;
+        const uvec4 now = gv4.v[i];   // (guest memory read only for a vector the GPU changed)
+        bvec4 put, same;
+        for (uint k = 0u; k < 4u; k++) {
+            put[k] = merge_word(ci, 4u * i + k, v[k], o[k], now[k]);
+            same[k] = put[k] || now[k] == v[k];   // (written, or the write would change nothing)
+        }
+        if (all(same)) gv4.v[i] = v;   // (the common case: the whole vector at once)
+        for (uint k = 0u; k < 4u && !all(same); k++)
+            if (put[k]) g.w[4u * i + k] = v[k];
+        sv4.v[i] = v;
+    }
+}
 void main() {
     const uint ci = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
     if (ci >= pc.count) return;
     const Chunk c = pc.table.c[ci];
+    if (pc.mode != 0u) {
+        merged(ci, c);
+        return;
+    }
     if (c.vecs != 0u) {
         Vecs m = Vecs(c.mirror), s = Vecs(c.shadow), g = Vecs(c.guest);
         for (uint i = gl_LocalInvocationID.x; i < c.count; i += 256u) {

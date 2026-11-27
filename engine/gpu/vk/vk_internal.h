@@ -552,6 +552,8 @@ bool rbring_serves(uint64_t guest, uint64_t size);
 bool rbring_quiet(uint64_t guest, uint64_t size);
 void rbring_quiet_result(uint64_t size, bool changed);
 void rbring_apply(uint64_t gpu, uint64_t size);
+/// (FLICK1, RX_VK_ORDER_METER_PACE) at a present's hand-over with the order thread: wait (bounded) for the frame's usual exposure-meter reads
+void rbring_meter_pace(int64_t clock);
 void rbring_check(uint64_t gpu, uint64_t size);
 /// (EXPO1, HL_METER_LOG) the ring's state of a range as one line of text (served or not, counters, entries newest first)
 void rbring_describe(uint64_t guest, uint64_t size, char* out, size_t cap);

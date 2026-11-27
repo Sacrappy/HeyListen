@@ -5916,6 +5916,16 @@ void sync_watch() {
 
 /// A submit on the replay thread: replayed as far as its waits allow, or (its queue stopped) after its queue's
 void submit_job(std::vector<uint64_t>& handles, uint64_t value, uint64_t queue) {
+    {   // (FLICK1, a test) HL_REPLAY_STALL_EVERY=<presents> HL_REPLAY_STALL_MS=<ms> (100): the replay of the first submission after every
+        // n-th present sleeps that long, as a pipeline's compile or a page fault would hold it: a hitch on demand, in either replay mode
+        static const int64_t every = getenv("HL_REPLAY_STALL_EVERY") ? atoll(getenv("HL_REPLAY_STALL_EVERY")) : 0;
+        static const int stall_ms = getenv("HL_REPLAY_STALL_MS") ? atoi(getenv("HL_REPLAY_STALL_MS")) : 100;
+        static int64_t last = 0;
+        if (every > 0 && presents_now / every != last) {
+            last = presents_now / every;
+            std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+        }
+    }
     const bool may_stop = event_waits_on() && !dump_on();
     if (consume_signals(value)) {   // (the CPU's signals made before this submit: the stopped ones they let on go first)
         burst_begin(0);
@@ -6369,6 +6379,19 @@ void invalidate(uint64_t gpu, uint64_t size) {
         int64_t t;
         ~R4MapPost() { if (n) r4map_read(g, n, t); }
     } r4map_post{gpu, size, std::chrono::steady_clock::now().time_since_epoch().count()};
+    struct SlowReadPost {   // (FLICK1, HL_RB_SLOW_US=<us>: a read-back that took longer, a line each: the frame, the range, how long)
+        uint64_t g, n;
+        int64_t t, f;
+        ~SlowReadPost() {
+            static const int64_t us = getenv("HL_RB_SLOW_US") ? atoll(getenv("HL_RB_SLOW_US")) : 0;
+            if (!us || !n) return;
+            const int64_t d = std::chrono::steady_clock::now().time_since_epoch().count() - t;
+            static std::atomic<int> lines{0};
+            if (d > us * 1000 && lines++ < 30000)
+                logf("vk: rbslow present %lld f %lld->%lld %#llx+%#llx %.2f ms", (long long)presents_now, (long long)f, (long long)rb_frame_now(),
+                     (unsigned long long)host->gpu_guest(g), (unsigned long long)n, d / 1e6);
+        }
+    } slow_post{gpu, size, std::chrono::steady_clock::now().time_since_epoch().count(), rb_frame_now()};
     // (READB2, HL_RB_R2 / HL_RB_R3, readbacks-r2-r3.md) the class of this read, whether it is read late (no wait: what guest memory holds),
     // and for the CHECK switch the value it holds at entry, compared with the value after the waits when the read is done
     // (STEP1, HL_RB_LAG) the range is learned as one to stage; one already staged is answered by the ring below and waits for nothing
@@ -9920,6 +9943,7 @@ void present(const nvn_tex* t, const int crop[4]) {
     if (lag_on() && presents % 600 == 0) log_order_stats();
     memory_precopy_present();
     memory_cap_present();
+    if (order_thread_on() && rb_fif_on()) rbring_meter_pace(rb_clock.load(std::memory_order_acquire));   // (FLICK1: the frame's meter reads first)
     if (rb_fif_on()) rb_clock.fetch_add(1, std::memory_order_release);   // (FIF1: the game's frame count)
     if (order_thread_on()) return ot_present(t, crop);   // (PIPE2: a job of the order thread)
     if (present_handed_over(t, crop)) return;
