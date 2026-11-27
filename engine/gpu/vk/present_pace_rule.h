@@ -50,6 +50,39 @@ inline int64_t start_wait(const Line& l, int64_t now, int64_t period, int64_t wo
     return start > now ? start - now : 0;
 }
 
+/// (the pacer thread, HL_PRESENT_PACE=3) The earliest the next present may go out: one period after the last one, less the
+/// wake-up's allowance. Never two presents closer than that, whatever the line says (a queued frame, a restarted line)
+inline int64_t not_before(int64_t last_present, int64_t period, int64_t early_ns) {
+    return last_present && period > 0 ? last_present + period - early_ns : 0;
+}
+
+/// (one clock) The line only moves later by itself (a late frame restarts it from itself), so it settles where every frame waits
+/// almost a period: the game's own clock (its window acquire, host/nn_vi.c) and the line drift apart in phase. Here the line moves
+/// EARLIER, by the excess of the recent frames' smallest waits (`low_hold`, a low mark of them) over `target_ns`, `max_step_ns` a
+/// frame at most: the presents stay even (each interval shortened by that step at most) and the wait comes down to about the
+/// frames' own spread. A late frame gives a wait of 0: the low mark falls under the target and the line stops moving
+inline int64_t slew(int64_t low_hold, int64_t target_ns, int64_t max_step_ns) {
+    const int64_t x = low_hold - target_ns;
+    return x > 0 ? std::min(x, max_step_ns) : 0;
+}
+
+/// The low mark of the last frames' waits: the n-th smallest of `v[0..count)` (n from 1); -1 for none
+inline int64_t low_mark(const int64_t* v, int count, int n) {
+    if (count <= 0) return -1;
+    if (count > 64) count = 64;
+    if (n < 1) n = 1;
+    if (n > count) n = count;
+    int64_t t[64];
+    for (int i = 0; i < count; i++) t[i] = v[i];
+    std::nth_element(t, t + (n - 1), t + count);
+    return t[n - 1];
+}
+
+/// The queue between the game's hand-over and the pacer thread: two frames at most (the game one frame ahead, never more). A third
+/// waits for room (the hand-over blocks, a period at most): no frame is dropped and none is shown early
+constexpr int kQueueMost = 2;
+inline bool must_wait_for_room(int queued) { return queued >= kQueueMost; }
+
 /// The high mark of the last frames' work: the n-th largest of `v[0..count)` (n from 1), the ring's values in any order
 inline int64_t high_mark(const int64_t* v, int count, int n) {
     if (count <= 0) return -1;

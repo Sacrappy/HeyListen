@@ -1,7 +1,8 @@
 # Copyright (C) 2026 Sacrappy
 """Compile and run the present pace's rule (gpu/vk/present_pace_rule.h; no game/GPU): at a frame rate limit each frame is handed
 over on an even line (an early frame waits for its point, a late one starts the line again: no short frame after it); and by the
-text, that vk_replay.cpp holds at present()'s start, before the order lock, and only where the pace applies."""
+text, that vk_replay.cpp holds at present()'s start, before the order lock, and only where the pace applies; and that the pacer
+thread (=3) keeps two presents a period apart, moves its line earlier, and bounds its queue at two."""
 import argparse
 import subprocess
 import tempfile
@@ -16,7 +17,11 @@ def check_source():
                    "present_pace_rule::hold(line, now, period,",
                    "present_pace_rule::start_wait(line, now, period, work,",
                    "if (limit <= 0 || framegen_on()) return 0;",
-                   "if (dev.present_mode_name && dev.present_mode_name[0] == 'f') return 0;"]:
+                   "if (dev.present_mode_name && dev.present_mode_name[0] == 'f') return 0;",
+                   "present_pace_rule::not_before(t_last, j.period, early + 250000)",
+                   "present_pace_rule::slew(present_pace_rule::low_mark(t_ring, t_ring_n, 4), target, 250000)",
+                   "if (present_pace_rule::must_wait_for_room((int)t_q.size())) {",
+                   "res = pace_thread_push(dev.swapchain, index);"]:
         if needle not in src:
             raise SystemExit("gpu/vk/vk_replay.cpp no longer has: " + needle)
     i = src.index("void present(const nvn_tex* t, const int crop[4]) {")
