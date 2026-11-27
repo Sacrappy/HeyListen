@@ -59,6 +59,7 @@
 #include "shaders/astc_bc_encode_comp_spv.h"
 #include "bc_levels.h"
 #include "vk_bc_disk.h"   // (TEXCACHE: the BC blocks on disk between sessions)
+#include "bc_disk_sync.h"   // (JOBS1: RX_VK_BC_DISK_SYNC's rule)
 #include "vk_paths.h"
 #include "msync_diff.h"   // (TICK-051: the BC cache's content hash)
 #include "astc_bc_policy.h"
@@ -1578,6 +1579,58 @@ BcCacheEntry bcd_take(uint64_t key, uint64_t size) {
     bcd_pool_bytes -= e.bytes;
     return e;
 }
+// (JOBS1) RX_VK_BC_DISK_SYNC=1 / 0 (on by default; =0: off), RX_VK_BC_DISK_SYNC_MB=<MB> (16 by default): a texture of that many MB of
+// blocks or more, whose whole record of blocks the disk cache has but has not read ahead into its pool, is read from the disk at once
+// on the render thread instead of transcoded on the GPU. Anything else takes the old path, unchanged: a texture under the size, a key
+// the disk does not have (a cold or missing cache), the disk cache off, a record whose read or hash check fails, a pack rotated during
+// the read. The read-ahead pool is not used for it (a full pool, as here, does not stop it: the buffer is its own, let go once the
+// GPU has copied it). Why: the laptop (Ryzen 7 5700U, Vega 8): Hyrule Field's two 1365 x 1365 x 90 terrain arrays are uploaded 3 to 7
+// times as play begins (the game streams their layers in: each state a key the disk has, none read ahead in time: the pool full), and
+// each GPU decode + BC encode of one (56.5 MB of ASTC) kept the GPU busy ~2.8 s: the CPU's reads of GPU results waited for that
+// submission and the game froze 8-20 s, or the GPU was reset (VK_ERROR_DEVICE_LOST in 5 of 10 starts). A read of such a record is
+// 0.09-0.4 s of the render thread (JOBS1, 10 starts a side: the long frame 1.4-1.8 s against 7.9-20.6 s or a lost device)
+bool bcd_sync_wanted(uint64_t size) {
+    static const char* const e = getenv("RX_VK_BC_DISK_SYNC");
+    static const uint64_t min_bytes = bc_disk_sync::min_bytes(getenv("RX_VK_BC_DISK_SYNC_MB"));
+    static const bool logged = [] {
+        logf("vk: BC disk cache: textures of %llu MB and up read from the disk at once, not transcoded on the GPU: %s (RX_VK_BC_DISK_SYNC)",
+             (unsigned long long)(min_bytes >> 20), bc_disk_sync::wanted(e, min_bytes, min_bytes) ? "on" : "off");
+        return true;
+    }();
+    (void)logged;
+    return bc_disk_sync::wanted(e, size, min_bytes);
+}
+std::atomic<int64_t> st_bcd_sync_n{0}, st_bcd_sync_fail{0}, st_bcd_sync_bytes{0}, st_bcd_sync_ns{0}, st_bcd_sync_max_ns{0};
+/// (JOBS1) the blocks of key read from the disk now into a buffer of their own (the caller lets it go once its copy is done); empty
+/// when the disk does not have them or the read failed (a transcode follows, as before)
+BcCacheEntry bcd_read_now(uint64_t key, uint64_t size) {
+    const auto steady_ns = [] {
+        return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const int64_t t0 = steady_ns();
+    BcCacheEntry e;
+    e.bytes = size;
+    bool ok;
+    {
+        MemKindScope mem_kind_(MemKind::BcCache);
+        ok = create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, e.buf, e.alloc, &e.mapped);
+    }
+    if (ok && !bcdisk::read_now(key, (uint32_t)size, (uint8_t*)e.mapped)) destroy_buffer(e.buf, e.alloc), ok = false;
+    if (ok) flush_mapped(e.alloc, size);
+    const int64_t ns = steady_ns() - t0;
+    if (!ok) {
+        st_bcd_sync_fail.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    const int64_t n = st_bcd_sync_n.fetch_add(1, std::memory_order_relaxed) + 1;
+    st_bcd_sync_bytes.fetch_add((int64_t)size, std::memory_order_relaxed), st_bcd_sync_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (ns > st_bcd_sync_max_ns.load(std::memory_order_relaxed)) st_bcd_sync_max_ns.store(ns, std::memory_order_relaxed);
+    if (n <= 20 || n % 100 == 0)
+        logf("vk: BC disk cache: %.1f MB read at once in %.1f ms, not transcoded (%lld so far, %.0f MB, %.0f ms in all, the longest %.1f ms; %lld failed)",
+             size / 1048576.0, ns / 1e6, (long long)n, st_bcd_sync_bytes.load() / 1048576.0, st_bcd_sync_ns.load() / 1e6,
+             st_bcd_sync_max_ns.load() / 1e6, (long long)st_bcd_sync_fail.load());
+    return e;
+}
 void bcd_hooks() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -1739,6 +1792,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             bcd_hooks();
             const uint64_t size = bcc_size(tex, pieces);
             hit = bcd_take(disk_key, size);
+            if (!hit.buf && bcd_sync_wanted(size)) hit = bcd_read_now(disk_key, size);   // (JOBS1: read here, not transcoded)
             if (hit.buf) {
                 from_disk = tl_disk_hit = true;
                 hit.last_value = rec_value;

@@ -485,6 +485,29 @@ inline bool probe(uint64_t key, uint32_t size) {
     return true;
 }
 
+/// (JOBS1, render thread) a record's blocks read here and now into out (size bytes), hash checked, on a file handle of its own (the
+/// thread's stay its own); false when the disk does not have it, the pack rotated meanwhile, or the read failed. For the large
+/// textures whose transcode costs an integrated GPU seconds (vk_texture.cpp bcd_sync_wanted)
+inline bool read_now(uint64_t key, uint32_t size, uint8_t* out) {
+    Store& s = store();
+    if (!s.ready.load(std::memory_order_acquire)) return false;
+    texcache::Loc l;
+    uint64_t seq;
+    {
+        std::lock_guard lk(s.mu);
+        const texcache::Loc* p = s.ix.find(key);
+        if (!p || p->size != size) return false;
+        l = *p, seq = s.ix.seq[l.gen];
+    }
+    std::ifstream f(s.path[l.gen], std::ios::binary);
+    if (!f) return false;
+    f.seekg((std::streamoff)l.at);
+    f.read((char*)out, l.size);
+    if (!f || (uint64_t)f.gcount() != l.size || texcache::hash_blocks(out, l.size) != l.hash) return false;
+    std::lock_guard lk(s.mu);
+    return s.ix.seq[l.gen] == seq;   // (the same pack still: its records were not overwritten by a rotation)
+}
+
 /// (render thread, a new texture about to be held back) whether the disk has its blocks; if so its record is read before anything
 /// else, and the run after it asked for
 inline bool want_now(uint64_t key, uint32_t size) {
