@@ -15,150 +15,140 @@ these files.
 Also on [RecompLauncher](https://recomplauncher.com), if you use it: HeyListen is in its library, with the same build done for you
 (`HeyListen-{TAG}-Windows-x64.zip` below is what the launcher installs; you don't need to download it).
 
-**Shaders are prepared again once** with this release: the first start takes a few minutes longer, and the first session
-builds the driver's pipelines as you play, so it stutters more than usual. The second start is smooth again.
+**Shaders are prepared again once, and the game's code is translated again once** with this release: the first start
+after updating takes a few minutes longer, and the first session builds the driver's pipelines as you play, so it
+stutters more than usual. The second start is smooth again.
 
 {TAG}, new since {SINCE}
 -----
 
 ## New options
 
-* **V-Sync On/Off and a V-Sync mode row**: On waits for the screen's refresh (no tearing); the mode row picks FIFO with
-  two images (least delay), FIFO with three (the default), or Mailbox. Off is the game's own way. A **VRR** row (G-Sync /
-  FreeSync) shows the game without tearing and without V-Sync's wait.
-* **NVIDIA DLSS Frame Generation** (RTX 40 and newer) as a *Frame generation by* choice, next to the built-in and AMD
-  FSR 3.1 makers: 2x up to the most your GPU's runtime allows (6x on an RTX 50). It needs the DLSS or FSR 4 upscaler for
-  depth and motion; until then the built-in one makes the frames. Off by default.
-* **AMD FSR 4 frame generation** (a Radeon RX 9000, **not tested on real hardware yet**) as a fourth *Frame generation by*
-  choice, 2x, through AMD's own runtime. The Builder's **AMD FSR 4** tick now also downloads AMD's frame generation file
-  (`amd_fidelityfx_framegeneration_vk.dll`, FidelityFX SDK v2.4.0, checked against its SHA-256 and size, under the same AMD
-  license you accept at the tick). A game built with the tick before this release shows **Get the file** in the Builder:
-  it fetches that one file without building the game again. The game's menu and log say what to do when the file is missing.
-* **DLSS model row names DLSS 4 and DLSS 4.5**, plus **DLSS 3** (CNN, preset E); the first-run default follows your GPU's
-  generation and VRAM (DLSS 3 under 7 GB).
-* **Upscaler and Render resolution** now sit above the frame rows; **DLAA** is a Render resolution choice; the **Frame
-  rate limit** is the rate you see; the multiplier stays within its mode. The Upscaler also has an **Off** choice, for GPUs
-  where the game's own network shows glitches.
-* **PsychoV35 HDR tone mapper** (Duck912, #101, after RenoDX's tone mapper for this game): with HDR set to *The game's
-  own*, the *HDR tone mapper* row picks the game's curve or PsychoV35, whose highlights roll off into your screen's peak
-  and keep their colour, with its own grading rows (saturation, contrast, exposure...). It works with every upscaler and
-  gives frame generation 10-bit frames (DLSS Frame Generation keeps 8-bit frames for now). A saved setting from the
-  pre-release's own tone mapper loads as PsychoV35.
-* **DLAA before the bloom** (Graphics, after Longshot): DLAA smooths the 3D before the game's bloom and tone map. It needs
-  the Render resolution at Native (DLAA); the row is greyed out otherwise.
-* **Keyboard button prompts**: *Button prompts = Keyboard* shows the keys and mouse buttons you bound, in the game's
-  texts, hints and menus (movement keys as they are bound).
-* **Button prompts change while you play** (after Longshot #2366, Gabriel Moisan Matte): a new *Button prompts* choice or a
-  new binding shows at once, in the texts, the ocarina's staff and its hint, the Talk ring and the pause menu's controller picture (the Switch's buttons stay on the Keyboard face),
-  with no restart. **Auto** follows the device you play with (the keyboard, an Xbox-type pad, a DualSense, a Switch or Steam
-  Deck pad: the one that gave input last, without flipping on a resting pad's drift or a nudge of the mouse). The ocarina's
-  notes show the keys you bound on the Keyboard face, not the Switch's letters.
-* **HUD layout row**: the HUD at the screen's edges (every screen shape) or in the middle 16:9.
-* **Handheld profile and Volumetric fog apply at once**: no restart. The game is told of the dock or undock as a console
-  tells it; the size of its picture still follows the start's profile.
-* **A tidier menu**: rows that only matter with another setting on (V-Sync mode, the frame generation rows, the DLSS
-  model, the HDR and PsychoV35 rows) are hidden while that setting is off; the HDR row says when your screen has no HDR
-  (Windows' *Use HDR* off); *Layout preset* and *Button prompts* are on the Controls tab. Button prompts apply at once, with no restart.
-* **Open menu** is a bindable control, and a touchpad click opens the in-game menu.
-* **Check for updates**: the update offer also works when the game is started without the launcher, with *Never ask
-  again* and a Settings row. The Builder's **Play** button starts the game through the builder (`--play`).
-* `--fullscreen`: a one-run start in the display mode a shortcut asks for.
-* **Performance statistics** (still opt-in and off by default) also say whether frame generation was on, its multiplier,
-  the DLSS model, the render scale, the frame's parts and what caused each hitch. The pipeline states and, per map, the
-  shader programs used can be shared too, with the same row. With the row on, a **detailed profile** is sent as well:
-  where the CPU spends its time (by module and thread kind, the costliest game functions by address) and the GPU's time
-  per render pass, with what was running during stutters; it costs about 3% of fps while the row is on
-  (`HL_TELEMETRY_PROFILE=0` keeps the rest and turns the profile off). Nothing is sent unless you turn the row on. Crash reports now
-  name every frame of the backtrace on your PC, the crash window says that a sent report is published (GitHub issue #55
-  and Discord) and how to have one removed, and every folder path is redacted before it is shown or sent.
+* **First person** (ToxicToucan; Gameplay tab, off by default): the camera sits at Link's eyes, with his head hidden so his
+  body and what he holds come into view. It turns with the mouse one to one, keeps Navi out of the picture and eases the
+  eye out while Link is in the air.
+* **Volume** (Chad-; Gameplay tab): the game's whole sound from 0% to 100%, heard at once.
+* **Ocarina pitch help** (timetohitthedopeho; Gameplay tab): a note you sing into the microphone is played as the nearest
+  ocarina note.
+* **Sprint with L3** (Controls tab): Off, Hold or Toggle.
+* **Texture resolution: High / Low** (Graphics tab): Low leaves out the top level of the biggest textures, for cards with
+  little video memory. It applies after a restart. A card with 3 to 4 GB should use Low.
+* **Quality preset Lowest (integrated GPU)**: one choice that sets what an integrated GPU needs (a lower render
+  resolution, Handheld profile on, Volumetric fog off). It replaces the earlier low-end settings row.
+* **Output device** row: choose the sound's device in the menu; it applies at once.
+* **Handheld profile, Volumetric fog and Button prompts apply at once**, with no restart. Every quality preset also sets
+  the Volumetric fog.
+* **Render resolution 33%** with the game's own upscaler, and **Off** for the game's own resolution (shown as Auto).
+* **Base frame rate limit before frame generation**, as a row of its own.
+* **F10 overlay**: the full overlay shows the 1% and 0.1% lows.
+* **HDR10 static metadata** (McNartin): on an HDR screen the game now tells the screen the picture's peak and black level.
+* **Button prompts follow a change while you play**: with *Auto*, the prompts follow the device that gave input last.
+  When the `prompts` folder is missing, the game's log, the row's help and the Builder now say so.
+* **A touchpad click opens the menu.**
+* **AMD FSR 4 frame generation** (Windows, Radeon RX 9000 only) is still **not tested on real hardware**. If you have the
+  card and try it, a report is welcome.
+* **Crash reports** (still opt-in, as before): the report you may send now carries a diagnosis in words, the area and play
+  time, memory figures, the last slow frames, the last Vulkan error and the switches set in `hookshot_env.txt`. Paths, the
+  user name and text-like values are masked. Saves, game files and memory are never sent.
 
 ## Fixes
 
-* **Cutting grass (#50)**: the leaves now fly and vanish at every cut, also on a busy CPU (before, debris piled up at the
-  first cut's place, or none showed). Small game memory pools the GPU writes are now always copied back to the game, and
-  a pool the CPU starts writing is copied back at once. This also ends the vegetation that vanished for a few frames when
-  you cut a plant right after loading. No measurable fps cost. (`RX_VK_WB_SMALL_EAGER_KB=0` / `RX_VK_WB_POOL_EAGER=0`
-  restore the old behaviour.)
-* **Above 60 fps** (CraftyCorvid, cuecuemoar, Jeff Aigner): Link pulls himself up a ledge at normal speed, frozen Zoras
-  stand still, water ripples step every frame, and the ocarina's notes show one at a time with the music.
-* **Exposure**: the light meter's sums are cleared on the GPU and a read that finds zeros gets the last result (pixl27);
-  its reads also wait for their write-back while the game runs slow, so no white flash under load.
-* **AMD integrated GPUs** (ROG Ally and similar): each present waits for its frame's GPU work by default, so HUD icons no
-  longer flash and the minimap keeps its texture (bubblesnout, #81, #34).
-* **Crash and robustness** (pixl27, jcabarca, Chad-, NotRexed): a driver fault while a shader is read becomes one failed
-  shader and a message instead of a silent close; an AMD pipeline the compiler rejects is built again without
-  optimization (the Market's and Kakariko's dogs); each submission ends with a barrier so the game reads the GPU's
-  results; vertex divisors and host memory imports follow what the device allows; the first-start preparation gives up
-  cleanly when it stalls; texture formats keep their own alpha; sparse BC images respect the device's limits.
-* **Long game folder paths** (NotRexed, monsterlag, cuecuemoar): a game folder whose deepest file passes 260 characters
-  plays, paths keep UTF-8, and the cutscenes' voices play in a deep folder.
-* **Linux** memory: the renderer gives memory back under memory pressure (dukenheimer) and the driver's compiles run as
-  many at once as the memory holds (Tomiss); Linux tries sound device 0 first when `HOS_AUDIO_DEVICE` is unset (Mooseca,
-  #99); Windows keeps the default output first.
-* **Voices**: a Voice Language saved in `option.sav` (for example Japanese voices under English text) is applied after a
-  restart, not only after you change it again (HumanBean, #94). A 5.1 mix's centre channel also goes to the front pair, so
-  voices survive a sound device that drops the centre (#82).
-* **Above 60 fps**: the Scarecrow's Song no longer hangs on its first note (mooki, #87); Epona jumps fences and the Shadow
-  Temple's barge carries Link (CraftyCorvid); the battle music stops after a fight (CraftyCorvid); Gohma reaches her
-  ceiling position (PirateKingIsh).
-* **No more white flashes on slower cards**: the captures' wait for late pages follows the GPU (pixl27, #81, #34).
-* **Water**: two volume-box draws left out (a GPU hang in water on RTX 50, Link white in water); a draw is skipped past
-  its pipeline only where the next frame redraws that target; compressed textures upload where render targets used their
-  storage (pixl27).
-* **Castle Town and Hyrule Castle direct sunlight**: the textures and samplers the game registers before the renderer
-  starts are read from the host's copies (mooki, #80).
-* **Shaders** (the stamp group): sized queries, texture handles from constant banks, conversions, subgroup barriers,
-  8/16-bit stores, TLD.MS, ISBERD.O, R2UR and more (jarynclouatre, klimovich008, hckrman101, Joey Magnus, Miguel Luna,
-  Kolkka, yassine milal, mooki).
-* **Foliage noise on wave64 GPUs** (#67) and AMD/RDNA fixes: 16-bit floats in shaders only where the device has them
-  (Mooseca); the mesh index map in whole 32-primitive blocks (Kolkka).
-* **Textures**: a re-upload or first upload takes only its own submission's copies (Mooseca, #66).
-* **Crashes**: the native main loop is off again by default (`HL_MAINLOOP=1` turns it on); it was the first suspect in
-  v0.4.2's `ModuleSystemWorker` crashes. Cold-page trimming backs off under memory pressure. The game never runs on a
-  software Vulkan device beside a real GPU, and stops with a message when it is the only one.
-* **New areas** wait for their translations again, as in v0.4.2.
-* **Menu**: the menu's clip rects stay upright and its help box stays inside a windowed window (NotRexed).
-* **Video**: the movie is decoded ahead on its own thread, and on the GPU through DXVA when your PC has an AV1 decoder.
-* **Frame generation** says its runtime's version at the start; its multiplier stops at what the runtime offers (#1486,
-  pmwork-personal); changing it while playing no longer crashes.
-* **Free camera (Cheats)** is found again on block lifts; the gameplay view's hook is set at lift time (Codex).
+* **One-frame brightness flashes** (the lit ground, the lights and the ground fog getting brighter or darker for a single
+  frame, seen in the late-November builds; #93): found and fixed. The **order thread**, the renderer's work on a thread of
+  its own that gave those builds their frame-rate gain, is **off by default** in this release. If your CPU has 8 or more
+  logical processors you can try it with `RX_VK_ORDER_THREAD=1` in `hookshot_env.txt`.
+* **Leaves and grass that vanished and came back** while you moved: fixed.
+* **Freezes of several seconds from file calls**: one cause fixed (no file or log call is made while a thread holds its
+  core).
+* **Lock-on ring** (#89): all four triangles show around the target.
+* **Crashes from GPU writes into memory the game had freed**: a write whose buffer the game freed is left unbound, so it
+  cannot land on the game's new objects. Crashes at an area's load and at the title screen are fixed, and the log says more
+  when memory runs out.
+* **Crash at address 0x150** (#114; NotRexed, after Rekarina's finding): an invalid resource handle now takes the game's own
+  empty path.
+* **Integrated AMD GPUs**: a driver crash at an area's load when memory is full is fixed (the game skips some drawing for
+  a moment instead of closing). The big terrain textures are read from the disk cache instead of decoded again at the
+  start of play, so a freeze of 8 to 20 seconds, or a lost GPU, at the start of play from the **second** start on is gone.
+  The **first** start after installing can still freeze about 20 seconds.
+* **No controller plugged in**: the hitch every second is gone (HumanBean, after Longshot #2124).
+* **Foliage cut-outs** are back on Intel Arc B-series and Lunar Lake (tiktiki, twisted89), and Death Mountain Trail's khaki
+  veil on Intel is gone (Guep).
+* **Pink and green flash** on some mesh shaders: fixed (nachochee3e).
+* **Microphone ocarina above 60 fps** (timetohitthedopeho).
+* **Gyro and sticks**: a pad's gyro stops with its buttons when the game is behind another window (Dylan Martin); a frozen
+  gyroscope is switched off and on again, as after Alt+Tab under Steam (Tony Malins); a stick steers once it has been
+  seen at rest, so the camera no longer spins on its own (NotRexed). Steam Input's doubled buttons can be cured with
+  `HL_XINPUT_SDL_FIRST=1` (oscarlosu-lab).
+* **Insert menu** (jarynclouatre): the pad no longer moves Link while the menu is open in the background, and an input
+  still held after the menu no longer blocks the pad's other buttons.
+* **Sound back after the device goes away** (Robin, #2190): the output reopens when its device disappears and returns, and
+  follows Windows' default when it changes.
+* **NPC speech bubbles** stay over their speaker on wide screens (CraftyCorvid).
+* **Render targets** (mooki, #30): a finished render target is let go when the game reuses its memory.
+* **Small cards**: past the driver's video memory allowance the textures' floor gives way, so a small card's memory comes
+  back under it (HumanBean). The storms of texture re-uploads after the pause menu are gone (Veix).
+* **Light-meter and capture waits**: a capture's wait for the GPU follows the recording's own timeline (Erfboom, #2458).
+* **Shaders and drawing**: dead-code removal keeps the warp-wide operations (black leaves, #97); a mesh draw's indirect
+  argument ranges no longer overlap (juliotec, #2719); a texture's storage size is computed in 64 bits (hckrman101);
+  overlapping inline buffer updates are ordered (klimovich008, #329); texture blits are checked before they run, a sparse
+  texture's blocks are bound when its upload runs out of staging, and clears of ASTC textures are skipped (juliotec).
+* **Other crashes and device losses**: the AMD cloth pipeline's optimizer hang (Mesquita); big GPU texture uploads in
+  bounded steps against a lost device on integrated AMD GPUs (Jer9); texture staging published before the GPU reads it
+  (Issai); capture reads invalidated before the CPU reads them (Arkex-ai); Media Foundation buffers balanced on rejected
+  frames (Ghost, #2859); a directory's listing read under one lock (NotRexed, #2539); a driver fault caught by the
+  Windows guards is logged (jarynclouatre) and the device's fault information is read on a lost device (Saul Ojeda).
+* **Linux saves and window** (jarynclouatre, Zelda Ootr, Itallo Ramon): moving the saves leaves a linked folder alone, a
+  move that fails part way brings back what it moved, and the window opens on COSMIC's Wayland (#992).
+* **RecompLauncher** (Xarishark): the manifest's build uses the player's own copy as the input game for every release, and
+  no update question is shown under the launcher.
+* **Frame generation** (HumanBean, SadTransGirl, futondestroyer, Jordan): the picture from before the HUD can feed FSR 3.1
+  and the built-in frame generation, with the HUD laid over each made frame (off by default); FSR 3.1's images are let go
+  when another maker makes the frames.
+* **Below 60 fps at the default 60 limit**, the game's whole-frame counters keep their fractions, so the time of day, the
+  water's ripples and the Scarecrow's Song no longer fall behind (SadTransGirl).
+* **Castle Town's market**: the neighbouring map is no longer reloaded each time Link turns (SadTransGirl).
 
 ## Performance
 
-* The game's yield gives up its virtual core only, not the processor.
-* Lifted stores mark only the pages the GPU can read (the bitmap form is off by default).
-* The shaders' preparation uses all of the PC's threads and tells the builders how long it will take; a driver compile
-  that outlasts the wait is given up and remembered.
-* NVIDIA's NGX starts on its own thread at the first present with DLSS chosen.
-* Intel and integrated GPUs without VRAM mirrors copy uniform buffers as submitted by default (Dukenheimer, #1795).
-* The dry pass's appends no longer wait behind the early segments' reads (Mooseca).
-* Stutters (pixl27): emptied video memory blocks go back to the driver on a thread of their own instead of the render
-  thread; the sync-object table's rehash no longer reads every object under its lock; retired memory pools nothing needs
-  are set aside instead of walked at every submission (a slowdown that grew with the session).
+* **Texture disk cache**: on integrated GPUs and cards under 10 GB, transcoded textures are kept on disk and read ahead,
+  and the entered map's textures are read first.
+* **Memory**: cold pages are trimmed only while RAM is short, and freed address regions stay resident for a while.
+* **Smaller gains** (HumanBean, SadTransGirl, Mooseca, pixl27): events and yields without locks when nobody waits, no wake
+  call when nobody sleeps, retired capture buffers destroyed on a thread of their own, the vegetation's mesh draws keep
+  their passes, cached programs read by the background workers, and a buffer binding checks the left-out ranges without
+  the shared lock.
+* **Shader preparation**: a comment edit in the translator, or a line about the GPU switches in `hookshot_env.txt`, no
+  longer makes every player prepare the shaders again (Jeff Aigner, pixl27).
 
 ## Linux
 
-* The AppImage builds again (CreateHardLinkA no longer hides link(2)), and the exe exports every function the Vulkan back
-  end looks up by name (Mooseca).
-* RDNA 3.5 APUs take the compute path on RADV (#81); RADV's mesh shaders stay off by default (#51, Dewey Harry D. bartolo,
-  hckrman101); `RX_VK_NO_DMABUF=1` gives the guest window anonymous memory (Mooseca).
-* The crash record's names link on Linux; the logs folder's `.log` links work for the launcher's crash reports.
+* The game links again on Linux (Mooseca, issue 133), and the sound driver's name and error are logged when the device
+  cannot be opened (issue 99).
+* The BC-250 runs the compute mesh path by default.
 
 ## Known issues
 
-* **The first visit to a new area can stall for about 30 seconds on slower PCs** while its shaders are translated (as in
-  v0.4.2); the next visits are smooth.
-* **The one-time shader preparation** after updating takes a few minutes, and the first session stutters while the
-  driver's pipelines are built.
+* **On an integrated GPU, the first start after installing can freeze about 20 seconds** when play begins. Later starts do
+  not.
+* **A freeze of 1 to 2 seconds at the start of play**, and shorter ones when an area loads.
+* **At a frame rate limit the frame times are slightly uneven**, so the 1% low reads lower than the game feels. A fix is
+  in this build, but it is off by default and not validated yet: `HL_PRESENT_PACE=3` in `hookshot_env.txt`.
+* **A rare one-frame white floor in Gerudo Fortress**, and **a rare single black frame of the 3D picture** with the HUD
+  intact.
+* **GTX 1060 3 GB class cards can lose the device entering Kokiri Forest**: try Texture resolution Low and
+  `RX_VK_SHADOW_SHIFT=2`.
+* **The first visit to a new area can stall for about 30 seconds on slower PCs** while its shaders are translated; the next
+  visits are smooth.
+* **The one-time preparation** after updating takes a few minutes, and the first session stutters while the driver's
+  pipelines are built.
 * **AMD on Windows**: if you lose the GPU (device lost) after area changes, set `RX_VK_KEEP_RETIRED=1`; terrain missing
-  after area changes is the opposite case, `RX_VK_AMD_GIVE_BACK=1` gives retired imports back as NVIDIA does (off by
-  default after an RX 6750 XT lost its device without KEEP_RETIRED). Add either to `hookshot_env.txt`.
-* **Some plants' wind animation** (the blue-flowered plants in Hyrule Field) looks wrong; it was there before 0.4.3 and is
-  being looked at.
+  after area changes is the opposite case, `RX_VK_AMD_GIVE_BACK=1` gives retired imports back as NVIDIA does. Add either
+  to `hookshot_env.txt`.
+* **Some plants' wind animation** (the blue-flowered plants in Hyrule Field) looks wrong.
 * **DLAA costs fps**: it draws the 3D at your screen's full resolution, so expect 15-20 fps fewer than DLSS's scaled
   modes.
-* **Integrated GPUs with no mesh shaders** (for example the Radeon in desktop Ryzen 7000 CPUs) take a long first start
-  and stay very slow; they are not a target yet.
+* **Integrated GPUs with no mesh shaders** (for example the Radeon in desktop Ryzen 7000 CPUs) are slow even with the
+  quality preset Lowest; they are not a target yet.
 * **V-Sync at 144 Hz**: with V-Sync On, a frame that misses a refresh waits for the next one (FIFO with two images shows
   72 fps on a 144 Hz screen while the game cannot reach 144). V-Sync Off is the game's own way.
 * **Native HDR needs an HDR screen with Windows' HDR switched on**; otherwise the game stays in SDR.
@@ -168,8 +158,9 @@ builds the driver's pipelines as you play, so it stutters more than usual. The s
 ## Credits
 
 Every port and its author is in the [README](https://github.com/Sacrappy/HeyListen#credits). Thanks in this release to
-Mooseca, Duck912 (PsychoV35), jarynclouatre, J and llun (Keyboard prompts and the HUD layout), Jeff Aigner, pixl27,
-NotRexed, Dukenheimer, Tomiss, HumanBean, mooki, CraftyCorvid, cuecuemoar, monsterlag, bubblesnout, jcabarca, Chad-,
-PirateKingIsh, Joey Magnus, hckrman101, klimovich008, Kolkka, Miguel Luna, yassine milal, Zacharias Xenakis,
-pmwork-personal, futondestroyer, LRF17, unixman69, MustardTiger, Codex, Dewey Harry D. bartolo, Robin and Mesquita, the
-RenoDX authors (ShortFuse, Carlos Lopez Jr.), and the testers who sent reports and logs. Upstream: the Hookshot (NotRexed) and Longshot (MagicBeanDev) forks.
+ToxicToucan (First person), McNartin (HDR10 metadata), Xarishark (RecompLauncher), Chad- (Volume), jarynclouatre,
+timetohitthedopeho (Ocarina pitch help), oscarlosu-lab, Robin, mooki, Erfboom, juliotec, Jeff Aigner, pixl27,
+CraftyCorvid, Mooseca, HumanBean, SadTransGirl, NotRexed, hckrman101, klimovich008, Mesquita, Jer9, GrimVisage,
+futondestroyer, Jordan, Guep, Veix, tiktiki, twisted89, nachochee3e, d4nkn3ss, Dylan Martin, Tony Malins, Saul Ojeda,
+Itallo Ramon, Zelda Ootr, Issai, Arkex-ai, Ghost, Mihawk, i-love-computers-dude, Rekarina, azy2, Dewey Harry D. bartolo,
+and the testers who sent reports and logs. Upstream: the Hookshot (NotRexed) and Longshot (MagicBeanDev) forks.
