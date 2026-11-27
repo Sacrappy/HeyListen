@@ -1052,6 +1052,12 @@ static void box_note(uint64_t box, uint64_t text, uint32_t len, const uint8_t *s
     }
 }
 
+/* 1 for a box whose text is drawn from a texture the game makes for it (+380 bit 2) */
+static int box_texture_text(uint64_t box) {
+    const uint32_t *flags = (const uint32_t *)hos_guest_range(box + 380, 4);
+    return flags && (*flags & 4);
+}
+
 /* the box's codes for the buttons as they are now; 1 when it changed them. note: the box is put in the table of boxes seen */
 static int box_rewrite(uint64_t box, int note) {
     uint64_t at;
@@ -1162,8 +1168,13 @@ static int boxes_rewrite(int *looked) {
         if (!st || *st != copy[k].status || !vt || *vt != copy[k].vtable || !box_text(copy[k].box, &at, &len)) continue;   /* (gone, or another) */
         (*looked)++;
         if (box_rewrite(copy[k].box, 0)) {
-            mark_box(copy[k].box, 0x20000 | 0x100000);
             done++;
+            /* (a box whose text the game draws from a texture of its own, +380 bit 2: the hint bars' icons. The game lays one out by
+                setting its status bits and telling the boxes above and the thread that makes the texture, in one go; bits written here
+                alone lay it out and drop its glyphs for good, for a bar shown at the change and for one hidden then. Its codes are
+                rewritten, and the game's own layout when the bar is shown again makes the new icons: PROMPT4) */
+            if (box_texture_text(copy[k].box)) continue;
+            mark_box(copy[k].box, 0x20000 | 0x100000);
             AcquireSRWLockExclusive(&seen_lock);   /* (laid out again when it is next drawn too: see box_drawn) */
             if (seen_box[k].box == copy[k].box) seen_box[k].pend = 1, seen_box[k].last = 0;
             ReleaseSRWLockExclusive(&seen_lock);

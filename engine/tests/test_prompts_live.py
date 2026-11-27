@@ -413,6 +413,18 @@ int main(void) {
     now_ns += 200000000;
     box_drawn(0x2000);
     CHECK((*(uint32_t *)(window + 0x3000) & 0x120000) == 0x120000 && boxes_relaid == 2);
+    /* a box whose text the game draws from a texture of its own (+380 bit 2: the hint bars' icons): its codes are rewritten but its
+       status is left alone (bits written there alone drop its glyphs for good: PROMPT4) and it is not laid out again when drawn */
+    *(uint32_t *)(window + 0x2000 + 380) = 4;
+    memcpy(window + 0x4000, "Back \xEE\x81\x80", 8);
+    *(uint32_t *)(window + 0x3000) = 0;
+    seen_box[0].pend = 0;
+    CHECK(boxes_rewrite(&looked) == 1 && memcmp(window + 0x4000, "Back \xEE\x81\x80", 8) != 0);
+    CHECK(*(uint32_t *)(window + 0x3000) == 0 && seen_box[0].pend == 0);
+    now_ns += 1000000000;
+    box_drawn(0x2000);
+    CHECK(*(uint32_t *)(window + 0x3000) == 0);
+    *(uint32_t *)(window + 0x2000 + 380) = 0;
     /* more boxes than the table holds: the oldest entry's place is taken, the table never grows past it */
     for (int i = 0; i < BOXES + 5; i++) {
         make(0x10000 + (uint64_t)i * 0x200, 0x3200, 0x7000 + (uint64_t)i * 0x10, "a \xEE\x81\x80", 6);
