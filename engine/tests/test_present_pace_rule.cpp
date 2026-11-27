@@ -119,7 +119,8 @@ int main() {
             last = shown;
             const int64_t held = shown - at;
             if (k >= 2000) hold_sum += held, n++;
-            ring[ring_at] = held, ring_at = (ring_at + 1) % 64, ring_n = ring_n < 64 ? ring_n + 1 : 64;
+            const int64_t slack = h.until ? std::max<int64_t>(0, h.until + early - at) : 0;   // (as the pacer: how early it came)
+            ring[ring_at] = slack, ring_at = (ring_at + 1) % 64, ring_n = ring_n < 64 ? ring_n + 1 : 64;
             if (ring_n >= 16 && l.at) l.at -= slew(low_mark(ring, ring_n, 4), target, step);
         }
         std::printf("loop: shortest interval %.2f ms, mean wait %.2f ms\n", shortest / 1e6, hold_sum / 1e6 / n);

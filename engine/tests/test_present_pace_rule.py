@@ -20,6 +20,7 @@ def check_source():
                    "if (dev.present_mode_name && dev.present_mode_name[0] == 'f') return 0;",
                    "present_pace_rule::not_before(t_last, j.period, early + 250000)",
                    "present_pace_rule::slew(present_pace_rule::low_mark(t_ring, t_ring_n, 4), target, 250000)",
+                   "const int64_t slack = h.until ? std::max<int64_t>(0, h.until + early - j.at) : 0;",
                    "if (present_pace_rule::must_wait_for_room((int)t_q.size())) {",
                    "res = pace_thread_push(dev.swapchain, index);"]:
         if needle not in src:

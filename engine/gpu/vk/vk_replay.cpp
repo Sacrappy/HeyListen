@@ -7756,13 +7756,16 @@ void thread_main() {
             t_last = shown;
             const int64_t held = std::max<int64_t>(0, shown - j.at);   // (ready to its present: the delay the pace adds)
             t_hold_sum += held, t_hold_hist[std::min<int64_t>(80, held / 250000)]++;
-            t_ring[t_ring_at] = held, t_ring_at = (t_ring_at + 1) % 64, t_ring_n = std::min(t_ring_n + 1, 64);
-            if (t_ring_n >= 16 && t_line.at) {   // (one clock: the line comes earlier while every recent frame waited over the target)
+            // (the slew's signal: how early the frame came before its own point, 0 for a late one. Not the wait itself, which also
+            // holds the present lock's wait and the wake's lateness: under load those kept the line moving earlier for nothing)
+            const int64_t slack = h.until ? std::max<int64_t>(0, h.until + early - j.at) : 0;
+            t_ring[t_ring_at] = slack, t_ring_at = (t_ring_at + 1) % 64, t_ring_n = std::min(t_ring_n + 1, 64);
+            if (t_ring_n >= 16 && t_line.at) {   // (one clock: the line comes earlier while every recent frame came more than the target early)
                 const int64_t d = present_pace_rule::slew(present_pace_rule::low_mark(t_ring, t_ring_n, 4), target, 250000);   // (0.25 ms a frame)
                 t_line.at -= d, t_slewed += d;
             }
         }
-        frame_log_note();
+        if (shown) frame_log_note();   // (RX_VK_FRAME_LOG: a frame not shown (its swapchain made again) is no line)
         if (r != VK_SUCCESS) {
             int expected = VK_SUCCESS;
             t_res.compare_exchange_strong(expected, (int)r);
