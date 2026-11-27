@@ -7682,6 +7682,8 @@ std::atomic<int> t_res{VK_SUCCESS};
 bool t_started = false;
 present_pace_rule::Line t_line;
 int64_t t_n = 0, t_hold_ns = 0, t_holds = 0, t_lates = 0, t_cut = 0, t_hist[8];
+std::atomic<int64_t> t_full{0};   // (hand-overs that found a frame still waiting: the pacer holding too long, saturation)
+int64_t t_wake[101], t_wake_n = 0, t_wake_sum = 0, t_wake_max = 0;   // (the present's start minus its line point, 50 us steps)
 void thread_main() {
 #ifdef _WIN32
     SetThreadDescription(GetCurrentThread(), L"hl present pacer");
@@ -7713,6 +7715,10 @@ void thread_main() {
         VkResult r = VK_SUCCESS;
         {
             std::lock_guard qk(dev.present_mu);
+            if (h.until) {   // (the wake's precision: how far after its point the present goes out)
+                const int64_t err = std::max<int64_t>(0, now_ns() - (h.until + env_us("HL_PRESENT_PACE_EARLY_US", 200)));
+                t_wake[std::min<int64_t>(100, err / 50000)]++, t_wake_n++, t_wake_sum += err, t_wake_max = std::max(t_wake_max, err);
+            }
             if (j.sc == dev.swapchain && dev.swapchain) {
                 VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
                 pi.waitSemaphoreCount = 1;
@@ -7742,10 +7748,16 @@ void thread_main() {
             int64_t c = 0, p90 = 0;
             for (int i = 0; i < 8; i++)
                 if ((c += t_hist[i]) * 10 >= 9 * 1200 && !p90) p90 = i + 1;
-            logf("vk: present pacer (HL_PRESENT_PACE=3): over 1200 presents %lld held, %.2f ms a present (p90 under %lld ms), %lld late, "
-                 "%lld cut short by the next frame", (long long)t_holds, t_hold_ns / 1e6 / 1200, (long long)p90, (long long)t_lates,
-                 (long long)t_cut);
-            t_holds = t_hold_ns = t_lates = t_cut = 0;
+            int64_t w99 = 0, wc = 0;
+            for (int i = 0; i <= 100; i++)
+                if ((wc += t_wake[i]) * 100 >= 99 * std::max<int64_t>(1, t_wake_n) && !w99) w99 = (i + 1) * 50;
+            logf("vk: present pacer (HL_PRESENT_PACE=3): over 1200 presents %lld held, %.2f ms a present (p90 under %lld ms), %lld late "
+                 "(the frame after its point: the game too slow), %lld cut short by the next frame, %lld hand-overs found a frame waiting "
+                 "(saturation), 0 dropped; the wake after its point %.0f us on average, p99 under %lld us, the longest %.0f us",
+                 (long long)t_holds, t_hold_ns / 1e6 / 1200, (long long)p90, (long long)t_lates, (long long)t_cut,
+                 (long long)t_full.exchange(0), t_wake_n ? t_wake_sum / 1e3 / t_wake_n : 0.0, (long long)w99, t_wake_max / 1e3);
+            t_holds = t_hold_ns = t_lates = t_cut = 0, t_wake_n = t_wake_sum = t_wake_max = 0;
+            for (int64_t& v : t_wake) v = 0;
             for (int64_t& v : t_hist) v = 0;
         }
     }
@@ -7767,6 +7779,7 @@ VkResult pace_thread_push(VkSwapchainKHR sc, uint32_t index) {
     {
         std::lock_guard lk(t_mu);
         if (!t_started) t_started = true, std::thread(thread_main).detach();
+        if (!t_q.empty()) t_full.fetch_add(1, std::memory_order_relaxed);
         t_q.push_back({sc, index, now_ns(), period_now()});
     }
     t_cv.notify_all();
