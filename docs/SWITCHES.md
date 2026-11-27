@@ -10,7 +10,7 @@ python -I engine/scripts/list_switches.py
 
 and commit both files. A test (`engine/tests/test_switches_documented.py`) fails when a switch read in the source is missing here or the data file is out of date.
 
-1560 switches: 56 players may be told to use, 400 diagnostic, 1104 developer-only; 1343 have a real explanation and 217 are marked `undocumented`.
+1561 switches: 56 players may be told to use, 400 diagnostic, 1105 developer-only; 1344 have a real explanation and 217 are marked `undocumented`.
 
 ## How to set a switch
 
@@ -64,7 +64,7 @@ The entries below say what each one does, its values and default, and when it is
 
 | Area | Switches | Player | Diagnostic | Developer |
 |---|---:|---:|---:|---:|
-| [Renderer](#renderer-upscaling-frame-generation-hdr-v-sync-and-presentation) | 506 | 23 | 14 | 469 |
+| [Renderer](#renderer-upscaling-frame-generation-hdr-v-sync-and-presentation) | 507 | 23 | 14 | 470 |
 | [Shaders and pipelines](#shaders-and-pipelines) | 128 | 6 | 0 | 122 |
 | [Memory and textures](#memory-and-textures) | 222 | 10 | 0 | 212 |
 | [Audio](#audio) | 15 | 5 | 10 | 0 |
@@ -77,7 +77,7 @@ The entries below say what each one does, its values and default, and when it is
 
 ## Renderer: upscaling, frame generation, HDR, V-Sync and presentation
 
-506 switches of the renderer: the upscaler, frame generation, HDR, V-Sync and what reaches the screen.
+507 switches of the renderer: the upscaler, frame generation, HDR, V-Sync and what reaches the screen.
 
 ### Upscaling (DLSS, FSR, TAAU)
 
@@ -777,13 +777,13 @@ So each submission first copies those pages from guest memory into the mirror, o
 
 #### `RX_VK_ORDER_METER_PACE_MS` - developer
 
-With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).
+With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (0, off: a fallback since the 0xc0 companion is kept, below; 20 was the first fix). ---- (FLICK1) the meter's 0xc0 companion: the game's own block, not a GPU result ---- The flash's data, found by a diff of the captured pages around each forced late job (HL_METER_DELAY_EVERY): page 0x11371e7000, words +0xf30..+0xf54, the meter's 0xc0 companion block, made one-frame non-zero floats where the game keeps zeros. The game's meter job invalidates that block (the ring learns the read as one of the meter's class) and then fills the whole 0xc0 bytes for the GPU; it never reads them.
 
-**Values:** a whole number. **Default:** 20.
+**Values:** a whole number. **Default:** 0.
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:374`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:388`.
 
 #### `RX_VK_PACE` - developer
 
@@ -4056,6 +4056,16 @@ The log says which rule decided after its first line, `env: Mesa's submit thread
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
 **Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_main.c:728` and 1 more place.
+
+#### `RX_VK_RB_C0_KEEP` - developer
+
+Forced late job, Kakariko standing still, order thread on, no pacing: 65 delays, 0 strict flashes (132 of 131 before). RX_VK_RB_C0_KEEP=0: as before (the staged copy is written).
+
+**Values:** on or off (0, false, off, no and empty are off); the description names `0`. **Default:** on (unless set to 0, false, off or no).
+
+**When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
+
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:373`.
 
 #### `RX_VK_RB_EARLY` - developer
 
@@ -9789,7 +9799,7 @@ The file, HL_MEM_DROP_SPILL_MB of slots at most (default 4096; 0: no spill, ever
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:406`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:420`.
 
 #### `HL_METER_DELAY_MS` - developer
 
@@ -9799,7 +9809,7 @@ The file, HL_MEM_DROP_SPILL_MB of slots at most (default 4096; 0: no spill, ever
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:407`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:421`.
 
 #### `HL_MODSTAGES` - developer
 
@@ -9899,7 +9909,7 @@ HL_RB_LAG_CHECK=1: the old path runs and the ring is compared with what it read 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:429`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:444`.
 
 #### `HL_RB_R2` - developer
 
@@ -9929,7 +9939,7 @@ HL_RB_LAG_CHECK=1: the old path runs and the ring is compared with what it read 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:555` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_rbring.cpp:570` and 1 more place.
 
 #### `HL_REGION_KEEP` - developer
 

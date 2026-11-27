@@ -2,7 +2,7 @@
  "schema": 1,
  "generated_by": "engine/scripts/list_switches.py",
  "scope": "C, C++ and headers under engine/ (engine/tests and vendored trees other than a64-kit excluded) and the Python the builder, the lifter and the scripts run: getenv, std::getenv, _wgetenv, the code's own env helpers and table-driven reads, and os.environ.",
- "count": 1560,
+ "count": 1561,
  "switches": [
   {
    "name": "A64_",
@@ -2150,7 +2150,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 406
+     "line": 420
     }
    ],
    "default": "0",
@@ -2171,7 +2171,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 407
+     "line": 421
     }
    ],
    "default": "10",
@@ -2624,7 +2624,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 429
+     "line": 444
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -2729,11 +2729,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 555
+     "line": 570
     },
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 557
+     "line": 572
     }
    ],
    "default": "0",
@@ -26718,13 +26718,13 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 374
+     "line": 388
     }
    ],
-   "default": "20",
+   "default": "0",
    "values": "a whole number",
-   "explanation": "With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).",
-   "comment": "With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).",
+   "explanation": "With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (0, off: a fallback since the 0xc0 companion is kept, below; 20 was the first fix). ---- (FLICK1) the meter's 0xc0 companion: the game's own block, not a GPU result ---- The flash's data, found by a diff of the captured pages around each forced late job (HL_METER_DELAY_EVERY): page 0x11371e7000, words +0xf30..+0xf54, the meter's 0xc0 companion block, made one-frame non-zero floats where the game keeps zeros. The game's meter job invalidates that block (the ring learns the read as one of the meter's class) and then fills the whole 0xc0 bytes for the GPU; it never reads them.",
+   "comment": "With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (0, off: a fallback since the 0xc0 companion is kept, below; 20 was the first fix). ---- (FLICK1) the meter's 0xc0 companion: the game's own block, not a GPU result ---- The flash's data, found by a diff of the captured pages around each forced late job (HL_METER_DELAY_EVERY): page 0x11371e7000, words +0xf30..+0xf54, the meter's 0xc0 companion block, made one-frame non-zero floats where the game keeps zeros. The game's meter job invalidates that block (the ring learns the read as one of the meter's class) and then fills the whole 0xc0 bytes for the GPU; it never reads them.",
    "documented_in": null,
    "source": "comment at gpu/vk/vk_rbring.cpp",
    "documented": true,
@@ -28839,6 +28839,27 @@
    "comment": "Amdgpu: an amdgpu card in /sys/class/drm. mesa_value: the user's MESA_VK_ENABLE_SUBMIT_THREAD (hos_submit_thread_user_value). switch_value: getenv(\"RX_VK_RADV_SUBMIT_THREAD\"). threads: the hardware threads online.",
    "documented_in": "development.md",
    "source": "development.md",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
+   "name": "RX_VK_RB_C0_KEEP",
+   "area": "renderer",
+   "group": "Rendering and GPU",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "gpu/vk/vk_rbring.cpp",
+     "line": 373
+    }
+   ],
+   "default": "on (unless set to 0, false, off or no)",
+   "values": "on or off (0, false, off, no and empty are off); the description names `0`",
+   "explanation": "Forced late job, Kakariko standing still, order thread on, no pacing: 65 delays, 0 strict flashes (132 of 131 before). RX_VK_RB_C0_KEEP=0: as before (the staged copy is written).",
+   "comment": "Forced late job, Kakariko standing still, order thread on, no pacing: 65 delays, 0 strict flashes (132 of 131 before). RX_VK_RB_C0_KEEP=0: as before (the staged copy is written).",
+   "documented_in": null,
+   "source": "comment at gpu/vk/vk_rbring.cpp",
    "documented": true,
    "set_via": "In `hookshot_env.txt`, or in the environment.",
    "use": null

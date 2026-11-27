@@ -18,7 +18,7 @@ VK = ROOT / "gpu/vk"
 
 def check_wiring():
     ring = (VK / "vk_rbring.cpp").read_text(encoding="utf-8")
-    for needle in ('getenv("RX_VK_ORDER_METER_PACE_MS") ? atoi(getenv("RX_VK_ORDER_METER_PACE_MS")) : 20;',
+    for needle in ('getenv("RX_VK_ORDER_METER_PACE_MS") ? atoi(getenv("RX_VK_ORDER_METER_PACE_MS")) : 0;',
                    "if (size == 0x1040) meter_read_note(c);   // (FLICK1)",
                    "for (int i = 0; i < 16; i++) expect = std::min(expect, hist[i]);",
                    "if (hi < 16) expect = 0;   // (learning)",
@@ -30,7 +30,7 @@ def check_wiring():
     tick = "if (rb_fif_on()) rb_clock.fetch_add(1, std::memory_order_release);   // (FIF1: the game's frame count)"
     if call not in rep or tick not in rep or rep.index(call) > rep.index(tick):
         raise SystemExit("vk_replay.cpp: the meter pace must run before the frame clock's tick, with the order thread only")
-    print("wiring: before the tick, the order thread only, reads by frame, 20 ms")
+    print("wiring: before the tick, the order thread only, reads by frame, off by default (a fallback)")
 
 
 class Pace:

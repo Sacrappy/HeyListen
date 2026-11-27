@@ -358,7 +358,21 @@ RbApplyNote rbring_take_note() {
 // wait: 132 delays, 1 flash (before it had learned the frame's reads). Here the hand-over waits, 20 ms at most, for as many meter
 // reads in the frame as the frames before had made by their own hand-over (the least of the last 16): a frame whose job is on time
 // waits for nothing (one wait in about 3600 presents, about 2 ms, in Kakariko). With the order thread only (without it the replay
-// holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).
+// holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (0, off: a fallback since the 0xc0 companion is kept, below; 20 was the first fix).
+// ---- (FLICK1) the meter's 0xc0 companion: the game's own block, not a GPU result ----
+// The flash's data, found by a diff of the captured pages around each forced late job (HL_METER_DELAY_EVERY): page 0x11371e7000,
+// words +0xf30..+0xf54, the meter's 0xc0 companion block, made one-frame non-zero floats where the game keeps zeros. The game's
+// meter job invalidates that block (the ring learns the read as one of the meter's class) and then fills the whole 0xc0 bytes for
+// the GPU; it never reads them. The ring answered the invalidate by writing its staged copy, the GPU's bytes of three frames before,
+// into guest memory; the job's own fill then wrote over them. When the job ran past the present's hand-over, the next frame's
+// capture took the page between the two: the GPU read its own old floats as the game's parameters, the picture one frame brighter.
+// Now such a read writes nothing: guest memory keeps the game's last complete block (the previous frame's, when the job is late),
+// and no frame waits. Forced late job, Kakariko standing still, order thread on, no pacing: 65 delays, 0 strict flashes (132 of 131
+// before). RX_VK_RB_C0_KEEP=0: as before (the staged copy is written).
+bool rb_c0_keep() {
+    static const bool v = !getenv("RX_VK_RB_C0_KEEP") || atoi(getenv("RX_VK_RB_C0_KEEP")) != 0;
+    return v;
+}
 std::atomic<int64_t> mp_c{-1}, mp_n{0};
 void meter_read_note(int64_t c) {
     int64_t cur = mp_c.load(std::memory_order_acquire);
@@ -371,7 +385,7 @@ void meter_read_note(int64_t c) {
     if (mp_c.load(std::memory_order_acquire) == c) mp_n.fetch_add(1, std::memory_order_acq_rel);
 }
 void rbring_meter_pace(int64_t clock) {
-    static const int ms = getenv("RX_VK_ORDER_METER_PACE_MS") ? atoi(getenv("RX_VK_ORDER_METER_PACE_MS")) : 20;
+    static const int ms = getenv("RX_VK_ORDER_METER_PACE_MS") ? atoi(getenv("RX_VK_ORDER_METER_PACE_MS")) : 0;
     if (ms <= 0) return;
     static int64_t hist[16], hi = 0, waits = 0, timeouts = 0, wait_ns = 0, ticks = 0;
     auto seen = [&] { return mp_c.load(std::memory_order_acquire) == clock ? mp_n.load(std::memory_order_acquire) : 0; };
@@ -412,6 +426,7 @@ void rbring_apply(uint64_t gpu, uint64_t size) {
         }
     }
     if (size == 0x1040) meter_read_note(c);   // (FLICK1)
+    if (size == 0xc0 && rb_c0_keep()) return;   // (FLICK1: the meter's 0xc0 companion is the game's own block: guest memory keeps it)
     tl_apply_note = RbApplyNote{};
     tl_apply_note.c = c;
     rb_wait_staged(c, config().lag);   // (frames in flight: the replay stages a frame's entries before it shows it)
