@@ -80,7 +80,12 @@ static int describe(Ctx *c, uint64_t heap, char *out, int cap) {
    the log tells only the first twelve, and the report's log tail may have lost them */
 static char alloc_null_last[400];
 static void alloc_null_keep(const char *line) {
-    snprintf(alloc_null_last, sizeof alloc_null_last, "%s", line);
+    /* (cut to the buffer on purpose: the report wants the line's head; a copy by length, so no compiler reads it as a
+       truncating format) */
+    size_t n = strlen(line);
+    if (n >= sizeof alloc_null_last) n = sizeof alloc_null_last - 1;
+    memcpy(alloc_null_last, line, n);
+    alloc_null_last[n] = 0;
 }
 const char *hl_alloc_null_last(void) { return alloc_null_last; }
 
