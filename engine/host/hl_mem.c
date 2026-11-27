@@ -883,8 +883,63 @@ static DWORD WINAPI fault_main(void *arg) {
     return 0;
 }
 
+/* ---- HL_MEM_TRIM_ARENAS=<seconds> (FOOT2, 23 Nov 2026; off by default): the graphics driver's big private arenas leave the working set.
+   nvoglv64 keeps, from the start-up precompile on, 6 GB of private memory in five allocations (2 GB and four of 1 GB: the cache file's
+   data it was given, 2.1 GB, and the 8,569 pipelines it built from it), written whole in the first 40 s and not read again by anyone
+   (the GPU runs from VRAM). Left alone they sit in the working set until Windows trims them under pressure (5.8 GB resident at 41 s,
+   1.1 GB at 565 s in the 12-minute tour), taking the RAM other pages needed meanwhile. Every <seconds> a pass looks at the private
+   allocations outside the guest window of 512 MB or more (reserved) that nobody tagged, and takes their committed pages out of the
+   working set with VirtualUnlock on a range that is not locked (as the cold pass does); they stay committed and keep their bytes, and
+   a later touch is a soft fault (a hard one if Windows needed the RAM). */
+static DWORD WINAPI arenas_main(void *arg) {
+    const int secs = (int)(intptr_t)arg;
+    const uint64_t g0 = (uint64_t)(uintptr_t)GP(0);
+    for (;;) {
+        Sleep((DWORD)secs * 1000);
+        MEMORY_BASIC_INFORMATION mbi;
+        struct { uint64_t base, reserved; } cur = {0, 0};
+        static uint64_t starts[64], sizes[64];
+        int n = 0;
+        uint64_t at = 0, trimmed = 0;
+        /* (pass 1: the allocations of 512 MB and more; pass 2 trims their committed runs) */
+        while (VirtualQuery((void *)(uintptr_t)at, &mbi, sizeof mbi)) {
+            const uint64_t lo = (uint64_t)(uintptr_t)mbi.BaseAddress, sz = mbi.RegionSize, ab = (uint64_t)(uintptr_t)mbi.AllocationBase;
+            if (mbi.State != MEM_FREE && mbi.Type == MEM_PRIVATE && !(lo >= g0 && lo < g0 + HOS_GUEST_SPACE)) {
+                if (cur.base != ab) {
+                    if (cur.base && cur.reserved >= (512ULL << 20) && n < 64) starts[n] = cur.base, sizes[n] = cur.reserved, n++;
+                    cur.base = ab, cur.reserved = 0;
+                }
+                cur.reserved += sz;
+            }
+            at = lo + sz;
+            if (at >= 0x7FFFFFFE0000ULL) break;
+        }
+        if (cur.base && cur.reserved >= (512ULL << 20) && n < 64) starts[n] = cur.base, sizes[n] = cur.reserved, n++;
+        for (int k = 0; k < n; k++) {
+            char nm[48];
+            if (hos_mem_tag_name(starts[k], nm, sizeof nm)) continue;   /* (ours: the table's own owner decides) */
+            uint64_t a = starts[k];
+            while (a < starts[k] + sizes[k] && VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) {
+                const uint64_t lo = (uint64_t)(uintptr_t)mbi.BaseAddress, sz = mbi.RegionSize;
+                if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE))
+                    for (uint64_t o = 0; o < sz; o += (16ULL << 20)) {
+                        const uint64_t len = sz - o < (16ULL << 20) ? sz - o : (16ULL << 20);
+                        VirtualUnlock((void *)(uintptr_t)(lo + o), (SIZE_T)len);
+                        trimmed += len;
+                    }
+                a = lo + sz;
+            }
+        }
+        hos_log("hl mem: arenas: %d private allocations of 512 MB and more looked at, %llu MB of committed pages taken out of the working set", n,
+                (unsigned long long)(trimmed >> 20));
+    }
+    return 0;
+}
+
 void hl_mem_init(void) {
     {
+        const char *ta = getenv("HL_MEM_TRIM_ARENAS");
+        if (ta && atoi(ta) > 0) CloseHandle(CreateThread(NULL, 0, arenas_main, (void *)(intptr_t)atoi(ta), 0, NULL));
         const char *ac = getenv("HL_MEM_ACCOUNT");
         if (ac && atoi(ac) > 0) CloseHandle(CreateThread(NULL, 0, account_main, (void *)(intptr_t)atoi(ac), 0, NULL));
     }
