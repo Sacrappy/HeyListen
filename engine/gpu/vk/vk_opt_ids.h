@@ -70,3 +70,8 @@ enum { HL_PROMPTS_LIVE_TEXTURES = 1, HL_PROMPTS_LIVE_LAYOUTS = 2, HL_PROMPTS_LIV
 #define HL_OPT_HANDHELD 101
 /* The Gameplay page's First person row (host/hos_main.c and host/nn_hid.c ask, gpu/vk/vk_replay.cpp answers 0 or 1) */
 #define HL_OPT_FIRST_PERSON 102
+
+/* The Gameplay tab's Volume row (after Hookshot 2c87e357; host/nn_audio.c asks as each frame is mixed, gpu/vk/vk_replay.cpp
+   answers in percent, 0 to 100). Hookshot's id for it is 44, which is the Skip title screen's here; 94 is free (90 to 93 are the
+   rows above). The options file keys it by the row's name ("volume"), so the id is not stored. */
+#define HL_OPT_VOLUME 94

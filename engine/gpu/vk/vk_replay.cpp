@@ -10588,6 +10588,7 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HL_OPT_PROMPTS) return opts.prompts;   // (host/prompts.c: the Button prompts row, live)
         if (id == HL_OPT_HANDHELD) return menu_handheld_now();   // (host/nn_applet.c: a dock or an undock while the game runs)
         if (id == HL_OPT_SPRINT) return opts.sprint;   // (host/nn_hid.c, host/oot_sprint.c)
+        if (id == HL_OPT_VOLUME) return std::clamp(opts.volume, 0, 100);   // (after Hookshot 2c87e357: host/nn_audio.c)
         if (id == HL_OPT_HUD_LAYOUT) return opts.hud_layout;
         if (id == HL_OPT_VSYNC_MODE) return opts.vsync_mode;
         if (id == HL_OPT_FIRST_PERSON) return opts.first_person != 0;   // (host/hos_main.c, host/nn_hid.c)

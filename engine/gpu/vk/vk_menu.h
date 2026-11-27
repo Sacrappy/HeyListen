@@ -86,6 +86,7 @@ struct Options {
     int preset = 0;       // quality preset: 0 Custom, 1 Lowest (integrated GPU), 2 Minimum (4GB), 3 Low (6GB), 4 Balanced (8GB), 5 High (12GB), 6 Ultra (16GB+)
     int vram_mb = 0;      // dynamic texture cache budget limit in MB
     int mirror_mb = 0;    // staging mirror limit in MB
+    int volume = 100;     // (hookshot, 2c87e357) the game's whole sound in percent, 0 to 100, heard at once (host/nn_audio.c, HL_OPT_VOLUME in vk_opt_ids.h)
     int audio_output = 0; // (hookshot) the speakers the game mixes for: 0 Auto (the default output's), 1 Stereo, 2 5.1; read once, at the start (host/nn_audio.c; HOS_AUDIO_CHANNELS)
     int first_person = 0;   // the view from Link's eyes, his head hidden (host/hos_main.c; HL_OPT_FIRST_PERSON)
     int skip_title = 0;   // (longshot) start with the most recent save, pressing through the title and its file list (host/oot_autoload.c); read at the start

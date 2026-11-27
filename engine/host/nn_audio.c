@@ -34,6 +34,8 @@
 #include "hos_sdl.h"
 #endif
 #include "hos_paths.h"   /* (the game folder: hookshot_options.ini, au_menu_output) */
+#include "../gpu/vk/vk_opt_ids.h"   /* (the Insert menu's Volume: HL_OPT_VOLUME) */
+int rx_option(int id, int otherwise);
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -709,9 +711,17 @@ static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the de
             lim_env = want < lim_env ? want : lim_env + (want - lim_env) * 0.0004f;
             for (int ch = 0; ch < nch; ch++) out[ch][i] *= lim_in * lim_env * lim_out;
         }
+    /* (after Hookshot 2c87e357) the Insert menu's Volume, in percent, after the limiter: heard at once, squared so its steps sound
+       even (50% is about a quarter of the power, -12 dB). Ramped over the frame: a change makes no click; 100% is 1.0 */
+    static float volume_gain = 1.0f;
+    int percent = rx_option(HL_OPT_VOLUME, 100);
+    percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+    const float want_volume = (float)percent * (float)percent / 10000.0f;
+    const float volume_from = volume_gain, volume_step = (want_volume - volume_from) / FRAME;
+    volume_gain = want_volume;
     for (int i = 0; i < FRAME; i++)
         for (int ch = 0; ch < nch; ch++) {
-            float a = out[ch][i] * 32767.0f;
+            float a = out[ch][i] * (volume_from + volume_step * (float)(i + 1)) * 32767.0f;
             if (a != a) a = 0;   /* (NaN) */
             if (a > 32767) a = 32767;
             if (a < -32768) a = -32768;

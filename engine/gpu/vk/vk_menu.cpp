@@ -1101,6 +1101,8 @@ Row rows[] = {
      hn_speed},
     {TAB_GAMEPLAY, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear.", hn_text_speed},
+    {TAB_GAMEPLAY, "Volume", &opts.volume, 0, 100, 5, tx_percent,   // (after Hookshot 2c87e357: host/nn_audio.c, HL_OPT_VOLUME)
+     "The game's sound: music, effects and voices together. 0% mutes it.", nullptr, false, true},
     {TAB_GAMEPLAY, "Audio output", &opts.audio_output, 0, 2, 1, tx_audio_output,
      "The speakers the game mixes its sound for. Applies after a restart.", hn_audio_output, true, true},
     {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
@@ -1479,9 +1481,9 @@ constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // 
 int hover_tab = -1;
 int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
-bool is_slider(const Row& r) { return (!strncmp(r.name, "PsychoV35 ", 10) && r.hi > 2) || r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+bool is_slider(const Row& r) { return (!strncmp(r.name, "PsychoV35 ", 10) && r.hi > 2) || r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume; }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
-bool stops_at_ends(const Row& r) { return (!strncmp(r.name, "PsychoV35 ", 10) && r.hi > 2) || r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+bool stops_at_ends(const Row& r) { return (!strncmp(r.name, "PsychoV35 ", 10) && r.hi > 2) || r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 150, the nearest 25)
 int rumble_step(int v) { return (std::min(std::max(v, 0), 150) + 12) / 25 * 25; }
 std::string ini_path() {
@@ -2845,6 +2847,7 @@ void menu_init() {
             logf("vk: options: the saved Upscaler was DLAA or FSR 4's Native AA: now the Upscaler %s with Render resolution %s",
                  opts.dlss == ur::FSR4 ? "AMD FSR 4" : "NVIDIA DLSS", opts.dlss == ur::FSR4 ? "Native AA" : "DLAA (native)");
         opts.rumble = rumble_step(opts.rumble);   // (a hand-edited 60: 50, on the arrows' steps)
+        opts.volume = opts.volume / 5 * 5;   // (a hand-edited 63: 60; the row is clamped to 0..100 above; host/nn_audio.c)
         // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
         // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
         if (!v2) opts.realtime = 1;

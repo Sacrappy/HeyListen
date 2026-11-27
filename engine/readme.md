@@ -269,6 +269,7 @@ they apply at once, with no new translation.
 | | Menu size | Auto, Small, Medium, Large | Auto |
 | | Game speed | Per frame, Real time | Real time |
 | | Text speed | Normal, 2x, 4x, Instant | Normal |
+| | Volume | 0% to 100% in steps of 5 | 100% |
 | | Audio output | Auto, Stereo, 5.1 (after a restart) | Auto |
 | | Skip title screen | Off, On (after a restart) | Off |
 | | Microphone | Off, Default, or each microphone by name | Default |
@@ -347,6 +348,8 @@ they apply at once, with no new translation.
   The full panel (F10 twice) adds the **1% low** and **0.1% low**: the benchmark's numbers, 1000 over the mean frame time of the
   slowest 1% (0.1%) of the frames of the last 10 seconds or the last 1000 frames, whichever is longer; with frame generation they
   count the frames shown. `-` until 100 frames are in.
+- **Volume** is the game's whole sound (music, effects and voices) from 0%, muted, to 100%, heard at once. It is applied after the
+  limiter, squared so its steps sound even: 50% is about a quarter of the power.
 - **Audio output** is the speakers the game mixes its sound for. Auto is 5.1 when your default output device has 5.1
   or more speakers, else stereo; Stereo or 5.1 chooses one whatever the device has (5.1 on stereo speakers is mixed
   down). For one run, `HOS_AUDIO_CHANNELS=2` or `6` chooses stereo or 5.1 and wins over the menu. In a 5.1 mix the centre
