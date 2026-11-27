@@ -339,3 +339,225 @@ taken before the held replay ends: the captures' order (`memory_capture_submit`'
 first capture) is not worth a second capture order. What gates the next present is the serial replay (held 0.77 + PT 6.8) behind the main thread's draw code, and the main thread's
 draw code waits for the previous present (`HOS_PRESENT_NOWAIT`'s territory, a different rule, with wrong pictures at stake).
 Scripts: `E:\OOT\scratch-feed1\gaps.py`, `gaps2.py` (the scratch folder; they read `tools/bench/chainb.py`'s trace format). No new run: no code changed.
+
+## Sections from branches that were not merged (brought over 27 Nov 2026)
+
+Written on those branches and left out when their notes came to main (256de8e6f); kept as they were, each under the branch it comes from. The verdicts on that work are in docs/research/perf-plan-2026-11.md and the branch audit.
+
+### From perf/desc-044 (d49d29188)
+
+# REPLAY1: the replay's CPU cost on market-spin, measured and ranked (2026-11-21, main PC, main 150a02c90 + HL_THREAD_CPU)
+
+Scene `market-spin` (save `market-mid`), dlss=0 upscaling=0 resolution=1 hdr=0 vsync=0, no cap, slot a, whole machine (speed lease).
+Diagnostics only: `HL_THREAD_CPU=1` (new, `vk_thread_cpu.cpp`: every 300 presents one line of CPU ms a frame by thread name),
+`RX_VK_PROF_FINE=1`, `RX_VK_PRESYNC_STATS=1`, `HL_PROFILE_LOCAL=1`, `HL_UBO_CHECK=1`. The profile run ran 75 fps (the profile sampler thread
+itself costs 1.1 ms a frame); 2,385 draws, 6 submits, 169 passes and 169 barriers a frame.
+
+### 1. A frame's CPU by thread (ms of CPU in an 11.9-12.8 ms frame)
+
+| Threads | ms a frame |
+|---|---|
+| all threads | 70-72 (about 6 cores busy) |
+| game: 6 BaseProcExecutor / 5 ModuleSystemWorker / sead::MainThread / NavMesh workers | ~27 / ~15 / 3.2-4.0 / ~2.5 |
+| **replay: 5 segment workers** | 9.9-12.1 |
+| **replay: Presentation Thread** (submit, dry pass, own segment, waits) | 4.6-5.5 |
+| replay: "order" thread, held submits, capture copy helpers | 2.0-2.5, 0.7-1.0, 0.2-1.5 |
+
+The replay is about 20 ms of CPU a frame on seven or more threads; the game's own threads are about 50. Parallel segments already spread it:
+the critical path is the Presentation Thread's 7.7 ms wall (submissions), not the sum.
+
+### 2. The replay by phase (ms a frame, summed over the threads that do it)
+
+| Phase | ms | Note |
+|---|---:|---|
+| draw (all sections) | 14.5 | workers: draw idx 13.06 ms (2,313 draws, 5.64 us each) |
+| of it descriptors | 7.4 | 6.2 descriptors pushed a draw; 0.56 of the pushes are changed-writes-only |
+| submit (replay thread wall) | 7.7 | dry pass 2.2, segments' recording and wait 3.76, small command buffers recorded whole 0.95, memory work 0.45 |
+| commands | 4.2 | |
+| programs / texture lookups / dispatch | 1.5 / 1.1 / 0.8 | |
+| memory sync / pipelines / queue submit | 0.45 / 0.4 / 0.2 | |
+
+Fine, per draw (summed): texture slots 3.8-3.9 (kept 3.94, resolved again 1.22, view and sampler misses 1.7), program lookup 1.5, user uniform
+buffers 1.4, descriptors pushed 1.0, vertex and index binds 0.9, storage buffers 0.9, pipeline bind 0.7. The dry pass is 1.69 ms of ops
+(depth-stencil clears 0.65 ms for 43 of them, 15 us each).
+
+### 3. Capture, mirror syncs, write-back (not the 40-46 MB a frame the brief assumed: that is gone)
+
+- Capture: 0.12 ms and 0.8 MB a submit (210 pages); 1,359 pages (5.3 MB) a frame in the UBO-check run. `RX_VK_CAP_ONLY_GPU`
+  (direct-emission.md section 10) took the 256 MB heap region out. Mirror syncs 5.3 MB a frame (990 copies); pre-sync 0.19 ms a submit
+  (dirty-page scan 0.05, chunk diff 0.02).
+- Write-back: 52.8 MB a frame written back (7.0 MB a submit copied), 4.2 GB compared per 600 submits (7 MB a submit). It has no timer of
+  its own and is not on the replay thread's wall (memory work 0.45, recordings ended 0.00), so it sits in the "order" thread's 2-2.5 ms or in
+  the workers. Not measured separately: the next timer to add before any brick on it.
+- Readbacks (exposure meter etc.): 270-340 of 3,000 waited for their write-back, 0.3-1.2 ms each, on the game's ModuleSystemWorkers.
+- `HL_UBO_CHECK=1` (48 fps, the check is heavy): 22.3 M binds (65 GB), 56.7% equal, 9.4 M different (99.4% changed between the end of the
+  recording and the submit). Capture pages a frame: 1,359; read only by equal uniform binds 144, by a uniform bind with a different one 215,
+  uniform and other records 123, only by other records 114, **read by no record 763** (602 in `0x22` pools of 1 MB or less). Uniform blocks
+  are at most 35% of the now small capture (482 pages, 1.9 MB a frame, about 0.04 ms of copy): **lever (a), as a capture saving, is worth
+  under 0.1 ms.** Its other gain is the descriptor work, below.
+
+### 4. RX_VK_PARALLEL
+
+It is **on by default** (5 recorders with 16 hardware threads, 4 with 8 or more: `par_threads()`), not off; the comment above the function
+saying so is stale. It became the default in TICK-006 after the fix for out-of-order segments (the washed-out fog: the meter's readback page
+was refreshed once a segment, now once a part). Default against `RX_VK_PARALLEL=0` (interleaved, 3 each, 110 s runs):
+
+| Run | default fps (1% low, p50) | =0 fps (1% low, p50) |
+|---|---|---|
+| 1 | 81.3 (14.7, 11.4 ms) | 70.3 (14.2, 13.3) |
+| 2 | 72.3 (5.6, 11.6) | 70.1 (12.8, 13.2) |
+| 3 | 82.1 (14.6, 11.3) | 66.9 (9.5, 13.6) |
+
+Parallel gives about +11 fps (p50 11.4 against 13.3 ms, 1.9 ms); one default run was disturbed (72 fps, 1% low 5.6). **Picture parity was not
+checked**: these runs wrote no shots (RX_VK_SHOTS was not honoured by the harness run); the R4/R6 and TICK-006 picture checks stand.
+`RX_VK_PARALLEL=1` is the same as 0.
+
+### 5. Ranked levers (estimates of CPU or critical path removed a frame, not measurements)
+
+1. **Texture slots and descriptor builds in native x64**: textures 3.9 ms + descriptors 1.0 + storage 0.9 of the 13-14 ms of per-draw work (on
+   the workers, so about 0.8-1.2 ms of wall, 4-5 ms of CPU). Brick: a resolved-handle table (handle to view, sampler, image generation)
+   kept by the replay and filled by a native registration observer; the "resolved again" 1.22 ms goes first. Risk medium (invalidation on
+   texture destroy and re-upload). Check: a `_CHECK` mode comparing the table with the lookup on every draw (0 mismatches over a run), and
+   the market, castle and Kokiri pictures.
+2. **Draw lists as records (brick D, the draw loop at 0x80255be0) with inline uniform data (brick C for those blocks) and resolved
+   handles**: removes the per-draw decode (draw idx 5.64 us a draw, 2,313 draws), the user uniform buffer calls 1.4 ms and the mirror reads
+   behind them. Estimated 2-4 ms of CPU, about 1 ms of critical path. Risk high (116 callees, structures read in place). Check: records equal
+   call for call, uniform bytes equal to what the translated loop wrote, 0 mismatches, pictures.
+3. **Program lookup memo (1.5 ms)**: `HL_PROG_MEMO` exists (direct-emission.md section 15, default off); measure it first. Expected 0.3 ms of
+   the critical path. Risk low. Check: its `_CHECK` counters.
+4. **The replay thread's own 7.7 ms wall is the critical path**: dry pass 2.2 ms (batch the 43 depth-stencil clears, 0.65 ms; a native dry
+   pass over the records), and the 17-18 small command buffers recorded whole 0.95 ms (R6 tried moving them: no gain). About -0.8 ms.
+   Risk medium (the dry pass writes guest memory in stream order). Check: the picture and the counters it writes equal.
+5. **Descriptor pushes**: 6.2 descriptors a draw and only 0.56 changed-writes-only pushes: a native per-slot "same as the draw before" test
+   on the record's generation. Expected 1-2 ms of CPU, 0.3 ms of wall. Risk low to medium.
+6. **Write-back (52.8 MB, 7 MB a submit compared)**: unmeasured on its own; add one timer (write-back diff ms a submit) first. If it is the
+   order thread's 2-2.5 ms it is off the critical path, and a native AVX2 diff would cut CPU, not frame time.
+7. **Readback waits** (~300 a frame wait, 0.3-1.2 ms each, on the game's threads): answering the meter from the last GPU value without a wait
+   would cut them; it touches picture exactness (exposure), so only with a one-frame-lag check.
+8. **Capture**: no longer a lever (0.12 ms a submit).
+
+Order: 3 (measure the memo), 1, 5, 4, then 2 with the draw loop. Every brick: a `HL_<NAME>` switch, `_CHECK` counters at 0, three scenes by
+picture, then speed in a whole-machine lease.
+
+### 6. Commands for the PC 3050 (not run here)
+
+    bash build/pc3050/pc.sh lock replay1
+    bash build/pc3050/pc.sh push /e/OOT/HeyListen-wt/replay1
+    bash build/pc3050/pc.sh build replay1
+    bash build/pc3050/pc.sh run replay1 rp1-3050-prof market-spin HL_THREAD_CPU=1 RX_VK_PROF_FINE=1 RX_VK_PRESYNC_STATS=1
+    # then, interleaved, three each:  ... rp1-3050-def<i> market-spin   and   ... rp1-3050-par0-<i> market-spin RX_VK_PARALLEL=0
+    # then one:  ... rp1-3050-ubo market-spin HL_UBO_CHECK=1
+    bash build/pc3050/pc.sh grep <label> "thread CPU"      # and "a frame (fine"
+
+Options as on the main PC (dlss=0 upscaling=0 resolution=1 hdr=0 vsync=0), save market-mid.
+
+# DESC1: the per-draw descriptor cost, three levers measured (2026-11-21, main PC, market-spin, branch perf/desc-044)
+
+Same scene and options as REPLAY1 (dlss=0, upscaling=0, resolution=1 = "Render resolution: 100% chosen, drawn at 100% with Upscaler 0", hdr=0,
+vsync=0, frame rate limit Unlimited, save market-mid, slot a, whole machine, 110 s runs). Pictures: `RX_VK_SHOTS` is honoured (REPLAY1 passed it
+through a path the harness did not give the game: use a drive path, `RX_VK_SHOTS=E:/...`; one shot every 600 presents).
+
+### (a) HL_PROG_MEMO on and off
+
+On since 2026-11-18. `HL_PROG_MEMO=0` against default, 3 runs each interleaved: 85.3 fps (1% low 18.5, p50 10.95 ms) default, 84.7 (18.1, 11.03)
+off, one of the three off runs disturbed (82.0). Fine sections (two runs each): program lookup 1.43-1.48 ms default, 1.51-1.52 off: the memo
+saves 0.05-0.1 ms of CPU a frame here. Keep it on; there is nothing more in it.
+
+### (b) HL_DESC_PATCH: a program's image and view descriptors kept between its draws
+
+The texture slot cache already answers a "kept" slot in about 0.2 us (4.0 kept and 0.75 resolved again a draw); the cost is in the resolved-again
+slots (handle of another texture, a first touch of a texture in a submission: `touch: not checked this submission` ~580 a command buffer, each
+through the parallel lock) and those are not what a descriptor cache can skip. Built anyway, as asked: for a program whose texture handles come
+from its own constants and the driver's texture bank only (no uniform buffer, storage buffer or handle program, no storage image), the image and
+view descriptors of its last whole build stand for its next draws while the handles read are the same, the registration count (or, with
+`RX_VK_DESC_SLOTGEN=1`, the versions of the slots it sampled), the samplers, and the textures of its own are unchanged; the draw makes its uniform
+and storage buffer descriptors again in place (their stamps and ledger marks are the build's). Switch `HL_DESC_PATCH=1`, default **off**;
+`HL_DESC_PATCH_CHECK=1` also builds every hit whole and compares (image and view descriptors, write list, sampled textures); `HL_DESC_PATCH_RING=0`
+lets any destroyed texture stale an entry.
+
+- Hit rate: 1,050-1,100 of 1,720 tries a frame (62%); 1,330 of 1,900 (70%) with `RX_VK_DESC_SLOTGEN=1`. Misses: handles differ 340, slot registered
+  (a submission boundary registers textures) 320 without SLOTGEN and 125 with it, texture destroyed 20 (257 with the ring off).
+- Check: 4.3 M, 4.8 M and 3.9 M hits compared in three runs (with and without SLOTGEN), **0 mismatches**; shots of the checked runs looked at.
+- Speed: nothing measurable. fps default / patch: 85.3 (1% low 18.5, p50 10.95) / 82.2 (16.1, 11.25) over 3 interleaved runs of one build, 79.1 and
+  72.4 / 84.6 and 73.6 over two more (disturbed runs, machine noise of 5-10 fps); replay workers' CPU 9.3-14.4 ms default, 10.2-10.6 patched.
+  The "textures" fine section moves 2.4-4.2 ms from run to run whatever the switch (it includes the waits for the parallel lock), so it cannot show
+  a 0.5 ms saving: the gross saving is 1,100 hits x 4 slots x ~0.2 us ~ 0.9 ms of CPU a frame, spent in part again on the entry's handle compare.
+- Left off. The remaining cost is the resolved-again slots, ~2 us each: next lever there is the first-touch of a texture per submission (580
+  slow touches a command buffer), not descriptor reuse.
+
+### (c) pushes identical to the previous draw's
+
+Already in `bind_descriptors`: `pushes of nothing` is 0.00 a draw and `pushes of changed writes only` 0.58: every build changes at least one write
+(the uniform buffer offsets, which move with every draw's data in the pool), so there is no identical push to skip; of the ~14 writes a build makes,
+about 7 are pushed (the changed ones). Nothing to add without dynamic uniform offsets (a pipeline layout change: a shader-stamp file).
+
+
+### From perf/replay-front (59ec2d9aa)
+
+# R7: can the heavy buffers' front half (pre-sync + dry pass) run at the submit? (2026-11-16, PC 3050, measurement only)
+
+C2's chain note says the heavy buffers are submitted about 1.7 ms before the CPU's signal that releases them, and that the pre-sync and
+dry pass read what the game writes in between. `RX_VK_FRONT_WRITES=1` (logging only, default off, with `RX_VK_LEDGER=3600` for the
+kinds; lines "vk: front half" every 300 presents) counts it. A page is **late** when its generation is newer than the submit's capture
+and not newer than the signal's capture (`resume_queue`'s). Counted over heavy buffers (`replay_handle_early`, 2.3-2.9 a frame).
+
+### Results (per frame, steady state, 3 valid 300-frame windows each; castle-move runs r7c2/c3/c4, kokiri-idle r7k2/k3/k4; the first run of each scene after a new build is a cold-cache run with 0 frames and was thrown away)
+
+| | castle-move | kokiri-idle |
+|---|---:|---:|
+| pre-sync dirty pages, early (in the submit's capture) | 6,200-7,300 (24-28 MB) | 5,300-9,200 (21-36 MB) |
+| pre-sync dirty pages, **late** (written submit..signal) | 230-310 (0.9-1.2 MB), ~4% | 180-290 (0.7-1.1 MB), ~3% |
+| written after the signal, before the pre-sync | 0 | 0 |
+| late, uniform / vertex+index | ~1 page each (4 KB) | ~1 page each |
+| late, storage and other GPU-written | 25-29 pages (~110 KB) | 25-28 pages |
+| late, report/counter pages (the dry pass's own) | 0 | 0 |
+| late, texture storage | 0 | 0 |
+| late, never marked by a binding (the rest) | 200-280 pages (0.8-1.1 MB) | 150-260 pages |
+| heavy buffers with no window (signal not newer than the submit) | 2-5% | 1-3% |
+| dry pass: report writes (counters), a frame | ~930-1,800 (15-30 KB) | 1,270-1,880 |
+| dry pass: CPU clear writes | ~1 | ~1 |
+| dry pass: render-condition reads (not snapped) | 460-900 | 600-900 |
+| dry pass reads/writes on a late page | **0** | **0** |
+| event reads | 0 | 0 |
+| game readbacks (`invalidate`) while a queue is stopped at a wait | 60-70 (3-8 MB) | 60-73 |
+| of them on a page the dry pass writes | **0** | **0** |
+
+Not counted: the game's plain loads of those pages (only `invalidate` is visible to the back end), the segment workers' syncs at bindings
+(they run after the signal either way), pools the buffer does not bind (the pre-sync syncs every mirrored pool, so the late counts are an
+upper bound for the buffer's own reads). The ~1 MB a frame of unmarked late pages was not identified (no uniform, vertex, storage or
+texture binding marked them: data read through pointers in buffers, or pools bound only by the workers' ledger-less path).
+
+### Conclusion
+
+The late write set is small but not empty: ~3-4% of the pre-sync's dirty pages, ~1 MB a frame, so an early pre-sync needs a second,
+small pass for the pages stamped between the submit's capture and the signal's (the dirty-page scan with `synced_gen` finds them: it is
+what a sync already does). The dry pass's accesses are the good news: none of its reads or writes touch a late page, and no game readback
+in the window hits a page it writes (a window of 60-70 readbacks a frame). So the conditions C2 worried about (the game's flags read by
+the conditions, the reports the game reads back) did not occur in these scenes.
+
+Not built: `RX_VK_DRY_AT_SUBMIT`. The numbers permit it, but the bound is small (C2: only ~1.7 ms of the 5.7 ms pre-sync + dry pass lies
+before the signal, ~6% of a 27 ms frame) and it is a restructuring of `run_submit` (the held submission would have to begin its recording,
+pre-sync and dry pass at the stop, keep them across the wait, and fall back to a second pre-sync of the late pages plus a re-check of the
+conditions read, with the other queues' replays ordered around it), plus the readback tail that decides where the signal falls. The
+design if wanted: at `q.waiting = true` run the pre-sync and dry pass of the held buffer into a kept recording; at the signal run the
+late-page pre-sync (pages with generation above the submit's) and compare the conditions' operands read at the dry pass against the
+memory (`memory_read_as_submitted` style) - any difference, or any late page in a dry-pass access, discards the early work and replays as
+today. Validate with this counter first on hyrule-walk and a zone change, which these runs did not cover.
+
+
+### From perf/draw-cost (74ea86fc7)
+
+# R5: the draw's own cost and the serial parts (2026-11-15 night)
+
+Switches (all read once, default on, =0 as before): `RX_VK_PICK_TABLE`, `RX_VK_SUBMITTED_WAYS` (=1), `RX_VK_TEX_TABLE`, `RX_VK_DRY_WANTED`;
+`RX_VK_PLAN_TAIL=1` is off by default (no gain).
+- Program lookup: two thirds of castle-move's 8.8 M lookups missed the last-two-picks pair and went to the picks' map, 0.25 to 2.5 us each; a handle
+  program (a texture handle read from a storage buffer) costs ~0.7 us an evaluation, and the pick and the descriptors each evaluated it, the pick
+  twice. Picks are kept by serial in 256 sets of 4 ways, with their handles; a pick evaluates once and the same draw's descriptors reuse it.
+  8.6 M reads of submitted memory a run took pools_mu and copied a 4 KB page (one page kept, a handle program alternates between two): 8 kept now.
+- Textures resolved again: the program's 4-way slots missed on other handles (a texture a second program samples is resolved for each program); a
+  thread table by handle and view cut the misses on the PC 3050 from 1.0-1.2 to 0.6 us a draw (RTX 5070: 0.18 to 0.04).
+- Dry pass: the early path took one point a boundary, every other point copied the 27 KB state (58 a big command buffer): dry loop 2.14 -> 1.90 ms and
+  the replay thread's own segment 4.16 -> 3.89 ms on the 3050.
+- The tail plan (the last segment starts after the dry loop, so earlier segments are cut longer): own segment 3.9 -> 3.4 ms, but waits and submits +0.55 ms:
+  submissions 14.3 -> 14.15 ms, 35.1 -> 35.3 fps, nothing. Left off.

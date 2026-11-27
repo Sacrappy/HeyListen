@@ -279,3 +279,59 @@ driver's part warms (7781 compute variants), and the driver's part is left out w
 start that was killed or crashed in the driver's part leaves it: "the last start did not finish the driver's part of the shaders: left
 out"). The graphics stage libraries are only built with RX_VK_GPL. It does not change the memory: the compute pipelines are built by the
 precompile instead (131 s, at most 3 GB).
+
+## Sections from branches that were not merged (brought over 27 Nov 2026)
+
+Written on those branches and left out when their notes came to main (256de8e6f); kept as they were, each under the branch it comes from. The verdicts on that work are in docs/research/perf-plan-2026-11.md and the branch audit.
+
+### From feat/install-full-pipelines (89fd5fd5c)
+
+### What the install builds, and what the first session still compiles (PIPE1, 2026-11-18, PC 3050)
+
+The owner's first session after an update stuttered and the second was smooth: the shaders were prepared (459 s), the pipeline prediction ran
+with its 90 s budget and made 80 of ~35,851 pipelines, the precompile built 6,570 noted pipelines in 37 s, and ~90 programs were translated in
+play. Measured here on the PC 3050 (i5-10400F, RTX 3050, 32 GB, a cold driver cache made by `__GL_SHADER_DISK_CACHE_PATH`, another stream's
+game on the other slot), a cold `--prepare-shaders` in a slot of its own (current seed: 38,809 programs, 116,427 translation steps), then
+the first plays of castle-move, hyrule-walk and kokiri-idle:
+
+| | main 8fba7092 (before) | the shipped list of 14,958 states, the noted pipelines before the predicted ones (after; the plays are of the first form of the change, tier 0 predicted first, and the install's last line of this column is the final one) |
+|---|---|---|
+| install, whole | 19.7 min | 21.2 min, then 2 to 2.5 min more for the default prediction below (about 24 min) |
+| programs (translation, the driver's part) | 859.6 s | 933.4 s (2,000 programs more come with the list) |
+| predicted pipelines | 107.8 s: 96 of 41,487 built (the 90 s budget) | 28 built in 24 s with the prediction first and tier 0 only; the default (tier 0 and 1, up to 40 k words, after the noted ones): 24,040 in 123 to 150 s in a separate start |
+| noted + compute pipelines (precompile) | 195.7 s: 6,262 + 10,330 | 301 s: 9,995 + 10,330 |
+| peak private commit (at the pipeline cache save) | 6.8 GB | 8.4 GB (8.7 GB with the cache's data in hand) |
+| first play, castle-move: pipelines built after play began (graphics and compute, cache hits too), the driver's time for them | 312, 20.0 s | 51, 0.001 s |
+| first play, hyrule-walk | 62, 0.9 s | 96, 0.046 s |
+| graphics pipelines a draw had to build in play, all three scenes (new log line `in play pipeline:`) | not logged; 231 new states in the slot's list | 6, each already built by the driver (listed), 0 ms |
+| programs translated in play | 0 | 0 |
+
+**The ~90 programs translated in play are the development slots' old seed, not the product.** The dev slots' `hookshot_shaders.bin` is the
+Nov 8 one (511 MB); a builder's current census makes 539 MB. Of the 980 stages kokiri-idle reads, 145 (62 fragment, 55 vertex, 27 compute, 1
+mesh) are not in the old seed, so 98 programs (71 graphics, 27 compute) were translated in play: 193 pipelines and 25.8 s of the driver
+in that run, a 6.3 s frame, 48 frames over 250 ms. All 980 are in the current seed (every build and update makes it again in `make_game.py`).
+The compute ones stall the frame: a dispatch is never left out, so it waits for its translation.
+
+**The predicted pipelines cost what the driver already compiled.** Predicted first (the old order), a pipeline took 3 to 36 s on six
+workers, whatever its program's size: the driver compiles each shader module once and a new pairing of known modules is a link. After the
+noted pipelines (`started_up`, `prepare_with_screen`) the 24,000 predicted pipelines of known modules (tier 0 and 1, programs up to 40 k
+words) took 150 s, 15 to 110 ms each (18,233 made); the rest of the 64,750 predicted there, 8,109 in 308 s, 88 ms (up to 40 k words) to
+330 ms (up to 80 k), a few of them seconds where neither module is known. The prediction is built tier by tier, small programs first, so an
+install that is closed part way keeps the best of it.
+
+**What play still asked for was states of programs the list knew.** The 231 pipelines three scenes built that the shipped list lacked (9,854
+states) were all of programs it names (0 of 231 were of a program no note names, which is what the prediction guesses), each with another
+texture variant (`variant` and `answers` differ from the nearest record of the program in all of them): a list from more plays has them. The
+lists of the other slots (the benchmark scenes played many times) held 104 of the 231; the merged list of every slot (14,958 states, 6,443
+programs, `tools/release/check_states.py` clean) is the new `profile/pipeline_states.bin`. Its scenes are the ones the lists came from, so
+the table's after column is what such a list gives for them; an area nobody played with a recording build is still compiled in play.
+Frame times of the two columns cannot be compared: another stream's game ran on the PC, and the after arm's three runs met the commit
+limit (30 to 38 "refused at the commit limit" retries and a "commit limit near" cut of the textures' budget; the before arm's none), so the
+after arm's castle-move shows a 4 s frame where the before arm's showed 1.1 s; whether the 3,700 more resident graphics pipelines (9,995
+noted, against 6,262) have a part in it is not known. The first kokiri-idle of the before arm ended at that limit (exit 0xC0000409) and is
+left out.
+
+**The order has a trap.** The precompile takes the noted programs' records out of the program cache's index, and the prediction reads the
+modules of those programs to know which pairings the notes have: predicted after the precompile in the same process, it found none (0 of
+0 programs, the install's second run). The install now works out the prediction first (`predict_plan`), builds the noted pipelines,
+then builds what was predicted (`predict_run` with the plan): 24,040 pipelines, 123 s, in the same process.

@@ -1996,3 +1996,121 @@ when the commit was refused. Now (`host/mkw_glue.c`) a refused commit (`ERROR_CO
 up to 5 s, as the host's own allocations are, with the drops' hold let go while it sleeps; past that the out-of-memory notice is
 shown and the game stops with "out of memory" rather than faulting. `hos_commit` (the kernel's buffers) waits the same way.
 `HOS_TEST_COMMIT_REFUSE=<ms>` refuses every first-touch commit for that long after the first, to see the wait in a run.
+
+## Sections from branches that were not merged (brought over 27 Nov 2026)
+
+Written on those branches and left out when their notes came to main (256de8e6f); kept as they were, each under the branch it comes from. The verdicts on that work are in docs/research/perf-plan-2026-11.md and the branch audit.
+
+### From mem/session-growth (3a2090179)
+
+### 21. Issue 30: what grows over a session, and what gives it back (2026-11-16, stream M1)
+
+Sources: `build/s5/play8.orch.log` (the owner, 45 minutes, 17 zones, main PC, RTX 5070, 2560x1440; a "decoupling on" session:
+`HOS_GUEST_PAGES=1 HL_MEM_DROP=1 RX_VK_NO_HOST_IMPORT=1 RX_VK_CAP_ONLY_GPU=1`, `HL_TRACE` on) and `play10.orch.log` (18 minutes,
+v0.4.0's defaults). Figures from the first gameplay line to the last; MB unless said.
+
+| What | play8 start of play | play8 end | Grows how |
+|---|---:|---:|---|
+| Free space inside VMA's device blocks | 199 | 3,553-3,637 | only rises: the textures' pool 128 -> 4,096 MB of 128 MB blocks holding 676 MB of images at the end (peak 2,197); render-target blocks 128 -> 1,408-2,048 holding 300-870 |
+| VRAM used (of what the driver allows) | 5,326 (11,175) | 9,586-10,000 (10,600-10,730) | blocks + mirrors; 89-94% at the end |
+| Mirrors | 1,606 | 1,689-2,878 | bounded (3 GB budget, idle rules); 175-255 in menus |
+| Texture budget | 6,144 | 4,188-5,500 | `0.8 x allowed - (mirrors + other)`: the mirrors squeeze it |
+| Live imports (pinned guest memory) | 22 (858) | 229 (6,615) | only rises (play10, defaults: 4 -> 108, 3,854 MB in 18 min) |
+| Private commit | 17,766 | 28,041-28,602 | the window, and the driver's commit beside VRAM, which follows the blocks (20 (b)) |
+| BC cache | 0 | 1,023 (cap) | from minute ~15; 45,838 textures made again from it (37.5 GB copied), mostly at zone loads |
+| Cold units of the heaps left in for good | 0 | 19,508 (1.2 GB) | only rises |
+| Longest heaps cold pass in 10 s | 2-27 ms | 290-1,645 ms | spikes, not monotone (90-500 ms from minute 5, 1.1-1.6 s around minute 33-38, ~300 ms after) |
+
+**What grows and why.**
+- *Image blocks.* VMA gives a block back only when its last image goes; the texture budget evicts by age, not by block. After a
+  zone change most of a block's textures go and a few stay, so the blocks stay at the session's high-water mark. The driver
+  counts them (VRAM 89-94% of what it allows on a 12 GB card; on a card shared with other programs that is paging), and its
+  system-memory commit follows them.
+- *Imports.* v0.4.0 never gives a live chunk's import back: every 16 MB chunk ever bound stays pinned. In play8's mode
+  (`RX_VK_NO_HOST_IMPORT=1`) imports were given back 579 times, but 575 were imported again, 524 of them by `mirror_free`
+  when the mirror went idle (`import_again(kAgainFree)`), and a pool with no mirror never gives its import back: those are the
+  229 at the end. They also cost 3.3 s of imports on the replay's thread over the session, 109.5 ms at most.
+- *Retired imports* (`retired_imports_give_back`) and imports evicted under pressure (`imports_give_back`) were freed without
+  telling the host (`hos_noaccess_unimport`): their pages stayed "imported" to the cold pages, the drop and the substrate.
+- *Cold units given up* stay in for good, and heap memory a zone read often is reused for the next zone's data with nothing to
+  forget its history (`forget` comes only from a pool made over it).
+- *The heaps pass* is bounded by construction (256 MB looked at and 1,024 region queries a pass); its 1.6 s cannot be work
+  that grows with history. Measured in the validation below: the region queries (VirtualQuery walks the page table to the end
+  of a committed region of several GB, at every pass) were 177-211 ms of 181-216 ms passes, on the CPU. S8's books-based walk
+  (`fix(host): cold heap pages found without VirtualQuery`, `HL_MEM_COLD_LISTED`, perf/steady-spikes) removes them; this branch
+  is built on it.
+- *Frame cost.* At similar draw counts (900-1,300 a frame, menus left out) play fell 95 -> 86-88 fps over the session, the
+  replay's per-draw time rose 10-20% (descriptors 1.85 -> 2.43 ms a frame), the GPU's per-draw time did not move; at 1,300-2,200
+  draws the replay did not change. Not one cause is proven: the zones differ.
+
+**Built (all off by default; off is the previous behaviour).**
+- `RX_VK_BLOCK_RECLAIM=1` (`vk_texture.cpp` `block_reclaim`, `vk_vma.cpp`): while the textures' pool blocks hold
+  `RX_VK_BLOCK_RECLAIM_FREE_MB` (512) free, every 60 presents, a block whose images are all textures uploaded from memory,
+  unused `RX_VK_BLOCK_RECLAIM_UNUSED` presents (1800) and done on the GPU has them evicted (least filled first,
+  `RX_VK_BLOCK_RECLAIM_MB`, 256, a pass), so VMA frees it. Made again from memory if wanted (counted), not kept as spares, not
+  starting the BC cache's storing. Line `vk: image blocks given back` every 600 presents: what holds the blocks (textures used
+  lately, drawn by the GPU, other images) and what was made again. Cost: a look every 60 presents (a pass over the textures only
+  while 512 MB are free, then every 600 if nothing can go); textures made again are uploads.
+- `RX_VK_POOL_MIRROR_IDLE=1` (the default with `RX_VK_POOL_MIRROR=1`): a never-imported pool's mirror goes as any idle one unless
+  the GPU wrote the pool; its next binding makes it again from guest memory (as the first did). Without it, lever B's mirrors
+  grow with every pool bound until the budget refuses and bindings import after all.
+- Imports freed after a retirement or eviction tell the host (`import_unpinned`; a no-op where another import holds the pages).
+- `HL_MEM_COLD_GIVE_UP_S=<s>`: a given-up unit is held that long at a time instead of for good (`taken out again after it`).
+
+**To validate (not run: the main PC was held for measurements).** Function and picture first, three scenes, with
+`RX_VK_BLOCK_RECLAIM=1 RX_VK_BLOCK_RECLAIM_FREE_MB=0 RX_VK_BLOCK_RECLAIM_UNUSED=120` (forces the reclaim in scenes without
+zone changes) and `RX_VK_POOL_MIRROR=1 RX_VK_POOL_MIRROR_CHECK=1`. Then one 60-minute hand-played session over several zones
+with `RX_VK_BLOCK_RECLAIM=1 RX_VK_POOL_MIRROR=1 RX_VK_POOL_MIRROR_CHECK=1 HL_MEM_COLD_GIVE_UP_S=1200 RX_VK_RES_LOG=1`, read
+against play8/play10: free in VMA blocks, live imports (0 with lever B), mirrors, private commit, the cold pass's time, `vk:
+image blocks given back` (held by what), mirrors made again (`made again within ... of going`), `storage buffer NOT bound`
+(a pool reached through the page table while its mirror was given back would read zeros there), the pool mirror check (0).
+
+#### Validation (main PC, whole machine, build `m1-mem2` = main 38ab626c + this branch, 2026-11-16, one run each)
+
+`valid.sh m1off` (no switch: main's behaviour) against `valid.sh m1on2` (`RX_VK_BLOCK_RECLAIM=1 RX_VK_BLOCK_RECLAIM_FREE_MB=0
+RX_VK_BLOCK_RECLAIM_UNUSED=120 RX_VK_POOL_MIRROR=1 RX_VK_POOL_MIRROR_CHECK=1 HL_MEM_COLD_GIVE_UP_S=60`). All six ran to the end,
+no crash line, game-speed ratio 59.1-60.3; the last shots of every scene complete and right (no black, missing or garbled texture).
+Pool mirror check 0 mismatches, imports asked for 0, no `storage buffer NOT bound` line. An earlier build (`m1on`, castle-move)
+emptied one block (180 textures evicted at the forced 120 presents, all made again, shots right).
+
+| Scene | Game RAM off / on | Commit | VRAM | Free in blocks | Live imports | Mirrors |
+|---|---|---|---|---|---|---|
+| kokiri-idle | 2177 / 861 | 16559 / 16043 | 4793 / 3895 | 413 / 399 | 45 (1512) / 0 | 1352 / 692 |
+| castle-move | 2331 / 960 | 18006 / 16954 | 6061 / 4681 | 1297 / 826 | 51 (1660) / 0 | 1500 / 732 |
+| hyrule-walk | 2475 / 973 | 17154 / 16372 | 5107 / 4083 | 335 / 405 | 52 (1619) / 0 | 1459 / 732 |
+
+- **The heaps cold pass** (a build of this branch then had a split of the pass in its line, and a fix that asked a region's
+  extent once a sweep): 181-216 ms at most before, of which 177-211 ms in 231-237 region queries, all on the CPU (a core 35-40%
+  busy every 500 ms); 27-37 ms with that fix. Both dropped for S8's books-based walk, which needs no region query (18-26 ms).
+- **fps** (kokiri-idle, play part of the run, the `presents` lines): off ~90; reclaim + cold give-up only (`m1rc`) ~93: no cost;
+  lever B alone (`m1pm`) ~85 (-5%); everything with the mirror check (`m1on2`) ~77: the check (a diagnostic) costs another ~8%.
+  Single runs: lever B's cost is to be confirmed, and B stays off by default until it is gone (the staged write-backs compared
+  ~68 GB of pages in 110 s in kokiri).
+- Not shown by these scenes (no zone change): blocks given back in play, the idle give-back of never-imported mirrors.
+
+#### The owner's zone tour with the levers on, and the A/B of its visual bugs (2026-11-16)
+
+Tour (build `m1-mem2`, `RX_VK_BLOCK_RECLAIM=1 RX_VK_POOL_MIRROR=1 HL_MEM_COLD_GIVE_UP_S=1200`, log `build/s5/m1tour`): ground
+textures smeared in Dodongo's Cavern after Goron City, a Deku stick's flame missing in Goron City, the dungeon map black for one
+frame as it rose from a chest. A/B in slot a, 110 s standing still from saves of both zones (`savelib/goron-city`,
+`savelib/dodongos-cavern`), shots every 300 presents; the torches beside Dodongo's Cavern's first door measured in the last 12
+shots (brightest R+G in their boxes: ~400-510 lit, ~225-235 unlit):
+- no switch: lit; `RX_VK_BLOCK_RECLAIM=1` (forced: free 0 MB, unused 120): lit; `RX_VK_TEST_ALLOWED_MB=5500` alone: lit;
+- **`RX_VK_POOL_MIRROR=1` alone: unlit in every shot**, with or without the texel-view fix (`1026956a`), with or without a small
+  allowance; Goron City's wall torches unlit as well. Lever B loses the flames, not the idle give-back: it stays off, and its
+  validation runs (market, field) had no flames to see.
+- Not reproduced standing still: the smeared ground (both zones' ground looks the same in every run) and the black map (no chest
+  reached). The block reclaim and the mirrors' idle give-back gave nothing back in these runs (no zone change; VRAM under the
+  80% rule): both still need a zone change to be tested.
+
+
+### From fix/cut-grass-mirror-bisect (0a83f7229)
+
+   - `RX_VK_MIRROR_SKIP_POOL=0x103d000000` (default unset) leaves the pools whose base it names in guest memory: imported and
+     never mirrored, so the GPU reads and writes the import and the game's CPU sees a shader's writes at once, with no
+     write-back between. It costs the mirror's two reasons: that pool is read over PCIe, and the game's threads write it while
+     a submission runs (no stable snapshot). Built for issue 50's cut-grass debris, whose effect state both sides write. Measured 2026-11-19/20 with the walk-and-cut
+     session (scratch-cut3\hunt3.sh, ARC600): 3 of 8 baseline sessions kept a batch at the first cut's place (the issue's
+     accumulating state) and 0 of 8 with this switch, same slot, same 20 cuts, 48-59 fps both (suggestive, n=8 each: the
+     sample does not establish it). The pool's write-backs are complete in the baseline (every written page copied back, 0
+     left in the mirror), so what the switch removes is the mirror read path and its end-of-submission copy, not a lost copy;

@@ -60,3 +60,48 @@ Defaults (coordinator, default-on rule): EXCL, HPTR and LAZY on; PROGFRONT and P
 7.5% / 14% figures above were measured with all five on; the per-switch split was not measured.
 
 Not done: pictures in the four scenes, the 3050 runs, per-switch gains (section "Per switch" below if filled in).
+
+## Sections from branches that were not merged (brought over 27 Nov 2026)
+
+Written on those branches and left out when their notes came to main (256de8e6f); kept as they were, each under the branch it comes from. The verdicts on that work are in docs/research/perf-plan-2026-11.md and the branch audit.
+
+### From perf/vkc1 (1af5904d7)
+
+# VKC1: the Vulkan calls themselves (22 Nov 2026, branch perf/vkc1 from refactor/draw1; main PC, RTX 5070, Market `market-spin`)
+
+`RX_VK_CALL_COUNT=1` puts a counting wrapper in front of every device `vkCmd*` call (vk_callcount.cpp): calls a frame, wall time inside
+the call (the driver's), and calls that repeat what the same command buffer had been given by the call before. It also counts the draws
+by kind. Runs with it are not timed.
+
+### Calls a frame (2,277 draws and dispatches; summed over threads)
+
+14,171 calls (6.2 a draw), 3.21 ms inside them. The driver is 3.2 ms of the ~12 ms of draw CPU, not half of it:
+
+| Call | calls | ms | ns a call | repeats the call before |
+|---|---:|---:|---:|---:|
+| vkCmdBindPipeline | 1,165 | 0.727 | 624 | 54 |
+| vkCmdPushDescriptorSetKHR | 1,901 | 0.568 | 299 | (pushed as a delta already) |
+| vkQueueSubmit2 | 22 | 0.474 | 21,798 | |
+| vkCmdBeginRendering | 166 | 0.229 | 1,380 | |
+| vkCmdSetCheckpointNV | 2,320 | 0.227 | 98 | (the NVIDIA marker: kept) |
+| vkCmdPipelineBarrier2 | 379 | 0.218 | 574 | |
+| vkCmdDrawIndexed | 2,036 | 0.114 | 56 | |
+| vkCmdBindIndexBuffer / BindVertexBuffers2 | 1,807 / 1,451 | 0.050 / 0.040 | 28 | 0 / 0 |
+| vkCmdPushConstants | 791 | 0.035 | 45 | 545 |
+| the dynamic state setters (25) | ~1,300 | ~0.05 | 30-130 | 0 for most; 18 of 90 for the blend ones |
+
+The descriptor-set path (allocate, update, bind) is 46 calls a frame, 0.07 ms: the 5070 takes push descriptors. Binds, dynamic state and
+descriptor pushes were made redundant-free by earlier streams; what still repeats is the push constants (69% of 791). Nothing among the
+calls reaches 1 ms, so a thin layer cannot give more than ~1 ms of 12 ms of draw CPU in this scene.
+
+### What was cut
+
+- `RX_VK_THIN_PUSHC` (default on): a graphics draw's push constants left out when the command buffer has those bytes for those stages
+  (791 -> ~100 calls a frame). The saving in call time is 0.03 ms; the A/B below is the check.
+- `RX_VK_THIN_PROXYREAD=1` (with `RX_VK_OCC_PROXY_SKIP`): read-only programs count as draws that change nothing. In the Market it adds ~1 draw
+  a frame. `RX_VK_OCC_PROXY_SKIP` itself has been on by default since sprint 5 (hos_main.c `heylisten_env_defaults`, 2026-11-12) and leaves
+  out 42-59 draws a frame of ~2,150-2,550 here; "write nothing" draws are 40-60 a frame, so the ~900 proxies of the brief are not in this scene.
+- Empty draws: no vertices 0, zero-height viewport 0, scissor that leaves nothing 0, rasterizer discard 0, mesh draws ~44 a frame.
+- `RX_VK_THIN_TEXSEC=1` (`RX_VK_THIN_TEXSEC_CHECK=1` compares): a stage's whole texture section kept by tex_gen while nothing it read
+  changed. The first build needed RX_VK_DESC_SLOTGEN (off by default) and so did nothing (0 sections kept, 0 built); the source now notes the section's own slot
+  versions whatever that switch says. That version is not built or measured.

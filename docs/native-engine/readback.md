@@ -331,3 +331,432 @@ NVIDIA driver.
   heavy submission**, with new submits (any content) held, the compute queue free, and no CPU or API cause found. A reproduction outside the game that submits
   the same kinds of work (passes, dispatches, barriers) and watches probes would show whether it is the driver; removing one kind of work at a time in the replay
   (render passes, dispatches, mesh draws, the 2560x1440 targets) would show which one starts the hold.
+
+## Sections from branches that were not merged (brought over 27 Nov 2026)
+
+Written on those branches and left out when their notes came to main (256de8e6f); kept as they were, each under the branch it comes from. The verdicts on that work are in docs/research/perf-plan-2026-11.md and the branch audit.
+
+### From perf/meter-latch (a3b5a46fb)
+
+### Stream R3 (2026-11-15): the N-1 latch, frames in flight, and Longshot's render thread
+
+Branch `stream/r3-pipeline` (worktree `E:\OOT\HeyListen-wt\r3-pipeline`, from main e80cb82e; stream R2's fourth session, `RX_VK_WB_COMPUTE`, is not in
+main and was not used). Everything below is default off.
+
+#### Axis 1: does a game thread wait on uploads, mirror syncs or captures? (`RX_VK_WAIT_LOG=1`, logging only)
+Castle-move, main PC, per frame: the slot ring (`recording_wait`) 0.04-0.06 ms (5 waits, 0.05 of them over 50 us) on the Presentation Thread, 0.01 on the
+held-submit thread; the replay lock taken by a submit 0.00 ms; by the present 0.04-0.24 ms; a capture's write-back wait: none seen; the capture's own
+copy (work, not a wait) 0.13 + 0.16 + 0.07 ms. The only game-thread wait of size is the main thread's readback (`wait_recorded`, 1-2 ms a frame, 0.8-1.4
+waits a frame) and the module workers' readback ticket. **The owner's guess (uploads of N+1 wait for N) does not hold here: no ring of upload slots
+is worth building.**
+
+#### Axis 2: the N-1 latch (`RX_VK_READBACK_LATCH=<sizes>`, `+` or `;` also separate): result, flashes. Not adopted.
+Built: the latched ranges' runs are cut out of the write-back copies and copied into a staging record per submission; a readback of that size is
+answered from the newest record the GPU's timeline has reached, written into guest memory at that range's own readback, with no wait and no ticket.
+- First build (a record applied at any latched range's readback): castle-move, whole machine, 3 against 3: base 100.4, 98.8, 95.6, latch 102.9,
+  103.1, 102.9 (+4.8%, against +17% for no waits at all); the frame log: **106 exposure pulses in 2,473 frames** (luma up to 77 against 53 in the
+  baseline, steps up to 15), the baseline 0. A write-back landing after the game's reset of the meter was taken into the next sum by the readback
+  refresh (a doubled sum).
+- Second build (each range answered at its own readback from a kept copy, never changed elsewhere): the exposure went to **white and stayed**
+  (frame-log luma 245 against 136 in the baseline, same scene). The owner saw the white flashes in the windows of these runs (r3-t1..t3, r3g-B-r1).
+  The meter is read by an auto-exposure loop that does not tolerate a late or zero sum. **Dropped by the owner's decision; the code stays, off.**
+  The targeted wait (`RX_VK_READBACK_STRICT` by sizes) is the way for the meter.
+- Side result: with the latch the readbacks' remaining cost was the ticket (1.56 of 2.14 ms a frame summed over threads), not the late fix.
+
+#### Axis 3: frames in flight (`RX_VK_FRAMES_IN_FLIGHT=<k>`, 1 = today)
+The present is handed to a thread of its own (drain, blit, present under the order lock) and returns at once while fewer than k earlier presents are
+being replayed; the host answers the game's present poll at once (`HOS_PRESENT_NOWAIT` is set by it). Longshot's 82886e89 (#588) does the same with a
+render thread and found the same flash and its fix ("whole frames"): the replay of a frame starts after the main thread's signal. Ours already
+starts the heavy queue only at that signal; what does not match is **the capture**.
+- PC 3050 (own numbers, `RX_VK_READBACK_STRICT=1040+c0`, castle-move, one run each, not interleaved): off 1,374 frames in the 66 s cut (32.0 fps), k=2
+  2,602 frames (59.4 fps, +85%), but the picture is wrong: frame-log luma step mean 12, 565 pulses in 661 frames.
+- Why (found in the code, then tried): a stopped queue that goes on from a CPU event takes its capture when the replay goes on
+  (`resume_queue`, `memory_capture_now`: the CPU's writes up to that signal). With the CPU a frame ahead that is the next frame's data. Built:
+  the capture is made at the CPU's signal (`signal_stash`, `memory_capture_stash_*`, only for events a queue has stopped at; `RX_VK_SIGNAL_CAPTURE=0`
+  off) and taken when the queue goes on. First runs with it: one run crawled (8 s frames), the next **lost the device** at the scene load. Not found
+  why (candidates: the stash taken out of the capture queue's order against the submit captures; resources released while the previous frame's
+  replay is under way; Longshot takes both captures in one ordered job queue, which this design has not). Not adopted; picture not verified.
+- Longshot's own answer to the readback question: their readbacks wait per part for what is recorded (#2602). Without that wait their thread was not
+  tried here; with ours (strict by the meter's sizes) the meter's value is the same as today's, but frames in flight makes the "previous frame's heavy
+  submission" a frame older at the CPU's read, so whether the meter-size wait stays enough is **not established** (the picture failed before that
+  could be told apart).
+
+#### Second session (2026-11-15, PC 3050): one ordered capture sequence, the picture right, no speed
+**How the captures are ordered now** (`RX_VK_FRAMES_IN_FLIGHT=2`; `RX_VK_SIGNAL_CAPTURE=0` off; with k=1 nothing of this runs): the capture sequence
+(`captures` in vk_memory.cpp) holds items in the CPU's order: a submit's capture, and every CPU event signal (`memory_capture_signal`), a signal with
+a capture where it meets a wait a submission is stopped at (the waits are noted at each submit, `note_waits`, as Longshot's `bh_note_waits`). Both are
+made on the CPU's thread under one lock (`submit_order_mu`), so the write marks are consumed in the CPU's order. The replay takes the items from the
+front (`consume_signals`, at the top of `schedule()` and of `submit_job`: the open recording is ended, each signal's capture taken, its event set),
+so a stopped queue goes on from the signal's own capture and never re-takes one (`resume_queue` skips `memory_capture_now` for it). The staging
+copies are plain host memory; the mirrors are written only by the replay.
+**Cause of the crawl and the device loss of the stash build**: the stash's capture was made on the main thread while a submit thread made its own: two
+`capture_make` at once (the write-mark scan, the copy helpers, the buffer pool are not made for it), and the stash was taken out of order against the
+submits' captures. The lock and the order fix both. **A second cause of the wrong picture**: the present thread's `drain(0)` forced stopped queues
+past waits the main thread had not signalled yet, the next frame's included: now it forces only submissions up to the value handed out at its own
+present (`PresentJob::upto`, `drain(why, limit)`), and waits (without any lock) for the frame's signal (`cpu_wait_open`, 200 ms at most).
+**Picture, k=2** (castle-move, kokiri-idle, hyrule-walk, strict wait on 1040+c0): frame-log pulses 0 in all three scenes (baseline k=1: 0-1 in a
+25 s capture); frames looked at (frame-log frames) right: lit, no flash; 10 starts from the title all reached play (32-36 fps), no device loss.
+**Speed, PC 3050, castle-move, 3 interleaved**: k=1 31.7 / 31.9 / 31.9 fps, k=2 31.8 / 31.9 / 32.5. **No gain.** The 59 fps of the first session is not
+reproduced and was the forced waits: k=2 with `RX_VK_SIGNAL_CAPTURE=0` here gives 24 fps and 411 pulses. Without the meter's strict wait (`RX_VK_READBACK_STRICT=0`)
+33.9 fps and 17 pulses; with no readback wait at all (`RX_VK_NO_READBACK_WAIT=1`) 36.7 fps, 3 pulses. So the meter's wait is not what holds the frame.
+**Where the threads wait** (`RX_VK_WAIT_LOG=1`, ms a frame): k=1: Presentation Thread's replay lock at the present 14.8; main thread's `wait_recorded`
+6.5 + readback ticket 2.7; module workers 3.0 + 2.1 (`wait_recorded`) and 1.2 + 0.9 (ticket). k=2: the present's wait is gone from the game's threads
+(the game waited 0.00 ms for a free present slot), but the main thread still waits 5.3 + 2.2, the workers about the same, the CPU signal's lock and capture
+0.4, a submit's replay lock 0.6 (the held-submits thread), its capture copy 2.9. The GPU is idle (5.5 ms of a 31 ms frame): the frame is CPU-bound on this
+6-core PC, and the replay of every submit still runs inline on the game's submitting threads, so overlapping the present's replay moves nothing the chain waits on.
+Not done: the main PC batch, the present arm (`RX_VK_PRESENT_QUEUE=1` with `RX_VK_ACQUIRE_FENCE=1`: the swapchain already asks for 4 images).
+The owner's three rules: (1) the staging copy is made at the CPU's submit or signal (host memory) and the mirrors are written only by the replay when it
+takes the item; (2) no lock is held across a readback wait (the present thread waits on a condition variable, `submit_order_mu` is held only for a
+capture; not checked by an assert); (3) validation as above.
+#### Hand-over (second session)
+Next: the replay itself, not the present: make the submits' replay leave the game's job threads (a render thread consuming the same ordered sequence,
+Longshot's `replay_thread_main` with its whole-frames gate), since with the sequence ordered the capture is no longer the obstacle. Then the main PC batch
+(castle-move and kokiri-idle x3, k=1 against k=2) and the present arm. Scratch: `E:\OOT\scratch-from-c\r3b` (`pcfl.sh`, `ab.sh`, `starts.sh`, `batch2.sh`).
+
+### Third session (2026-11-15, PC 3050): a render thread of its own (R3c)
+`RX_VK_RENDER_THREAD=1` with `RX_VK_FRAMES_IN_FLIGHT=2` (default off; k=1 and the switch off are exactly the previous behaviour).
+**What it is.** The game's threads capture (host staging, at the CPU's time, under `submit_order_mu`: the ordered sequence of the second session), hand
+out the fence value and queue a job; the render thread (`render_thread_main`, pinned to the core kept for the replay, one thread) replays the jobs in the
+order they were queued: a submit as `submit_q` does inline (under `sync_order_mu`, `submit_job`), a present, a texture or program release and a texture or
+sampler registration after the submits before them (a registration at once would have the replay sample a later frame's slots: the async mode's lesson).
+The mirrors are written only by the replay; no lock is held across a readback wait.
+**What the game's threads wait for** (a fence's value, a finish, a read of a range the GPU writes back):
+- a fence wait or poll of value f waits for f's job to be replayed (`rt_wait_value`; a poll says "not yet" until then), `fence_q` answers from `q_last` under its own lock;
+- `finish` and the catch-ups wait for the queue to empty (`rt_wait_idle`);
+- a CPU read (`invalidate`) of a range the GPU may write back waits for the submits queued before it (`rt_readback_catch_up`: the write-backs the replay has not
+  reached are not registered yet). Ranges are learned by 64 KB regions (one a write-back was seen in always waits; one is trusted after 4 reads with none), so
+  most of the 33 readbacks a frame wait for nothing; the strict wait on the meter's sizes is kept.
+**A cycle found and removed.** The first build queued the present as a job. The Presentation Thread presents before the main thread's CPU signal for the frame,
+so the render thread stood at the present waiting for the signal while the main thread's readback waited for a submit queued behind the present: 9 presents of
+600 let go after the 200 ms limit. Now a present is **held** (`rt_held_presents`) and queued when the CPU's signal its frame's waits need has been made (`seq`: only the
+waits noted before the present call; `upto`: the work handed over up to the call, so the next frame's stopped work is not forced); 0-1 let go in 2,400 frames.
+Work the CPU queued after the present call replays before it.
+**Picture** (frame log, strict wait on 1040+c0): pulses castle-move 0, 0, 0, 0, 0 (baseline 1, 0, 1), kokiri-idle 2, 0, 2 (baseline 0, 2, 0), hyrule-walk 0 (baseline 0);
+frames of the three scenes looked at (lit, no flash, no missing geometry). 11 starts from the title with it on all reached play, no crash, no hang, no device loss.
+**Speed, PC 3050, interleaved, fps of the whole run** (k=1 / k=2 + render thread): castle-move 32.0, 32.6, 33.3 / 31.3, 33.1, 32.6 (mean 32.6 / 32.3), kokiri-idle
+33.0, 31.9, 33.3 / 33.1, 35.9, 33.3 (32.7 / 34.1), hyrule-walk 32.0 / 35.1 (one run each); the earlier ab1 batch (k=1, k=2, k=2 + render thread: 32.3 and 31.8,
+32.3 and 31.1, 32.9 and 31.6). **No gain beyond the spread in castle-move; at most +4% in kokiri-idle.** One run (c1a) gave 37.2 and was not repeated.
+**Why** (`RX_VK_WAIT_LOG=1`, castle-move, ms a frame; render thread's own log line every 600 presents): the present's wait on the replay lock is gone for good
+and the main thread's waits fell from ~8 ms (second session) to ~4.5 (wait_value 2.4, wait_recorded 0.9, ticket 0.3, CPU signal 0.4, catch-up 0.45; the module workers
+0.5-2.3 each), but **the render thread is busy 21 ms of a 31 ms frame** (submits 1.8, the present job 19.0: the heavy submission is replayed inside the present's
+drain, with the parallel segments on the replay's workers, then the blit; the wait for a job 10.6) and the queue behind it is 52 jobs deep on average (247 at most:
+texture releases and registrations, 184 a frame). The heavy replay cannot start before the main thread's signal (its first command buffer waits for it), and the next
+frame's first readbacks of GPU results (the meter, strict) wait for it plus the GPU's tail: the chain is signal N -> replay 19 ms -> GPU tail -> readbacks of N+1 -> rest of
+N+1's CPU phase. The GPU is not the limit here (6.5 ms a frame of work, gaps between recordings 22.6 ms). A thread of its own for the replay does not shorten that
+chain; only a shorter heavy replay (more parallel segments, a faster CPU) or a readback that does not wait for it (the latch, dropped) would.
+**Not verified**: the main PC (frames of 10 ms: the render thread may matter more there; needs `slot.sh all`), the present arm (`RX_VK_PRESENT_QUEUE`), `RX_VK_LAG_LOG`
+and the replay dump with the render thread on (not supported: `lag_*` and the dump assume the inline replay), Linux. Test suite: 1 failure (the known one).
+#### Hand-over (third session)
+Scratch: `E:\OOT\scratch-from-c\r3` (`pcfl.sh`, `ab3.sh`, `batch3.sh`). Next, if the owner wants the render thread kept: the main PC batch (castle-move and kokiri-idle x3, k=1
+against k=2 + render thread, whole machine); then shorten the present job (what the 19 ms are made of: drain's segments against `do_present`'s waits).
+
+### Stream C1o (2026-11-17, main PC): the light meter latched word by word, and the phase-lag question
+
+Branch `perf/meter-latch` (worktree `E:\OOT\HeyListen-wt\c1b-meter`): main 8045fe73 + stream/r3-pipeline (merged: R3's latch code, `RX_VK_FRAMES_IN_FLIGHT`,
+`RX_VK_RENDER_THREAD`) + this stream. Everything below is default off.
+
+#### What the CPU reads, at the data level (`RX_VK_METER_DIFF=<present>`, logging only)
+`RX_VK_METER_DIFF` logs, for each read of a 0x1040 or 0xc0 range, the words that changed since the range's last read (what the CPU wrote, or a
+write-back that landed before this read) and the words that changed during this read's wait (the write-back it waited for). Default waits,
+castle-move (Market save), the Deku tree (inside, dark) and Kokiri Forest. The reads all come from the ring helper `f_80357060` (five sites), once
+a frame each except the 0xc0 block, read twice:
+- **0xc0 block** (one address in all the scenes, 0x11371e7f00): words 4-11 hold one float eight times that the CPU writes after its first read
+  (outdoors it drifts slowly and steadily, 8.1e-4 to 5.6e-4 over 1,200 frames of the Market, not with the sums; in the Deku tree it does not
+  change: a light scale of the time of day, by inference); words 12-27 are four vectors of sums the GPU adds (outdoors; negative terms: a
+  spherical-harmonic sky probe, E1's "sky probe sums"); words 32-35 four more sums (E1's "RGBL"; seen in the Deku tree and Kokiri). The CPU
+  reads them, then writes 0 into words 12-35 and its new scale into 4-11 before its second read of the block.
+- **0x113c88e000 +0x1040**: words 0-3 are sums the GPU adds (about 19, 19, 7, 18 in the Deku tree: R, G, B and a luminance), set back to 0 by
+  the CPU after it reads them; ~950 other words are a table the GPU rewrites every frame and the CPU never writes. In the Deku tree this range's
+  write-back landed during the read's wait in 2,968 of 3,756 reads: it is the read the wait is for.
+- **0x113c88b000 +0x1040** (outdoors only): word 0 a count of at most 256 (the CPU turns it into v/256: a sun visibility, by inference),
+  set to 0 by the CPU after it reads it; the rest per-entry state the GPU writes. **0x113c891000 +0x1040**: a table the GPU rewrites (~160 words a frame).
+- What the CPU does with the counts (read in the lifted code, not copied here): a moving average per value over a ring of samples, then a
+  64-byte block of constants for the next frame. The sums of the 0xc0 block and of the first 0x1040 range are read and reset; where the
+  exposure is derived from them was not found. **The final pass's cbuffer 3 (`RX_VK_EXPOSURE_LOG=3`) holds no exposure**: over 770 frames of the
+  Deku tree only one flag and a three-vector change, and the word `RX_VK_EXPOSURE_LOG` names (c3+0x38) stays 1.0.
+
+#### The latch, word by word (`RX_VK_METER_LATCH=1`; `gpu/vk/meter_latch.h`, `vk_memory.cpp` `latch_answer_words` / `latch_refresh_words`)
+Built on R3's latch (the ranges' runs cut out of the write-backs and kept in a staging record per submission). What changed, and why R3's
+second build burned out to white: R3 wrote the whole range back at each read through `hos_gpu_write_live`, which refuses a page the CPU
+wrote since its last collection, and the CPU writes these pages every frame (its resets): the reads saw the CPU's own zeros, the light
+measured 0, the exposure went to its maximum. Here:
+- **The answer** (a read of 0x1040 or 0xc0, no ticket, no wait) takes the newest record the GPU's timeline has reached and merges it word by
+  word into guest memory against the range as the CPU last saw it (`merge`): a word the CPU did not change takes the record's (the GPU's
+  table and state); a word the CPU set to 0 (a sum it took and reset) takes the record's only when the record is new to the CPU or a new
+  frame reads with none newer (the sample held); at the 0xc0 block's second read of the frame it stays 0 (the first version put the sums
+  back there: the GPU then added the next frame onto them, the sums grew without end and the picture burned out to white, the same symptom
+  as R3's); a word the CPU set to anything else is the CPU's own from then on and is never written (the 0xc0 block's scale).
+- **The readback refresh** (each submission's copy of the read pages from guest memory into the mirror) gives the GPU only the latched
+  words the CPU wrote since the last answer (its resets and its scale), not the whole page: guest memory holds the GPU's words of an older
+  frame at best, and copying them would set the GPU's own state back.
+- The records keep coming whatever the CPU does; a read of a range with no finished record, or before the CPU's view is known, waits as before.
+- Diagnostics: `RX_VK_METER_DEBUG=<n>` (n answers after the 3,000th, with the CPU's word, the record's and the answer; n records' runs), and
+  a line every 3,000 asks (`vk: meter latch: ... asks`).
+
+#### Pictures (main PC, one slot, at most two games on the machine; build c1o-e = the latch and its fix)
+Frame logs (320x180) for 25 s from 5 s after play began, scratch `E:\OOT\scratch-from-c\c1o\flrun.sh`; pulses by E1's detector (a run of frames more
+than 3 luma off the median of the 121 around it, last 30% of the log); shots every 600 presents in `build/s5/c1o-a4-*-shots` (local). Saves from
+`build/s5/savelib` (the game loads the save it wrote last). A run that stayed on the load screen (the known flake, any arm) was run again.
+
+| scene | arm | fps (one run, the machine shared) | frames | luma mean | pulse runs | largest frame step |
+|---|---|---:|---:|---:|---:|---:|
+| kokiri-idle (Kokiri Forest) | default (waits) | 87.6 | 2,327 | 56.6 | **0** | 0.1 |
+| | no wait (`RX_VK_NO_READBACK_WAIT=1`, the reference) | 105.0 | 2,684 | 57.4 | **10** | 12.9 |
+| | latch | 70.8 | 1,375 | 56.8 | **0** | 0.6 after the fade-in |
+| | latch + ratio | 91.4 | 2,402 | 57.7 | **0** | 1.1 |
+| | latch + freeze | 87.8 | 2,275 | 57.2 | **0** | 0.1 |
+| | latch + frames in flight 2 + render thread | 97.3 | 2,523 | 56.8 | **1** (a 3.0 step) | 3.0 |
+| castle-move (Market; a moving view: E1's detector counts the view's own changes) | default | 40.6 (a loaded moment) | 579 | 74.0 | 13 (18 bumps) | 30.6 |
+| | no wait | 76.6 | 2,269 | 75.4 | 52 (57 bumps) | 33.3 |
+| | latch | 75.8 | 1,995 | 73.2 | 11 (10 bumps) | 31.4 |
+| | latch + ratio | 75.8 | 2,020 | 73.7 | 11 (7 bumps) | 31.3 |
+| | latch + freeze | 70.8 | 1,866 | 74.2 | 12 (11 bumps) | 50.3 |
+| | latch + frames in flight 2 + render thread | 58.7 | 1,554 | 73.6 | 14 (11 bumps) | 30.6 |
+| hyrule-walk (Hyrule Field) | default | 46.2 (shared machine) | 1,113 | 117.6 | **0** | 1.6 |
+
+("bumps": a frame more than 5 luma off the mean of the frames 8 before and 8 after while those two agree within 3: a short brightness bump the
+view's motion rarely makes; scratch `bumps` in this stream's notes.) Shots of the castle runs looked at: lit right, no flash, no burn.
+
+#### Speed (build c1o-f = d471b9bc)
+**Main PC** (Ryzen 7 7800X3D, RTX 5070), whole machine held (`slot.sh all`), arms interleaved and rotated each round, fps of the run (110 s,
+cut from play). Before and after every run the script checked that no clang / lld / build.py / other game ran and no build or slot lock
+existed; one run caught a compile and was redone (scratch `speed2.sh`). "ratio" = `RX_VK_METER_LATCH=1 RX_VK_METER_COMP=ratio`;
+"FIF" = `RX_VK_FRAMES_IN_FLIGHT=2 RX_VK_RENDER_THREAD=1` (without the latch the meter's strict wait is on: R3's default).
+
+| scene | base | ratio | ratio + FIF | FIF alone |
+|---|---|---|---|---|
+| castle-move (Market) | 77.1, 83.9, 79.5 (80.2) | 67.6, 86.2, 81.3 (78.4) | 80.0, 79.5, 81.8 (80.4) | 81.9, 81.3, 40.6* (81.6 without *) |
+| kokiri-idle (Kokiri Forest) | 90.8, 90.6, 94.3 (91.9) | 89.9, 89.7, 95.1 (91.6) | 97.7, 96.3, 96.9 (**97.0, +5.5%**) | 80.5, 83.4, 91.0 (85.0) |
+
+(*the whole run slow, every phase of the render thread ~1.6x: an outside disturbance between the checks, by inference; not redone.)
+1% lows: castle base 15.7 / 21.4 / 16.4, ratio + FIF 15.3 / 20.1 / 9.5; Kokiri base 21.5 / 19.6 / 21.0, ratio + FIF 22.4 / 21.3 / 25.0.
+
+**PC 3050** (i5-10400F, RTX 3050), castle-move, whole machine, one series of 3 rounds with the latch without compensation (the ratio is ~1
+there, see below) before the coordinator's arm list; the first rounds ran slower for every arm (caches settling): base 27.3 / 25.6 / 31.8,
+latch 24.9 / 28.6 / 32.2, latch + FIF 27.4 / 31.9 / 32.7, FIF alone 26.7 / 31.4 / 32.0. The settled third round: 31.8 / 32.2 / 32.7 / 32.0, all
+within the spread: no gain there, as R3 found (the chain is the heavy replay on that CPU). A second series with the coordinator's arms waited
+3 h for the PC 3050 (held by another stream) and gave up.
+
+#### What the phase-lag question came to
+- The pulses of the no-wait reads are an **accounting** fault, not a phase lag: a sum reset by the CPU came back (a write-back landing after the
+  reset, or an answer given again after it) and the GPU added the next frame onto it, or the CPU read its own zeros. With the words kept exact
+  (the latch above) the pulses are gone with no compensation: Kokiri 0 (no wait: 10), castle-move at the default's level (11 against 52 for no
+  wait), Hyrule Field's default 0 (the latch arms there were not finished: the main PC was taken for the owner's tests).
+- The only CPU value in the meter's block that looks like an exposure (the 0xc0 block's scale, words 4-11) drifts by about 0.1% a frame
+  outdoors and not at all indoors; `RX_VK_METER_COMP=ratio` scales the sums by it (a factor of ~1.000; 7,011 scalings in a castle run) and
+  `freeze` holds the sums when it moves past 0.1% (it practically never does). Both are neutral by the counts above. Where the game turns the
+  sums into its exposure was not found; the final pass's c3+0x38 (`RX_VK_EXPOSURE_LOG`) is constant 1.0 in every scene logged.
+
+### Hand-over (C1o)
+- Branch `perf/meter-latch`, worktree `E:\OOT\HeyListen-wt\c1b-meter`; builds `build/s5/bin/c1o-e` (the latch fixed), `c1o-f` (HEAD logging
+  counters). Switches, all default off: `RX_VK_METER_LATCH=1`, `RX_VK_METER_COMP=ratio|freeze` (`RX_VK_METER_COMP_WORDS`, `RX_VK_METER_COMP_SCALE`,
+  `RX_VK_METER_FREEZE_EPS`), `RX_VK_METER_DIFF=<present>`, `RX_VK_METER_DEBUG=<n>`, `RX_VK_METER_EXPOSURE_AT=<hex>`; the R3 merge brings
+  `RX_VK_FRAMES_IN_FLIGHT` and `RX_VK_RENDER_THREAD`. Test: `tests/test_meter_latch.py`.
+- Scratch `E:\OOT\scratch-from-c\c1o`: `flrun.sh` (frame-log run, load-screen retries, two-game gate `gate2.sh`), `speed2.sh` (guarded whole-machine
+  series), `speed_pc3.sh` (PC 3050, Kokiri and Hyrule), frame logs in `fl/`.
+- Not done (the machines were held by others): the frame-log counts of ratio + FIF on castle-move, Kokiri and Hyrule Field (latch + FIF without the
+  ratio: castle 14 / 11 bumps, Kokiri 1 run of a 3.0 step), Hyrule Field's ratio arm, and the PC 3050 series on Kokiri and Hyrule.
+- A known flake made planning hard: with three games at once, or a zone not prepared for the build's shader stamp, runs stay on the load
+  screen or load past the 110 s of the run (Hyrule Field from the `lake-hylia` save took 99 s to begin play next to another game).
+
+
+### From feat/native-readback-early (50db91b9e)
+
+### HL_RB_EXACT: which readback waits are needed (stream HLE3, 2026-11-17/18, PC 3050)
+
+Question (brick 3 of `build/s5/hle-plan-2026-11-17.md`): a CPU read of GPU results that waits only where a write-back or in-place GPU write
+the game will read is pending, by an exact ledger answer, 1.5-1.9 ms off the PC 3050's ~27 ms frame chain; the named risk is the light meter.
+Built on main 8ccfbeb4, branch `feat/native-readback-exact`, default off. Everything below is the PC 3050 (i5-10400F, RTX 3050), the check
+mode on the three scenes; **it is a measurement of the waits, not of speed** (see "Not verified").
+
+#### The waits there are
+
+On the CPU's read of a GPU result (`invalidate`, `vk_replay.cpp`), in order:
+
+| wait | where | needed? |
+|---|---|---|
+| the ticket: wait for the replay section in progress when the fence was polled (`order_ticket_wait`, `RX_VK_READBACK_TICKET`, on by default) | first, before any ledger lookup | yes for the exactness of any ledger answer: a section in progress has not registered its write-backs yet; 1.2-1.4 ms a frame summed over threads; **not touched here** |
+| the write-back wait: `v` = the page ledger's value (`memory_writeback_value`: the largest submission value on any page the range touches); when `v` is above the GPU's progress, `wait_recorded(v)` = `queue_flush_for` (first `late_fix_wait_unlocked`: the capture's view of the previous frame's last write-back, i.e. the GPU finishing that frame) and then the recordings' timeline up to the FIRST recording `v`'s submission went into; with no recording known, `wait_queue_empty` and `wait_value(v)` | after the ticket, only for ranges with a write-back (`ever`) | the dependence is real for a range a write lands on; **the wait as built is neither minimal (it waits for the whole frame's last write-back) nor strict (the first recording)**, which is why `RX_VK_WAIT_REC_SENT` burned the picture out and why the late fix cannot be dropped without replacing it (above) |
+| the strict wait: `wait_value(v)` on the timeline for the light meter's sizes (`RX_VK_READBACK_STRICT`, on by default on RADV only; `fix/white-flash-load` adds it on any driver while the presents are slow) | after the write-back wait | for the meter on RADV and under load; unchanged here |
+| the texture catch-up: `sync_settle` / `wait_queue_empty` and `texture_flush_to_guest` when a texture the GPU wrote may be in the range | after the above | only for ranges a GPU-written texture is in; unchanged here |
+
+Outside `invalidate`: the fence polls (answered "done" from the recordings' timeline, `wait_inner`), the capture's wait for a late page
+(`vk_timeline_wait`) and the late-fix waits before every submit (`late_fix_wait_unlocked`); none is a CPU read of GPU results, none is touched.
+
+#### What the logs say (check mode, three scenes)
+
+~45-48 reads a frame go to ranges with a write-back; **2.0-3.3 a frame are pending by the page ledger**, always the same ranges (`rb exact size ...` lines):
+
+- the small rings and the light meter: 0x40 (27 reads a frame, 0.6 pending), 0x1040 (3 reads, 0.45-0.7 pending: the meter's sums), 0x2000 (2, 0.45-0.7), 0x3980 (3-4, 0.16-0.3): **every pending read of these has a write on its own bytes**. The recording that carries that write is, at the time of the read, **1.8-2.7 recordings ahead of the GPU** and never already done (`carrier done`: 0.00 a frame): the CPU reads the previous frame's results at ~4-8 ms into its phase and the GPU finishes the carrying recording at ~9.7 ms (this file, second and third sessions). These waits are the real dependence.
+- the big ranges: 0x1b580, 0x8b040, 0x9b040, 0x44b040 (1-2 reads a frame, 0.1-0.4 pending by pages): **no write-back on their bytes at all**, a write-back elsewhere on a page they touch. The byte ledger skips them: 0.25-1.05 a frame, **24-40% of the pending reads**.
+
+| scene (check run) | presents | reads a frame | pending by pages a frame | no write on the bytes | carrier already done | waited for a recording | unnumbered write (old wait) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| kokiri-idle | 7,800 | 45.1 | 2.65 | 1.05 (40%) | 0.00 | 1.59 | 0.002 |
+| castle-move | 600 | 47.5 | 2.0 | 0.23 | 0.00 | 1.78 | 0.007 |
+| hyrule-walk | 3,600 | 48.0 | 2.84 | 0.53 | 0.00 | 2.3 | 0.002 |
+
+What the exact answer saves, from the check mode (the old wait done after the exact one, its time counted): **0.29 (kokiri-idle) and 0.34 ms
+(hyrule-walk) a frame summed over the reading threads**; the exact waits themselves are 20-40 ms a frame summed in the same frames. The ranges
+the byte ledger frees are read after another read of the same frame has already waited for the same GPU completion, so freeing them shortens
+nothing. The check mode and a second game on the machine (below) slowed the frames to 5-25 fps: the per-frame pending counts are lower bounds
+(at 27 ms R2 found 6-10 pending of 19) and the milliseconds are not the chain's.
+
+#### The design (default off, `HL_RB_EXACT=1`)
+
+- **A byte ledger beside the page ledger** (`gpu/vk/rb_exact.h`, `Ledger`): every `wb_pages_note` (write-back runs and in-place GPU writes: the same calls, under the same lock) is kept as a byte range with its submission's value until the GPU is done with it and, once the recording that carries it is submitted, with **that recording's number on the recordings' timeline** (`memory_writeback_seal(seq)`, called from `submit_recording` right after `++rec_seq`). A piece's write-back copies are recorded at the end of that piece's recording (`memory_end_submission`) and an in-place write happens while its recording runs, so a read of the range is safe once that recording is done. A note with no number (not sealed yet) or applied by value (RX_VK_POOL_MIRROR's staged write-backs, `fixed`) keeps the old wait, on the ledger's value. A ledger that has to drop unfinished entries (16,384 held) says so (`exact` false) and the page ledger's answer stands.
+- **The wait** (`invalidate`, `xmode`): the exact answer is asked only where the page ledger said pending and no `RX_VK_READBACK_LATE` rule named the range. No pending write on the bytes, or only writes whose recordings are done: **no wait**. Else `wait_recorded_exact(seq)`: held recordings sent unless a pending late fix holds them (the fix thread sends those), then the recordings' timeline up to the highest carrying recording; **no wait for the late fix**, no first-recording shortcut. The strict list (`RX_VK_READBACK_STRICT`) is asked after it, on the ledger's value. The ticket, the texture catch-up and the late rule are as before.
+- **The check** (`HL_RB_EXACT_CHECK=1`, implies the switch): the exact action, the bytes the CPU would read taken (ranges up to `HL_RB_EXACT_CHECK_KB`, 256), then **the old wait in full and the submission's own value waited for on the timeline**, then the bytes taken again and compared. A difference is a read the exact answer would have changed; the first sixteen are logged (the words differing, a third read at once to tell bytes still moving, the newest write ever noted on the bytes). A line every 600 presents (`rb exact window`, `rb exact all`, `rb exact size ...`).
+- Unit test: `tests/rb_exact_test.cpp` + `tests/test_rb_exact.py`: the header against brute force over 560,000 reads of a made-up world (submissions of several recordings, writes sealed with the recording's number, some by value, the GPU finishing recordings in order, a ledger small enough to drop entries): 0 mismatches, answers exact or erring upward when entries were dropped; the wiring: every write goes into both ledgers, the seal is made with the number the recording signals, the late fix is not waited for, the old wait is done in full in the check mode.
+
+#### Check results (builds `hle3c` and `hle3d`, PC 3050, `HL_RB_EXACT_CHECK=1`)
+
+| scene | runs | reads compared | skipped by the exact answer (no write on the bytes) | waited for a recording | differed |
+|---|---:|---:|---:|---:|---:|
+| kokiri-idle | 2 | 16,979 | 8,243 | 13,958 | **0** |
+| castle-move | 2 | 6,750 | 1,091 | 6,241 | **1** |
+| hyrule-walk | 2 | 16,305 | 3,114 | 15,110 | **1** |
+
+(reads above 256 KB, 0x44b040 and the like, are not compared: 6,000-7,000 of them, all skipped by the exact answer.) The light meter's ranges (0x1040, 0xc0) and the rings 0x40 and 0x2000: **0 differences**. The two that differed are the same kind of read: the 0x3980 range at one word (0x40), **1-2 ulps** of a float near 0.9-1.0 (`3f67df18` against `3f67df1a`; `3f7fdbe4` against `3f7fdbe5`), after a skip, 1 in 8,000-9,000 compares; the first build (the submission's last recording instead of the carrier's) had one more in the same range at word 0x244 (a float near 8.4e-4, which is the size of the CPU's meter scale of C1o). The cause is **not separated**: the words look like values the CPU smooths itself (the range is read and written by the game); the later runs, which had the third-read diagnostic and a page watch on the two pages (`RX_VK_WATCH_CPU`), had no mismatch. Said plainly: two reads of ~40,000 would have changed by 1-2 ulps in a word the CPU may have written itself; none in the meter's or the rings' ranges.
+
+#### Pictures
+
+Shots every 300 presents (`RX_VK_SHOTS`, 1280x720) of every run, looked at by eye and by mean luma: kokiri-idle (the Market in these slots), castle-move and hyrule-walk, in the check mode and the exact mode: lit right, geometry and HUD whole, no tint, no black frame after the fade-in, no flash. The luma of the picture in play was 98-106 in kokiri-idle (both modes) and 112-116 in hyrule-walk (s2); in the slow runs (5-14 fps) the luma of the same view moved between 81 and 111 shot to shot (hyrule-walk, check mode, the fountain): the baseline run (default waits, hyrule-walk, the same slow conditions, `hle3-s4-base-hyrule-walk`) has **one blown-out, blue-tinted frame (luma 173, shot 7500) among shots of 109-113**, the exposure pulse this file's first sessions describe; none of the ~100 shots of the check runs and the exact runs shows one (the exact hyrule run reached only one shot after its fade-in, at 2 fps). The first shot after a fade-in is bright in every arm (base 130, check 149, exact 148): the fade, not the meter. The view of hyrule-walk differs from run to run (the script walks by time), so the luma of two runs is only comparable in the steady stretches.
+
+#### Expected saving
+
+**~0.3 ms a frame summed over threads on the PC 3050, ~0 on the chain**, against the 1.5-1.9 the plan estimated. The estimate came from the experiment with every wait off (27.0 -> 25.5 ms), which includes the meter's and the rings' real dependence; the ledger cannot remove it, because those reads wait for write-backs that land at the end of the frame's last recordings and the GPU gets there ~5 ms into the next CPU phase (the queue hole above). What the ledger does give: (1) the exact answer a latch (`perf/meter-latch`, C1o) or an earlier-landing write-back needs: it says which recording carries each range, and that no pending read is carried by an early one, so **moving the write-back of the 0x40 / 0x1040 / 0x2000 rings to a small recording submitted right after the last pass that writes them is the lever, not the ledger**; (2) a wait that does not hold the late-fix thread and does not flush the queue under `dev.present_mu`.
+
+#### Not verified
+
+- **Speed.** No fps round was made (as asked), and the runs were slow: the check mode (copies of 256 KB ranges, two waits) and a second game on slot a (another stream's) cut every run to 5-25 fps. The exact mode's own frame rate against the old wait's is open: the one pair run under the same load, hyrule-walk (base `HL_RB_EXACT=0` against `HL_RB_EXACT=1`), gave **7.2 fps (windows 4.7-21.9) for the base and 2.0 fps for the exact mode, whose readback waits were 360-400 ms each against 7-8.6 ms**; the second game was running, the windows of both swung by 5x, and the exact mode's earlier runs on kokiri-idle (24.3 against the check mode's 25.1) and castle-move (12.7) were not slower than the check mode's. So the exact mode is **not shown to be faster and one pair says slower**; it needs the same pair on a machine with nothing else running (the log lines `readbacks of GPU results: ... ms each` and `rb exact all` carry the wait times).
+- A hand-played zone change: the exact answer is only as good as the registrations (`wb_pages_note`); a GPU write that is never noted (a binding over 1 MB written in place, the `RX_VK_WB_MAX_KB` cut) is not waited for by either ledger on its own bytes, and the old wait covered it by accident when it waited for the whole frame.
+- RADV, AMD and Intel: the batch path (`batch_on`) and the late fix hold recordings there; the exact wait sends them unless a fix holds them. Not run.
+- `fix/white-flash-load` (the meter's wait under load) is not on main; with `HL_RB_EXACT` the meter's reads wait for their carrying recording, which is what the strict wait means, so the two do not conflict, but they were not run together.
+
+### HL_RB_EARLY: the small write-backs out of the big recording (stream HLE4, 2026-11-18, PC 3050)
+
+Question (HLE3's lever): the rings (0x40, 0x2000), the light meter (0x1040) and the 0x3980 block are read by the CPU at ~4-8 ms into its
+phase, and the exact ledger shows their write-back copies in the frame's LAST recording, 1.8-2.7 recordings ahead of the GPU. Copy them
+earlier, in a recording the GPU finishes sooner, and the read waits less. Built on `HL_RB_EXACT` (its ledger; `HL_RB_EARLY=1` implies it),
+default off. **Result: the mechanism works on the ledger, the bytes are not right (0x3980), and the frame rate did not move. Not adopted.**
+
+#### Where the writes and the copies are (`HL_RB_EARLY_LOG=1` with `RX_VK_TL_S`; the `rbe-*` lines)
+
+`rbe-end`/`rbe-note`/`rbe-tag`/`rbe-seg`/`rbe-read` give, per recording number, the small notes (kind 3: a binding bound for writing, 0: a
+write-back copy, 1: in place), the parallel replay's segments and the reads with the number they waited for. Castle-move, PC 3050:
+
+- The meter's 0x1040 (three buffers), the 0x3980 block and ~24 of the 0x40 rings are bound for writing in the recordings that go to the
+  queue ahead of the big command buffer's segments (`r`, submitted with `submit_recording(r, false)` and **no write-back at its end**);
+  the segments (a few 0x4, 0xc0 and 0x5b40 notes carry a segment tag) and the last recording bind only some more 0x40 and 0xc0 words.
+- Every copy of them (`k0` notes: 0x1040 x3, 0x2000, 0x3980, 0x40 x27-29, 0x1000 x18, ...) is made at the end of the LAST recording of the
+  submission, which follows the heavy recording, its segments, by 12-15 ms of GPU time at 21 fps: that recording is the carrier every read
+  waits for. The GPU time between a ring's last writing pass and its copy is the whole big command buffer.
+
+#### The design (`HL_RB_EARLY=1`)
+
+Two places copy a small result back at the end of the recording that holds its last write so far, with the same copy as before (cut at the
+CPU's own words, the lazy rule, the diff shadows told with `shadow_forget`), noted in the byte ledger and removed from the submission's list:
+1. `memory_early_flush(r.cmd)` before `submit_recording(r, false)` in the three parallel-replay paths: what the write-back list holds, small
+   (`HL_RB_EARLY_MAX_KB`, 16), in a pool with an import and in pages the CPU has read (`rb_pages`).
+2. `memory_seg_early_begin/_end` around a segment's recording (`record_job`, both paths): the small CPU-read writes bound in the segment are
+   copied at the segment's end, and the segment is submitted with a recording number of its own (`seg_early_number`: `++rec_seq` in the
+   queue's order under `dev.present_mu`, signalled on the recordings' timeline, notes sealed by tag: `BasicLedger::seal_tag`).
+Unit tests: `tests/rb_exact_test.cpp` (tagged notes sealed out of order, 560,000 reads against brute force, 0 mismatches) and the wiring
+checks in `tests/test_rb_exact.py`. A recording recorded whole with no segments (the serial path) is not touched: the cut after the last
+writing pass (`split_part`) was not built.
+
+#### What the PC 3050 said
+
+- Check mode (`HL_RB_EARLY=1 HL_RB_EXACT_CHECK=1`, castle-move, build hle4c): **792 compared, 224 differed**; every difference logged (the first
+  16) is the 0x3980 block, 749-818 words, values within ~3% of each other (`31f99d53` against `320452b3`): the early copy holds the block
+  as it was when the recording ended, the whole submission leaves more in it. The meter's and the rings' differences were not counted by size
+  (the log keeps 16 lines); none of the 16 is theirs. Cause not found (candidates: writes through a binding noted before the copy and used
+  after it, the CPU-word cut made at another time). **This alone stops adoption.**
+- Reads: `rb exact all` of an A/B arm: 43.7 reads a frame, 26.9 pending by pages, **23.3 already carried by done recordings** (HLE3: 0.00),
+  1.38 still waited for a recording (10.1 ms a frame summed over threads).
+- Speed (castle-move, whole machine under a speed lease, `--slot b`, build hle4c, one throwaway then base, early, early, base; the PC ran
+  slow in this window, 43-47 ms frames, 21 fps, where HLE3 saw a 27 ms chain; the base arms had `RX_VK_RB_PROF` on, a few timestamps a read):
+  fps base 21.3, 21.2; early 21.4, 22.4 (p50 46.7, 46.9 against 40.2, 45.4 ms; p99 95, 91 against 139, 93): inside the spread, **no gain
+  shown**. Reads in the early arm (`rb exact all`): 43.7 and 44 reads a frame, 26.9 and 24.2 pending by pages, **23.3 and 21.1 already
+  carried by done recordings** (HLE3: 0.00), 1.4 waited a recording each (10-11 ms a frame summed over threads). Base arm (default waits): 300-450 of
+  3,000 reads waited, 2-7 ms each. Why fewer waits did not move the frame: in these runs the GPU is the long pole (the heavy recording
+  is 12-15 ms of GPU time and the frame is 43 ms), and the reads that still wait are the late 0x40 ring (102dd34020, bound 22 times in the last recording).
+
+#### Not verified
+
+Pictures were taken in the check run only (RX_VK_SHOTS in `hle4-c1`); kokiri-idle and hyrule-walk were not run for this switch; the A/B has
+too few rounds (the speed lease allowed 5 runs); the serial (whole-recording) path, where the big write-backs of the 3050's frame are
+recorded, is not covered; RADV, AMD, Intel not run.
+
+
+### From stream/r2-readback (7283f4204)
+
+### Fourth session (2026-11-15/16, main PC): the write-backs on the compute-family queue (`RX_VK_WB_COMPUTE`, default 0)
+
+#### What was built
+- `RX_VK_WB_COMPUTE=1`: a queue of the compute-only family (`vk_main.cpp`, `dev.wb_queue`), buffers made while it is set shared by both
+  families (`buffer_share`: concurrent sharing, so no ownership transfers), a command buffer of that family per recording
+  (`Recording::wb_cmd`), and in `memory_end_submission` the copies of what *already sent* recordings wrote (writers tagged per write-back by
+  the command buffer of the recording that bound the range, `draw_recording_cmd()`) recorded there; the copies of what the recording's own work
+  wrote stay in its own command buffer. Every submit on the replay's queue signals `gfx_tl` with a number; the copies' submit waits for the
+  numbers of their writers, signals `wb_tl` (its own counter) and `wb_done_tl` (the recordings' timeline values, "copies landed"); a later
+  submit on the replay's queue waits for `wb_tl` only if the copies are not done. `completed()` is the minimum of `timeline` and `wb_done_tl`.
+  Readbacks of pages whose last write-back was a compute copy wait for `wb_done_tl` alone (`memory_writeback_need`), 2 ms at most, then as before.
+- `=2`: the queue and the shared buffers only, copies where they were (a measurement). `RX_VK_TL_WB=1` (with the timeline): the small write-back
+  runs, the ones left in the recording's own buffer (`wb-own`) and the compute submits (`wb-submit`, `wb-writer`). Refused with `RX_VK_POOL_MIRROR`.
+
+#### Findings (castle-move, RTX 5070, whole machine)
+1. **The meter, the rings and the event words are written by the heavy submission's last recording's own work**, not by the pieces before it: the
+   earlier pieces (render passes) register no buffer write-back; the last piece (0.03 ms of GPU work: dispatches, the final event signal) registers
+   all of them (`wb-own`: the meter's 0x1040 ranges, the 0x2000 rings, the event page). That recording is the one the graphics queue holds.
+   So the compute copy has nothing earlier to wait for: the hold only moves.
+2. **Making the compute queue wait for that held piece makes the frame slower**: first build (all copies on compute, awaiting their writers
+   including the last recording): castle-move 100.0 -> 77.3 fps (3 against 3: 99.9, 100.2, 99.9 against 78.7, 76.3, 76.8). The Presentation
+   Thread's `vkQueuePresentKHR` (under `dev.present_mu`) then blocks 4-5 ms, until the held piece runs, and every readback's flush waits for that
+   lock: `RX_VK_RB_PROF` shows the late-fix wait (1.0-1.2 ms a frame) gone and a lock wait of 1.8-2.0 ms in its place (2.4-2.7 ms a frame of readback
+   wait without the switch, 2.0-2.2 with it). The late start of the last piece is unchanged (3.6-4.2 ms after its submit).
+3. Isolated: queue + shared buffers only (`=2`): 98.2, 97.1 against 98.3, 100.0, no cost. The copies not waiting for the last recording's own
+   work (a diagnostic, wrong picture): 100.2 fps; no waits at all: 106.2 (+7%, the bound for this route).
+4. Final build (copies of earlier writers only; here none exist, so only signals go through the compute queue), castle-move x3 interleaved: base 95.7,
+   93.0, 92.6 (mean 93.8), switch 77.1, 78.2, 72.0 (mean 75.8): **-19%**. Readback wait 3.7-3.8 ms a frame (the wait moved to the full timeline).
+5. Picture with the switch on: frame log 1,859 frames, luma mean 41.21 (range 28.6-52.7, largest step 0.77, 0 pulses) against 40.66 (28.8-54.0, 0.92,
+   0 pulses) without; `valid.sh` three scenes ran (3,342 / 3,287 / 3,121 frames, no crash, ratio 60.4 / 60.0 / 59.7), last shots looked at by eye: right.
+
+Result: the hypothesis does not hold for this game: the readbacks wait for the graphics queue's hold because what they read is produced by work inside
+the hold, and a cross-queue wait on that work costs more than it saves. Not built / not verified: running the last piece's dispatches themselves on the
+compute queue (they share the recording's state with the draws); the PC 3050; the picture over long runs (one frame log per arm).
+
+#### Hand-over (fourth session)
+Branch `stream/r2-readback`. Scratch under `E:\OOT\scratch-from-c\r2d` (`ab.sh` interleaved runs waiting for builds, `tl2.sh`, `final.sh`). The switch is
+off by default and changes nothing then (except that `memory_end_submission` returns a bool and `WriteBack` carries a command buffer).
+
+
+### From perf/meter-clear (98961ce6d)
+
+### RX_VK_METER_CLEAR: the sky sums zeroed on the GPU (stream E1, 2026-11-16)
+
+Ported from ProjectReLink (`gpu/vk/vk_draw.cpp`, "sky_sums", commit 433d229 by pixl27): right before each dispatch of the compute
+programs `499dbfd0721d2858` (sky probe sums, 0x40 bytes at c1[0] of the block at c0+0x20) and `ab7699ee7f536755` (RGBL sums, 0x10
+bytes at +0x80 of the block at c0+0x30) the block is zeroed with `vkCmdFillBuffer` plus a barrier, so a CPU reset or a mirror sync of the
+page that lands between the game's clear (`6ccba775ea111ee9`) and the adds cannot double the frame's sums. ReLink runs without the
+readback and capture waits by default (opt-in there: 59.0 against 47.5 fps in the village). Switch `RX_VK_METER_CLEAR=1` (default off;
+`=2` also logs the compute programs seen). Test: `tests/test_meter_clear.py`.
+
+Measured on the main PC (whole machine held, slot a, build e1 = main cb087555 + the clear, frame logs at 320x180, last 30% of each log,
+a pulse = a run of frames more than 3 luma off the median of the 121 around it; kokiri-idle here is the castle-gate view after the load).
+Many runs did not leave the load screen (0 frames; the known flake, in every arm, and worse with a frame log): few valid runs per arm.
+
+| arm | valid runs, fps | luma mean | pulses (peak, max frame step) |
+|---|---|---:|---|
+| a: default (waits on) | 91.7, 89.4, 89.5 | 65.3-65.9 | 0 (0.1) |
+| b: `RX_VK_NO_READBACK_WAIT=1` | 94.2, 90.0, 84.8 | 71.7 | 228-267 (peak 28-31, step 25-33) |
+| c: b + `RX_VK_METER_CLEAR=1` | 89.9 (clean run), others cut by a load | 69.6 | 182 (peak 13, step 3.9) |
+
+castle-move (a moving view: the pulse count is not clean there): a 90.6 / 86.2, b 89.1, c 94.6 / 65.1 (cut); pulses a 18-45, b 127,
+c 33-106. Verdict: the clear works (it ran about 2 zeroings a frame, the blocks bound, window 0xc0) and cuts the size of the
+pulses (peak 28 -> 13, frame step 25 -> 4 luma) but does not remove them: 182 against 0 with the waits. So it is NOT on by default
+with the waits off, and the waits stay. Waits off gave no fps gain in these runs on this build (b ~ a, noise +-4%), where the older
+note measured +17% (main now has early GPU work). What else the meter reads is not found: the other ranges the CPU reads
+(0x1040 x3 from the ring helper f_80357060) are not the blocks these two programs write; a probe binding-size log found none. Next:
+find the programs that write the 0x1040 blocks (RX_VK_LOG_WRITTEN is capped at 10 lines; widen it), and zero or version those too.

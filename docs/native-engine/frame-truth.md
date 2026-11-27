@@ -110,3 +110,60 @@ GPU's 20.5 ms still exceeds it.
 * C2's and R3c's builds were not re-run; the explanation of their low figures is from commit 17308b8c and their logs' gap
   columns.
 * No picture checked (diagnostic runs only, one extra run at 1920x1080).
+
+## Sections from branches that were not merged (brought over 27 Nov 2026)
+
+Written on those branches and left out when their notes came to main (256de8e6f); kept as they were, each under the branch it comes from. The verdicts on that work are in docs/research/perf-plan-2026-11.md and the branch audit.
+
+### From perf/fixed-overhead (7a3e2ab47)
+
+### Fixed GPU overhead bound (P3, PC 3050, kokiri-forest, main 8045fe73, 2 runs each, interleaved, warm run first)
+
+Switches that remove the work outright (picture wrong, bounds only): base 39.75 / 41.44 fps (mean 40.6), `RX_VK_NO_RB_REFRESH=1`
+39.85 / 41.77 (40.8, +0.5%), `RX_VK_NO_WRITEBACK=1` 40.32 / 41.12 (40.7, +0.2%). Run-to-run spread is ~1.7 fps. So the ~2.3 ms of
+rbrefresh, msync, write-back copies and their barriers seen in PASS_TIMING is not on the frame's critical path: removing a whole
+piece moves nothing measurable. Reasons from the code: rbrefresh (2.26 MB) and msync (1.82 MB) are PCIe reads of host memory
+(~2.7 GB/s: bytes, not barriers or dispatches; scatters are already one dispatch per recording); the refresh must read live guest
+memory at GPU time (it catches CPU writes made after the submit's capture), so a page_gen skip is unsafe; the write-back's
+10.9 of 14.8 MB a frame are GPU-written ranges inside pools the CPU reads, but the CPU reads ~22 pages: a page-level filter would need a
+synchronous first-read fallback for exactness, for a bound of ~0.2%. No code change made.
+
+
+### From perf/gmem-hoist (37e836d38)
+
+### G5: global-access range hoist in every stage, and the PLOP3 fold (PC 3050, 2026-11-16, 1440p, kokiri-forest and hyrule-field saves)
+
+Switches (all off by default; "RX_VK_GMEM" is now in the program cache stamp's prefix list, vk_shader.cpp, and any translator change moves HOOKSHOT_SHADER_STAMP):
+`RX_VK_GMEM_HOIST=1` (every stage) or letters `v f c m` (vertex, fragment, compute, task+mesh); `RX_VK_GMEM_FOLD=1` (PLOP3 booleans done on booleans).
+
+GPU ms a frame (RX_VK_PASS_TIMING=2, last 600-present block; "pass" = draws, "dispatch" = compute) and plain fps (2 runs):
+
+| arm | kokiri GPU / pass / dispatch | kokiri fps | hyrule GPU / pass / dispatch | hyrule fps |
+| --- | --- | --- | --- | --- |
+| default | 22.30 / 14.29 / 4.42 | 39.4, 40.8 | 19.89 / 12.30 / 4.08 | 45.7, 45.7 |
+| RX_VK_MESH_G3=1 | 21.72 / 13.71 / 4.43 | 37.6, 45.3 | 18.46 / 10.89 / 4.08 | 48.6, 49.1 |
+| HOIST=1 (all) | 30.73 / 20.29 / 6.84 | 24.2 (+153 outlier) | 24.74 / 14.69 / 6.52 | 37.5, 37.4 |
+| HOIST=1 + FOLD=1 | 30.73 / 20.32 / 6.80 | 26.5, 27.3 | 24.72 / 14.69 / 6.53 | 37.7, 37.2 |
+| HOIST=v only (kokiri) | 22.34 / 14.35 / 4.41 | 41.2 | | |
+| HOIST=f only (kokiri) | 28.84 / 20.83 / 4.43 | 32.0 | | |
+| HOIST=c only (kokiri) | 24.78 / 14.36 / 6.82 | 31.6 | | |
+
+Reading: the hoist helps task/mesh only (G3's gain reproduced: -0.6 Kokiri, -1.4 Hyrule). Hoisting fragment programs costs +6.5 ms and compute +2.4 ms, vertex is neutral: the prologue (two UBO loads, ArrayLength, 64-bit ops per candidate) runs for every invocation, a pixel included, where the old search paid only for accesses actually reached. The FOLD changed nothing measurable. Pictures (same save, late scene shot, four arms) match: geometry, textures, lighting, water.
+Run notes: RX_VK_SHOTS needs the folder to exist before the run (a cmd `mkdir` through pc.sh with `\$lab` in double quotes created a folder named `$lab`: close the quote); shots only after the loading screen (present ~7000+ at this speed).
+
+
+### From perf/mesh-overlap (bfb23e627)
+
+### G4: indirect mesh draws without the pass break (RX_VK_MESH_INDIRECT_INLINE=1, default off, measured: no gain)
+
+Why each indirect mesh draw ended its pass: NVN2 keeps the record as {count, first}, Vulkan reads {x, y, z}. mesh_indirect_convert copies each
+count into a {count, 1, 1} ring (a fill and a copy) and a copy cannot be made inside a render pass: end_pass, three barriers, then the pass
+opens again behind a full pass-start barrier (the copy is transfer work). Kokiri has about 42 such draws a frame (4423 + 1727 in 5 s at ~30 fps with the
+profile on), Hyrule about the same.
+The switch converts them ahead (mesh_hoist_* in vk_draw.cpp; vk_replay.cpp scans the ops after the game's barrier, a dispatch or a met
+wait, and at the start of each replay part, up to the first op that may write memory) so the draws keep their pass. 72% of the draws
+were covered (the rest: draws after a dispatch whose scan did not reach them).
+Measured on the PC 3050 (build g4f, 1440p, plain runs): Kokiri 40.4 / 40.9 fps default, 39.2 / 36.1 inline; Hyrule 45.7 / 45.7 default,
+40.0 / 43.0 inline; GPU time Kokiri 20.3 -> 20.5-20.6 ms. With RX_VK_PASS_TIMING=2 (which serialises the spans and cannot show overlap)
+-0.1 ms Kokiri, -0.46 ms Hyrule. The draws stay behind the game's own full nvnCommandBufferBarrier and the dispatch that writes their counts,
+so there is nothing to overlap with; the extra full barrier a batch needs costs more than the breaks it saves. Left off.
