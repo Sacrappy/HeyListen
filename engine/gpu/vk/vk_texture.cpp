@@ -1351,6 +1351,7 @@ struct BcCacheEntry {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
     uint64_t bytes = 0, last_value = 0, tick = 0;
+    int64_t used_ns = 0;   // (FOOT2: when it last served or was stored, for RX_VK_BC_CACHE_IDLE_S)
     uint64_t made_value = 0;   // (the submission that writes its blocks: read only once the GPU is done with it. The parallel
                                // replay's segments are queued in their order, not in the order they record: a hit in an
                                // earlier segment of the same submission would copy blocks not yet written)
@@ -1420,6 +1421,25 @@ void bcc_trim_locked() {
         bcc_dead.push_back(old->second);
         bcc.erase(old);
     }
+}
+int64_t bcc_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+// (FOOT2) RX_VK_BC_CACHE_IDLE_S=<seconds> (0: off, the default): an entry not served for that long goes, so that the cache holds what
+// the zone in play uses and not every zone's textures of the session (1 GB of host-cached RAM in the end, 28 blocks of 64 MB). FOOT2's
+// ten-minute tour at 120 s: 50 MB saved for 6.8 GB more copied back from the transcoder (the tour comes back to its zones)
+void bcc_trim_idle() {
+    static const int64_t idle = (getenv("RX_VK_BC_CACHE_IDLE_S") ? std::max(0, atoi(getenv("RX_VK_BC_CACHE_IDLE_S"))) : 0) * 1000000000LL;
+    if (!idle) return;
+    const int64_t now = bcc_now_ns();
+    std::lock_guard lk(bcc_mu);
+    int n = 0;
+    for (auto it = bcc.begin(); it != bcc.end();) {
+        if (now - it->second.used_ns <= idle) { ++it; continue; }
+        bcc_bytes -= it->second.bytes;
+        bcc_dead.push_back(it->second);
+        it = bcc.erase(it);
+        n++;
+    }
+    if (n) logf("vk: BC cache: %d entries not served for %lld s let go, %zu left, %llu MB", n, (long long)(idle / 1000000000LL), bcc.size(), (unsigned long long)(bcc_bytes >> 20));
 }
 // ---- (TEXCACHE) the BC disk cache's side here (vk_bc_disk.h): the pool its reads ahead land in, the transcodes waiting to be written ----
 // perf/bc7c ran 78 fps against 112 with its disk cache on (any arm, cold or warm) on the RTX 5070. What it did that this does not:
@@ -1703,7 +1723,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             std::lock_guard lk(bcc_mu);
             auto it = bcc.find(cache_key);
             if (it != bcc.end() && it->second.bytes == bcc_size(tex, pieces) && it->second.made_value <= completed_value) {
-                it->second.tick = ++bcc_tick;
+                it->second.tick = ++bcc_tick, it->second.used_ns = bcc_now_ns();
                 it->second.last_value = std::max(it->second.last_value, rec_value);
                 hit = it->second;
             } else {   // (a transcode follows: of bytes transcoded before, or not)
@@ -1819,7 +1839,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 bool kept = false;
                 {
                     std::lock_guard lk(bcc_mu);
-                    entry.tick = ++bcc_tick;
+                    entry.tick = ++bcc_tick, entry.used_ns = bcc_now_ns();
                     if (cache_key) {
                         auto [it, fresh] = bcc.emplace(cache_key, entry);
                         if (fresh) {
@@ -6031,6 +6051,7 @@ void texture_frame(uint64_t completed) {
     upload_frame_report();
     if (bcc_cap() || bcd_on()) {   // (TICK-051: the BC cache's entries let go, and every 600 frames what it did)
         bcc_free_done(completed);
+        if (frame_no % 300 == 150) bcc_trim_idle();
         if (bcd_on() && frame_no % 15 == 0 && host && host->perf_info) {   // (TEXCACHE: the map now, for the maps' lists)
             char name[120] = "";
             int64_t movie[5] = {};
