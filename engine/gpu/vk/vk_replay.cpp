@@ -54,6 +54,7 @@
 #include "segment_plan.h"   // (TICK-050: the parallel replay's segment count)
 #include "par_ideal_rule.h"   // (the recording workers' ideal processors, RX_VK_PARALLEL_IDEAL)
 #include "completion_tracker.h"   // (stream ORDER2: the recordings' completion tracked off the order thread)
+#include "present_pace_rule.h"   // (ARR1: the present pace, HL_PRESENT_PACE)
 #include "feed_stats.h"           // (stream ORDER3: why the GPU sat idle between recordings)
 #include "submit_seq.h"           // (stream DECOUPLE: the lanes' submit sequencer, RX_VK_LANES / RX_VK_LANES_CHECK)
 #include "timeline_order.h"       // (DECOUPLE3: the timeline's signals never go back, a present held by the order thread)
@@ -9909,7 +9910,112 @@ bool present_handed_over(const nvn_tex* t, const int crop[4]) {
     pj_cv.notify_one();
     return true;
 }
+/// (ARR1, 27 Nov) The present pace (present_pace_rule.h): at a frame rate limit each frame is handed over on an even line, one
+/// period after the line's last point, the game's presenting thread waiting here when it is early, before the order lock and the
+/// replay's drain (no lock held, nothing of the replay waits). The limit itself waits at the game's window acquire (host/nn_vi.c),
+/// at the START of the game's frame: the present came one period after the one before plus the difference of the two frames'
+/// work, and a mailbox swapchain (V-Sync off) showed that difference. In the owner's Kakariko (main PC, 60 limit) 12 % of the
+/// frames were 20-33 ms, 70 % of them followed by one under 14 ms, with about 11 ms of work a frame: the hitch log named the
+/// pacing sleep in 365 of 428 such frames. HL_PRESENT_PACE=0: off; 1 (the default): the hold; 2: the hold, and after the present the game's
+/// next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point:
+/// the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace),
+/// a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that
+/// much early, for the timer's wake-up
+namespace pace {
+int mode() {
+    static const int m = [] {
+        const char* e = getenv("HL_PRESENT_PACE");
+        return e && *e ? std::clamp(atoi(e), 0, 2) : 1;   // (on by default, 27 Nov: ARR1's walks)
+    }();
+    return m;
+}
+int64_t env_us(const char* name, int otherwise) {
+    const char* e = getenv(name);
+    return (int64_t)(e && *e ? std::max(0, atoi(e)) : otherwise) * 1000;
+}
+present_pace_rule::Line line;
+int64_t last_exit = 0, ring[64];
+int ring_n = 0, ring_at = 0;
+int64_t n = 0, holds = 0, hold_ns = 0, lates = 0, starts = 0, start_ns = 0, hist[8];
+int64_t now_ns() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void sleep_until_ns(int64_t want) {
+    const int64_t now = now_ns();
+    if (want <= now) return;
+#ifdef _WIN32
+    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    LARGE_INTEGER d;
+    d.QuadPart = -std::max<int64_t>(1, (want - now) / 100);
+    if (timer && SetWaitableTimerEx(timer, &d, 0, nullptr, nullptr, nullptr, 0)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::nanoseconds(want - now));
+}
+/// the period, 0 where the pace does not apply now
+int64_t period_now() {
+    if (!mode()) return 0;
+    const int limit = menu_fps_limit();
+    if (limit <= 0 || framegen_on()) return 0;
+    if (dev.present_mode_name && dev.present_mode_name[0] == 'f') return 0;   // (FIFO: V-Sync on, the display paces)
+    return 1000000000LL / limit;
+}
+}  // namespace pace
+/// (present(), on the game's presenting thread, first) the hold
+void present_pace_begin() {
+    using namespace pace;
+    const int64_t period = period_now();
+    int64_t now = now_ns();
+    if (last_exit && period) {   // (the frame's work since the last present: the game's, and the replays at its submits)
+        ring[ring_at] = now - last_exit, ring_at = (ring_at + 1) % 64, ring_n = std::min(ring_n + 1, 64);
+    }
+    if (!period) {
+        line = {}, last_exit = 0, ring_n = 0;
+        return;
+    }
+    const present_pace_rule::Hold h = present_pace_rule::hold(line, now, period, env_us("HL_PRESENT_PACE_EARLY_US", 200));
+    if (h.until) {
+        sleep_until_ns(h.until);
+        const int64_t held = now_ns() - now;
+        holds++, hold_ns += held, hist[std::min<int64_t>(7, held / 1000000)]++;
+        perf_parts::pace_us.fetch_add(held / 1000, std::memory_order_relaxed);   // (the hitch log's pace part)
+    } else {
+        hist[0]++;
+    }
+    if (h.late) lates++;
+    if (++n % 1200 == 0) {
+        int64_t c = 0, p90 = 0;
+        for (int i = 0; i < 8; i++)
+            if ((c += hist[i]) * 10 >= 9 * 1200 && !p90) p90 = i + 1;
+        logf("vk: present pace (HL_PRESENT_PACE=%d): over 1200 presents %lld held, %.2f ms a present (p90 under %lld ms), %lld late; "
+             "start waits %lld, %.2f ms a present", mode(), (long long)holds, hold_ns / 1e6 / 1200, (long long)p90, (long long)lates,
+             (long long)starts, start_ns / 1e6 / 1200);
+        holds = hold_ns = lates = starts = start_ns = 0;
+        for (int64_t& v : hist) v = 0;
+    }
+}
+/// (present(), last) form 2: the game's next frame starts later
+void present_pace_end() {
+    using namespace pace;
+    const int64_t period = period_now();
+    int64_t now = now_ns();
+    if (period && mode() == 2 && ring_n >= 16) {
+        const int64_t work = present_pace_rule::high_mark(ring, ring_n, 4);
+        const int64_t w = present_pace_rule::start_wait(line, now, period, work, env_us("HL_PRESENT_PACE_MARGIN_US", 1500));
+        if (w > 0) {
+            sleep_until_ns(now + w);
+            now = now_ns();
+            starts++, start_ns += w;
+        }
+    }
+    last_exit = period ? now : 0;
+}
+
 void present(const nvn_tex* t, const int crop[4]) {
+    present_pace_begin();   // (ARR1: the frame handed over on an even line at the limit; before the renderer's own part)
+    struct PaceEnd { ~PaceEnd() { present_pace_end(); } } pace_end;
     perf_parts::Scope perf_entry(perf_parts::t_render);   // (the renderer's entry on this thread: the summary's render part)
     tl_at_present(presents_now);
     tl_ev("present+");

@@ -39,6 +39,7 @@ ARGS = {
     "tests/test_precompile_save.py": ["--cxx", "{cxx}"],
     "tests/test_prepare_speed.py": ["--cxx", "{cxx}"],
     "tests/test_state_report.py": ["--cxx", "{cxx}"],
+    "tests/test_present_pace_rule.py": ["--cxx", "{cxx}"],
     "tests/test_zone_report.py": ["--cxx", "{cxx}"],
     "tests/test_linux_pressure.py": ["--cxx", "{cxx}"],
     "tests/test_mem_guard_rule.py": ["--cxx", "{cxx}"],
