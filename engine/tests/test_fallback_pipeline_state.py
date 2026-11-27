@@ -104,7 +104,7 @@ void driver_fault_note(uint64_t) {}
 [[maybe_unused]] constexpr VkResult kDriverFault = static_cast<VkResult>(-77);
 bool driver_cache_only = false;
 VkPipelineCache pcache = VK_NULL_HANDLE, driver_ask_cache = VK_NULL_HANDLE;
-uint64_t pcache_built_since_save = 0, st_pipelines = 0, st_pipeline_us = 0;
+uint64_t pcache_built_since_save = 0, pcache_new_total = 0, st_pipelines = 0, st_pipeline_us = 0;   // (FOOT3: pcache_new_total, what the file did not hold)
 // (what main's build_graphics also names around the pipeline creation: its guard, the Intel gate, the ledger and the resource log;
 // none of them is the state under test, so they are plain stand-ins)
 VkResult graphics_with(VkPipelineCache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* out);
