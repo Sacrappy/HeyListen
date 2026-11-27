@@ -1,5 +1,5 @@
 # Copyright (C) 2026 Sacrappy
-"""The order thread's default: OFF since 26 Nov 2026 (docs/research/measures-2026-11-26.md); with HL_ORDER_THREAD_AUTO=1 the rule of
+"""The order thread's default in the test build v0.4.4-test2: on again by the rule (off with HL_ORDER_THREAD_AUTO=0): the rule of
 DECOUPLE3 (docs/research/decouple-cross-frame.md 4.9) decides: RX_VK_ORDER_THREAD on where the host keeps a
 core for the replay, off elsewhere, and the switch always wins.
 
@@ -34,10 +34,10 @@ def need(c, msg):
 def main():
     hm = (ROOT / "host/hos_main.c").read_text(encoding="utf-8")
     f = function(hm, "static void order_thread_default(void) {")
-    # (26 Nov 2026: off by default; the rule decides only where HL_ORDER_THREAD_AUTO=1 asks, and that check comes first)
-    auto = 'if (!getenv("HL_ORDER_THREAD_AUTO") || atoi(getenv("HL_ORDER_THREAD_AUTO")) == 0) return;'
+    # (test build v0.4.4-test2: the rule decides again unless HL_ORDER_THREAD_AUTO=0; that check comes first)
+    auto = 'if (getenv("HL_ORDER_THREAD_AUTO") && atoi(getenv("HL_ORDER_THREAD_AUTO")) == 0) return;'
     need(auto in f and f.index(auto) < f.index('_putenv("RX_VK_ORDER_THREAD=1");'),
-         "the order thread is on by default again: it must wait for HL_ORDER_THREAD_AUTO=1 (the brightness flicker)")
+         "HL_ORDER_THREAD_AUTO=0 no longer keeps the order thread off")
     need('if (getenv("RX_VK_ORDER_THREAD") || !hos_reserved_cpus()) return;' in f,
          "the default overrides a set switch, or is on without a core kept for the replay")
     need('_putenv("RX_VK_ORDER_THREAD=1");' in f and 'setenv("RX_VK_ORDER_THREAD", "1", 0);' in f, "the default does not set the switch")

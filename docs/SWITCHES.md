@@ -9833,9 +9833,9 @@ HL_JOBGROUP_CHECK=1: its invariants are counted and the counters logged every 10
 
 #### `HL_ORDER_THREAD_AUTO` - developer
 
-OFF BY DEFAULT since 26 Nov 2026: with the order thread the picture's brightness flickers for single frames while the camera moves (Hyrule Field, the Market's pot storeroom; clean with it off by the owner's eye; docs/research/measures-2026-11-26.md). The rule above decides only where HL_ORDER_THREAD_AUTO=1 asks for it; RX_VK_ORDER_THREAD=1 still turns the thread on anywhere.
+It was off by default from 26 Nov 2026 (one-frame brightness flashes while the camera moved; docs/research/measures-2026-11-26.md); their cause is fixed (RX_VK_RB_C0_KEEP, docs/research/measures-2026-11-27.md section 4.5). TEST BUILD v0.4.4-test2: the rule above decides again unless HL_ORDER_THREAD_AUTO=0 says not to; RX_VK_ORDER_THREAD=0 / =1 still win.
 
-**Values:** on or off (0, false, off, no and empty are off); the description names `0`, `1`. **Default:** on (unless set to 0, false, off or no).
+**Values:** on or off (0, false, off, no and empty are off); the description names `0`, `1`. **Default:** off (unset).
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 

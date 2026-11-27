@@ -694,11 +694,11 @@ uint64_t hos_reserved_cpus(void);   /* hos_thread.c */
    RX_VK_ORDER_THREAD=0 in hookshot_env.txt or the environment: off, =1: on anywhere. After hookshot_env.txt (its
    HOS_RESERVE_CORE=0 counts, and hos_reserved_cpus keeps its first answer); the host's readers of the switch (nvn_native.c) and
    the renderer's read the same variable later, so they agree.
-   OFF BY DEFAULT since 26 Nov 2026: with the order thread the picture's brightness flickers for single frames while the camera
-   moves (Hyrule Field, the Market's pot storeroom; clean with it off by the owner's eye; docs/research/measures-2026-11-26.md).
-   The rule above decides only where HL_ORDER_THREAD_AUTO=1 asks for it; RX_VK_ORDER_THREAD=1 still turns the thread on anywhere */
+   It was off by default from 26 Nov 2026 (one-frame brightness flashes while the camera moved; docs/research/measures-2026-11-26.md);
+   their cause is fixed (RX_VK_RB_C0_KEEP, docs/research/measures-2026-11-27.md section 4.5). TEST BUILD v0.4.4-test2: the rule
+   above decides again unless HL_ORDER_THREAD_AUTO=0 says not to; RX_VK_ORDER_THREAD=0 / =1 still win */
 static void order_thread_default(void) {
-    if (!getenv("HL_ORDER_THREAD_AUTO") || atoi(getenv("HL_ORDER_THREAD_AUTO")) == 0) return;
+    if (getenv("HL_ORDER_THREAD_AUTO") && atoi(getenv("HL_ORDER_THREAD_AUTO")) == 0) return;
     if (getenv("RX_VK_ORDER_THREAD") || !hos_reserved_cpus()) return;
 #ifdef _WIN32
     _putenv("RX_VK_ORDER_THREAD=1");
