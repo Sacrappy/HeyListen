@@ -25,7 +25,7 @@ def check_source():
                    "const int64_t slack = h.until ? std::max<int64_t>(0, h.until + early - j.at) : 0;",
                    "if (present_pace_rule::must_wait_for_room((int)t_q.size())) {",
                    "res = pace_thread_push(dev.swapchain, index);",
-                   "return e && *e ? std::clamp(atoi(e), 0, 4) : 0;",
+                   "return e && *e ? std::clamp(atoi(e), 0, 4) : 4;",
                    "const present_pace_rule::Slot s = present_pace_rule::slot(s_line, now, period);",
                    "present_pace_rule::step(s_step, s.at, 250000000)",
                    "present_pace_rule::free_wait(slot_back, now_ns(), s_period)",

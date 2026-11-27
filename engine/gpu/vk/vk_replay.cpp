@@ -7606,11 +7606,13 @@ void frame_log_note() {
 /// at the START of the game's frame: the present came one period after the one before plus the difference of the two frames'
 /// work, and a mailbox swapchain (V-Sync off) showed that difference. In the owner's Kakariko (main PC, 60 limit) 12 % of the
 /// frames were 20-33 ms, 70 % of them followed by one under 14 ms, with about 11 ms of work a frame: the hitch log named the
-/// pacing sleep in 365 of 428 such frames. HL_PRESENT_PACE=0 (the default): off; 1: the hold; 2: the hold, and after the present the game's
+/// pacing sleep in 365 of 428 such frames. HL_PRESENT_PACE=0: off; 1: the hold; 2: the hold, and after the present the game's
 /// next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point:
 /// the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace),
 /// a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that
-/// much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of
+/// much early, for the timer's wake-up. 3: the pacer thread (below). 4 (THE DEFAULT since 27 Nov 2026: on the main PC at a 60
+/// limit 99 % of the presents within 0.75 ms of the period against 39-49 % without, the game's time step exactly the period, 8 ms
+/// from ready to shown; smoother by the owner's eye): the pacer thread on the slot line, the pacing of
 /// MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is
 /// handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire
 /// waits on the same slots (HL_PRESENT_PACE_AHEAD=<1-3>, 1: the frames the game may run ahead of the display) and its time step
@@ -7619,7 +7621,7 @@ namespace pace {
 int mode() {
     static const int m = [] {
         const char* e = getenv("HL_PRESENT_PACE");
-        return e && *e ? std::clamp(atoi(e), 0, 4) : 0;   // (off by default until =3 / =4 are measured: =1 and =2 lost frames)
+        return e && *e ? std::clamp(atoi(e), 0, 4) : 4;   // (the slot line by default since 27 Nov 2026; =0: off)
     }();
     return m;
 }
