@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Sacrappy
 // perf_lows (gpu/vk/perf_lows.h): the FPS counter's 1% and 0.1% lows. tests/test_perf_lows.py
-//   test_perf_lows <file>: reads "n" then n frame times (ms) and prints the two lows, to compare with tools/bench's low_fps
+//   test_perf_lows <file>: reads "n" then n frame times (ms) and prints the two lows, to compare with the percentile's frame
 //   test_perf_lows: the window's and the text's own checks
 #include "../gpu/vk/perf_lows.h"
 
@@ -46,9 +46,10 @@ int main(int argc, char** argv) {
         std::printf("%.12f %.12f\n", a, b);
         return 0;
     }
-    expect(window_after(1500, 2.0) == 1500, "240+ fps: 1500 frames in 3 s: all of them (the 1000 frames and the 10 s both reached)");
-    expect(window_after(3000, 20.0) == 1000, "50 fps: 1000 frames reach back 20 s, longer than 10 s: 1000");
-    expect(window_after(5000, 1000.0 / 240) >= 2399 && window_after(5000, 1000.0 / 240) <= 2402, "240 fps: 10 s of frames, about 2400");
+    expect(window_after(1500, 2.0) == 1500, "500 fps: 1500 frames in 3 s: all of them (under 30 s)");
+    expect(window_after(3000, 40.0) == 1000, "25 fps: 1000 frames reach back 40 s, longer than 30 s: 1000");
+    expect(window_after(3000, 20.0) >= 1499 && window_after(3000, 20.0) <= 1502, "50 fps: 30 s of frames, about 1500");
+    expect(window_after(9000, 1000.0 / 240) >= 7199 && window_after(9000, 1000.0 / 240) <= 7202, "240 fps: 30 s of frames, about 7200");
     expect(window_after(300, 16.0) == 300, "fewer frames than that: all of them");
     expect(window_after(kCap + 100, 0.5) == kCap, "a ring that wrapped keeps its capacity");
     {   // a slow stretch at 10 fps: 1000 frames reach back 100 s but the ring has 40 only
@@ -61,13 +62,24 @@ int main(int argc, char** argv) {
     expect(!std::strcmp(b, "57 FPS"), "the number, rounded, with its unit");
     text(b, sizeof b, 0, 500);
     expect(!std::strcmp(b, "-"), "no number: a dash");
-    {   // a known series: 1000 frames of 10 ms and 10 of 50 ms stalls make the 1% low the mean of the slowest 11 frames
+    {   // a known series: 1000 frames of 10 ms, 10 of them 50 ms: the 10th slowest is a 50 ms one
         std::vector<float> v(1000, 10.0f);
         for (int i = 0; i < 10; i++) v[(size_t)i * 90] = 50.0f;
         double a, c;
         lows(v.data(), 1000, &a, &c);
-        expect(std::abs(a - 1000.0 / 50.0) < 1e-9, "1%: the slowest 10 frames are the 50 ms ones: 20 fps");
+        expect(std::abs(a - 1000.0 / 50.0) < 1e-9, "1%: the 10th slowest frame is a 50 ms one: 20 fps");
         expect(std::abs(c - 1000.0 / 50.0) < 1e-9, "0.1%: the slowest frame: 20 fps");
+    }
+    {   // what the change is for: 2400 frames of 12.5 ms (80 fps, 30 s), twenty-three of 20 ms and ONE stall of 500 ms: the 1% low
+        // is the 24th slowest frame, 12.5 ms: 80 fps (the mean of the slowest 24 would read 25 fps); the 0.1% low is the 3rd slowest
+        std::vector<float> v(2400, 12.5f);
+        for (int i = 0; i < 23; i++) v[(size_t)i * 100 + 7] = 20.0f;
+        v[1234] = 500.0f;
+        double a, c;
+        lows(v.data(), 2400, &a, &c);
+        expect(std::abs(a - 1000.0 / 20.0) < 1e-9, "1%: one stall does not move it: the 24th slowest is a 20 ms frame, 50 fps");
+        expect(std::abs(c - 1000.0 / 20.0) < 1e-9, "0.1%: the 3rd slowest frame, 20 ms: 50 fps");
+        expect(slowest(2400, 0.01) == 24 && slowest(2400, 0.001) == 3 && slowest(50, 0.001) == 1 && slowest(0, 0.01) == 0, "how many frames a fraction takes");
     }
     if (failures) return 1;
     std::printf("perf_lows: all checks passed\n");

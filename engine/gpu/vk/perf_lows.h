@@ -1,10 +1,13 @@
 // Copyright (C) 2026 Sacrappy
 
-// The 1% low and 0.1% low of the FPS counter's full overlay (F10), by the benchmark's own definition (tools/bench/run_bench.py
-// low_fps): 1000 / the mean frame time of the slowest ceil(fraction * N) frames of the window, at least one frame. Not the 99th
-// percentile's frame time: the mean of the slowest frames, so one long stall counts for its length. The window is the last 10 s or
-// the last 1000 frames, whichever is longer. The frames are the ones the counter counts: every frame shown (with frame generation
-// the made ones too). tests/test_perf_lows.py
+// The 1% low and 0.1% low of the FPS counter's full overlay (F10), as the usual tools show them (RTSS, MSI Afterburner): the
+// frame rate of the 99th and of the 99.9th percentile's frame time, that is 1000 / the frame time of the ceil(fraction * N)-th
+// slowest frame of the window, at least the slowest one. Until 27 Nov 2026 they were the benchmark's (tools/bench/run_bench.py
+// low_fps: the MEAN frame time of the slowest 1 %) over the last 10 s or 1000 frames: at 80 fps the 1 % was 10 frames, so one
+// stall of half a second took the line from 50 to 14 fps for 12 s, far under what players read in other tools at the same
+// moment. The benchmark keeps its own definition (one long stall counts for its length there). The window is the last 30 s or
+// the last 1000 frames, whichever is longer (the ring's capacity at most: 30 s up to 546 frames a second). The frames are the
+// ones the counter counts: every frame shown (with frame generation the made ones too). tests/test_perf_lows.py
 #pragma once
 
 #include <algorithm>
@@ -15,9 +18,9 @@
 namespace mkwvk {
 namespace perflows {
 
-constexpr int kCap = 16384;                    // frame times kept: 10 s up to 1600 shown frames a second
+constexpr int kCap = 16384;                    // frame times kept: 30 s up to 546 shown frames a second
 constexpr int kLeast = 1000;                   // the window holds at least this many frames...
-constexpr int64_t kWindowNs = 10000000000LL;   // ...and at least this much time
+constexpr int64_t kWindowNs = 30000000000LL;   // ...and at least this much time
 constexpr int kShowFrom = 100;                 // fewer frames than this in the window: the lines read "-"
 
 /// A ring of the latest frame times (ms) and when each ended (ns). Static storage, nothing allocated while frames come in
@@ -43,28 +46,21 @@ struct Ring {
     }
 };
 
-/// The benchmark's low_fps for the slowest `fraction` of v[0..n) (reordered). 0 for no frames
+/// How many of the n slowest frames the fraction takes: ceil(fraction * n), one at least
+inline int slowest(int n, double fraction) { return n > 0 ? std::max(1, (int)std::ceil(fraction * n - 1e-9)) : 0; }
+/// The low for `fraction` of v[0..n) (reordered): 1000 / the frame time of the slowest(n, fraction)-th slowest frame, the
+/// percentile's own frame. 0 for no frames
 inline double low_fps(float* v, int n, double fraction) {
     if (n <= 0) return 0.0;
-    const int k = std::max(1, (int)std::ceil(fraction * n - 1e-9));
-    std::nth_element(v, v + (n - k), v + n);   // the k slowest end up in v[n-k..n)
-    double sum = 0;
-    for (int i = n - k; i < n; i++) sum += v[i];
-    return 1000.0 / (sum / k);
+    const int k = slowest(n, fraction);
+    std::nth_element(v, v + (n - k), v + n);   // (the k slowest end up in v[n-k..n), the k-th slowest at v[n-k])
+    return v[n - k] > 0 ? 1000.0 / v[n - k] : 0.0;
 }
 /// Both lows from one window (reordered): the 1% selection first, the 0.1% one inside it
 inline void lows(float* v, int n, double* low1, double* low01) {
     *low1 = low_fps(v, n, 0.01);
-    const int k1 = n > 0 ? std::max(1, (int)std::ceil(0.01 * n - 1e-9)) : 0;   // (low_fps just left the k1 slowest in v[n-k1..n))
-    const int k01 = n > 0 ? std::max(1, (int)std::ceil(0.001 * n - 1e-9)) : 0;   // (<= k1: inside the slice the first selection left)
-    *low01 = 0.0;
-    if (k01 > 0) {
-        float* top = v + (n - k1);
-        std::nth_element(top, top + (k1 - k01), top + k1);
-        double sum = 0;
-        for (int i = k1 - k01; i < k1; i++) sum += top[i];
-        *low01 = 1000.0 / (sum / k01);
-    }
+    const int k1 = slowest(n, 0.01);   // (low_fps just left the k1 slowest in v[n-k1..n))
+    *low01 = k1 > 0 ? low_fps(v + (n - k1), k1, 0.001 * n / k1) : 0.0;   // (the same frame as slowest(n, 0.001) of the whole window)
 }
 /// The line's number: "-" while the window holds too few frames to say
 inline void text(char* b, size_t cap, double fps, int frames) {

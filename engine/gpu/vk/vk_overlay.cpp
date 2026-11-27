@@ -228,7 +228,7 @@ void perf_picture(uint32_t w, uint32_t h, const ImVec4& c) {
     ImGui::EndTable();
 }
 
-// (HeyListen) The 1% low and 0.1% low lines under the graph: the benchmark's definition over the last 10 s or 1000 frames (perf_lows.h),
+// (HeyListen) The 1% low and 0.1% low lines under the graph: the 99th and 99.9th percentile's frame over the last 30 s or 1000 frames (perf_lows.h),
 // worked out twice a second, never while the overlay is hidden or compact. With frame generation they count the frames shown
 void perf_lows_draw(const ImVec4& c) {
     static uint64_t at;
