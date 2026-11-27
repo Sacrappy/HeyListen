@@ -468,9 +468,51 @@ static DWORD WINAPI account_main(void *arg) {
                         top[4].name, (unsigned long long)(top[4].ws / MB));
             }
         }
-        for (int k = 0; k < 6 && k < nalloc; k++)
-            hos_log("hl mem: account:   host allocation %#llx: %llu MB reserved, %llu MB committed", (unsigned long long)allocs[k].base,
-                    (unsigned long long)allocs[k].reserved / MB, (unsigned long long)allocs[k].committed / MB);
+        for (int k = 0; k < 6 && k < nalloc; k++) {
+            char tagname[48] = "no tag";
+            extern int hos_mem_tag_name(uint64_t addr, char *out, int n);
+            hos_mem_tag_name(allocs[k].base, tagname, sizeof tagname);
+            /* (FOOT2: how the allocation looks inside: its sub-regions by state, and where its resident pages are, in 8 slices of
+               its reserved size, sampled every 16th page) */
+            int nreg = 0, nres = 0;
+            uint64_t comm_bytes = 0, res_bytes = 0, slice_res[8] = {0};
+            char first[120] = "";
+            if (allocs[k].reserved >= (128ull << 20)) {
+                uint64_t q = allocs[k].base;
+                const uint64_t end = allocs[k].base + allocs[k].reserved;
+                MEMORY_BASIC_INFORMATION rb;
+                while (q < end && VirtualQuery((void *)(uintptr_t)q, &rb, sizeof rb)) {
+                    if (nreg < 4) {
+                        const size_t at = strlen(first);
+                        snprintf(first + at, sizeof first - at, " [+%llu MB %s %llu MB]", (unsigned long long)((q - allocs[k].base) / MB),
+                                 rb.State == MEM_COMMIT ? "commit" : rb.State == MEM_RESERVE ? "reserve" : "free", (unsigned long long)rb.RegionSize / MB);
+                    }
+                    nreg++;
+                    if (rb.State == MEM_COMMIT) comm_bytes += rb.RegionSize;
+                    q += rb.RegionSize;
+                }
+                typedef BOOL(WINAPI * AcctQueryWsEx)(HANDLE, PVOID, DWORD);
+                AcctQueryWsEx query_ex = (AcctQueryWsEx)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32QueryWorkingSetEx");
+                if (query_ex && allocs[k].reserved <= (4096ull << 20)) {
+                    const uint64_t pages = allocs[k].reserved >> 12, n = pages / 16;
+                    ULONG_PTR *w = (ULONG_PTR *)malloc((size_t)n * 2 * sizeof(ULONG_PTR));
+                    if (w) {
+                        for (uint64_t i = 0; i < n; i++) w[2 * i] = (ULONG_PTR)(allocs[k].base + (i << 16)), w[2 * i + 1] = 0;
+                        if (query_ex(GetCurrentProcess(), w, (DWORD)(n * 2 * sizeof(ULONG_PTR))))
+                            for (uint64_t i = 0; i < n; i++)
+                                if (w[2 * i + 1] & 1) slice_res[i * 8 / n] += 16 * 4096, res_bytes += 16 * 4096;
+                        free(w);
+                    }
+                }
+                (void)nres;
+            }
+            hos_log("hl mem: account:   host allocation %#llx: %llu MB reserved, %llu MB committed; tag: %s; %d regions%s; resident (sampled) %llu MB in 8 slices: "
+                    "%llu %llu %llu %llu %llu %llu %llu %llu",
+                    (unsigned long long)allocs[k].base, (unsigned long long)allocs[k].reserved / MB, (unsigned long long)allocs[k].committed / MB,
+                    tagname, nreg, first, (unsigned long long)res_bytes / MB, (unsigned long long)slice_res[0] / MB, (unsigned long long)slice_res[1] / MB,
+                    (unsigned long long)slice_res[2] / MB, (unsigned long long)slice_res[3] / MB, (unsigned long long)slice_res[4] / MB,
+                    (unsigned long long)slice_res[5] / MB, (unsigned long long)slice_res[6] / MB, (unsigned long long)slice_res[7] / MB);
+        }
     }
     return 0;
 }

@@ -254,7 +254,13 @@ uint8_t* take_stream_memory(uint64_t size) {
             }
         }
     }
-    return static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    uint8_t* m = static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (m) {   // (FOOT2: named for the census)
+        using Tag = void (*)(const void*, uint64_t, const char*);
+        static const Tag tag = (Tag)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_mem_tag");
+        if (tag) tag(m, size, "rx recording stream");
+    }
+    return m;
 }
 void give_stream_memory(uint64_t size, uint8_t* m, uint64_t used) {
 #if !RX_WEB

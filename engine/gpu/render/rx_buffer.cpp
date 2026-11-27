@@ -69,6 +69,11 @@ struct PageTable {
     void assign(size_t count, T) {
         p = static_cast<T*>(VirtualAlloc(nullptr, count * sizeof(T), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         n = p ? count : 0;
+        if (p) {   // (named for the census, HOS_HOST_SPLIT / HL_MEM_ACCOUNT)
+            using Tag = void (*)(const void*, uint64_t, const char*);
+            static const Tag tag = (Tag)(void*)GetProcAddress(GetModuleHandleA(nullptr), "hos_mem_tag");
+            if (tag) tag(p, count * sizeof(T), sizeof(T) == 8 ? "rx page table, 8 bytes a page" : "rx page table, 1 byte a page");
+        }
     }
     T& operator[](size_t i) { return p[i]; }
     const T& operator[](size_t i) const { return p[i]; }

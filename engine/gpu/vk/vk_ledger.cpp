@@ -551,10 +551,14 @@ void count(const LedgerSnap& s, const char* why, double secs) {
          (unsigned long long)MB(s.retired_mirror_bytes), (unsigned long long)MB(vram(MemKind::WbShadow)), (unsigned long long)MB(vram(MemKind::Stream)),
          (unsigned long long)MB(vram(MemKind::Staging)), (unsigned long long)MB(vram(MemKind::Readback)), (unsigned long long)MB(vram(MemKind::Scratch)),
          (unsigned long long)MB(vram(MemKind::Other) + vram(MemKind::Capture) + vram(MemKind::BcCache)));
+    // (FOOT2) The device-local heaps' blocks are what the driver charges the process's private commit for, VMA's blockBytes per heap (the
+    // probe: 64 x 32 MB of device-local memory, +2052 MB of commit and nothing in the working set). So HL_MEM_ACCOUNT's "other" is this
+    // figure plus the host's own allocations: the host side is "other" less "the driver's blocks for VRAM".
     logf("vk: ledger: VRAM, MB: free in VMA blocks %llu (image blocks %llu, render-target blocks %llu, buffer blocks %llu); outside VMA %llu "
-         "(pipelines, shader modules, descriptor pools, swapchain, the driver's own); VMA allocations not counted by kind %llu",
+         "(pipelines, shader modules, descriptor pools, swapchain, the driver's own); VMA allocations not counted by kind %llu; "
+         "the driver's blocks for VRAM %llu (the device-local heaps' blockBytes, the process's private commit for them)",
          (unsigned long long)MB(free_all), (unsigned long long)MB(free_img), (unsigned long long)MB(free_rt), (unsigned long long)MB(free_buf),
-         (unsigned long long)MB(outside), (unsigned long long)MB(uncounted));
+         (unsigned long long)MB(outside), (unsigned long long)MB(uncounted), (unsigned long long)MB(v[4]));
     logf("vk: ledger: VRAM reconciled: the rows %llu MB against the heaps' %llu MB used of %llu allowed (the VRAM breakdown's figure): "
          "remainder %lld MB. Of it the game's resources (images + live mirrors) %llu MB for %llu MB of console bytes: x%.2f",
          (unsigned long long)MB(vram_rows), (unsigned long long)MB(v[6]), (unsigned long long)MB(v[7]),
