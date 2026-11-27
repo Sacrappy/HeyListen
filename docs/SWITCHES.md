@@ -10,7 +10,7 @@ python -I engine/scripts/list_switches.py
 
 and commit both files. A test (`engine/tests/test_switches_documented.py`) fails when a switch read in the source is missing here or the data file is out of date.
 
-1589 switches: 56 players may be told to use, 403 diagnostic, 1130 developer-only; 1370 have a real explanation and 219 are marked `undocumented`.
+1590 switches: 56 players may be told to use, 403 diagnostic, 1131 developer-only; 1371 have a real explanation and 219 are marked `undocumented`.
 
 ## How to set a switch
 
@@ -69,7 +69,7 @@ The entries below say what each one does, its values and default, and when it is
 | [Memory and textures](#memory-and-textures) | 229 | 10 | 0 | 219 |
 | [Audio](#audio) | 15 | 5 | 10 | 0 |
 | [Input and controllers](#input-and-controllers) | 13 | 1 | 12 | 0 |
-| [Native engine (`HL_*`)](#native-engine-hl_) | 124 | 1 | 42 | 81 |
+| [Native engine (`HL_*`)](#native-engine-hl_) | 125 | 1 | 42 | 82 |
 | [Host and OS (`HOS_*` and the system's variables)](#host-and-os-hos_-and-the-systems-variables) | 140 | 10 | 0 | 130 |
 | [Telemetry and crash reports](#telemetry-and-crash-reports) | 12 | 0 | 12 | 0 |
 | [Diagnostics and logging](#diagnostics-and-logging) | 313 | 0 | 313 | 0 |
@@ -99,7 +99,7 @@ The entries below say what each one does, its values and default, and when it is
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:327` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:339` and 1 more place.
 
 #### `RX_FSR` - developer
 
@@ -663,7 +663,7 @@ Over the options file: the output resolution (0 2048x1152, 1 2560x1440, 2 3840x2
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:413`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:425`.
 
 #### `HOS_SDL_VERSION` - diagnostic
 
@@ -985,7 +985,7 @@ HOS_FRAME_CARRY (default on): at a cap of 60 with a rate under 60 that is not a 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:486`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:498`.
 
 #### `HOS_FRAME_SLEEP_MS` - developer
 
@@ -995,7 +995,7 @@ HOS_FRAME_SLEEP_MS (diagnostic): slower frames, for game speed against frame rat
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:565`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:577`.
 
 #### `HOS_VIDEO_AHEAD` - developer
 
@@ -9129,7 +9129,7 @@ As above; the last lets every device count while the window is behind another on
 
 ## Native engine (`HL_*`)
 
-124 switches of the native engine (`HL_*`).
+125 switches of the native engine (`HL_*`).
 
 ### Main loop
 
@@ -9193,7 +9193,7 @@ Not asked if you had set the Quality preset or the rows it sets. `HL_LOWEND=0` n
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:425`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:437`.
 
 #### `HL_STEP_SCAN` - developer
 
@@ -10063,7 +10063,7 @@ OFF BY DEFAULT since 26 Nov 2026: with the order thread the picture's brightness
 
 #### `HL_PRESENT_PACE` - developer
 
-HL_PRESENT_PACE=0 (the default): off; 1: the hold; 2: the hold, and after the present the game's next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point: the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace), a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire waits on the same slots and its time step follows the frames as ...
+HL_PRESENT_PACE=0 (the default): off; 1: the hold; 2: the hold, and after the present the game's next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point: the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace), a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire waits on the same slots (HL_PRESENT_PACE_AHEAD=<1-3>, 1: the ...
 
 **Values:** text (`0` named). **Default:** unset.
 
@@ -10071,9 +10071,19 @@ HL_PRESENT_PACE=0 (the default): off; 1: the hold; 2: the hold, and after the pr
 
 **Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7621`.
 
+#### `HL_PRESENT_PACE_AHEAD` - developer
+
+(HL_PRESENT_PACE=4, the present pacer's slot line: gpu/vk/present_pace_rule.h free_wait) the wait is the line's own: the game's frame starts one period after the slot of the frame `back` hand-overs ago, on the clock that shows the frames. -1: the slot line is not pacing, the wait below holds. HL_PRESENT_PACE_AHEAD=<1-3> (1): how many frames the game may run ahead of the display. 1: a frame starts when the one before it is shown and waits its slack (the period less its work, a few ms) before its own slot; 2 (what the window's three textures allow, and what the host's own wait does): a frame slower than the period is taken by the run-ahead and never shown late, but every frame waits a whole period more before it is shown (25 ms of delay measured in the Market at 60, against 4).
+
+**Values:** text (`4` named). **Default:** unset.
+
+**When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
+
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:231`.
+
 #### `HL_PRESENT_PACE_EARLY_US` - developer
 
-Not with frame generation (its own pacer, opts.pace), a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire waits on the same slots and its time step follows the frames as they are shown (host/nn_vi.c; HL_PRESENT_PACE_STEP=0: the step from the present calls' times as before).
+Not with frame generation (its own pacer, opts.pace), a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire waits on the same slots (HL_PRESENT_PACE_AHEAD=<1-3>, 1: the frames the game may run ahead of the display) and its time step follows the frames as they are shown (host/nn_vi.c; HL_PRESENT_PACE_STEP=0: the step from the present calls' times as before).
 
 **Values:** text (`0` named). **Default:** unset.
 
@@ -10475,7 +10485,7 @@ HOS_FPS_LEDGE=0 and HOS_FPS_SONG=0 leave the game's. HOS_FPS_SOUND=0: the sound 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:442`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:454`.
 
 #### `HOS_FPS_TARGET` - developer
 
@@ -10485,7 +10495,7 @@ HOS_FPS_LEDGE=0 and HOS_FPS_SONG=0 leave the game's. HOS_FPS_SOUND=0: the sound 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:360`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:372`.
 
 #### `HOS_FPS_WATER` - developer
 
@@ -11323,7 +11333,7 @@ HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own o
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:589`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:601`.
 
 #### `HOS_MW_BUCKETS` - developer
 
@@ -11623,7 +11633,7 @@ HOS_SCAN_DT=<file prefix> (diagnostic): writes every float in guest memory betwe
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:253`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:265`.
 
 #### `HOS_SCENE_NATIVE` - developer
 
@@ -11643,7 +11653,7 @@ Over the options file: Resolution 100% (non-zero: Auto), Game speed Per frame (1
 
 **When a player would use it:** Text is too slow or too fast for one run: `0` to `3`.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:320`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:332`.
 
 #### `HOS_THP` - developer
 
@@ -12137,7 +12147,7 @@ The game's frame limiter, VRR flags and nominal rate every 300 presents; a CSV l
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In the process environment (or in a file named by `HOS_ENV_FILE`); `hookshot_env.txt` refuses this one. **Read at:** `host/nn_vi.c:499`.
+**Set it:** In the process environment (or in a file named by `HOS_ENV_FILE`); `hookshot_env.txt` refuses this one. **Read at:** `host/nn_vi.c:511`.
 
 #### `HOS_QUEUE_TRACE` - diagnostic
 
@@ -12177,7 +12187,7 @@ HOS_RES_LOG=1: the 3D's scale every 300 presents. +0xe20: flags (bit 3: 0.75, bi
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:343`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:355`.
 
 #### `HOS_SIZE_TRACE` - diagnostic
 
@@ -12207,7 +12217,7 @@ HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, aske
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:466` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:478` and 1 more place.
 
 #### `HOS_SYNC_TRACE` - diagnostic
 

@@ -34,7 +34,9 @@ def check_source():
         if needle not in src:
             raise SystemExit("gpu/vk/vk_replay.cpp no longer has: " + needle)
     host = (ROOT / "host/nn_vi.c").read_text(encoding="utf-8")
-    for needle in ["const int wait_ns = rx_option(HL_OPT_PACE_FREE_NS + textures - 1, -1);",
+    for needle in ["const int wait_ns = rx_option(HL_OPT_PACE_FREE_NS + back - 1, -1);",
+                   "const int back = textures < ahead + 1 ? textures : ahead + 1;",
+                   "ahead = e && *e ? atoi(e) : 1;",
                    "const int shown_ns = follow ? rx_option(HL_OPT_PACE_STEP_NS, 0) : 0;",
                    "if (shown_ns > 0) sum = shown_ns / 1e9 * count;"]:
         if needle not in host:

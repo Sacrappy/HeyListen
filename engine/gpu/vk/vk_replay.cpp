@@ -7613,8 +7613,8 @@ void frame_log_note() {
 /// much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of
 /// MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is
 /// handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire
-/// waits on the same slots and its time step follows the frames as they are shown (host/nn_vi.c; HL_PRESENT_PACE_STEP=0: the step
-/// from the present calls' times as before)
+/// waits on the same slots (HL_PRESENT_PACE_AHEAD=<1-3>, 1: the frames the game may run ahead of the display) and its time step
+/// follows the frames as they are shown (host/nn_vi.c; HL_PRESENT_PACE_STEP=0: the step from the present calls' times as before)
 namespace pace {
 int mode() {
     static const int m = [] {
@@ -7894,9 +7894,9 @@ VkResult pace_thread_push(VkSwapchainKHR sc, uint32_t index) {
     t_cv.notify_all();
     return (VkResult)t_res.exchange(VK_SUCCESS);
 }
-/// (mode 4, the host's window acquire: HL_OPT_PACE_FREE_NS) how long the game waits before its next frame: its window texture is
-/// free one period after the slot of the frame `back` hand-overs ago (as many as the window has textures). -1: the slot line is
-/// not pacing (the host's own wait holds)
+/// (mode 4, the host's window acquire: HL_OPT_PACE_FREE_NS) how long the game waits before its next frame: until one period
+/// after the slot of the frame `back` hand-overs ago (the host's run-ahead + 1, HL_PRESENT_PACE_AHEAD; the window's textures at
+/// most). -1: the slot line is not pacing (the host's own wait holds)
 int pace_free_ns(int back) {
     using namespace pace;
     if (mode() != 4 || !period_now()) return -1;

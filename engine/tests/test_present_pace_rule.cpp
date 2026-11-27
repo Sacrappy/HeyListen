@@ -161,20 +161,18 @@ int main() {
         CHECK(step(st, T + 9 * P + 300000000 + P, 250000000) == P);
         CHECK(step(st, T, 250000000) == 0);                                         // (a time not after the last one)
     }
-    {   // (mode 4) the whole loop, the game's frames started by the line itself (three window textures: the game runs up to two
-        // frames ahead, as with the host's own wait): at a 60 limit with 11 ms of work and 0-3 ms of spread every frame is shown on
-        // its slot and the step is exactly the period; a frame of 30 ms is taken by the run-ahead (nothing late); one of 45 ms is
-        // shown late and so are the one or two after it while the game catches up (each at once, closer than a period), then the
-        // line is where it was (the phase kept: the rate holds at the limit)
+    // (mode 4) the whole loop, the game's frames started by the line itself: a 60 limit, 11 ms of work with 0-3 ms of spread, a
+    // frame of 30 ms and one of 45 ms. `back` is the host's run-ahead + 1 (HL_PRESENT_PACE_AHEAD).
+    for (int back = 2; back <= 3; back++) {
         Line l;
         Step st;
-        int64_t slots[16] = {}, ready = T, last = 0, step_ns = 0, at100 = 0;
+        int64_t slots[16] = {}, ready = T, last = 0, step_ns = 0, at100 = 0, wait_sum = 0;
         uint64_t n = 0;
-        int lates = 0, restarts = 0, off = 0, uneven = 0;
+        int lates = 0, restarts = 0, off = 0, uneven = 0, waits = 0;
         uint32_t seed = 777;
         for (int k = 0; k < 3000; k++) {
-            const int64_t back = n >= 3 ? slots[(n - 3) & 15] : 0;
-            const int64_t start = ready + free_wait(back, ready, P);                // (the window acquire)
+            const int64_t slot_back = n >= (uint64_t)back ? slots[(n - (uint64_t)back) & 15] : 0;
+            const int64_t start = ready + free_wait(slot_back, ready, P);           // (the window acquire)
             seed = seed * 1103515245u + 12345u;
             int64_t work = 11000000 + (int64_t)(seed >> 8) % 3000000;
             if (k == 1500) work = 30000000;
@@ -185,14 +183,29 @@ int main() {
             step_ns = step(st, s.at, 250000000);
             if (s.late) lates++, restarts += s.restarted;
             if (k == 100) at100 = s.at;
-            if (k > 100 && (k < 2200 || k > 2203) && last && s.at - last != P) off++;
-            if (k > 100 && (k < 2200 || k > 2208) && step_ns != P) uneven++;
+            const bool calm = k > 100 && (k < 1500 || k > 1516) && (k < 2200 || k > 2216);   // (not the frames around the two slow ones)
+            if (calm && last && s.at - last != P) off++;
+            if (calm && step_ns != P) uneven++;
+            if (calm) wait_sum += s.at - ready, waits++;
             last = s.at;
         }
-        std::printf("slot loop: %d late (%d restarts), %d intervals off the period, %d uneven steps, phase moved %lld ns\n", lates, restarts,
-                    off, uneven, (long long)(last - at100 - (int64_t)2899 * P));
-        CHECK(lates >= 1 && lates <= 3 && restarts == 0 && off == 0 && uneven == 0);
-        CHECK(last - at100 == (int64_t)2899 * P);
+        std::printf("slot loop, %d frame(s) ahead: %d late (%d restarts), %d intervals off the period, %d uneven steps, phase moved %lld ns, "
+                    "the wait from ready to shown %.2f ms\n", back - 1, lates, restarts, off, uneven,
+                    (long long)(last - at100 - (int64_t)2899 * P), wait_sum / 1e6 / waits);
+        // (every calm frame on its slot, the step exactly the period, the phase kept through both slow frames: the rate holds)
+        CHECK(off == 0 && uneven == 0 && restarts <= 1);
+        if (back == 2) {
+            // (one frame ahead: a frame waits its slack, the period less its work, about 4 ms here; the 30 ms frame and the 45 ms
+            // one are shown late, with the one or two after them while the game catches up)
+            CHECK(wait_sum / waits > 3000000 && wait_sum / waits < 6000000);
+            CHECK(lates >= 2 && lates <= 8);
+        } else {
+            // (two frames ahead, what three window textures allow: the 30 ms frame is taken by the run-ahead, but every frame
+            // waits a period more)
+            CHECK(wait_sum / waits > 19000000 && wait_sum / waits < 23000000);
+            CHECK(lates >= 1 && lates <= 3 && restarts == 0);
+            CHECK(last - at100 == (int64_t)2899 * P);
+        }
     }
     if (fails) return 1;
     std::printf("present pace rule: ok\n");

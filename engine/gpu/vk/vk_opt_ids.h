@@ -81,7 +81,9 @@ enum { HL_PROMPTS_LIVE_TEXTURES = 1, HL_PROMPTS_LIVE_LAYOUTS = 2, HL_PROMPTS_LIV
 
 /* The present pacer's slot line (HL_PRESENT_PACE=4, gpu/vk/present_pace_rule.h), asked by host/nn_vi.c and answered by
    gpu/vk/vk_replay.cpp. HL_OPT_PACE_STEP_NS: the mean of the last intervals between the frames' show times, in ns, which the
-   game's time step follows (0: none, the host's own). HL_OPT_PACE_FREE_NS + (textures - 1), for a window of 1 to 4 textures:
-   how long the game's window acquire waits, in ns (-1: the slot line is not pacing, the host's own wait holds). */
+   game's time step follows (0: none, the host's own). HL_OPT_PACE_FREE_NS + (back - 1), back from 1 to 4: how long the game's
+   window acquire waits, in ns, for one period after the slot of the frame `back` hand-overs ago (-1: the slot line is not
+   pacing, the host's own wait holds). The host asks with back = its run-ahead + 1 (HL_PRESENT_PACE_AHEAD), the window's
+   textures at most. */
 #define HL_OPT_PACE_STEP_NS 105
 #define HL_OPT_PACE_FREE_NS 110

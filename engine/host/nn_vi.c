@@ -218,11 +218,23 @@ void hos_vi_native_acquire(int active) {
     if (double_buffered < 0) double_buffered = getenv("HOS_VI_DOUBLE") != NULL;
     if (no_pacing || !next_frame_at) return;
     {   /* (HL_PRESENT_PACE=4, the present pacer's slot line: gpu/vk/present_pace_rule.h free_wait) the wait is the line's own:
-           this window texture is free one period after the slot of the frame that used it, so the game's frames start on the
-           clock that shows them. -1: the slot line is not pacing, the wait below holds */
+           the game's frame starts one period after the slot of the frame `back` hand-overs ago, on the clock that shows the
+           frames. -1: the slot line is not pacing, the wait below holds.
+           HL_PRESENT_PACE_AHEAD=<1-3> (1): how many frames the game may run ahead of the display. 1: a frame starts when the
+           one before it is shown and waits its slack (the period less its work, a few ms) before its own slot; 2 (what the
+           window's three textures allow, and what the host's own wait does): a frame slower than the period is taken by the
+           run-ahead and never shown late, but every frame waits a whole period more before it is shown (25 ms of delay
+           measured in the Market at 60, against 4) */
         int rx_option(int id, int otherwise);
+        static int ahead = -1;
+        if (ahead < 0) {
+            const char *e = getenv("HL_PRESENT_PACE_AHEAD");
+            ahead = e && *e ? atoi(e) : 1;
+            ahead = ahead < 1 ? 1 : ahead > 3 ? 3 : ahead;
+        }
         const int textures = active < 1 ? 1 : active > 4 ? 4 : active;
-        const int wait_ns = rx_option(HL_OPT_PACE_FREE_NS + textures - 1, -1);
+        const int back = textures < ahead + 1 ? textures : ahead + 1;
+        const int wait_ns = rx_option(HL_OPT_PACE_FREE_NS + back - 1, -1);
         if (wait_ns >= 0) {
             if (wait_ns > 0) {
                 const int64_t t0 = hos_now_ns();
