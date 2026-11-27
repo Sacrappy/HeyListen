@@ -4,7 +4,8 @@
 read from the disk at once (gpu/vk/vk_bc_disk.h read_now) instead of transcoded on the GPU. On the laptop (Vega 8) the terrain's
 1365 x 1365 x 90 arrays, transcoded 3-7 times as play began, froze the game 8-20 s or lost the device (5 of 10 starts).
 
-The rule (gpu/vk/bc_disk_sync.h) is compiled with a small program: on unless =0, 16 MB and up (RX_VK_BC_DISK_SYNC_MB). And, by the
+The rule (gpu/vk/bc_disk_sync.h) is compiled with a small program: unset on for an integrated GPU and off for another, =1 on and =0 off
+anywhere, 16 MB and up (RX_VK_BC_DISK_SYNC_MB). And, by the
 text, that the read is asked only after the pool missed and before the old path (probe, transcode), that a failed read or a key the
 disk does not have falls back to it, and that the read checks the record's hash and its pack.
 
@@ -28,9 +29,13 @@ int main() {
     const uint64_t MB = 1ull << 20;
     CHECK(min_bytes(nullptr) == 16 * MB && min_bytes("") == 16 * MB && min_bytes("0") == 16 * MB && min_bytes("-4") == 16 * MB);
     CHECK(min_bytes("64") == 64 * MB && min_bytes("1") == MB);
-    CHECK(wanted(nullptr, 16 * MB, 16 * MB) && wanted("", 107 * MB, 16 * MB) && wanted("1", 16 * MB, 16 * MB));   // (on by default)
-    CHECK(!wanted(nullptr, 16 * MB - 1, 16 * MB));   // (a smaller texture: the old path)
-    CHECK(!wanted("0", 214 * MB, 16 * MB));          // (=0: off)
+    // the four cases: unset on an integrated GPU on, unset on another off, =1 on anywhere, =0 off anywhere
+    CHECK(wanted(nullptr, true, 107 * MB, 16 * MB) && wanted("", true, 16 * MB, 16 * MB));
+    CHECK(!wanted(nullptr, false, 107 * MB, 16 * MB) && !wanted("", false, 214 * MB, 16 * MB));
+    CHECK(wanted("1", false, 107 * MB, 16 * MB) && wanted("1", true, 107 * MB, 16 * MB));
+    CHECK(!wanted("0", true, 214 * MB, 16 * MB) && !wanted("0", false, 214 * MB, 16 * MB));
+    CHECK(on(nullptr, true) && !on(nullptr, false) && on("1", false) && !on("0", true));
+    CHECK(!wanted(nullptr, true, 16 * MB - 1, 16 * MB) && !wanted("1", false, 16 * MB - 1, 16 * MB));   // (a smaller texture: the old path)
     if (!fails) std::printf("PASS the rule\n");
     return fails;
 }
@@ -60,7 +65,7 @@ def main():
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8").replace("\r\n", "\n")
     bcd = (ROOT / "gpu/vk/vk_bc_disk.h").read_text(encoding="utf-8").replace("\r\n", "\n")
     sw = function(tex, "bool bcd_sync_wanted(uint64_t size) {")
-    assert 'getenv("RX_VK_BC_DISK_SYNC")' in sw and 'getenv("RX_VK_BC_DISK_SYNC_MB")' in sw and "bc_disk_sync::wanted(" in sw, \
+    assert 'getenv("RX_VK_BC_DISK_SYNC")' in sw and 'getenv("RX_VK_BC_DISK_SYNC_MB")' in sw and "bc_disk_sync::wanted(e, integrated, size, min_bytes)" in sw and "VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU" in sw, \
         "the switches or the rule are not used"
     i_take = tex.index("hit = bcd_take(disk_key, size);")
     i_sync = tex.index("if (!hit.buf && bcd_sync_wanted(size)) hit = bcd_read_now(disk_key, size);")

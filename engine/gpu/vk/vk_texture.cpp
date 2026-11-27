@@ -1579,7 +1579,8 @@ BcCacheEntry bcd_take(uint64_t key, uint64_t size) {
     bcd_pool_bytes -= e.bytes;
     return e;
 }
-// (JOBS1) RX_VK_BC_DISK_SYNC=1 / 0 (on by default; =0: off), RX_VK_BC_DISK_SYNC_MB=<MB> (16 by default): a texture of that many MB of
+// (JOBS1) RX_VK_BC_DISK_SYNC=1 / 0 (unset: on for an integrated GPU, off otherwise: a discrete GPU transcodes such a texture in
+// milliseconds, and the read on the render thread could add a hitch there), RX_VK_BC_DISK_SYNC_MB=<MB> (16 by default): a texture of that many MB of
 // blocks or more, whose whole record of blocks the disk cache has but has not read ahead into its pool, is read from the disk at once
 // on the render thread instead of transcoded on the GPU. Anything else takes the old path, unchanged: a texture under the size, a key
 // the disk does not have (a cold or missing cache), the disk cache off, a record whose read or hash check fails, a pack rotated during
@@ -1591,14 +1592,17 @@ BcCacheEntry bcd_take(uint64_t key, uint64_t size) {
 // 0.09-0.4 s of the render thread (JOBS1, 10 starts a side: the long frame 1.4-1.8 s against 7.9-20.6 s or a lost device)
 bool bcd_sync_wanted(uint64_t size) {
     static const char* const e = getenv("RX_VK_BC_DISK_SYNC");
+    static const bool integrated = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     static const uint64_t min_bytes = bc_disk_sync::min_bytes(getenv("RX_VK_BC_DISK_SYNC_MB"));
     static const bool logged = [] {
-        logf("vk: BC disk cache: textures of %llu MB and up read from the disk at once, not transcoded on the GPU: %s (RX_VK_BC_DISK_SYNC)",
-             (unsigned long long)(min_bytes >> 20), bc_disk_sync::wanted(e, min_bytes, min_bytes) ? "on" : "off");
+        const bool v = bc_disk_sync::on(e, integrated);
+        logf("vk: BC disk cache: textures of %llu MB and up read from the disk at once, not transcoded on the GPU: %s", (unsigned long long)(min_bytes >> 20),
+             e && *e ? (v ? "on (RX_VK_BC_DISK_SYNC=1)" : "off (RX_VK_BC_DISK_SYNC=0)")
+                     : (v ? "on: integrated GPU" : "off: not an integrated GPU, RX_VK_BC_DISK_SYNC=1 turns it on"));
         return true;
     }();
     (void)logged;
-    return bc_disk_sync::wanted(e, size, min_bytes);
+    return bc_disk_sync::wanted(e, integrated, size, min_bytes);
 }
 std::atomic<int64_t> st_bcd_sync_n{0}, st_bcd_sync_fail{0}, st_bcd_sync_bytes{0}, st_bcd_sync_ns{0}, st_bcd_sync_max_ns{0};
 /// (JOBS1) the blocks of key read from the disk now into a buffer of their own (the caller lets it go once its copy is done); empty
