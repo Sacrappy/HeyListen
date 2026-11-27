@@ -167,6 +167,56 @@ static void sw_where(void *rip, char *out, size_t cap) {
         snprintf(out, cap, "%s+%#llx", base ? base + 1 : path, (unsigned long long)((char *)rip - (char *)mod));
     } else snprintf(out, cap, "%p", rip);
 }
+/* HL_STALL_WATCH_STACK=<n> (diagnostic, JOBS1 27 Nov 2026; default 0: the top frame only, as before): at the mark each suspended
+   thread's stack is walked n frames deep (at most 16) with the unwind tables of its modules (RtlLookupFunctionEntry +
+   RtlVirtualUnwind), and the gap's lines give every frame as module+offset ("<" between frames, the innermost first): the wait
+   SITES in our code (HeyListen.exe: its .map names them; hookshot_vk.dll: llvm-nm of the dll at 0x180000000 + offset) under the
+   ntdll wait the top frame alone showed. Done while the thread is suspended (the walk reads its stack). Windows only: elsewhere
+   the top frame, as before */
+static int sw_stack_depth(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("HL_STALL_WATCH_STACK");
+        v = e && atoi(e) > 0 ? (atoi(e) > 16 ? 16 : atoi(e)) : 0;
+    }
+    return v;
+}
+/* (while the thread is suspended: the return addresses only, into pcs; nothing named, logged or allocated, no module lookup: the
+   thread may hold the loader's lock) */
+static int sw_walk(CONTEXT *cx, int depth, uint64_t *pcs) {
+    int f = 0;
+#ifdef _WIN32
+    for (; f < depth && cx->Rip; f++) {
+        pcs[f] = cx->Rip;
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(cx->Rip, &base, NULL);
+        if (!fn) {   /* (a leaf function: its return address is at the top of the stack) */
+            if (!cx->Rsp) break;
+            cx->Rip = *(DWORD64 *)(uintptr_t)cx->Rsp;
+            cx->Rsp += 8;
+        } else {
+            PVOID data = NULL;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, cx->Rip, fn, cx, &data, &frame, NULL);
+        }
+    }
+#else
+    if (depth > 0) pcs[f++] = (uint64_t)cx->Rip;
+#endif
+    return f;
+}
+/* (after the thread is resumed) the frames named, module+offset, innermost first */
+static void sw_where_stack(const uint64_t *pcs, int n, char *out, size_t cap) {
+    size_t at = 0;
+    out[0] = 0;
+    for (int f = 0; f < n; f++) {
+        char one[96];
+        sw_where((void *)(uintptr_t)pcs[f], one, sizeof one);
+        const int w = snprintf(out + at, cap - at, "%s%s", f ? " < " : "", one);
+        if (w < 0 || (size_t)w >= cap - at) break;
+        at += (size_t)w;
+    }
+}
 static void sw_dump(const char *dir, int n, int64_t from, int64_t to) {
     char path[MAX_PATH];
     snprintf(path, sizeof path, "%s/stall_%02d.jt", dir, n);
@@ -202,7 +252,10 @@ static DWORD WINAPI sw_thread(void *p) {
     static HANDLE hs[512];
     static SwCpu c0[512], c1[512];
     static CONTEXT ctx[512];
-    static char have[512], where[512][96];
+    static char have[512], where[512][1024];   /* (HL_STALL_WATCH_STACK: up to 16 frames of module+offset) */
+    const int depth = sw_stack_depth();
+    static uint64_t pcs[512][16];
+    static int npc[512];
     PROCESS_MEMORY_COUNTERS pm0, pm1;
     memset(&pm0, 0, sizeof pm0);
     int64_t cur = 0;   /* (the present the running gap began at; 0: none) */
@@ -275,12 +328,18 @@ static DWORD WINAPI sw_thread(void *p) {
                 if (!hs[i] || ths[i].tid == self) continue;
                 if (SuspendThread(hs[i]) == (DWORD)-1) continue;
                 memset(&ctx[i], 0, sizeof ctx[i]);
+#ifdef _WIN32
+                ctx[i].ContextFlags = depth ? CONTEXT_FULL : CONTEXT_CONTROL;
+#else
                 ctx[i].ContextFlags = CONTEXT_CONTROL;
+#endif
                 have[i] = GetThreadContext(hs[i], &ctx[i]) != 0;
+                npc[i] = have[i] && depth ? sw_walk(&ctx[i], depth, pcs[i]) : 0;   /* (the stack read while it stands still) */
                 ResumeThread(hs[i]);
             }
             for (LONG i = 0; i < m; i++)
-                if (have[i]) sw_where((void *)(uintptr_t)ctx[i].Rip, where[i], sizeof where[i]);
+                if (have[i] && depth) sw_where_stack(pcs[i], npc[i], where[i], sizeof where[i]);
+                else if (have[i]) sw_where((void *)(uintptr_t)ctx[i].Rip, where[i], sizeof where[i]);
         }
     }
     return 0;

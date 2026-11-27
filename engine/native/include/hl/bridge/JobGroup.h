@@ -178,6 +178,10 @@ private:
     void over(GuestThread as, GuestAddr g_at);
     void timed_sleep(GuestThread as);
     void violation(const char* what, GuestAddr job);
+    // (JOBS1, HL_JOBS_WATCH=<ms>, diagnostic: JobGroup.cpp) a group's entry and end, and the dump of one that runs that long
+    void watch_enter(GuestAddr group);
+    void watch_leave(GuestAddr group);
+    void watch_dump(GuestAddr group, double ms);
 
     GuestRuntime& runtime_;
     Options options_;

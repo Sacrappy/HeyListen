@@ -251,7 +251,9 @@ void run(Context& cx, Q& q, Stats& stats) {
         if (n >= 1) cx.wake(stats, n, q.context_count(), q.contexts());
         if (!job) break;
         stats.runs.fetch_add(1, std::memory_order_relaxed);
+        if constexpr (requires { q.running(job); }) q.running(job);   // (JOBS1, HL_JOBS_WATCH: the job this context runs, and since when)
         cx.run_job(q.scheduler(), job, Q::kKindAt, Q::kFrameWord);
+        if constexpr (requires { q.running(job); }) q.running(0);
     }
 leave:
     __atomic_thread_fence(__ATOMIC_SEQ_CST);

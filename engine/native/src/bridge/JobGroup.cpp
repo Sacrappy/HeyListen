@@ -6,11 +6,23 @@
 // 0x811c4160 and its sifts 0x811c41f0, 0x811c4290).
 #include "hl/bridge/JobGroup.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "DispatchLoop.h"
 
 namespace hl::bridge {
+
+int watch_ms();   // (JOBS1, HL_JOBS_WATCH: below)
+void watch_running(GuestAddr ctx, GuestAddr group, GuestAddr job);
 
 using loop::cas;
 using loop::ld;
@@ -138,7 +150,149 @@ struct JobGroup::Heap {
         d.stats_.runs_from_takes.fetch_add(1, std::memory_order_relaxed);
         return {loop::Taken::Job, job, wake};
     }
+
+    // (JOBS1, HL_JOBS_WATCH) the job this context runs now (0: none), for the watch's dump
+    void running(GuestAddr job) {
+        if (watch_ms() > 0) watch_running(cx.at, g_at, job);
+    }
 };
+
+// ---- (JOBS1) HL_JOBS_WATCH=<ms> (diagnostic, default 0: off): a group that has run for <ms> (its first context's entry to now,
+// its end job not complete) is dumped once: every job of its graph with its state (done / waiting for n / ready in the heap /
+// running on which context since when / taken), the end job, and every context of its list with its lane, its state word (awake,
+// asleep on its wake event, a job handed to it) and the job it runs. A thread of its own looks every 100 ms; the guest memory is
+// read without the group's mutex (a dump may catch a change in progress). Logging only ----
+namespace {
+struct WatchRun {
+    GuestAddr job = 0, group = 0;
+    int64_t since = 0;
+};
+std::mutex watch_mu;
+std::unordered_map<GuestAddr, std::pair<int64_t, bool>> watch_groups;   // (a group: since when it runs, dumped already)
+std::unordered_map<GuestAddr, WatchRun> watch_runs;                     // (a context: the job it runs)
+int64_t watch_now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}   // namespace
+
+int watch_ms() {
+    static const int v = [] {
+        const char* e = std::getenv("HL_JOBS_WATCH");
+        return e && std::atoi(e) > 0 ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+void watch_running(GuestAddr ctx, GuestAddr group, GuestAddr job) {
+    std::lock_guard lk(watch_mu);
+    WatchRun& r = watch_runs[ctx];
+    r.job = job, r.group = group, r.since = watch_now();
+}
+
+void JobGroup::watch_enter(GuestAddr g_at) {
+    if (watch_ms() <= 0) return;
+    {
+        std::lock_guard lk(watch_mu);
+        watch_groups.try_emplace(g_at, watch_now(), false);
+    }
+    static std::once_flag started;
+    std::call_once(started, [this] {
+        std::thread([this] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::vector<std::pair<GuestAddr, int64_t>> due;
+                const int64_t now = watch_now();
+                {
+                    std::lock_guard lk(watch_mu);
+                    for (auto& [g, v] : watch_groups)
+                        if (!v.second && now - v.first >= (int64_t)watch_ms() * 1000000) v.second = true, due.emplace_back(g, v.first);
+                }
+                for (const auto& [g, since] : due) watch_dump(g, (now - since) / 1e6);
+            }
+        }).detach();
+    });
+}
+void JobGroup::watch_leave(GuestAddr g_at) {
+    if (watch_ms() <= 0) return;
+    std::lock_guard lk(watch_mu);
+    watch_groups.erase(g_at);
+}
+
+void JobGroup::watch_dump(GuestAddr g_at, double ms) {
+    static std::atomic<int> dumps{0};
+    if (dumps.fetch_add(1) >= 20) return;
+    const guest::Group* g = at<guest::Group>(g_at);
+    char line[900];
+    const int32_t n = ld(&g->jobs), nc = ld(&g->context_count), size = ld(&g->heap.size);
+    std::snprintf(line, sizeof line, "hl jobs watch: group %#llx running for %.0f ms: %d jobs, heap %d, take count %d, flags %#x, poll lane %u, %d contexts",
+                  (unsigned long long)g_at, ms, (int)n, (int)size, (int)ld(&g->take_count), (unsigned)ld(&g->flags), (unsigned)ld(&g->poll_lane), (int)nc);
+    runtime_.log(line);
+    std::unordered_map<GuestAddr, WatchRun> runs;
+    {
+        std::lock_guard lk(watch_mu);
+        runs = watch_runs;
+    }
+    const int64_t now = watch_now();
+    const GuestAddr clist = ld(&g->contexts);
+    std::unordered_map<GuestAddr, GuestAddr> run_by;   // (a job: the context running it)
+    for (int32_t i = 0; i < nc && i < 64; i++) {
+        const GuestAddr c = ld(at<GuestAddr>(clist + (GuestAddr)i * 8));
+        const guest::DispatchContext* dc = at<guest::DispatchContext>(c);
+        const uint64_t s = ld(&dc->state);
+        const auto it = runs.find(c);
+        const bool runs_here = it != runs.end() && it->second.job && it->second.group == g_at;
+        if (runs_here) run_by[it->second.job] = c;
+        std::snprintf(line, sizeof line, "hl jobs watch:   context %#llx lane %d flags %#x: %s%s", (unsigned long long)c, (int)ld(&dc->lane),
+                      (unsigned)ld(&dc->flags), s == 0 ? "awake" : s == 1 ? "asleep on its wake event" : "a job handed to it",
+                      runs_here ? "" : "; no job of this group running");
+        if (s == 1) std::snprintf(line + std::strlen(line), sizeof line - std::strlen(line), " (event %#llx)",
+                                  (unsigned long long)(c + offsetof(guest::DispatchContext, wake_event)));
+        if (s > 1) std::snprintf(line + std::strlen(line), sizeof line - std::strlen(line), " (job %#llx)", (unsigned long long)s);
+        if (runs_here)
+            std::snprintf(line + std::strlen(line), sizeof line - std::strlen(line), "; running job %#llx for %.1f ms",
+                          (unsigned long long)it->second.job, (now - it->second.since) / 1e6);
+        runtime_.log(line);
+    }
+    const GuestAddr items = ld(&g->heap.items), list = ld(&g->job_list);
+    auto in_heap = [&](GuestAddr job) {
+        for (int32_t k = 0; k < size && items; k++)
+            if (ld(at<GuestAddr>(items + (GuestAddr)k * 8)) == job) return true;
+        return false;
+    };
+    auto describe = [&](GuestAddr job, char* out, size_t cap) {
+        const guest::GroupJob* j = at<guest::GroupJob>(job);
+        const int32_t w = ld(&j->waiting);
+        const uint32_t r = ld(&j->runners);
+        const auto rb = run_by.find(job);
+        int k = std::snprintf(out, cap, " [%#llx id %u lane %d obj %#llx: ", (unsigned long long)job, (unsigned)ld(&j->id), (int)ld(&j->lane),
+                              (unsigned long long)ld(&j->object));
+        if (k < 0 || (size_t)k >= cap) return;
+        if (w == -1) k += std::snprintf(out + k, cap - (size_t)k, "done");
+        else if (w > 0) k += std::snprintf(out + k, cap - (size_t)k, "not ready, waits for %d", (int)w);
+        else if (rb != run_by.end()) k += std::snprintf(out + k, cap - (size_t)k, "running on %#llx (%u running, %u to start)", (unsigned long long)rb->second, r >> 16, r & 0xffff);
+        else if (r >> 16) k += std::snprintf(out + k, cap - (size_t)k, "running (%u, no native context: the guest's?), %u to start", r >> 16, r & 0xffff);
+        else if (in_heap(job)) k += std::snprintf(out + k, cap - (size_t)k, "ready in the heap, %u to start", r & 0xffff);
+        else k += std::snprintf(out + k, cap - (size_t)k, "ready, not in the heap (taken or handed), runners %#x", r);
+        if (k > 0 && (size_t)k < cap) std::snprintf(out + k, cap - (size_t)k, "]");
+    };
+    char one[200];
+    line[0] = 0;
+    describe(g_at + kEndJob, one, sizeof one);
+    std::snprintf(line, sizeof line, "hl jobs watch:   end job%s", one);
+    runtime_.log(line);
+    line[0] = 0;
+    int in_line = 0;
+    for (int32_t i = 0; i < n && i < 256; i++) {
+        describe(ld(at<GuestAddr>(list + (GuestAddr)(int64_t)i * 8)), one, sizeof one);
+        if (std::strlen(line) + std::strlen(one) + 24 >= sizeof line || in_line == 5) {
+            runtime_.log(line);
+            line[0] = 0, in_line = 0;
+        }
+        if (!line[0]) std::snprintf(line, sizeof line, "hl jobs watch:   jobs");
+        std::strncat(line, one, sizeof line - std::strlen(line) - 1);
+        in_line++;
+    }
+    if (line[0]) runtime_.log(line);
+}
 
 JobGroup::JobGroup(GuestRuntime& runtime, Options options) : runtime_(runtime), options_(options) {}
 
@@ -156,6 +310,7 @@ void JobGroup::violation(const char* what, GuestAddr job) {
 
 void JobGroup::run(GuestThread as, GuestAddr g_at, GuestAddr c_at) {
     stats_.groups.fetch_add(1, std::memory_order_relaxed);
+    watch_enter(g_at);   // (JOBS1, HL_JOBS_WATCH)
     loop::Context cx(runtime_, as, c_at);
     Heap heap{*this, cx, g_at, at<guest::Group>(g_at), -1};
     if (options_.check) heap.lane_byte = heap.read_lane_byte();
@@ -445,6 +600,7 @@ void JobGroup::over(GuestThread as, GuestAddr g_at) {
     lock(as, g_at);
     __atomic_fetch_or(&g->flags, kOver, __ATOMIC_SEQ_CST);
     stats_.ends.fetch_add(1, std::memory_order_relaxed);
+    watch_leave(g_at);   // (JOBS1, HL_JOBS_WATCH)
     const int32_t n = ld(&g->context_count);
     const GuestAddr list = ld(&g->contexts);
     if (options_.check) {

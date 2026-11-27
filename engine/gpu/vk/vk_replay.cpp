@@ -709,13 +709,20 @@ void vk_timeline_wait_sent(uint64_t v) {
 thread_local bool tl_poll = false;
 namespace {
 bool order_thread_on();   // (PIPE2: RX_VK_ORDER_THREAD; FLASH1: the late fix's last resort is the order thread's alone)
+int late_fix_watch_ms();   // (JOBS1: RX_VK_LATE_FIX_WATCH, below with the order thread's watch)
+void late_fix_watch_note(const char* who, uint64_t lv, int64_t waited_ns);
 }
 bool late_fix_wait_unlocked() {
     WaitScope wait_scope(WS_LATE_FIX);   // (DECOUPLE: the stall watch's site)
     auto w0 = std::chrono::steady_clock::now();
+    const auto watch0 = w0;   // (JOBS1: RX_VK_LATE_FIX_WATCH)
     uint64_t done0 = completed();
     for (uint64_t lv; (lv = memory_late_fix_pending()) && completed() < lv;) {
         if (tl_poll) return false;   // (a poll: what is held is not done anyway; the fix thread sends it)
+        if (const int wm = late_fix_watch_ms()) {
+            const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - watch0).count();
+            if (ns >= (int64_t)wm * 1000000) late_fix_watch_note("a sender's wait", lv, ns);
+        }
         // (DECOUPLE3, a last resort: the cause of the load hang is fixed in timeline_order.h) a fix whose value the timeline has not
         // reached is applied as it is, as late_fix_flush_locked does after its own 2 s, and said: a value nothing will reach
         // again (the timeline gone back) held every recording behind it for good. (FLASH1) Only with the order thread, and only once
@@ -803,6 +810,13 @@ void late_fix_main() {
         vkWaitSemaphores(dev.device, &wi, 250000000ull);   // (a flush elsewhere may have applied it meanwhile)
         tl_ev("fix-wait-", v);
         jt_mark(38, v);
+        {   // (JOBS1, RX_VK_LATE_FIX_WATCH: the same value waited for since)
+            static uint64_t watch_v = 0;
+            static auto watch_t0 = std::chrono::steady_clock::now();
+            if (v != watch_v) watch_v = v, watch_t0 = std::chrono::steady_clock::now();
+            const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - watch_t0).count();
+            if (late_fix_watch_ms() && ns >= (int64_t)late_fix_watch_ms() * 1000000 && completed() < v) late_fix_watch_note("the fix thread", v, ns);
+        }
         // (TICK-060m) the copies as soon as the value is reached, before the queue's lock (another thread's submit may hold it):
         // the take's wait made them at once, and the game's CPU may write such a page again soon after the write-back (OoT's
         // exposure page). Every fix reached, whatever the others' values; late_fix_mu orders this with any other apply
@@ -9326,6 +9340,59 @@ bool ot_pending() {
     if (ot_holding.load(std::memory_order_acquire)) return true;
     std::lock_guard lk(ot_mu);
     return !ot_jobs.empty();
+}
+/// (JOBS1, RX_VK_LATE_FIX_WATCH=<ms>, diagnostic, default 0: off) a wait for a pending late fix's value that has lasted <ms> (then
+/// every 2 s while it lasts, 40 lines at most): the value, how far the GPU's timeline is, the highest signal sent to the queue, the
+/// held batch (its command buffers and signals: the recordings held behind the fix), the stopped queues and the oldest of them, the
+/// recordings' timeline, and where the threads that passed the renderer's wait sites are (WaitScope's table). Logging only
+int late_fix_watch_ms() {
+    static const int v = getenv("RX_VK_LATE_FIX_WATCH") ? std::max(0, atoi(getenv("RX_VK_LATE_FIX_WATCH"))) : 0;
+    return v;
+}
+void late_fix_watch_note(const char* who, uint64_t lv, int64_t waited_ns) {
+    static std::atomic<int> logged{0};
+    static std::atomic<int64_t> last_ns{0};
+    const int64_t now = ot_now();
+    if (logged.load(std::memory_order_relaxed) >= 40 || now - last_ns.load(std::memory_order_relaxed) < 2000000000ll) return;
+    last_ns.store(now, std::memory_order_relaxed);
+    logged.fetch_add(1, std::memory_order_relaxed);
+    uint64_t rc = 0, bc = 0;
+    if (rec_timeline) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &rc);
+    if (batch_tl) vkGetSemaphoreCounterValue(dev.device, batch_tl, &bc);
+    char held[160] = "queue lock busy";
+    {
+        std::unique_lock pl(dev.present_mu, std::try_to_lock);
+        if (pl) snprintf(held, sizeof held, "%zu command buffers held (batch %llu, flushed %llu, batch done %llu), their signal %llu%s, recordings %llu",
+                         pend.cbs.size(), (unsigned long long)batch_next, (unsigned long long)batch_flushed, (unsigned long long)bc,
+                         (unsigned long long)pend.signal, pend.any_signal ? "" : " (none)", (unsigned long long)pend.rec);
+    }
+    char stopped[256] = "order lock busy";
+    {
+        std::unique_lock ol(sync_order_mu.mu, std::try_to_lock);
+        if (ol) {
+            int n = snprintf(stopped, sizeof stopped, "%d stopped, oldest %llu, done_max %llu, signaled %llu:", (int)blocked_n.load(),
+                             (unsigned long long)oldest_unfinished(), (unsigned long long)done_max, (unsigned long long)signaled);
+            for (const auto& [queue, q] : qruns) {
+                if (!q.blocked() || n < 0 || n >= (int)sizeof stopped - 48) continue;
+                n += snprintf(stopped + n, sizeof stopped - (size_t)n, " q%llx at %llu%s +%zu", (unsigned long long)(queue & 0xfffff),
+                              (unsigned long long)q.oldest(), q.waiting ? " (wait)" : "", q.later.size());
+            }
+        }
+    }
+    std::string where;
+    const int n = std::min(where_n.load(std::memory_order_relaxed), kWhereSlots);
+    for (int k = 0; k < n; k++) {
+        const int site = where_slots[k].site.load(std::memory_order_acquire);
+        if (site < 0 || site >= WS_COUNT) continue;
+        char b[200];
+        snprintf(b, sizeof b, " %s: %s %.1f s;", thread_name_of(where_slots[k].tid.load(std::memory_order_relaxed)).c_str(), kWaitSite[site],
+                 (now - where_slots[k].since.load(std::memory_order_relaxed)) / 1e9);
+        where += b;
+    }
+    logf("vk: late fix watch (%s): waited %.1f s for value %llu; timeline done %llu, highest signal sent %llu, recordings' timeline %llu, "
+         "submissions so far %llu; %s; queues %s; where:%s",
+         who, waited_ns / 1e9, (unsigned long long)lv, (unsigned long long)completed(), (unsigned long long)tl_signal_sent.load(),
+         (unsigned long long)rc, (unsigned long long)q_values.load(), held, stopped, where.empty() ? " none" : where.c_str());
 }
 /// a job to the order thread, in order (the caller holds submit_order_mu for submits and presents: their values in the same order)
 void ot_push(Job&& j) {
