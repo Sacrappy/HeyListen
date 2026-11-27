@@ -334,6 +334,7 @@ bool fence_poll_fast_on() {
     return v;
 }
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
+std::map<uint64_t, uint64_t> value_own;     // a recording's own value -> that recording (Erfboom: vk_timeline_wait's rec_timeline wait)
 // (HeyListen, RX_VK_SYNC_HONEST=1, default off) value_rec keeps the FIRST recording a value was put in (emplace): a submission stopped at an
 // event wait is mapped to the recording of its piece before the wait, and a game fence for it was answered as soon as that one was
 // done, while the rest of its work (after the wait) was still on the GPU (RX_VK_LAG_LOG: 96% of the answers the game gets, 8 ms early).
@@ -899,6 +900,16 @@ void wait_value(uint64_t v) {
     vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
     (void)completed();   // (RX_VK_POOL_MIRROR: its staged write-backs applied)
 }
+bool wait_recorded_own(uint64_t f, uint64_t timeout_ns, int* ok);
+/// (ported from Erfboom, Hookshot #2458; RX_VK_REC_WAIT=0 turns it off) A wait for a value that is a recording's own (the burst value
+/// a write-back stamped its pages with) waits on the recordings' timeline, where that recording signalled, instead of on `timeline`:
+/// while an older queue submission is stopped at an event wait `timeline` does not reach the value, and the wait ran out its whole
+/// bound (a capture's 250 ms, a stall of the thread that waited). The same bound, the same pages; only a value that is the
+/// recording's own takes it, so the wait ends when its work is done and not when the first piece of a split submission was
+bool rec_wait_on() {
+    static const bool v = !getenv("RX_VK_REC_WAIT") || atoi(getenv("RX_VK_REC_WAIT")) != 0;
+    return v;
+}
 /// (longshot #670) A timeline wait that came back VK_ERROR_DEVICE_LOST, said as a lost device (8 times at most): some drivers mark the
 /// device lost, signal every timeline waited on and leave the counter unwritten, so completed() read 0 and the log showed a wait that
 /// "timed out (done 0)" where the GPU was gone. Only the line: the next submit or the GPU hang watch ends the game, as before
@@ -919,6 +930,18 @@ int64_t vk_value_submitted_ns(uint64_t v);
 // RX_VK_CAPTURE_WAIT_ADAPT=0 the 250 ms of vk_timeline_wait, as before)
 bool vk_timeline_wait_for(uint64_t v, uint32_t timeout_ms) {
     if (!timeline || completed() >= v) return true;
+    if (rec_wait_on()) {   // (Erfboom, #2458: see rec_wait_on)
+        int ok = 0;
+        if (wait_recorded_own(v, (uint64_t)timeout_ms * 1000000ull, &ok)) {
+            if (!ok) {
+                static std::atomic<int> logged{0};
+                if (logged++ < 8)
+                    logf("vk: a capture's wait for write-back %llu timed out on its recording (done %llu)", (unsigned long long)v,
+                         (unsigned long long)completed());
+            }
+            return ok != 0;
+        }
+    }
     queue_flush_for(FR_VALUE);
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
@@ -1522,9 +1545,10 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
         if (sync_honest_on())   // (RX_VK_SYNC_HONEST: the recording the last piece of each went into)
             for (uint64_t v : rec_open_values) value_end[v] = seq;
-        if (r.value) value_rec.emplace(r.value, seq);
+        if (r.value) value_rec.emplace(r.value, seq), value_own[r.value] = seq;
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
+        while (value_own.size() > 8192) value_own.erase(value_own.begin());
         while (value_end.size() > 8192) value_end.erase(value_end.begin());
         // (TICK-058: after value_rec has them, so a poll that sees the mark finds the recording; see wait_inner)
         for (uint64_t v : rec_open_qvalues) whole_val[v & (kWholeSlots - 1)].store(v, std::memory_order_release);
@@ -5996,9 +6020,9 @@ uint64_t get_replayed() {
 }
 /// (hookshot) Waits for the recording submission value f (or the recording of value f) was finished in, on the recordings'
 /// timeline: true when that recording is known (the result in *ok), false when it is not (f not finished yet)
+bool wait_recorded_seq(uint64_t f, uint64_t seq, uint64_t timeout_ns, int* ok);
 bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
     if (!rec_timeline || per_queue_fences_off()) return false;
-    WaitScope wait_scope(WS_RECORDED);
     uint64_t seq = 0;
     {
         std::lock_guard mk(rec_map_mu);
@@ -6007,6 +6031,22 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         if (honest ? it == value_end.end() : it == value_rec.end()) return rb_wr_miss++, false;
         seq = it->second;
     }
+    return wait_recorded_seq(f, seq, timeout_ns, ok);
+}
+/// (Erfboom, #2458) as wait_recorded, for a value that is a recording's own only: false for any other (the caller waits on `timeline`)
+bool wait_recorded_own(uint64_t f, uint64_t timeout_ns, int* ok) {
+    if (!rec_timeline || per_queue_fences_off()) return false;
+    uint64_t seq = 0;
+    {
+        std::lock_guard mk(rec_map_mu);
+        const auto it = value_own.find(f);
+        if (it == value_own.end()) return false;
+        seq = it->second;
+    }
+    return wait_recorded_seq(f, seq, timeout_ns, ok);
+}
+bool wait_recorded_seq(uint64_t f, uint64_t seq, uint64_t timeout_ns, int* ok) {
+    WaitScope wait_scope(WS_RECORDED);
     const int64_t wr0 = std::chrono::steady_clock::now().time_since_epoch().count();
     // (a batched submit holds its recordings' signal until the batch goes out: the readback wait in invalidate came here
     // without a flush, and the job that waited held up the main thread, so nothing flushed it: the load hang on RADV)

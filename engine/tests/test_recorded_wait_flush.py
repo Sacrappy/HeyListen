@@ -19,9 +19,13 @@ def body(src, signature):
 
 def main():
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
-    wait = body(replay, "bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {")
+    wait = body(replay, "bool wait_recorded_seq(uint64_t f, uint64_t seq, uint64_t timeout_ns, int* ok) {")
     if "vkWaitSemaphores(" not in wait:
         raise SystemExit("wait_recorded no longer waits on the recordings' timeline: update this test")
+    for entry in ("bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {",
+                  "bool wait_recorded_own(uint64_t f, uint64_t timeout_ns, int* ok) {"):
+        if "wait_recorded_seq(f, seq, timeout_ns, ok)" not in body(replay, entry):
+            raise SystemExit(entry + " does not wait through wait_recorded_seq: update this test")
     flush = wait.find("queue_flush_for(")
     if flush < 0 or flush > wait.index("vkWaitSemaphores("):
         raise SystemExit("wait_recorded waits without sending the held batch: a batched recording's signal never comes")
