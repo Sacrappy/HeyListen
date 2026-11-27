@@ -750,14 +750,23 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     next_read = now + 2000000;
     uint64_t raw = 0;   /* (by position: 1 << HOS_PAD_*) */
     int32_t s[4] = {0};
+    int sdl_pads = 0;   /* (the controllers SDL has open) */
     {   /* every controller SDL knows (DualSense, DualShock 4, Switch Pro, ...: hos/pad_sdl.c) */
         int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);
         static int was;
         const int n = hos_sdl_pads(&raw, s);
         if (n != was) hos_log("hid: %d controller%s through SDL", n, n == 1 ? "" : "s");
         was = n;
+        sdl_pads = n;
     }
-    xinput_read(now, &raw, s);
+    /* (after Hookshot 731898a2, oscarlosu-lab, #1480 #1583) Steam Input and other controller wrappers show a pad SDL already
+       reads as an Xbox pad on XInput too: both merged, a face button gives the physical button and the Xbox position at
+       once (swapped or doubled buttons, stick jitter). HL_XINPUT_SDL_FIRST=1 leaves XInput's pads out while SDL has a
+       controller open (SDL reads Xbox pads itself); unset or 0, both are merged as before. Off until tried with Steam
+       Input and with an Xbox pad beside another pad. The XInput thread keeps polling either way (prompts' Auto) */
+    static int sdl_first = -1;
+    if (sdl_first < 0) sdl_first = getenv("HL_XINPUT_SDL_FIRST") && atoi(getenv("HL_XINPUT_SDL_FIRST")) != 0;
+    if (!(sdl_first && sdl_pads)) xinput_read(now, &raw, s);
     InterlockedExchange(&pad_raw_now, (LONG)raw);
     {   /* (Auto's device in use: a button, or a stick past halfway) */
         const uint64_t pressed = raw & ((1ULL << HOS_PAD_N) - 1);   /* (the touchpad's click is the menu's, not a play) */
