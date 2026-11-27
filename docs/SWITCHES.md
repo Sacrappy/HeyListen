@@ -12037,7 +12037,7 @@ A heap of the sead class here has +0x20 its name, +0x28 its memory, +0x30 its si
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hl_alloc_null.c:90` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hl_alloc_null.c:95` and 1 more place.
 
 #### `HOS_NVN_CHMASK_LOG` - diagnostic
 
