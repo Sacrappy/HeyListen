@@ -111,6 +111,9 @@ def main():
     check(r.returncode == 0 and r.stdout.strip() == "ok", "face_runs: %s%s" % (r.stdout, r.stderr))
     assets = (ROOT / "nx2" / "prompt_assets.py").read_text(encoding="utf-8")
     check("keyboard_layers(" in assets and 'f"{name}.key{k:02x}.png"' in assets, "nx2/prompt_assets.py makes no keyboard notes")
+    kb = assets[assets.index("def keyboard_layers("):assets.index("def face_textures(")]
+    check("for name, sw in NOTES.items():" in kb and "for name, sw in LETTERS.items():" in kb,
+          "the keyboard face must make the Talk ring's letters (KeyTexFont*) as well as the notes: the ring showed the Switch's X Y B")
     check('"%sprompts/keyboard/textures.bin"' in src, "host/prompts.c does not read keyboard/textures.bin")
     print("ok: face_runs: a pad face's bindings; the keyboard face's Switch defaults then its keys' notes, a key without a picture "
           "and a build without the notes leaving the Switch's")

@@ -14,7 +14,7 @@ and the sticks' pictures as the keys that move and the mouse (nx2/prompt_draw.py
 bold font, and the mice); host/prompts.c points each Switch button at the first key bound to it there.
 
 The textures with button icons (the ocarina's notes, the letters on black, the controller in the pause menu) the same way (the
-keyboard face: only the notes, keyboard/textures.bin: one picture for each key, the Switch's textures for the rest), with
+keyboard face: the notes and the Talk ring's letters, keyboard/textures.bin: one picture for each key, the Switch's textures for the rest), with
 Pillow, astc_encoder and texture2ddecoder: <out>/Common.bntx is the game's UI/Layout2Archive/Common bntx decompressed, and
 <face>/textures.bin the encoded blocks to write over it for each Switch button on each pad input, which the game picks by the
 controls when it serves the file. The Talk ring's buttons and the ocarina hint's icons (the layouts of UI/Layout2Archive/Common,
@@ -515,9 +515,10 @@ class KeyIcons(Icons):
 
 
 def keyboard_layers(tex, font):
-    """the keyboard face's images, as layers (the notes only: the white key with its name cut out, for each key the font has an icon
-    of and each of A B X Y L R: the texture's name, then ".<key code>"; the Switch's textures stay for the rest, host/prompts.c
-    face_runs). The pad input of a layer is the key code (textures.bin's second byte)"""
+    """the keyboard face's images, as layers: the notes (the white key with its name cut out, for each key the font has an icon
+    of and each of A B X Y L R) and the letters on black (the Talk ring's A B X Y: the key's name alone; they stayed the Switch's
+    letters until 27 Nov 2026, so the ring showed X Y B around a key): the texture's name, then ".<key code>"; the Switch's
+    textures stay for the rest, host/prompts.c face_runs. The pad input of a layer is the key code (textures.bin's second byte)"""
     from fontTools.ttLib import TTFont
     from PIL import Image
     cmap = TTFont(io.BytesIO(font)).getBestCmap()
@@ -533,6 +534,15 @@ def keyboard_layers(tex, font):
             o = ((w - icon.width) // 2, (h - icon.height) // 2)
             im.paste(Image.new("RGBA", icon.size, (255, 255, 255, 255)), o, shape)
             im.paste(Image.new("RGBA", icon.size, (0, 0, 0, 255)), o, holes)
+            layers.append(Layer(f"{name}.key{k:02x}.png", name, SW[sw], k, im))
+    for name, sw in LETTERS.items():   # (as face_layers: the icon's letter, here the key's name; a key with none: its shape)
+        t = tex[name]
+        w, h = t[2], t[3]
+        for k in codes:
+            icon, shape, holes = icons.masks(k, int(min(w, h) * 0.9))
+            letter = holes if holes.getbbox() else icon
+            im = Image.new("L", (w, h), 0)
+            im.paste(letter, ((w - letter.width) // 2, (h - letter.height) // 2))
             layers.append(Layer(f"{name}.key{k:02x}.png", name, SW[sw], k, im))
     for layer in layers:   # (a hand-made image in nx2/prompt_faces/keyboard/ takes a layer's place, as for the other faces)
         hand = override("keyboard", layer.name)
