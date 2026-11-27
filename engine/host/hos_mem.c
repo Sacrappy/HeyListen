@@ -182,11 +182,38 @@ static void discard_pages(uint64_t addr, uint64_t size) {
 /* (hos_regionkeep.c, HL_REGION_KEEP: a kept region that has aged is discarded here) */
 void hos_keep_discard(uint64_t addr, uint64_t size) { discard_pages(addr, size); }
 
+static int64_t pages_count_locked(uint64_t a, uint64_t n, int map);
+static void pages_report_locked(void);
+static uint64_t mapped_bytes;
+static uint64_t region_unmapped_bytes;   /* (the pages of freed regions the game had not freed first: counted out) */
+static int region_free_keeps_count(void) {
+    static int keep = -1;
+    if (keep < 0) keep = getenv("HOS_REGION_FREE_KEEPS_COUNT") && getenv("HOS_REGION_FREE_KEEPS_COUNT")[0] != '0';
+    return keep;
+}
+/* (LOCK held) a freed region's pages still counted as mapped, counted out. The bytes counted out */
+static uint64_t region_count_out_locked(uint64_t addr, uint64_t size) {
+    const int64_t out = pages_count_locked(addr, size, 0);
+    if (out <= 0) return 0;
+    mapped_bytes -= (uint64_t)out, region_unmapped_bytes += (uint64_t)out;
+    static uint64_t told_step;
+    if (region_unmapped_bytes >> 28 != told_step) {   /* (a line each 256 MB) */
+        told_step = region_unmapped_bytes >> 28;
+        hos_log("mem: %llu MB of mapped pages counted out with their freed regions so far", (unsigned long long)(region_unmapped_bytes >> 20));
+    }
+    pages_report_locked();
+    return (uint64_t)out;
+}
+
 void hos_region_free(uint64_t addr) {
     uint64_t freed = 0, freed_size = 0;
     LOCK();
     for (int i = 0; i < nregions; i++) {
         if (regions[i].addr == addr) {
+            /* (DEGRADE1) the game often frees a region without freeing its pages first (Longshot's da1c3f524 counted them out
+               here; the port left it out): those pages are gone, and still counting them would tell the game, with the used
+               memory report on, that memory it no longer holds is in use. HOS_REGION_FREE_KEEPS_COUNT=1: kept, as before */
+            if (!region_free_keeps_count()) region_count_out_locked(regions[i].addr, regions[i].size);
             pages_mark_used_locked(regions[i].addr, regions[i].size);
             freed = regions[i].addr;
             freed_size = regions[i].size;
@@ -332,7 +359,7 @@ static int env_on(const char *name) {
 #define PAGES_LEAF_SHIFT 30   /* (a GB of the window: 2^18 pages, 4096 words of bits) */
 #define PAGES_LEAF_PAGES (1ULL << (PAGES_LEAF_SHIFT - 12))
 static uint64_t *mapped_bits[(HOS_GUEST_SPACE + (1ULL << PAGES_LEAF_SHIFT) - 1) >> PAGES_LEAF_SHIFT];
-static uint64_t mapped_bytes, mapped_peak, mapped_logged;
+static uint64_t mapped_peak, mapped_logged;   /* (mapped_bytes: above hos_region_free) */
 /* map 1: marked mapped, 0: marked free, 2: nothing changed. The bytes that change (or would, for 2: those not mapped yet) */
 static int64_t pages_count_locked(uint64_t a, uint64_t n, int map) {
     int64_t changed = 0;
@@ -371,6 +398,8 @@ static void pages_report_locked(void) {
 /* (HeyListen, owner's rule 2026-11-15) the default by the PC's RAM: on the RTX 5070 PC (64 GB) the A/B measured castle-move
    +3% and kokiri-idle -5% with it, so it is on only where memory is short: under 32 GB of RAM (16 GB PCs, the Deck), off
    from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way */
+/* (the old rule, HOS_MEMINFO_RAM_RULE=1: off from 31 GB, as a "32 GB" PC reports a little under 32 GB) */
+static int meminfo_old_by_ram(uint64_t ram) { return ram >= (31ULL << 30); }
 static int meminfo_old_default(void) {
     const char *e = getenv("HOS_MEMINFO_OLD");
     if (e && e[0]) {
@@ -378,20 +407,30 @@ static int meminfo_old_default(void) {
         hos_log("mem: used memory report: %s, forced by HOS_MEMINFO_OLD=%s", old ? "OFF (as before #324)" : "ON (#324)", e);
         return old;
     }
-    uint64_t ram = 0;
+    /* (DEGRADE1, 27 Nov 2026) on for every PC. Off from 32 GB of RAM, the game believed ~9.6 GB were always free and never gave
+       its mapped pages back: on a 32 GB PC (31861 MB here, 31877 MB for a Linux tester) they grew from 360 MB to 7168 MB in the
+       first 15 minutes of a warp tour, the process's private commit to 28-33 GB, and once the system's commit ran short the
+       textures' budget was cut (RX_VK_COMMIT_RESERVE_MB) and the Market went from 80-87 fps to 10 (issues 30 and 121, "memory
+       maxed out" crashes on Linux). HOS_MEMINFO_RAM_RULE=1: by the PC's RAM again (on under 32 GB, off from 32 GB) */
+    if (env_on("HOS_MEMINFO_RAM_RULE")) {
+        uint64_t ram = 0;
 #ifdef _WIN32
-    MEMORYSTATUSEX m = {sizeof m};
-    if (GlobalMemoryStatusEx(&m)) ram = m.ullTotalPhys;
+        MEMORYSTATUSEX m = {sizeof m};
+        if (GlobalMemoryStatusEx(&m)) ram = m.ullTotalPhys;
 #else
-    const long pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && size > 0) ram = (uint64_t)pages * (uint64_t)size;
+        const long pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && size > 0) ram = (uint64_t)pages * (uint64_t)size;
 #endif
-    const int old = ram >= (31ULL << 30);   /* (a "32 GB" PC reports a little under 32 GB) */
-    hos_log("mem: used memory report: %s, chosen by this PC's RAM (%llu MB; on under 32 GB, off from 32 GB). "
-            "HOS_MEMINFO_OLD=0 forces it on, HOS_MEMINFO_OLD=1 forces it off",
-            old ? "OFF (the program's memory only, as before #324)" : "ON (the heap and the mapped pages too, #324)",
-            (unsigned long long)(ram >> 20));
-    return old;
+        const int old = meminfo_old_by_ram(ram);
+        hos_log("mem: used memory report: %s, chosen by this PC's RAM (%llu MB; on under 32 GB, off from 32 GB; HOS_MEMINFO_RAM_RULE). "
+                "HOS_MEMINFO_OLD=0 forces it on, HOS_MEMINFO_OLD=1 forces it off",
+                old ? "OFF (the program's memory only, as before #324)" : "ON (the heap and the mapped pages too, #324)",
+                (unsigned long long)(ram >> 20));
+        return old;
+    }
+    hos_log("mem: used memory report: ON (the heap and the mapped pages too, #324), on every PC; HOS_MEMINFO_OLD=1 turns it off, "
+            "HOS_MEMINFO_RAM_RULE=1 decides by the PC's RAM as before");
+    return 0;
 }
 
 uint64_t hos_used_memory(uint64_t base) {
