@@ -55,6 +55,15 @@ HUD = ("{ extern volatile float hos_wide_squeeze; if (hos_wide_squeeze > 0.0f) {
        % (UI_M00, UI_M11, " : ".join(["_vt == 0x%xULL ? %du" % (v, 1 << k) for k, v in enumerate(KEEP_VTABLES)] +
                                      ["_vt == 0x%xULL ? %du" % (v, 1 << k) for v, k in KEEP_ALSO]) + " : 0u"))
 
+# The speech bubble over a talking NPC (BalloonMessage_00): the game anchors it at the speaker's place on the screen times the
+# canvas's half size (x * 1920 in s0, y * 1080 in s1, then stp s0, s1 to the bubble), but its screen draws through the HUD's
+# scaled projection: divided by hos_ui_qx and hos_ui_qy, the bubble lands over its speaker. (The site is the ultrawide IPS
+# mod's, there 1920 / squeeze in place of 1920; y too here, as the HUD is drawn smaller on a screen narrower than 16:9)
+BUBBLE = ("{ extern volatile float hos_ui_qx, hos_ui_qy; const float _qx = hos_ui_qx, _qy = hos_ui_qy; "
+          "if (_qx > 0.0f && _qy > 0.0f) { float _x, _y; memcpy(&_x, c->vreg[0], 4); memcpy(&_y, c->vreg[1], 4); "
+          "_x /= _qx; _y /= _qy; memcpy(c->vreg[0], &_x, 4); memcpy(c->vreg[1], &_y, 4); } }"
+          "   /* (nx2/oot_wide.py: the speech bubble over its speaker) */")
+
 MOVIE = ("{ extern volatile float hos_wide_margin; const float _m = hos_wide_margin; if (_m > 0.0f) { "
          "const uint64_t _vp = c->x[29] - 40; uint32_t _ua = (uint32_t)recomp_load32(c, _vp + 8), _ub = (uint32_t)recomp_load32(c, _vp + 16); "
          "float _a, _b; memcpy(&_a, &_ua, 4); memcpy(&_b, &_ub, 4); const float _in = (_b - _a) * _m; _a += _in; _b -= _in; "
@@ -117,6 +126,8 @@ SITES = (
     (0x33b82c, 0x2d558440, _ratio(1, 2)),
     # the 2D canvas setup: the layout's projection rows (ldp q1, q4, [x2]); the canvas is x0, its screen 0x1b8 before it
     (0x774368, 0xad401041, HUD),
+    # the speech bubble's anchor: after fmul s1, s2, s1 (y * 1080; x * 1920 already in s0)
+    (0x20c2c8, 0x1e210841, BUBBLE),
     # the movie layer's draw: its viewport (min x at x29 - 32, max x at x29 - 24) after ldp x9, x8, [x19, #0x18]
     (0x3b5c758, 0xa941a269, MOVIE),
     # the viewport helper's SetViewport, after the call's address is loaded (ldr x8, [x8]), before blr x8
