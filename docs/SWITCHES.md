@@ -10,7 +10,7 @@ python -I engine/scripts/list_switches.py
 
 and commit both files. A test (`engine/tests/test_switches_documented.py`) fails when a switch read in the source is missing here or the data file is out of date.
 
-1591 switches: 56 players may be told to use, 404 diagnostic, 1131 developer-only; 1372 have a real explanation and 219 are marked `undocumented`.
+1593 switches: 56 players may be told to use, 404 diagnostic, 1133 developer-only; 1374 have a real explanation and 219 are marked `undocumented`.
 
 ## How to set a switch
 
@@ -70,7 +70,7 @@ The entries below say what each one does, its values and default, and when it is
 | [Audio](#audio) | 15 | 5 | 10 | 0 |
 | [Input and controllers](#input-and-controllers) | 14 | 1 | 13 | 0 |
 | [Native engine (`HL_*`)](#native-engine-hl_) | 125 | 1 | 42 | 82 |
-| [Host and OS (`HOS_*` and the system's variables)](#host-and-os-hos_-and-the-systems-variables) | 140 | 10 | 0 | 130 |
+| [Host and OS (`HOS_*` and the system's variables)](#host-and-os-hos_-and-the-systems-variables) | 142 | 10 | 0 | 132 |
 | [Telemetry and crash reports](#telemetry-and-crash-reports) | 12 | 0 | 12 | 0 |
 | [Diagnostics and logging](#diagnostics-and-logging) | 313 | 0 | 313 | 0 |
 | [Build and lift time (`A64_*`, `RX_*` and `HOOKSHOT_*` the builder reads)](#build-and-lift-time-a64_-rx_-and-hookshot_-the-builder-reads) | 100 | 0 | 0 | 100 |
@@ -8085,7 +8085,7 @@ A diagnostic: `AllocateMemoryPages` is refused past the console's total (heap an
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:419`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:458`.
 
 #### `HOS_SHADOW_BUCKET` - developer
 
@@ -8125,7 +8125,7 @@ HOS_TEST_ALLOC_REFUSE=<text>: every allocation through here whose label contains
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:436`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:475`.
 
 #### `RX_GPU_FRAMES_AHEAD` - developer
 
@@ -10403,7 +10403,7 @@ HOS_OPT_PERF_PACE, gpu/vk/perf_parts.h (what this thread waited on since its las
 
 ## Host and OS (`HOS_*` and the system's variables)
 
-140 switches of the Horizon OS layer, the window and the system.
+142 switches of the Horizon OS layer, the window and the system.
 
 ### Frame rate and timing
 
@@ -10577,7 +10577,7 @@ TICK-062 B1, HOS_CV_SIGNAL_FAST=1: a signal with no waiter changes nothing a lat
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:207`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:234`.
 
 #### `HOS_JOBTRACE` - developer
 
@@ -11327,13 +11327,23 @@ Every page's bit in the mark bitmap set: every lifted store marks its page, as w
 
 #### `HOS_MEMINFO_OLD` - developer
 
-The used memory the game is told (`QueryMemoryInfo`, svc `GetInfo` 7 and 22) is the program and the system's share alone, as before. By default it adds the heap and the pages the game mapped through `AllocateMemoryPages`, at most the console's total (`hos_used_memory`, `host/hos_mem.c`): told less, the game kept mapping pages for its caches (7.9 GB in a long session). Ported from Longshot a4c77174 (#324). For A/B.
+The used memory the game is told (`QueryMemoryInfo`, svc `GetInfo` 7 and 22) is the program and the system's share alone, as before. By default it adds the heap and the pages the game mapped through `AllocateMemoryPages`, at most the console's total (`hos_used_memory`, `host/hos_mem.c`): told less, the game kept mapping pages for its caches (7.9 GB in a long session). Ported from Longshot a4c77174 (#324). On for every PC since DEGRADE1 (27 Nov 2026: off from 32 GB of RAM, the mapped pages grew to 7.2 GB in 15 minutes and the commit limit cut the textures); `HOS_MEMINFO_RAM_RULE=1` decides by the PC's RAM as before (on under 32 GB). For A/B.
 
-**Values:** text. **Default:** unset.
+**Values:** text (`1` named). **Default:** unset.
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:375`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:404`.
+
+#### `HOS_MEMINFO_RAM_RULE` - developer
+
+(DEGRADE1, 27 Nov 2026) on for every PC. Off from 32 GB of RAM, the game believed ~9.6 GB were always free and never gave its mapped pages back: on a 32 GB PC (31861 MB here, 31877 MB for a Linux tester) they grew from 360 MB to 7168 MB in the first 15 minutes of a warp tour, the process's private commit to 28-33 GB, and once the system's commit ran short the textures' budget was cut (RX_VK_COMMIT_RESERVE_MB) and the Market went from 80-87 fps to 10 (issues 30 and 121, "memory maxed out" crashes on Linux). HOS_MEMINFO_RAM_RULE=1: by the PC's RAM again (on under 32 GB, off from 32 GB).
+
+**Values:** on or off (0, false, off, no and empty are off); the description names `1`. **Default:** off (unset).
+
+**When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
+
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:415`.
 
 #### `HOS_MKW_INTERVAL` - developer
 
@@ -11613,7 +11623,7 @@ HOS_PREFAULT=1 (experiment): the new heap pages touched now (a zero written to f
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:272`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:299`.
 
 #### `HOS_REALTIME_STEP` - developer
 
@@ -11624,6 +11634,16 @@ Over the options file: Resolution 100% (non-zero: Auto), Game speed Per frame (1
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
 **Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_menu.cpp:2897`.
+
+#### `HOS_REGION_FREE_KEEPS_COUNT` - developer
+
+A region the game frees (`FreeAddressRegion`) keeps its mapped pages in the used-memory count, as before DEGRADE1. By default they leave it, as Longshot's da1c3f524 does, so the game is not told memory it no longer holds is in use (`region_count_out_locked`, `host/hos_mem.c`).
+
+**Values:** text. **Default:** unset.
+
+**When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
+
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hos_mem.c:191`.
 
 #### `HOS_RESTART_OF` - developer
 

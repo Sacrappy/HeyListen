@@ -2,7 +2,7 @@
  "schema": 1,
  "generated_by": "engine/scripts/list_switches.py",
  "scope": "C, C++ and headers under engine/ (engine/tests and vendored trees other than a64-kit excluded) and the Python the builder, the lifter and the scripts run: getenv, std::getenv, _wgetenv, the code's own env helpers and table-driven reads, and os.environ.",
- "count": 1591,
+ "count": 1593,
  "switches": [
   {
    "name": "A64_",
@@ -5608,7 +5608,7 @@
    "files": [
     {
      "path": "host/hos_mem.c",
-     "line": 207
+     "line": 234
     }
    ],
    "default": "off (unset)",
@@ -7340,15 +7340,36 @@
    "files": [
     {
      "path": "host/hos_mem.c",
-     "line": 375
+     "line": 404
     }
    ],
    "default": "unset",
-   "values": "text",
-   "explanation": "The used memory the game is told (`QueryMemoryInfo`, svc `GetInfo` 7 and 22) is the program and the system's share alone, as before. By default it adds the heap and the pages the game mapped through `AllocateMemoryPages`, at most the console's total (`hos_used_memory`, `host/hos_mem.c`): told less, the game kept mapping pages for its caches (7.9 GB in a long session). Ported from Longshot a4c77174 (#324). For A/B.",
-   "comment": "(Longshot) what the game is told it uses: base (its program, and the system's share) plus the heap and its mapped pages; base alone with HOS_MEMINFO_OLD=1. QueryMemoryInfo below, and svc GetInfo's used memory (hos_svc.c). Never more than the console's total: nothing refuses AllocateMemoryPages by default (HOS_PAGES_LIMIT), and past the total the game's free = total - used would wrap to a huge figure and it would map without limit again (HeyListen, owner's rule 2026-11-15) the default by the PC's RAM: on the RTX 5070 PC (64 GB) the A/B measured castle-move +3% and kokiri-idle -5% with it, so it is on only where memory is short: under 32 GB of RAM (16 GB PCs, the Deck), off from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way.",
+   "values": "text (`1` named)",
+   "explanation": "The used memory the game is told (`QueryMemoryInfo`, svc `GetInfo` 7 and 22) is the program and the system's share alone, as before. By default it adds the heap and the pages the game mapped through `AllocateMemoryPages`, at most the console's total (`hos_used_memory`, `host/hos_mem.c`): told less, the game kept mapping pages for its caches (7.9 GB in a long session). Ported from Longshot a4c77174 (#324). On for every PC since DEGRADE1 (27 Nov 2026: off from 32 GB of RAM, the mapped pages grew to 7.2 GB in 15 minutes and the commit limit cut the textures); `HOS_MEMINFO_RAM_RULE=1` decides by the PC's RAM as before (on under 32 GB). For A/B.",
+   "comment": "(Longshot) what the game is told it uses: base (its program, and the system's share) plus the heap and its mapped pages; base alone with HOS_MEMINFO_OLD=1. QueryMemoryInfo below, and svc GetInfo's used memory (hos_svc.c). Never more than the console's total: nothing refuses AllocateMemoryPages by default (HOS_PAGES_LIMIT), and past the total the game's free = total - used would wrap to a huge figure and it would map without limit again (HeyListen, owner's rule 2026-11-15) the default by the PC's RAM: on the RTX 5070 PC (64 GB) the A/B measured castle-move +3% and kokiri-idle -5% with it, so it is on only where memory is short: under 32 GB of RAM (16 GB PCs, the Deck), off from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way (the old rule, HOS_MEMINFO_RAM_RULE=1: off from 31 GB, as a \"32 GB\" PC reports a little under 32 GB).",
    "documented_in": "development.md",
    "source": "development.md",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
+   "name": "HOS_MEMINFO_RAM_RULE",
+   "area": "host",
+   "group": "System and services",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "host/hos_mem.c",
+     "line": 415
+    }
+   ],
+   "default": "off (unset)",
+   "values": "on or off (0, false, off, no and empty are off); the description names `1`",
+   "explanation": "(DEGRADE1, 27 Nov 2026) on for every PC. Off from 32 GB of RAM, the game believed ~9.6 GB were always free and never gave its mapped pages back: on a 32 GB PC (31861 MB here, 31877 MB for a Linux tester) they grew from 360 MB to 7168 MB in the first 15 minutes of a warp tour, the process's private commit to 28-33 GB, and once the system's commit ran short the textures' budget was cut (RX_VK_COMMIT_RESERVE_MB) and the Market went from 80-87 fps to 10 (issues 30 and 121, \"memory maxed out\" crashes on Linux). HOS_MEMINFO_RAM_RULE=1: by the PC's RAM again (on under 32 GB, off from 32 GB).",
+   "comment": "(DEGRADE1, 27 Nov 2026) on for every PC. Off from 32 GB of RAM, the game believed ~9.6 GB were always free and never gave its mapped pages back: on a 32 GB PC (31861 MB here, 31877 MB for a Linux tester) they grew from 360 MB to 7168 MB in the first 15 minutes of a warp tour, the process's private commit to 28-33 GB, and once the system's commit ran short the textures' budget was cut (RX_VK_COMMIT_RESERVE_MB) and the Market went from 80-87 fps to 10 (issues 30 and 121, \"memory maxed out\" crashes on Linux). HOS_MEMINFO_RAM_RULE=1: by the PC's RAM again (on under 32 GB, off from 32 GB).",
+   "documented_in": null,
+   "source": "comment at host/hos_mem.c",
    "documented": true,
    "set_via": "In `hookshot_env.txt`, or in the environment.",
    "use": null
@@ -8673,13 +8694,13 @@
    "files": [
     {
      "path": "host/hos_mem.c",
-     "line": 419
+     "line": 458
     }
    ],
    "default": "off (unset)",
    "values": "on or off (0, false, off, no and empty are off)",
    "explanation": "A diagnostic: `AllocateMemoryPages` is refused past the console's total (heap and mapped pages), as on the console. Keep it off: the game retries a refused allocation forever.",
-   "comment": "QueryMemoryInfo below, and svc GetInfo's used memory (hos_svc.c). Never more than the console's total: nothing refuses AllocateMemoryPages by default (HOS_PAGES_LIMIT), and past the total the game's free = total - used would wrap to a huge figure and it would map without limit again (HeyListen, owner's rule 2026-11-15) the default by the PC's RAM: on the RTX 5070 PC (64 GB) the A/B measured castle-move +3% and kokiri-idle -5% with it, so it is on only where memory is short: under 32 GB of RAM (16 GB PCs, the Deck), off from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way.",
+   "comment": "QueryMemoryInfo below, and svc GetInfo's used memory (hos_svc.c). Never more than the console's total: nothing refuses AllocateMemoryPages by default (HOS_PAGES_LIMIT), and past the total the game's free = total - used would wrap to a huge figure and it would map without limit again (HeyListen, owner's rule 2026-11-15) the default by the PC's RAM: on the RTX 5070 PC (64 GB) the A/B measured castle-move +3% and kokiri-idle -5% with it, so it is on only where memory is short: under 32 GB of RAM (16 GB PCs, the Deck), off from 32 GB. HOS_MEMINFO_OLD=0 / 1 decides either way (the old rule, HOS_MEMINFO_RAM_RULE=1: off from 31 GB, as a \"32 GB\" PC reports a little under 32 GB).",
    "documented_in": "development.md",
    "source": "development.md",
    "documented": true,
@@ -8996,7 +9017,7 @@
    "files": [
     {
      "path": "host/hos_mem.c",
-     "line": 272
+     "line": 299
     }
    ],
    "default": "unset",
@@ -9246,6 +9267,27 @@
    "values": "text",
    "explanation": "`NvnCommandBufferEndRecording`'s periodic log lines written under the recording table's lock, holding the guest core. By default after the lock is let go and with the core given up (a blocked stderr stalled other recorders and the threads pinned to that core for hundreds of ms).",
    "comment": "HOS_REC_LOG_AWAY=0: written under the lock, holding the core, as before (65536 / 2688 * 1024: every bucket once in ~25,000 recordings) (longshot 7daafa7a, #1553, ff5809e8) The recording diagnostics' lines are written after copy_lock is let go, and with the thread's virtual core given up: stderr can block for hundreds of milliseconds, and every other recorder (and the guest threads pinned to this thread's core, an audio thread waited 321 ms for it) waited behind the line. The sweep returns what it let go, for EndRecording to say. HOS_REC_LOG_AWAY=0: written under the lock, holding the core, as before.",
+   "documented_in": "development.md",
+   "source": "development.md",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
+   "name": "HOS_REGION_FREE_KEEPS_COUNT",
+   "area": "host",
+   "group": "System and services",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "host/hos_mem.c",
+     "line": 191
+    }
+   ],
+   "default": "unset",
+   "values": "text",
+   "explanation": "A region the game frees (`FreeAddressRegion`) keeps its mapped pages in the used-memory count, as before DEGRADE1. By default they leave it, as Longshot's da1c3f524 does, so the game is not told memory it no longer holds is in use (`region_count_out_locked`, `host/hos_mem.c`).",
+   "comment": "(DEGRADE1) the game often frees a region without freeing its pages first (Longshot's da1c3f524 counted them out here; the port left it out): those pages are gone, and still counting them would tell the game, with the used memory report on, that memory it no longer holds is in use. HOS_REGION_FREE_KEEPS_COUNT=1: kept, as before.",
    "documented_in": "development.md",
    "source": "development.md",
    "documented": true,
@@ -10919,7 +10961,7 @@
    "files": [
     {
      "path": "host/hos_mem.c",
-     "line": 436
+     "line": 475
     }
    ],
    "default": "off (unset)",
