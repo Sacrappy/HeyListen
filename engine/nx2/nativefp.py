@@ -294,9 +294,12 @@ def native_text(text):
 
 
 def native_fp_cold():
-    # (LIFT3) A64_NATIVE_FP_COLD (lift time, off unless =1; with A64_NATIVE_FP): the same native helpers in every other function
-    # (the cold ones, not in A64_HOT_FUNCS), except those the text edits and the gates read (fastvec.PLAIN0)
-    return native_fp() and on(os.environ.get("A64_NATIVE_FP_COLD"))
+    # (LIFT3) A64_NATIVE_FP_COLD (lift time, on unless =0 since 27 Nov 2026; with A64_NATIVE_FP): the same native helpers in every
+    # other function (the cold ones, not in A64_HOT_FUNCS), except those the text edits and the gates read (fastvec.PLAIN0).
+    # The owner's choice after a hand session on the build (physics as before): the main PC's Market 108-114 -> 116-118 fps (one
+    # run a side); inside the noise on the PC 3050 (57.6 against 57.4 / 57.1); the game's C compiles longer with it (480 -> 1677 s
+    # on a Ryzen 7 5700U, 309 -> 994 s on an i5-10400F). =0 gives the lift of before
+    return native_fp() and on_by_default(os.environ.get("A64_NATIVE_FP_COLD"))
 
 
 # (a cold function's FPX helper calls as outline_fpx writes them: a64_fpx_<fast>_<exact>(c, ...), noinline, gate and range tests)
