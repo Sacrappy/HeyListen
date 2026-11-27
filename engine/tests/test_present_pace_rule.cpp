@@ -127,6 +127,73 @@ int main() {
         CHECK(shortest >= P - early - step);
         CHECK(hold_sum / n < 3000000);
     }
+    {   // (mode 4) the slot line: early waits for its slot, a little late keeps the phase, a period late starts again
+        Line l;
+        Slot s = slot(l, T, P);
+        CHECK(s.at == T && !s.late && l.at == T);                                   // (the first frame starts the line)
+        s = slot(l, T + 5000000, P);
+        CHECK(s.at == T + P && !s.late && l.at == T + P);                           // (early: shown at its slot)
+        s = slot(l, T + 2 * P, P);
+        CHECK(s.at == T + 2 * P && !s.late);                                        // (exactly on it)
+        s = slot(l, T + 3 * P + 4000000, P);
+        CHECK(s.at == T + 3 * P + 4000000 && s.late && !s.restarted && l.at == T + 3 * P);   // (4 ms late: at once, the phase kept)
+        s = slot(l, T + 3 * P + 9000000, P);
+        CHECK(s.at == T + 4 * P && !s.late && l.at == T + 4 * P);                   // (the frame after: its slot, under a period after the late one)
+        s = slot(l, T + 6 * P + 1000000, P);
+        CHECK(s.late && s.restarted && l.at == T + 6 * P + 1000000 && s.at == l.at);   // (a period or more behind: from it)
+        s = slot(l, T + 6 * P + 2000000, P);
+        CHECK(s.at == T + 7 * P + 1000000 && !s.late);
+        s = slot(l, T, 0);
+        CHECK(s.at == T && l.at == 0);                                              // (no pace: the line forgets)
+        // the game's wait at its window acquire: until one period after the slot of the frame that used the texture
+        CHECK(free_wait(T, T + 1000000, P) == P - 1000000);
+        CHECK(free_wait(T, T + P, P) == 0 && free_wait(T, T + 2 * P, P) == 0);
+        CHECK(free_wait(0, T, P) == 0 && free_wait(T, T, 0) == 0);
+    }
+    {   // (mode 4) the time step: the mean of the last five intervals between show times; a gap starts again
+        Step st;
+        CHECK(step(st, T, 250000000) == 0);
+        CHECK(step(st, T + P, 250000000) == P);
+        CHECK(step(st, T + 2 * P + 3000000, 250000000) == P + 1500000);
+        for (int k = 3; k < 9; k++) step(st, T + (int64_t)k * P, 250000000);
+        CHECK(step(st, T + 9 * P, 250000000) == P);                                 // (five even intervals: exactly the period)
+        CHECK(step(st, T + 9 * P + 300000000, 250000000) == 0);                     // (a load: again from here)
+        CHECK(step(st, T + 9 * P + 300000000 + P, 250000000) == P);
+        CHECK(step(st, T, 250000000) == 0);                                         // (a time not after the last one)
+    }
+    {   // (mode 4) the whole loop, the game's frames started by the line itself (three window textures: the game runs up to two
+        // frames ahead, as with the host's own wait): at a 60 limit with 11 ms of work and 0-3 ms of spread every frame is shown on
+        // its slot and the step is exactly the period; a frame of 30 ms is taken by the run-ahead (nothing late); one of 45 ms is
+        // shown late and so are the one or two after it while the game catches up (each at once, closer than a period), then the
+        // line is where it was (the phase kept: the rate holds at the limit)
+        Line l;
+        Step st;
+        int64_t slots[16] = {}, ready = T, last = 0, step_ns = 0, at100 = 0;
+        uint64_t n = 0;
+        int lates = 0, restarts = 0, off = 0, uneven = 0;
+        uint32_t seed = 777;
+        for (int k = 0; k < 3000; k++) {
+            const int64_t back = n >= 3 ? slots[(n - 3) & 15] : 0;
+            const int64_t start = ready + free_wait(back, ready, P);                // (the window acquire)
+            seed = seed * 1103515245u + 12345u;
+            int64_t work = 11000000 + (int64_t)(seed >> 8) % 3000000;
+            if (k == 1500) work = 30000000;
+            if (k == 2200) work = 45000000;
+            ready = start + work;                                                   // (the hand-over)
+            const Slot s = slot(l, ready, P);
+            slots[n++ & 15] = s.at;
+            step_ns = step(st, s.at, 250000000);
+            if (s.late) lates++, restarts += s.restarted;
+            if (k == 100) at100 = s.at;
+            if (k > 100 && (k < 2200 || k > 2203) && last && s.at - last != P) off++;
+            if (k > 100 && (k < 2200 || k > 2208) && step_ns != P) uneven++;
+            last = s.at;
+        }
+        std::printf("slot loop: %d late (%d restarts), %d intervals off the period, %d uneven steps, phase moved %lld ns\n", lates, restarts,
+                    off, uneven, (long long)(last - at100 - (int64_t)2899 * P));
+        CHECK(lates >= 1 && lates <= 3 && restarts == 0 && off == 0 && uneven == 0);
+        CHECK(last - at100 == (int64_t)2899 * P);
+    }
     if (fails) return 1;
     std::printf("present pace rule: ok\n");
     return 0;

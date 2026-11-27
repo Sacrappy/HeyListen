@@ -78,3 +78,10 @@ enum { HL_PROMPTS_LIVE_TEXTURES = 1, HL_PROMPTS_LIVE_LAYOUTS = 2, HL_PROMPTS_LIV
    answers in percent, 0 to 100). Hookshot's id for it is 44, which is the Skip title screen's here; 94 is free (90 to 93 are the
    rows above). The options file keys it by the row's name ("volume"), so the id is not stored. */
 #define HL_OPT_VOLUME 94
+
+/* The present pacer's slot line (HL_PRESENT_PACE=4, gpu/vk/present_pace_rule.h), asked by host/nn_vi.c and answered by
+   gpu/vk/vk_replay.cpp. HL_OPT_PACE_STEP_NS: the mean of the last intervals between the frames' show times, in ns, which the
+   game's time step follows (0: none, the host's own). HL_OPT_PACE_FREE_NS + (textures - 1), for a window of 1 to 4 textures:
+   how long the game's window acquire waits, in ns (-1: the slot line is not pacing, the host's own wait holds). */
+#define HL_OPT_PACE_STEP_NS 105
+#define HL_OPT_PACE_FREE_NS 110

@@ -83,6 +83,65 @@ inline int64_t low_mark(const int64_t* v, int count, int n) {
 constexpr int kQueueMost = 2;
 inline bool must_wait_for_room(int queued) { return queued >= kQueueMost; }
 
+/// (HL_PRESENT_PACE=4, the slot line) The rule of MacNativeGames' nvn_pace.h, which Rekarina paces with too, written again here:
+/// a frame's slot is the slot before plus one period, given when the frame is HANDED OVER (not when the pacer thread takes it).
+/// Early: the frame is shown at its slot. Late by less than a period: shown at once and the line KEEPS ITS PHASE (the slot stays
+/// where it was, so the frame after is shown a little less than a period later and the rate holds at the limit). A period or more
+/// behind: the line starts again from the frame, with no burst to catch up. One line for everything: the pacer thread shows at
+/// the slot, the game's window acquire waits on the slots (free_wait) and its time step follows them (Step)
+struct Slot {
+    int64_t at = 0;           // (when the frame is shown: its slot, or `now` for a late one)
+    bool late = false;        // (the frame came after its slot)
+    bool restarted = false;   // (a period or more behind: the line starts again from it)
+};
+inline Slot slot(Line& l, int64_t now, int64_t period) {
+    Slot s;
+    s.at = now;
+    if (period <= 0) {
+        l.at = 0;
+        return s;
+    }
+    if (!l.at) {
+        l.at = now;
+        return s;
+    }
+    const int64_t next = l.at + period;
+    if (now <= next) {
+        l.at = s.at = next;
+        return s;
+    }
+    s.late = true;
+    if (now - next < period) l.at = next;
+    else l.at = now, s.restarted = true;
+    return s;
+}
+
+/// (the slot line) The game's wait at its window acquire: the window texture it takes is free one period after the slot of the
+/// frame that used it (`slot_back`: the slot of the frame as many hand-overs back as the window has textures; 0: none yet). The
+/// game's frames start on the line's own clock, so the line never has to follow another one
+inline int64_t free_wait(int64_t slot_back, int64_t now, int64_t period) {
+    return slot_back && period > 0 && slot_back + period > now ? slot_back + period - now : 0;
+}
+
+/// (the slot line) The game's time step: the mean of the last intervals between the frames' show times, five at most, so the
+/// game advances by what is shown, the pacer's waits included (a steady line: exactly the period). A gap over `gap_ns` (a
+/// load) or a time not after the last one starts again: 0 until there is an interval
+struct Step {
+    int64_t last = 0, d[5] = {};
+    int n = 0, at = 0;
+};
+inline int64_t step(Step& s, int64_t shown_at, int64_t gap_ns) {
+    if (!s.last || shown_at <= s.last || shown_at - s.last > gap_ns) {
+        s.last = shown_at, s.n = s.at = 0;
+        return 0;
+    }
+    s.d[s.at] = shown_at - s.last, s.at = (s.at + 1) % 5, s.last = shown_at;
+    if (s.n < 5) s.n++;
+    int64_t sum = 0;
+    for (int i = 0; i < s.n; i++) sum += s.d[i];
+    return sum / s.n;
+}
+
 /// The high mark of the last frames' work: the n-th largest of `v[0..count)` (n from 1), the ring's values in any order
 inline int64_t high_mark(const int64_t* v, int count, int n) {
     if (count <= 0) return -1;

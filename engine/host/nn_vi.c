@@ -217,6 +217,21 @@ void hos_vi_native_acquire(int active) {
     if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
     if (double_buffered < 0) double_buffered = getenv("HOS_VI_DOUBLE") != NULL;
     if (no_pacing || !next_frame_at) return;
+    {   /* (HL_PRESENT_PACE=4, the present pacer's slot line: gpu/vk/present_pace_rule.h free_wait) the wait is the line's own:
+           this window texture is free one period after the slot of the frame that used it, so the game's frames start on the
+           clock that shows them. -1: the slot line is not pacing, the wait below holds */
+        int rx_option(int id, int otherwise);
+        const int textures = active < 1 ? 1 : active > 4 ? 4 : active;
+        const int wait_ns = rx_option(HL_OPT_PACE_FREE_NS + textures - 1, -1);
+        if (wait_ns >= 0) {
+            if (wait_ns > 0) {
+                const int64_t t0 = hos_now_ns();
+                hos_sleep_ns(wait_ns);
+                pace_since_present_us += (hos_now_ns() - t0) / 1000;
+            }
+            return;
+        }
+    }
     int64_t until = next_frame_at;
     if (!double_buffered && active >= 2) {
         const int64_t n = shown_count, frame = n - active + 1;   /* (the frame whose showing frees this texture) */
@@ -402,6 +417,15 @@ static void realtime_step(int64_t now) {
     if (count < (unsigned)window) count++;
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
+    {   /* (HL_PRESENT_PACE=4, the present pacer's slot line) the step follows the frames as they are SHOWN: the mean of the last
+           five intervals between the pacer's show times, not between this thread's present calls, which carry each frame's
+           change of work while the pictures go out evenly (the game then moved by uneven steps between even pictures).
+           HL_PRESENT_PACE_STEP=0: the present calls' times as before */
+        static int follow = -1;
+        if (follow < 0) follow = !(getenv("HL_PRESENT_PACE_STEP") && !atoi(getenv("HL_PRESENT_PACE_STEP")));
+        const int shown_ns = follow ? rx_option(HL_OPT_PACE_STEP_NS, 0) : 0;
+        if (shown_ns > 0) sum = shown_ns / 1e9 * count;
+    }
     /* (TICK-014: the carry is kept against the unclamped time; clamped first, a frame shorter than 1 / cap lost its
        difference and one longer kept it: +0.9% speed at the 60 limit) */
     const double owed = sum / count * 60.0 + carry;

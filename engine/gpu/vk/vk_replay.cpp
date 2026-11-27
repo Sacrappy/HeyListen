@@ -7610,12 +7610,16 @@ void frame_log_note() {
 /// next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point:
 /// the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace),
 /// a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that
-/// much early, for the timer's wake-up
+/// much early, for the timer's wake-up. 3: the pacer thread (below). 4: the pacer thread on the slot line, the pacing of
+/// MacNativeGames' nvn_pace.h and of Rekarina written again here (present_pace_rule.h slot): the frame's slot is given when it is
+/// handed over, a frame late by less than a period is shown at once and the line keeps its phase, the game's window acquire
+/// waits on the same slots and its time step follows the frames as they are shown (host/nn_vi.c; HL_PRESENT_PACE_STEP=0: the step
+/// from the present calls' times as before)
 namespace pace {
 int mode() {
     static const int m = [] {
         const char* e = getenv("HL_PRESENT_PACE");
-        return e && *e ? std::clamp(atoi(e), 0, 3) : 0;   // (off by default until =3 is measured: =1 and =2 lost frames)
+        return e && *e ? std::clamp(atoi(e), 0, 4) : 0;   // (off by default until =3 / =4 are measured: =1 and =2 lost frames)
     }();
     return m;
 }
@@ -7656,7 +7660,7 @@ int64_t period_now() {
 /// (present(), on the game's presenting thread, first) the hold
 void present_pace_begin() {
     using namespace pace;
-    const int64_t period = mode() == 3 ? 0 : period_now();   // (mode 3: the pacer thread holds, not the game's)
+    const int64_t period = mode() >= 3 ? 0 : period_now();   // (modes 3 and 4: the pacer thread holds, not the game's)
     int64_t now = now_ns();
     if (last_exit && period) {   // (the frame's work since the last present: the game's, and the replays at its submits)
         ring[ring_at] = now - last_exit, ring_at = (ring_at + 1) % 64, ring_n = std::min(ring_n + 1, 64);
@@ -7689,7 +7693,7 @@ void present_pace_begin() {
 /// (present(), last) form 2: the game's next frame starts later
 void present_pace_end() {
     using namespace pace;
-    const int64_t period = mode() == 3 ? 0 : period_now();
+    const int64_t period = mode() >= 3 ? 0 : period_now();
     int64_t now = now_ns();
     if (period && mode() == 2 && ring_n >= 16) {
         const int64_t work = present_pace_rule::high_mark(ring, ring_n, 4);
@@ -7717,7 +7721,16 @@ struct PJob {
     VkSwapchainKHR sc;
     uint32_t index;
     int64_t at, period;
+    int64_t slot;   // (mode 4: when to show it, given at the hand-over; 0 in mode 3)
+    bool late;      // (mode 4: handed over after its slot)
 };
+// (HL_PRESENT_PACE=4, the slot line: present_pace_rule.h slot / free_wait / Step) under t_mu: the line, the slots of the last
+// hand-overs (the game's window acquire waits on them: pace_free_ns) and the game's time step (pace_step_ns)
+present_pace_rule::Line s_line;
+present_pace_rule::Step s_step;
+int64_t s_slots[16], s_period = 0, s_kept = 0, s_restarts = 0;
+uint64_t s_n = 0;
+std::atomic<int> s_step_ns{0};
 std::mutex t_mu;
 std::condition_variable t_cv;
 std::deque<PJob> t_q;
@@ -7762,9 +7775,13 @@ void thread_main() {
             t_cv.wait(lk, [] { return !t_q.empty(); });
             j = t_q.front();
         }
-        const present_pace_rule::Hold h = present_pace_rule::hold(t_line, j.at, j.period, early);
-        // (never closer than a period, less the wake's allowance and the slew's step: the line can come earlier, 0.25 ms a frame)
-        const int64_t until = std::max(h.until, present_pace_rule::not_before(t_last, j.period, early + 250000));
+        // (mode 4: the slot was given at the hand-over and the wake is to the slot itself; mode 3: this thread's own line)
+        present_pace_rule::Hold h;
+        if (j.slot) h.until = j.late ? 0 : j.slot - early, h.late = j.late;
+        else h = present_pace_rule::hold(t_line, j.at, j.period, early);
+        // (mode 3: never closer than a period, less the wake's allowance and the slew's step: the line can come earlier, 0.25 ms a
+        // frame. Mode 4 keeps the phase: the frame after a late one comes sooner than a period, by the lateness)
+        const int64_t until = j.slot ? h.until : std::max(h.until, present_pace_rule::not_before(t_last, j.period, early + 250000));
         if (until > now_ns()) spin_until_ns(until);
         if (h.late) t_lates++;
         VkResult r = VK_SUCCESS;
@@ -7810,22 +7827,29 @@ void thread_main() {
             int expected = VK_SUCCESS;
             t_res.compare_exchange_strong(expected, (int)r);
         }
-        int64_t full = 0, blocked = 0, block_ns = 0;
+        int64_t full = 0, blocked = 0, block_ns = 0, kept = 0, restarts = 0;
         {
             std::lock_guard lk(t_mu);
             t_q.pop_front();
-            if (++t_n % 1200 == 0) full = t_full, blocked = t_blocked, block_ns = t_block_ns, t_full = t_blocked = t_block_ns = 0;
+            if (++t_n % 1200 == 0) {
+                full = t_full, blocked = t_blocked, block_ns = t_block_ns, t_full = t_blocked = t_block_ns = 0;
+                kept = s_kept, restarts = s_restarts, s_kept = s_restarts = 0;
+            }
         }
         t_cv.notify_all();
         if (t_n % 1200 == 0) {
-            logf("vk: present pacer (HL_PRESENT_PACE=3) over 1200 presents: the wait from ready to present %.2f ms on average, p90 under "
+            logf("vk: present pacer (HL_PRESENT_PACE=%d) over 1200 presents: the wait from ready to present %.2f ms on average, p90 under "
                  "%.2f ms; %lld late (the frame after its point: the game too slow); %lld hand-overs found a frame waiting, %lld found "
                  "the queue full (%.1f ms waiting for room), 0 dropped; the wake after its point %.0f us on average, p99 under %lld us, "
                  "the longest %.0f us; the line moved earlier by %.1f ms; the shortest interval %.2f ms",
-                 t_hold_sum / 1e6 / 1200, pct(t_hold_hist, 81, 1200, 90, 250) / 1000.0, (long long)t_lates, (long long)full,
+                 mode(), t_hold_sum / 1e6 / 1200, pct(t_hold_hist, 81, 1200, 90, 250) / 1000.0, (long long)t_lates, (long long)full,
                  (long long)blocked, block_ns / 1e6, t_wakes ? t_wake_sum / 1e3 / t_wakes : 0.0,
                  (long long)pct(t_wake_hist, 101, t_wakes, 99, 10), t_wake_max / 1e3, t_slewed / 1e6,
                  t_shortest == INT64_MAX ? 0.0 : t_shortest / 1e6);
+            if (mode() == 4)
+                logf("vk: present pacer's slot line: of the late frames %lld kept the line's phase (late by less than a period) and "
+                     "%lld started it again; the game's time step follows the slots: %.3f ms now",
+                     (long long)kept, (long long)restarts, s_step_ns.load(std::memory_order_relaxed) / 1e6);
             t_lates = t_hold_sum = t_wake_sum = t_wake_max = t_wakes = t_slewed = 0, t_shortest = INT64_MAX;
             for (int64_t& v : t_hold_hist) v = 0;
             for (int64_t& v : t_wake_hist) v = 0;
@@ -7836,11 +7860,12 @@ void thread_main() {
 /// (do_present, mode 3) whether this present goes to the pacer thread now; once it does not, the thread is waited for to be empty
 bool pace_thread_wanted() {
     using namespace pace;
-    if (mode() != 3) return false;
+    if (mode() < 3) return false;
     if (period_now()) return true;
     std::unique_lock lk(t_mu);   // (the pace stops (a menu row, frame generation): what the thread holds goes out first, in order)
     t_cv.wait(lk, [] { return t_q.empty(); });
     t_line = {}, t_last = 0, t_ring_n = 0;
+    s_line = {}, s_step = {}, s_period = 0, s_n = 0, s_step_ns.store(0, std::memory_order_relaxed);   // (the host: its own pacing and step again)
     return false;
 }
 /// (do_present, mode 3) the image to the pacer thread; an earlier paced present's result back (VK_SUCCESS when none failed)
@@ -7855,15 +7880,40 @@ VkResult pace_thread_push(VkSwapchainKHR sc, uint32_t index) {
             t_cv.wait(lk, [] { return !present_pace_rule::must_wait_for_room((int)t_q.size()); });
             t_blocked++, t_block_ns += now_ns() - t0;
         }
-        t_q.push_back({sc, index, now_ns(), period_now()});
+        const int64_t now = now_ns(), period = period_now();
+        PJob j{sc, index, now, period, 0, false};
+        if (mode() == 4 && period) {   // (the slot line: the frame's slot now, at the hand-over)
+            const present_pace_rule::Slot s = present_pace_rule::slot(s_line, now, period);
+            j.slot = s.at, j.late = s.late;
+            if (s.late) (s.restarted ? s_restarts : s_kept)++;
+            s_slots[s_n++ & 15] = s.at, s_period = period;
+            s_step_ns.store((int)std::min<int64_t>(present_pace_rule::step(s_step, s.at, 250000000), INT32_MAX), std::memory_order_relaxed);
+        }
+        t_q.push_back(j);
     }
     t_cv.notify_all();
     return (VkResult)t_res.exchange(VK_SUCCESS);
 }
+/// (mode 4, the host's window acquire: HL_OPT_PACE_FREE_NS) how long the game waits before its next frame: its window texture is
+/// free one period after the slot of the frame `back` hand-overs ago (as many as the window has textures). -1: the slot line is
+/// not pacing (the host's own wait holds)
+int pace_free_ns(int back) {
+    using namespace pace;
+    if (mode() != 4 || !period_now()) return -1;
+    std::lock_guard lk(t_mu);
+    if (!s_period) return -1;   // (no frame handed over on the line yet)
+    const int64_t slot_back = s_n >= (uint64_t)back ? s_slots[(s_n - (uint64_t)back) & 15] : 0;
+    return (int)std::min<int64_t>(present_pace_rule::free_wait(slot_back, now_ns(), s_period), 250000000);
+}
+/// (mode 4, the host's time step: HL_OPT_PACE_STEP_NS) the mean of the last intervals between the frames' show times, ns; 0: none
+int pace_step_ns() {
+    using namespace pace;
+    return mode() == 4 ? s_step_ns.load(std::memory_order_relaxed) : 0;
+}
 /// (mode 3) before the swapchain is made again or the image acquired: nothing of the old one left in the pacer thread
 void pace_thread_drain() {
     using namespace pace;
-    if (mode() != 3) return;
+    if (mode() < 3) return;
     std::unique_lock lk(t_mu);
     t_cv.wait(lk, [] { return t_q.empty(); });
 }
@@ -10632,6 +10682,8 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HL_OPT_HUD_LAYOUT) return opts.hud_layout;
         if (id == HL_OPT_VSYNC_MODE) return opts.vsync_mode;
         if (id == HL_OPT_FIRST_PERSON) return opts.first_person != 0;   // (host/hos_main.c, host/nn_hid.c)
+        if (id == HL_OPT_PACE_STEP_NS) return pace_step_ns();   // (host/nn_vi.c realtime_step: HL_PRESENT_PACE=4)
+        if (id >= HL_OPT_PACE_FREE_NS && id < HL_OPT_PACE_FREE_NS + 4) return pace_free_ns(id - HL_OPT_PACE_FREE_NS + 1);   // (host/nn_vi.c, the window acquire)
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !temporal_full_scale() : id == 3 ? (temporal_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y : id == HOS_OPT_GYRO_DEADZONE ? opts.gyro_deadzone :
                id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H || id == HOS_OPT_DLSS_JITTER_PHASES ? jitter_option(id) :

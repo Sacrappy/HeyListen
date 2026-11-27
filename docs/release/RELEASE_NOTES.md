@@ -38,7 +38,8 @@ stutters more than usual. The second start is smooth again.
   the Volumetric fog.
 * **Render resolution 33%** with the game's own upscaler, and **Off** for the game's own resolution (shown as Auto).
 * **Base frame rate limit before frame generation**, as a row of its own.
-* **F10 overlay**: the full overlay shows the 1% and 0.1% lows.
+* **F10 overlay**: the full overlay shows the 1% and 0.1% lows, read as the usual tools read them (the frame rate of the 99th and
+  99.9th percentile frame over the last 30 seconds), so one long frame no longer drags the line down for seconds.
 * **HDR10 static metadata** (McNartin): on an HDR screen the game now tells the screen the picture's peak and black level.
 * **Button prompts follow a change while you play**: with *Auto*, the prompts follow the device that gave input last.
   When the `prompts` folder is missing, the game's log, the row's help and the Builder now say so.
@@ -129,8 +130,9 @@ stutters more than usual. The second start is smooth again.
 * **On an integrated GPU, the first start after installing can freeze about 20 seconds** when play begins. Later starts do
   not.
 * **A freeze of 1 to 2 seconds at the start of play**, and shorter ones when an area loads.
-* **At a frame rate limit the frame times are slightly uneven**, so the 1% low reads lower than the game feels. A fix is
-  in this build, but it is off by default and not validated yet: `HL_PRESENT_PACE=3` in `hookshot_env.txt`.
+* **At a frame rate limit the frame times are slightly uneven.** Two fixes are in this build, both off by default and not
+  validated yet: `HL_PRESENT_PACE=4` in `hookshot_env.txt` (frames shown on an even line, the game's time following
+  it) or `HL_PRESENT_PACE=3` (the earlier attempt).
 * **A rare one-frame white floor in Gerudo Fortress**, and **a rare single black frame of the 3D picture** with the HUD
   intact.
 * **GTX 1060 3 GB class cards can lose the device entering Kokiri Forest**: try Texture resolution Low and
