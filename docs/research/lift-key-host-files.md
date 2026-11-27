@@ -47,3 +47,11 @@ folder.
 - Not needed: hashing the whole host/hl_*.c text (it would re-lift for every host edit) or host/*.c beyond the HLE names
   already in the key (nothing else of host/ is read by the lift).
 - Risk: low; the failure mode of a wrong key is one extra lift (minutes), never a wrong build.
+
+## Done (27 Nov, OLD1)
+
+`lift_key()` now hashes `lift_host_addresses()`: the sorted guest addresses of the four hl_gates tables (addresses only).
+Who lifts again: the commit edits nx2/make_game.py, which the key already covers, so every builder lifts once at its first
+build or update with it (as for any nx2 change; this release's nx2/nativefp.py change does the same). After that, a lift is
+redone only when host/hl_*.c adds or drops a gated or hooked address, which is exactly when the lifted text must change; an
+edit of a hook's C or of its recorded hash keeps the lift skipped. tests/test_lift_key_hosts.py checks both.

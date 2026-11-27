@@ -1210,7 +1210,19 @@ def lift_key(exefs, work, env):
                 h.update(hashlib.sha1(src.read(), usedforsecurity=False).digest())
     lift_env = dict(env, **{k: v for k, v in os.environ.items() if k.startswith(("A64_", "OOT_", "RX_"))})
     h.update(repr(sorted(lift_env.items())).encode())
+    h.update(lift_host_addresses().encode())
     return h.hexdigest()
+
+
+def lift_host_addresses():
+    """(OLD1) the guest addresses host/hl_*.c gates or hooks, which the lift itself reads (guest_locals.mentioned_addresses: those
+    functions keep the context, so their lifted text differs): sorted, one text. Only the addresses: an edit of a hook's C or
+    hash that adds or drops none keeps the lift skipped (docs/research/lift-key-host-files.md)"""
+    import hl_gates
+    found = set()
+    for table in (hl_gates.wanted(), hl_gates.wanted_steps(), hl_gates.wanted_movies(), hl_gates.wanted_lifts()):
+        found |= {int(a, 16) for a in table}
+    return "host addresses " + " ".join("%x" % a for a in sorted(found))
 
 
 def gen_print(gen):
