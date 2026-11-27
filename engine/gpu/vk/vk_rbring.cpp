@@ -5,6 +5,7 @@
 // of it applies to guest memory the newest unapplied entry that is `lag` frames old, without a wait for the GPU (rb_ring.h has the rules).
 // HL_RB_LAG_CHECK=1: the old path runs unchanged and what the ring would have applied is compared with what the game read.
 #include <algorithm>
+#include <thread>   // (FLICK1: the meter pace's sleep)
 #include <chrono>
 #include <cstdio>
 #include <map>
@@ -348,10 +349,69 @@ RbApplyNote rbring_take_note() {
     return n;
 }
 
+// ---- (FLICK1) the exposure meter's reads before the frame's present ----
+// The game's module job reads the meter's three blocks (0x1040) once a frame and turns them into the frame's exposure and light
+// parameters. With the order thread the game's present is not held by the replay, and when that job runs late (a hitch, a wait of
+// its own) the present is handed over while the job is still reading: the next frame is shown with the whole 3D picture brighter
+// (the HUD is not), the one-frame flash. Proven with HL_METER_DELAY_EVERY=60 HL_METER_DELAY_MS=12 (the frame's first meter read held
+// 12 ms every 60th frame, Kakariko standing still, 180 s): 131 delays, 132 strict flashes, each one frame after a delay; with this
+// wait: 132 delays, 1 flash (before it had learned the frame's reads). Here the hand-over waits, 20 ms at most, for as many meter
+// reads in the frame as the frames before had made by their own hand-over (the least of the last 16): a frame whose job is on time
+// waits for nothing (one wait in about 3600 presents, about 2 ms, in Kakariko). With the order thread only (without it the replay
+// holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).
+std::atomic<int64_t> mp_c{-1}, mp_n{0};
+void meter_read_note(int64_t c) {
+    int64_t cur = mp_c.load(std::memory_order_acquire);
+    if (c > cur) {
+        if (mp_c.compare_exchange_strong(cur, c, std::memory_order_acq_rel)) {
+            mp_n.store(1, std::memory_order_release);
+            return;
+        }
+    }
+    if (mp_c.load(std::memory_order_acquire) == c) mp_n.fetch_add(1, std::memory_order_acq_rel);
+}
+void rbring_meter_pace(int64_t clock) {
+    static const int ms = getenv("RX_VK_ORDER_METER_PACE_MS") ? atoi(getenv("RX_VK_ORDER_METER_PACE_MS")) : 20;
+    if (ms <= 0) return;
+    static int64_t hist[16], hi = 0, waits = 0, timeouts = 0, wait_ns = 0, ticks = 0;
+    auto seen = [&] { return mp_c.load(std::memory_order_acquire) == clock ? mp_n.load(std::memory_order_acquire) : 0; };
+    int64_t expect = INT64_MAX;
+    for (int i = 0; i < 16; i++) expect = std::min(expect, hist[i]);
+    if (hi < 16) expect = 0;   // (learning)
+    int64_t n = seen();
+    if (expect > 0 && n < expect) {
+        const auto t0 = std::chrono::steady_clock::now();
+        waits++;
+        while ((n = seen()) < expect) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) {
+                timeouts++;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+    hist[hi++ % 16] = n;
+    if (++ticks % 3600 == 0) {
+        logf("vk: meter pace (FLICK1, 3600 presents): %lld waited for the frame's meter reads (%.3f ms each), %lld gave up after %d ms; reads by a "
+             "present now %lld", (long long)waits, waits ? wait_ns / 1e6 / waits : 0.0, (long long)timeouts, ms, (long long)expect);
+        waits = timeouts = wait_ns = 0;
+    }
+}
 /// The read of a served range: the newest unapplied entry `lag` frames old into guest memory
 void rbring_apply(uint64_t gpu, uint64_t size) {
     const uint64_t guest = host->gpu_guest(gpu);
     const int64_t c = rb_frame_now();
+    if (size == 0x1040) {   // (FLICK1, a test: HL_METER_DELAY_EVERY=<frames> HL_METER_DELAY_MS=<ms> (10): the frame's first meter read held that long, every n-th frame)
+        static const int64_t every = getenv("HL_METER_DELAY_EVERY") ? atoll(getenv("HL_METER_DELAY_EVERY")) : 0;
+        static const int dms = getenv("HL_METER_DELAY_MS") ? atoi(getenv("HL_METER_DELAY_MS")) : 10;
+        static std::atomic<int64_t> last{-1};
+        if (every > 0 && c % every == 0 && last.exchange(c) != c) {
+            logf("vk: meter delay at f %lld (present %lld): %d ms", (long long)c, (long long)presents_now, dms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(dms));
+        }
+    }
+    if (size == 0x1040) meter_read_note(c);   // (FLICK1)
     tl_apply_note = RbApplyNote{};
     tl_apply_note.c = c;
     rb_wait_staged(c, config().lag);   // (frames in flight: the replay stages a frame's entries before it shows it)

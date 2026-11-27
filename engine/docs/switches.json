@@ -2,7 +2,7 @@
  "schema": 1,
  "generated_by": "engine/scripts/list_switches.py",
  "scope": "C, C++ and headers under engine/ (engine/tests and vendored trees other than a64-kit excluded) and the Python the builder, the lifter and the scripts run: getenv, std::getenv, _wgetenv, the code's own env helpers and table-driven reads, and os.environ.",
- "count": 1557,
+ "count": 1560,
  "switches": [
   {
    "name": "A64_",
@@ -2143,6 +2143,48 @@
    "use": null
   },
   {
+   "name": "HL_METER_DELAY_EVERY",
+   "area": "native",
+   "group": "Native engine",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "gpu/vk/vk_rbring.cpp",
+     "line": 406
+    }
+   ],
+   "default": "0",
+   "values": "a whole number",
+   "explanation": "(FLICK1, a test: HL_METER_DELAY_EVERY=<frames> HL_METER_DELAY_MS=<ms> (10): the frame's first meter read held that long, every n-th frame).",
+   "comment": "(FLICK1, a test: HL_METER_DELAY_EVERY=<frames> HL_METER_DELAY_MS=<ms> (10): the frame's first meter read held that long, every n-th frame).",
+   "documented_in": null,
+   "source": "comment at gpu/vk/vk_rbring.cpp",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
+   "name": "HL_METER_DELAY_MS",
+   "area": "native",
+   "group": "Native engine",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "gpu/vk/vk_rbring.cpp",
+     "line": 407
+    }
+   ],
+   "default": "10",
+   "values": "a whole number",
+   "explanation": "(FLICK1, a test: HL_METER_DELAY_EVERY=<frames> HL_METER_DELAY_MS=<ms> (10): the frame's first meter read held that long, every n-th frame).",
+   "comment": "(FLICK1, a test: HL_METER_DELAY_EVERY=<frames> HL_METER_DELAY_MS=<ms> (10): the frame's first meter read held that long, every n-th frame).",
+   "documented_in": null,
+   "source": "comment at gpu/vk/vk_rbring.cpp",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
    "name": "HL_METER_LOG",
    "area": "native",
    "group": "Native engine diagnostics",
@@ -2444,7 +2486,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 166
+     "line": 167
     }
    ],
    "default": "the engine's own value",
@@ -2465,15 +2507,15 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 25
+     "line": 26
     },
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 30
+     "line": 31
     },
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 35
+     "line": 36
     }
    ],
    "default": "off (unset)",
@@ -2494,7 +2536,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 25
+     "line": 26
     }
    ],
    "default": "unset",
@@ -2515,7 +2557,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 229
+     "line": 230
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -2536,16 +2578,16 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 41
+     "line": 42
     },
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 176
+     "line": 177
     }
    ],
    "default": "off (unset)",
    "values": "on or off (0, false, off, no and empty are off); the description names `0`",
-   "explanation": "undocumented: gpu/vk/vk_rbring.cpp:41 (in `frame_log_on()`) reads it as an on/off switch: `static const bool on = getenv(\"HL_RB_LAG_LOG\") && atoi(getenv(\"HL_RB_LAG_LOG\")) != 0;`. No comment in the source says what it changes.",
+   "explanation": "undocumented: gpu/vk/vk_rbring.cpp:42 (in `frame_log_on()`) reads it as an on/off switch: `static const bool on = getenv(\"HL_RB_LAG_LOG\") && atoi(getenv(\"HL_RB_LAG_LOG\")) != 0;`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -2561,7 +2603,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 25
+     "line": 26
     }
    ],
    "default": "unset",
@@ -2582,7 +2624,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 369
+     "line": 429
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -2687,11 +2729,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 495
+     "line": 555
     },
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 497
+     "line": 557
     }
    ],
    "default": "0",
@@ -21263,7 +21305,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 29
+     "line": 30
     },
     {
      "path": "gpu/vk/vk_replay.cpp",
@@ -26669,6 +26711,27 @@
    "use": null
   },
   {
+   "name": "RX_VK_ORDER_METER_PACE_MS",
+   "area": "renderer",
+   "group": "HDR, V-Sync and presentation",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "gpu/vk/vk_rbring.cpp",
+     "line": 374
+    }
+   ],
+   "default": "20",
+   "values": "a whole number",
+   "explanation": "With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).",
+   "comment": "With the order thread only (without it the replay holds the present). RX_VK_ORDER_METER_PACE_MS=<ms> (20; 0 off).",
+   "documented_in": null,
+   "source": "comment at gpu/vk/vk_rbring.cpp",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
    "name": "RX_VK_ORDER_PIN",
    "area": "renderer",
    "group": "Rendering and GPU",
@@ -26890,7 +26953,7 @@
     },
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 34
+     "line": 35
     },
     {
      "path": "gpu/vk/vk_replay.cpp",
@@ -27220,7 +27283,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_replay.cpp",
-     "line": 10283
+     "line": 10284
     }
    ],
    "default": "0 (unset)",
@@ -28495,7 +28558,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_internal.h",
-     "line": 783
+     "line": 785
     }
    ],
    "default": "unset",
@@ -28516,7 +28579,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_internal.h",
-     "line": 822
+     "line": 824
     }
    ],
    "default": "unset",
@@ -28918,7 +28981,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_rbring.cpp",
-     "line": 147
+     "line": 148
     }
    ],
    "default": "off (unset)",
@@ -29266,7 +29329,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_replay.cpp",
-     "line": 9934
+     "line": 9935
     },
     {
      "path": "gpu/vk/vk_shader.cpp",
@@ -29358,7 +29421,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_replay.cpp",
-     "line": 10192
+     "line": 10193
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -30435,7 +30498,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_internal.h",
-     "line": 783
+     "line": 785
     },
     {
      "path": "gpu/vk/vk_replay.cpp",

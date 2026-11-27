@@ -9841,6 +9841,7 @@ void present(const nvn_tex* t, const int crop[4]) {
     if (lag_on() && presents % 600 == 0) log_order_stats();
     memory_precopy_present();
     memory_cap_present();
+    if (order_thread_on() && rb_fif_on()) rbring_meter_pace(rb_clock.load(std::memory_order_acquire));   // (FLICK1: the frame's meter reads first)
     if (rb_fif_on()) rb_clock.fetch_add(1, std::memory_order_release);   // (FIF1: the game's frame count)
     if (order_thread_on()) return ot_present(t, crop);   // (PIPE2: a job of the order thread)
     if (present_handed_over(t, crop)) return;
