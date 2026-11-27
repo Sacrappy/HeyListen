@@ -20,8 +20,6 @@
    frames and level). */
 #include "hos.h"
 #include "hos_sdl.h"
-#include "../gpu/vk/vk_opt_ids.h"   /* (HL_OPT_MIC_PITCH_HELP) */
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,117 +102,6 @@ void hos_mic_select(int mode, const char *name, int index) {   /* (the row's cho
     sel_mode = mode, sel_index = index, sel_gen++;
     snprintf(sel_name, sizeof sel_name, "%s", name ? name : "");
     ReleaseSRWLockExclusive(&list_lock);
-}
-
-/* ---- (HeyListen) Ocarina pitch help ----
-   The Insert menu's Gameplay row (HL_OPT_MIC_PITCH_HELP, gpu/vk/vk_opt_ids.h; HOS_MIC_PITCH_HELP=1 over it): what the microphone hears becomes a
-   clean tone on the nearest of the ocarina's five notes (D4 F4 A4 B4 D5), so a voice that is a little off, or in another
-   octave, still plays them. Each 10 ms the newest 43 ms (taken to 12 kHz) is looked at for its pitch (YIN: de Cheveigne
-   and Kawahara, 2002), 70 to 1200 Hz; a quiet one (below about -34 dBFS) or one with no clear pitch is silence. The pitch
-   goes on the nearest of D, F, A and B in any octave, so a low voice and a whistle both play them; D, the only one of
-   the five twice, is the high D when it is above what the singer sang on average (followed over about a second, kept
-   from song to song), the low one otherwise. A note sounds once it was the nearest 3 looks running
-   (30 ms), and stops 50 ms after the voice does; the tone fades in and out over 5 ms. 16-bit mono only (the game's
-   format); anything else, and Off, pass as they are. HOS_MIC_LOG=1 logs each note it starts. */
-int rx_option(int id, int otherwise);
-#define TUNE_WIN 2048   /* (the samples looked at: 43 ms at 48 kHz) */
-#define TUNE_DS 4       /* (looked at at a quarter of the rate: 12 kHz) */
-typedef struct {
-    float win[TUNE_WIN];   /* the newest input, -1..1, a ring from at */
-    int at, fill, since;   /* (the next sample's place, how many there are, samples since the last look) */
-    double center;         /* the singer's average pitch (MIDI note), 0: none yet */
-    int note, cand, cand_n, quiet_n;   /* the note sounding (MIDI, 0 none), the nearest one lately and its looks, quiet looks */
-    double hz, phase, amp; /* the tone: its pitch, its phase in cycles, its level 0..1 */
-} Tune;
-static Tune tunes[MAX_STREAMS];
-static int help_env = -1;
-static int pitch_help(void) {
-    if (help_env < 0) help_env = getenv("HOS_MIC_PITCH_HELP") ? atoi(getenv("HOS_MIC_PITCH_HELP")) != 0 : 2;
-    return help_env != 2 ? help_env : rx_option(HL_OPT_MIC_PITCH_HELP, 0) != 0;
-}
-/* the pitch of the newest TUNE_WIN samples in Hz, 0 when quiet or unclear (YIN's cumulative mean normalised difference) */
-static double tune_pitch(const Tune *t, int rate) {
-    enum { N = TUNE_WIN / TUNE_DS };
-    float x[N];
-    double energy = 0;
-    for (int i = 0; i < N; i++) {
-        float v = 0;
-        for (int k = 0; k < TUNE_DS; k++) v += t->win[(t->at + i * TUNE_DS + k) % TUNE_WIN];
-        x[i] = v / TUNE_DS, energy += (double)x[i] * x[i];
-    }
-    if (sqrt(energy / N) < 0.02) return 0;   /* (quiet) */
-    const double srate = (double)rate / TUNE_DS;
-    const int lo = (int)(srate / 1200), hi = (int)(srate / 70), len = N - hi;
-    if (lo < 2 || len < hi) return 0;
-    double d[N], sum = 0;
-    d[0] = 1;
-    for (int tau = 1; tau <= hi; tau++) {
-        double s = 0;
-        for (int j = 0; j < len; j++) {
-            const double e = (double)x[j] - x[j + tau];
-            s += e * e;
-        }
-        sum += s;
-        d[tau] = sum > 0 ? s * tau / sum : 1;
-    }
-    int best = 0;
-    for (int tau = lo; tau < hi; tau++)
-        if (d[tau] < 0.25) {   /* (the first dip under the threshold, to its bottom) */
-            while (tau + 1 < hi && d[tau + 1] < d[tau]) tau++;
-            best = tau;
-            break;
-        }
-    if (!best) return 0;
-    const double a = d[best - 1], b = d[best], c = d[best + 1], den = a - 2 * b + c;   /* (between samples: a parabola) */
-    const double at = best + (den > 0 ? 0.5 * (a - c) / den : 0);
-    return srate / at;
-}
-/* one look: the note to sound from the newest pitch */
-static void tune_look(Tune *t, int rate) {
-    static const int notes[5] = {62, 65, 69, 71, 74};   /* D4 F4 A4 B4 D5 */
-    const double hz = tune_pitch(t, rate);
-    if (hz <= 0) {
-        if (++t->quiet_n >= 5) t->note = 0, t->cand_n = 0;
-        return;
-    }
-    t->quiet_n = 0;
-    const double m = 69 + 12 * log2(hz / 440), pc = m - 12 * floor(m / 12);   /* (its note in any octave: 0 C .. 12) */
-    static const double names[5] = {2, 5, 9, 11, 14};   /* D F A B, and D above (the wrap) */
-    int k = 0;
-    for (int i = 1; i < 5; i++)
-        if (fabs(pc - names[i]) < fabs(pc - names[k])) k = i;
-    if (t->center <= 0) t->center = m;
-    /* (D is the only name twice: high D when above what this singer sings on average) */
-    const int pick = k == 1 ? notes[1] : k == 2 ? notes[2] : k == 3 ? notes[3] : m > t->center + 1 ? notes[4] : notes[0];
-    t->center += 0.01 * (m - t->center);   /* (the average, followed over about a second) */
-    t->cand_n = pick == t->cand ? t->cand_n + 1 : 1, t->cand = pick;
-    if (t->cand_n >= 3 && t->note != pick) {
-        t->note = pick, t->hz = 440 * pow(2, (pick - 69) / 12.0);
-        if (log_on < 0) log_on = getenv("HOS_MIC_LOG") != NULL;
-        if (log_on) hos_log("audio in: pitch help: %.0f Hz sung -> note %d (%.1f Hz)", hz, pick, t->hz);
-    }
-}
-/* the microphone's newest samples, in place: a tone on the nearest note, or silence */
-static void tune(const Source *src, uint8_t *buf, int bytes) {
-    Tune *t = &tunes[src - sources];
-    if (src->format != FMT_PCM16 || src->channels != 1 || !pitch_help()) {
-        if (t->fill) memset(t, 0, sizeof *t);   /* (Off: the next On starts afresh) */
-        return;
-    }
-    int16_t *p = (int16_t *)buf;
-    const int n = bytes / 2, hop = src->rate / 100;
-    for (int i = 0; i < n; i++) {
-        t->win[t->at] = p[i] / 32768.0f, t->at = (t->at + 1) % TUNE_WIN;
-        if (t->fill < TUNE_WIN) t->fill++;
-        if (++t->since >= hop && t->fill == TUNE_WIN) t->since = 0, tune_look(t, src->rate);
-        const double want = t->note ? 0.35 : 0, step = 1.0 / (src->rate / 200);   /* (5 ms fades) */
-        t->amp = t->amp < want ? fmin(want, t->amp + step) : fmax(want, t->amp - step);
-        if (t->amp > 0) {
-            t->phase += t->hz / src->rate;
-            t->phase -= floor(t->phase);
-        }
-        p[i] = (int16_t)lrint(32767 * t->amp * sin(6.283185307179586 * t->phase));
-    }
 }
 
 /* ---- the sources: one microphone (or silence) for the started streams of one format ---- */
@@ -374,7 +261,6 @@ static void pump(Source *src) {
         while (avail > 0) {
             const int got = hos_sdl_mic_read(src->mic, buf, avail < chunk ? avail - avail % src->frame_bytes : chunk);
             if (got <= 0) break;
-            tune(src, buf, got);   /* (HeyListen: Ocarina pitch help, when on) */
             push_all(src, buf, got), heard = 1;
             avail -= got;
         }

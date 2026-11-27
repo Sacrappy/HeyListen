@@ -98,7 +98,6 @@ struct Options {
     int debug_tools = 0;   // (hookshot) the Debug tab's tools (#785: flight, free camera, teleport, inventory): 0 off; HOS_OOT_CHEATS=1 also turns them on
     int out_dev = 0;      // (heylisten) the Output device row: 0 the system's default, 1.. a device as host->out_name lists it (host/nn_audio.c), saved as output_device= (and its id, output_device_id=)
     int mic = 1;          // (hookshot) the ocarina's microphone: 0 Off, 1 the system's default, 2.. a device as host->mic_name lists it (host/nn_audio_in.c)
-    int pitch_help = 0;   // (HeyListen) Ocarina pitch help: 1 the microphone's pitch played as the nearest ocarina note (host/nn_audio_in.c)
 };
 extern Options opts;
 /// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more
