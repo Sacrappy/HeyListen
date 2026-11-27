@@ -28,8 +28,6 @@ stutters more than usual. The second start is smooth again.
   body and what he holds come into view. It turns with the mouse one to one, keeps Navi out of the picture and eases the
   eye out while Link is in the air.
 * **Volume** (Chad-; Gameplay tab): the game's whole sound from 0% to 100%, heard at once.
-* **Ocarina pitch help** (timetohitthedopeho; Gameplay tab): a note you sing into the microphone is played as the nearest
-  ocarina note.
 * **Sprint with L3** (Controls tab): Off, Hold or Toggle.
 * **Texture resolution: High / Low** (Graphics tab): Low leaves out the top level of the biggest textures, for cards with
   little video memory. It applies after a restart. A card with 3 to 4 GB should use Low.
@@ -159,7 +157,7 @@ stutters more than usual. The second start is smooth again.
 
 Every port and its author is in the [README](https://github.com/Sacrappy/HeyListen#credits). Thanks in this release to
 ToxicToucan (First person), McNartin (HDR10 metadata), Xarishark (RecompLauncher), Chad- (Volume), jarynclouatre,
-timetohitthedopeho (Ocarina pitch help), oscarlosu-lab, Robin, mooki, Erfboom, juliotec, Jeff Aigner, pixl27,
+timetohitthedopeho, oscarlosu-lab, Robin, mooki, Erfboom, juliotec, Jeff Aigner, pixl27,
 CraftyCorvid, Mooseca, HumanBean, SadTransGirl, NotRexed, hckrman101, klimovich008, Mesquita, Jer9, GrimVisage,
 futondestroyer, Jordan, Guep, Veix, tiktiki, twisted89, nachochee3e, d4nkn3ss, Dylan Martin, Tony Malins, Saul Ojeda,
 Itallo Ramon, Zelda Ootr, Issai, Arkex-ai, Ghost, Mihawk, i-love-computers-dude, Rekarina, azy2, Dewey Harry D. bartolo,

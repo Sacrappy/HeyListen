@@ -2,7 +2,7 @@
  "schema": 1,
  "generated_by": "engine/scripts/list_switches.py",
  "scope": "C, C++ and headers under engine/ (engine/tests and vendored trees other than a64-kit excluded) and the Python the builder, the lifter and the scripts run: getenv, std::getenv, _wgetenv, the code's own env helpers and table-driven reads, and os.environ.",
- "count": 1589,
+ "count": 1588,
  "switches": [
   {
    "name": "A64_",
@@ -1634,11 +1634,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2721
+     "line": 2718
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2725
+     "line": 2722
     }
    ],
    "default": "off (unset)",
@@ -1659,7 +1659,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2717
+     "line": 2714
     }
    ],
    "default": "0 (unset)",
@@ -1680,7 +1680,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2706
+     "line": 2703
     }
    ],
    "default": "unset",
@@ -5654,7 +5654,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2901
+     "line": 2898
     }
    ],
    "default": "0 (unset)",
@@ -5801,11 +5801,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2910
+     "line": 2907
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2918
+     "line": 2915
     },
     {
      "path": "host/nn_vi.c",
@@ -5880,11 +5880,11 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2910
+     "line": 2907
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2918
+     "line": 2915
     },
     {
      "path": "host/nn_vi.c",
@@ -6207,7 +6207,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 3006
+     "line": 3003
     },
     {
      "path": "host/display.c",
@@ -7378,19 +7378,15 @@
    "files": [
     {
      "path": "host/nn_audio_in.c",
-     "line": 193
+     "line": 332
     },
     {
      "path": "host/nn_audio_in.c",
-     "line": 446
+     "line": 370
     },
     {
      "path": "host/nn_audio_in.c",
-     "line": 484
-    },
-    {
-     "path": "host/nn_audio_in.c",
-     "line": 485
+     "line": 371
     }
    ],
    "default": "off (unset)",
@@ -7411,7 +7407,7 @@
    "files": [
     {
      "path": "host/nn_audio_in.c",
-     "line": 475
+     "line": 361
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -7420,27 +7416,6 @@
    "comment": "At 60 nothing changes. HOS_MIC_PACE=0: as before above 60 too. HOS_MIC_LOG=2: also each of the game's calls for the first 400 after a start (when, what it asked, what it got).",
    "documented_in": null,
    "source": "comment at host/nn_audio_in.c",
-   "documented": true,
-   "set_via": "In `hookshot_env.txt`, or in the environment.",
-   "use": null
-  },
-  {
-   "name": "HOS_MIC_PITCH_HELP",
-   "area": "audio",
-   "group": "Mixing and effects",
-   "audience": "diagnostic",
-   "files": [
-    {
-     "path": "host/nn_audio_in.c",
-     "line": 132
-    }
-   ],
-   "default": "2",
-   "values": "a whole number (`0` in the description)",
-   "explanation": "**Ocarina pitch help** (Off by default) turns what the microphone hears into a clean ocarina note: the nearest of the five, in any octave, so a song sung a little off key still plays. Silence or an unclear pitch gives silence. `HOS_MIC_PITCH_HELP=0` or `1` overrides the row for one run.",
-   "comment": "(HeyListen) Ocarina pitch help ---- The Insert menu's Gameplay row (HL_OPT_MIC_PITCH_HELP, gpu/vk/vk_opt_ids.h; HOS_MIC_PITCH_HELP=1 over it): what the microphone hears becomes a clean tone on the nearest of the ocarina's five notes (D4 F4 A4 B4 D5), so a voice that is a little off, or in another octave, still plays them. Each 10 ms the newest 43 ms (taken to 12 kHz) is looked at for its pitch (YIN: de Cheveigne and Kawahara, 2002), 70 to 1200 Hz; a quiet one (below about -34 dBFS) or one with no clear pitch is silence.",
-   "documented_in": "readme.md",
-   "source": "readme.md",
    "documented": true,
    "set_via": "In `hookshot_env.txt`, or in the environment.",
    "use": null
@@ -8476,7 +8451,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2794
+     "line": 2791
     }
    ],
    "default": "unset",
@@ -8497,7 +8472,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2797
+     "line": 2794
     },
     {
      "path": "host/hos_main.c",
@@ -8606,7 +8581,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2902
+     "line": 2899
     },
     {
      "path": "host/nn_applet.c",
@@ -9155,7 +9130,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2900
+     "line": 2897
     }
    ],
    "default": "0 (unset)",
@@ -19657,7 +19632,7 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2893
+     "line": 2890
     }
    ],
    "default": "unset",
@@ -21284,7 +21259,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2663
+     "line": 2660
     }
    ],
    "default": "unset",
@@ -21661,7 +21636,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2887
+     "line": 2884
     }
    ],
    "default": "0 (unset)",
@@ -22566,7 +22541,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2889
+     "line": 2886
     }
    ],
    "default": "unset",
@@ -24590,7 +24565,7 @@
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2881
+     "line": 2878
     }
    ],
    "default": "2",
@@ -24783,7 +24758,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 3212
+     "line": 3209
     }
    ],
    "default": "unset",
@@ -27472,7 +27447,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2888
+     "line": 2885
     }
    ],
    "default": "0 (unset)",
@@ -27744,7 +27719,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_replay.cpp",
-     "line": 10683
+     "line": 10682
     }
    ],
    "default": "0 (unset)",
@@ -29987,7 +29962,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2895
+     "line": 2892
     }
    ],
    "default": "0 (unset)",
@@ -32453,11 +32428,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2769
+     "line": 2766
     },
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2894
+     "line": 2891
     }
    ],
    "default": "unset",
@@ -32499,7 +32474,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2768
+     "line": 2765
     }
    ],
    "default": "off (unset)",
@@ -33005,7 +32980,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 3184
+     "line": 3181
     }
    ],
    "default": "unset",
@@ -33173,7 +33148,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_menu.cpp",
-     "line": 2897
+     "line": 2894
     }
    ],
    "default": "0 (unset)",
