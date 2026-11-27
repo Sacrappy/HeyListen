@@ -52,6 +52,8 @@ std::atomic<std::size_t> pcache_saved_size{0};
 std::atomic<bool> pcache_released{false};   // (FOOT2, RX_VK_PCACHE_RELEASE: the cache let go after the precompile: nothing is saved)
 // (FOOT3: what the release leaves is saved to its file of its own instead)
 void pcache_play_save(bool) {}
+// (FOOT3: the release's swap is held off while a save runs; no release here)
+struct PcacheSwapHold { PcacheSwapHold() {} };
 // The size the driver gives for the cache's data; a case grows it for pipelines taken in between saves.
 std::atomic<std::size_t> cache_size{64};
 enum Fault { NONE, VECTOR_ALLOC, VECTOR_LENGTH, TMP_ALLOC, QUERY_FAIL, EMPTY, COPY_FAIL, SHORT_WRITE, BLOCK_COPY, REPLACE_FAIL };

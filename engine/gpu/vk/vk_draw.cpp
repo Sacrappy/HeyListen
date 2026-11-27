@@ -912,6 +912,34 @@ bool pcache_release_wanted() {
     static const bool v = getenv("RX_VK_PCACHE_RELEASE") && atoi(getenv("RX_VK_PCACHE_RELEASE")) != 0;
     return v;
 }
+// (FOOT3, 27 Nov) The release destroys the cache it replaces. It ran on the precompile's last worker, which the start does not wait
+// for (the game goes on once every pipeline is done, before that worker calls precompile_finished), and nothing kept another thread
+// from being inside the driver with the old handle at that moment: a pipeline built in play, a compute program's first dispatch, or a
+// save's fetch of the cache's data (outside Intel there is no fetch lock). A save that straddled the swap could also fetch the size
+// from one cache and the data from the other and write the small one over mkw_vk_pipelines.bin. So, while the release is still to
+// come, every use of the handle holds this shared and reads pcache under it (the callers' copy may be the old one), and the release
+// takes it exclusive: it waits for the builds and saves under way, and those after it see the new cache. Once released nothing more
+// is swapped and no lock is taken. Nested holds on one thread count, not lock again (a waiting writer would stall a second shared lock)
+std::shared_mutex pcache_swap_mu;
+thread_local int pcache_swap_depth = 0;
+struct PcacheSwapHold {
+    bool on = false, nested = false;
+    PcacheSwapHold() {
+        if (pcache_swap_depth > 0) {
+            nested = true, pcache_swap_depth++;
+            return;
+        }
+        if (!pcache_release_wanted() || pcache_released.load(std::memory_order_acquire)) return;
+        pcache_swap_mu.lock_shared();
+        on = true, pcache_swap_depth = 1;
+    }
+    ~PcacheSwapHold() {
+        if (nested) pcache_swap_depth--;
+        else if (on) pcache_swap_depth = 0, pcache_swap_mu.unlock_shared();
+    }
+    PcacheSwapHold(const PcacheSwapHold&) = delete;
+    PcacheSwapHold& operator=(const PcacheSwapHold&) = delete;
+};
 /// A pipeline cache file's data, or empty when there is none, it is another device's or driver's, or it is not a pipeline cache
 std::vector<uint8_t> pcache_file_data(const std::string& path) {
     std::vector<uint8_t> data;
@@ -1237,10 +1265,14 @@ VkResult note_out_of_memory(VkResult r) {
     return r;
 }
 VkResult guarded_graphics_held(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+    const PcacheSwapHold swap;   // (FOOT3: the release's swap waits for this build; the only cache passed here is pcache, read now)
+    if (cache) cache = pcache;
     PcacheUse use(cache);
     return note_out_of_memory(guarded_graphics(cache, ci, pl));
 }
 VkResult guarded_compute_held(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+    const PcacheSwapHold swap;
+    if (cache) cache = pcache;
     PcacheUse use(cache);
     return note_out_of_memory(guarded_compute(cache, ci, pl));
 }
@@ -10896,15 +10928,20 @@ void precompile_finished(Pre* pre) {
     // session's play finds those pipelines instead of compiling them; the file the release let go of stays as it was).
     static const bool release = pcache_release_wanted();
     if (release && !pre->background && pcache && !pcache_released.load()) {
+        const auto w0 = std::chrono::steady_clock::now();
+        std::unique_lock swap(pcache_swap_mu);   // (FOOT3: no build or save is inside the driver with the old handle now)
+        const double waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
         VkPipelineCache old = pcache;
         VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         ci.initialDataSize = pcache_play_data.size();   // (FOOT3: what play met last session, a few MB: not the file's 2 GB)
         ci.pInitialData = pcache_play_data.empty() ? nullptr : pcache_play_data.data();
         VkPipelineCache fresh = VK_NULL_HANDLE;
         if (vkCreatePipelineCache(dev.device, &ci, nullptr, &fresh) == VK_SUCCESS) {
-            pcache_released = true;
             pcache = fresh;
+            pcache_released.store(true, std::memory_order_release);
+            swap.unlock();   // (no one holds the old handle now: the ones after the swap read the new one)
             vkDestroyPipelineCache(dev.device, old, nullptr);
+            logf("vk: pipeline cache release: %.1f ms waited for the builds and saves using the old cache", waited_ms);
             const size_t play_kb = pcache_play_data.size() >> 10;   // (before the buffer goes: the log says what was taken in)
             pcache_play_data.clear();   // (the driver has its own copy now: a few MB of the heap given back)
             std::vector<uint8_t>().swap(pcache_play_data);
@@ -12489,6 +12526,9 @@ void pipeline_cache_save(bool force) {
     }
     auto save = [force, between, built] {
         struct Done { ~Done() { busy = false; } } done;
+        // (FOOT3: the release does not swap the cache under this save; one that comes after it has nothing to write to the main file)
+        const PcacheSwapHold swap;
+        if (pcache_released.load(std::memory_order_acquire)) return;
 #ifdef _WIN32
         // (HeyListen, S8: a save in play runs in Windows' background mode, on its own thread: its disk writes at low I/O
         // priority and the pages it touches, the file's among them, at low memory priority, so that RAM gives them up before

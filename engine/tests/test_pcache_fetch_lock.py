@@ -127,6 +127,17 @@ def main():
     assert "guarded_compute(pcache," not in draw, "a build with pcache that does not hold it from a fetch"
     # (the masked clear's pipeline too, through guarded_graphics_held since the Intel gate: a raw create with pcache is none)
     assert "guarded_graphics(pcache," not in draw and "vkCreateGraphicsPipelines(dev.device, pcache," not in draw
+    # (FOOT3, 27 Nov: RX_VK_PCACHE_RELEASE destroys the cache it replaces: the swap is exclusive, every build and the main file's
+    # save hold it shared and read pcache under it, never the caller's copy, and the old cache goes after the swap is let go)
+    for held in ("VkResult guarded_graphics_held(", "VkResult guarded_compute_held("):
+        body = cut(draw, held, "\n}\n")
+        assert "const PcacheSwapHold swap;" in body and "if (cache) cache = pcache;" in body, held + " without the release's hold"
+    assert "const PcacheSwapHold swap;" in save and "if (pcache_released.load(std::memory_order_acquire)) return;" in save, \
+        "the main file's save without the release's hold"
+    release = cut(draw, "if (release && !pre->background && pcache && !pcache_released.load()) {", "\n    }\n")
+    assert "std::unique_lock swap(pcache_swap_mu);" in release, "the release swaps the cache without the exclusive hold"
+    assert release.index("swap.unlock();") < release.index("vkDestroyPipelineCache(dev.device, old, nullptr);")
+    assert release.index("pcache = fresh;") < release.index("pcache_released.store(true, std::memory_order_release);")
     assert draw.count("vkGetPipelineCacheData(") == 5, \
         "a fetch outside the locked ones (the save's, the mapped write's under it, the play save's two, and pcache_init's size query before any build)"
     with tempfile.TemporaryDirectory(prefix="pcache-fetch-") as tmp:
