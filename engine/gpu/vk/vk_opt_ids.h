@@ -53,8 +53,10 @@
    Talk ring's places, the ocarina hint's spacing), the icons in texts. The row asks for a restart unless all three are there
    (a mod that replaces one of those files, a build without the prompts, a game not loaded far enough yet). Not Longshot's:
    there the host gives it to the menu in its own call (MkwVkHost.prompts_live), which a change of vk_api.h would put in this
-   tree's shader stamp. */
-#define HL_OPT_PROMPTS_LIVE 95
+   tree's shader stamp.
+   103, not 95: the host's per-frame pushes for the performance summary take 90, 91 and 94 to 99 (gpu/vk/perf_parts.h), and a
+   push at 95 was taken there as a wait and never reached the menu (tests/test_option_push_ids.py). */
+#define HL_OPT_PROMPTS_LIVE 103
 enum { HL_PROMPTS_LIVE_TEXTURES = 1, HL_PROMPTS_LIVE_LAYOUTS = 2, HL_PROMPTS_LIVE_TEXTS = 4, HL_PROMPTS_LIVE_ALL = 7 };
 
 /* The Controls tab's Sprint with L3 row (host/nn_hid.c asks at each read of the controllers, host/oot_sprint.c acts;
@@ -63,8 +65,9 @@ enum { HL_PROMPTS_LIVE_TEXTURES = 1, HL_PROMPTS_LIVE_LAYOUTS = 2, HL_PROMPTS_LIV
 
 /* The Controls tab's Button prompts row (host/prompts.c tells at the start, gpu/vk/vk_menu.cpp shows): 1 when the game folder has no
    prompts/ folder (the Builder did not make it: no fontTools or Pillow), so the row changes nothing and the game shows its own
-   icons. 96 is free here. */
-#define HL_OPT_PROMPTS_MISSING 96
+   icons. 104, not 96: 96 is one of the host's per-frame pushes (the presenting thread's wait for a virtual core, perf_parts.h),
+   which made the row's hint flip at every frame. */
+#define HL_OPT_PROMPTS_MISSING 104
 /* The Graphics tab's Handheld profile row (host/nn_applet.c asks at each poll for notifications, gpu/vk/vk_replay.cpp answers 0 docked
    or 1 handheld, -1 while the options are not read yet): a change of the row is told to the game as an undock or a dock. */
 #define HL_OPT_HANDHELD 101
