@@ -675,9 +675,12 @@ static int crash_driver_module(const char *m) {   /* (the graphics drivers' own 
     }
     return 0;
 }
-static void crash_context_lines(DWORD code, int write, uint64_t guest, const char *module) {
+static void crash_context_lines(DWORD code, int write, uint64_t address, uint64_t guest, const char *module) {
     const char *how = write ? "write" : "read";
-    if (code == 0xc0000005u && guest < 0x10000)
+    if (code == 0xc0000005u && address < 0x10000)
+        hos_log("CRASH: diagnosis: a host %s through a null pointer (+%#llx) in %s: our own code used an object it did not get", how,
+                (unsigned long long)address, module);
+    else if (code == 0xc0000005u && guest < 0x10000)
         hos_log("CRASH: diagnosis: a guest %s through a null pointer (+%#llx): the game used an object it did not get", how,
                 (unsigned long long)guest);
     else if (code == 0xc0000005u && guest < (uint64_t)HOS_SPACE_END)
@@ -744,7 +747,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
         const char *hos_lift_key(void);
         hos_log("CRASH: build %s, lifted code %s", hos_version(), hos_lift_key());
     }
-    crash_context_lines(rec->ExceptionCode, rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1,
+    crash_context_lines(rec->ExceptionCode, rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1, addr,
                         addr - (uint64_t)A64_MEM, base ? base + 1 : name);
 #ifdef _WIN32
     {
