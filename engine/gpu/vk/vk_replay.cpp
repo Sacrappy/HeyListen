@@ -77,6 +77,11 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+// (FOOT3) The pipeline cache's count for the log line in log_frame_stats, defined in vk_draw.cpp (the cache's file, and the
+// release's play file). Declared here and not in vk_draw.h: that header's text is part of the notes' state stamp
+// (nx2/build.py HOOKSHOT_STATE_STAMP) and a change there starts every player's notes over; a log accessor is not worth that.
+int64_t pcache_new_since_start();
+int64_t pcache_new_since_save();
 // (HeyListen, TICK-054) the host's frame-timeline marks (HOS_JOBTRACE, tools/bench/frameline.py): hos_jt_mark_ext, exported by
 // the game's exe and looked up there (the host's headers are not included here; vk_api.h is a shader-stamp input). A call that
 // returns at once while the trace window is closed. Kinds: 9/10 the replay thread waiting for its segments, 11/12 a submit's
@@ -7162,6 +7167,10 @@ uint64_t made_ring[32];
 int64_t made_ring_present = 0;
 void log_frame_stats() {
     log_slow_frame();
+    // (FOOT3) the pipeline cache's count, every five seconds of presents: what play built that its file did not hold
+    if (presents && presents % 600 == 0)
+        logf("vk: pipeline cache: %lld pipelines new to the file since the start, %lld since its last save",
+             (long long)pcache_new_since_start(), (long long)pcache_new_since_save());
     made_ring[presents % 32] = texture_made();
     made_ring_present = presents;
     if (++fps_n == 120) {

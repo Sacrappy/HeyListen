@@ -120,10 +120,15 @@ def main():
     assert "PcacheFetch lock(wait_ms, queue);" in save and "if (!had)" in save and "kFetchPutOffs" in save
     assert save.count("vkGetPipelineCacheData") == 1, "a fetch in the save outside its locked fetch"
     assert save.count("return put_off_now();") == 3, "a save whose fetch was put off is lost without a log line"
+    # (FOOT3: after the release the play file's save fetches the same cache, its two calls each under the fetch's lock)
+    play = cut(draw, "void pcache_play_save(bool force) {", "\n}\n")
+    assert play.count("vkGetPipelineCacheData") == 2 and play.count("PcacheFetch lock(") == 2, \
+        "a fetch in the play file's save outside its locked fetch"
     assert "guarded_compute(pcache," not in draw, "a build with pcache that does not hold it from a fetch"
     # (the masked clear's pipeline too, through guarded_graphics_held since the Intel gate: a raw create with pcache is none)
     assert "guarded_graphics(pcache," not in draw and "vkCreateGraphicsPipelines(dev.device, pcache," not in draw
-    assert draw.count("vkGetPipelineCacheData(") == 3, "a fetch outside the locked ones (the save's, the mapped write's under it, and pcache_init's size query before any build)"
+    assert draw.count("vkGetPipelineCacheData(") == 5, \
+        "a fetch outside the locked ones (the save's, the mapped write's under it, the play save's two, and pcache_init's size query before any build)"
     with tempfile.TemporaryDirectory(prefix="pcache-fetch-") as tmp:
         source, exe = Path(tmp) / "check.cpp", Path(tmp) / "check.exe"
         source.write_text(HEAD + lock + MAIN, encoding="utf-8")

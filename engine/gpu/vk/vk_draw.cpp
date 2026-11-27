@@ -891,31 +891,31 @@ void ensure_layout(Program& p) {
 // ---- the pipeline cache, on disk ----
 VkPipelineCache pcache = VK_NULL_HANDLE;
 namespace { void ledger_drop_all(); }
+std::atomic<bool> pcache_released{false};   // (FOOT2, RX_VK_PCACHE_RELEASE=1: the loaded cache was let go after the start-up precompile; what play builds goes to pcache_play_path instead)
 bool pcache_loaded = false;   // (TICK-038: it began with this device's and driver's data from the file)
 std::string pcache_path;
 std::atomic<int64_t> pcache_built_since_save{0};
-// (HeyListen) RX_VK_PCACHE_MISSES=0: every pipeline made counts toward a save of the cache, as before
-bool pcache_misses_only() {
-    static const bool v = !getenv("RX_VK_PCACHE_MISSES") || atoi(getenv("RX_VK_PCACHE_MISSES")) != 0;
+// (FOOT3, behind RX_VK_PCACHE_RELEASE) What play builds when the file is not saved at all is compiled again by a later session, at
+// the zone entry that first needs it: the empty cache the release leaves is created from a small file of its own
+// (mkw_vk_pipelines_play.bin, the pipelines play met) and each save in play writes back what it has taken in since.
+std::string pcache_play_path;
+std::vector<uint8_t> pcache_play_data;   // (what the play file held at this start: the fresh cache's initial data)
+std::atomic<size_t> pcache_play_known_bytes{0};   // (the size of its data as last read or written)
+std::atomic<int64_t> pcache_play_saved_at_s{-1};
+std::atomic<int64_t> pcache_new_total{0};
+// (FOOT2, RX_VK_PCACHE_RELEASE=1, off by default) The driver holds the cache file's whole data (2.1 GB here) and every pipeline it
+// built from it in host memory for the session (nvoglv64's arenas: 6 GB of commit, 5.8 GB of it resident in the first minute, 2 GB
+// of it this cache). The start-up precompile built everything the notes name; the cache is let go after it and an empty one takes
+// its place, created from the play file above (FOOT3), so that a later session finds the pipelines play built instead of compiling
+// them. The file on disk stays as it was: the next start's precompile finds it all again.
+bool pcache_release_wanted() {
+    static const bool v = getenv("RX_VK_PCACHE_RELEASE") && atoi(getenv("RX_VK_PCACHE_RELEASE")) != 0;
     return v;
 }
-// (hookshot) The size of the cache's data when it was last read or written. The count above takes in every pipeline made
-// with the cache, the ones it already held too: the precompile's ~13,000 at each start, all found in the cache, made the
-// first check in play (present 300) write the whole cache again, 1.1 GB, at every start, the file the same 1146 MB each
-// time. On a SATA SSD that write took 4-10 s and left the disk's reads slow (10-450 ms) for the minutes after, the game's
-// own reads too. A save asks the driver the data's size first (no data is copied for that) and writes only a different
-// size: data the cache took in since. The pipeline creation feedback cannot tell the new ones apart: NVIDIA's driver reports
-// most precompiled pipelines as not found in the app's cache (~460 of ~12,900 here), which it then serves from its own.
-std::atomic<size_t> pcache_saved_size{0};
-void pcache_init() {
-    if (pcache) return;
-    char exe[MAX_PATH];
-    const DWORD n = game_module_path(exe, MAX_PATH);
-    std::string dir(exe, n);
-    dir = dir.substr(0, dir.find_last_of("\\/") + 1);
-    pcache_path = dir + "mkw_vk_pipelines.bin";
+/// A pipeline cache file's data, or empty when there is none, it is another device's or driver's, or it is not a pipeline cache
+std::vector<uint8_t> pcache_file_data(const std::string& path) {
     std::vector<uint8_t> data;
-    if (FILE* f = fopen(pcache_path.c_str(), "rb")) {
+    if (FILE* f = fopen(path.c_str(), "rb")) {
         _fseeki64(f, 0, SEEK_END);
         const int64_t sz = _ftelli64(f);
         _fseeki64(f, 0, SEEK_SET);
@@ -937,6 +937,29 @@ void pcache_init() {
             std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
             data.clear();
     }
+    return data;
+}
+// (HeyListen) RX_VK_PCACHE_MISSES=0: every pipeline made counts toward a save of the cache, as before
+bool pcache_misses_only() {
+    static const bool v = !getenv("RX_VK_PCACHE_MISSES") || atoi(getenv("RX_VK_PCACHE_MISSES")) != 0;
+    return v;
+}
+// (hookshot) The size of the cache's data when it was last read or written. The count above takes in every pipeline made
+// with the cache, the ones it already held too: the precompile's ~13,000 at each start, all found in the cache, made the
+// first check in play (present 300) write the whole cache again, 1.1 GB, at every start, the file the same 1146 MB each
+// time. On a SATA SSD that write took 4-10 s and left the disk's reads slow (10-450 ms) for the minutes after, the game's
+// own reads too. A save asks the driver the data's size first (no data is copied for that) and writes only a different
+// size: data the cache took in since. The pipeline creation feedback cannot tell the new ones apart: NVIDIA's driver reports
+// most precompiled pipelines as not found in the app's cache (~460 of ~12,900 here), which it then serves from its own.
+std::atomic<size_t> pcache_saved_size{0};
+void pcache_init() {
+    if (pcache) return;
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string dir(exe, n);
+    dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+    pcache_path = dir + "mkw_vk_pipelines.bin";
+    std::vector<uint8_t> data = pcache_file_data(pcache_path);
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
@@ -950,6 +973,14 @@ void pcache_init() {
     size_t held = 0;
     if (pcache && vkGetPipelineCacheData(dev.device, pcache, &held, nullptr) == VK_SUCCESS) pcache_saved_size = held;
     logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size() >> 10);
+    // (FOOT3) the play file, read now for the cache the release makes after the precompile: it holds what play met last time
+    if (pcache_release_wanted()) {
+        pcache_play_path = dir + "mkw_vk_pipelines_play.bin";
+        pcache_play_data = pcache_file_data(pcache_play_path);
+        pcache_play_known_bytes = pcache_play_data.size();
+        logf("vk: the play pipeline cache %s (%zu KB): the pipelines met in play, for the empty cache the release makes",
+             pcache_play_path.c_str(), pcache_play_data.size() >> 10);
+    }
 }
 
 struct Targets {
@@ -2485,7 +2516,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     if (!driver_cache_only &&
         !(pcache_misses_only() && (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
           (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)))
-        pcache_built_since_save++;
+        pcache_built_since_save++, pcache_new_total++;
     st_pipeline_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     return pl;
 }
@@ -9934,12 +9965,26 @@ bool cs_module_drop() {
 }
 std::atomic<int64_t> cs_modules_dropped{0};
 std::atomic<int64_t> cs_cache_hits{0}, cs_cache_misses{0};   // (compute pipelines built in play: in the pipeline cache or not)
+// (FOOT3) The dispatch thread's own builds, where the lazy compute programs are made. Their times say what the pipeline cache's
+// file saved a session: a few ms is the driver serving one from the cache, a compile is not. NVIDIA's feedback bit is not trusted
+// here (it stays clear for what the cache had), so the times are kept as they are, by count over 30 ms and 100 ms.
+std::atomic<int64_t> cs_play_built{0}, cs_play_over30{0}, cs_play_over100{0}, cs_play_max_ms{0}, cs_play_sum_ms{0};
+void cs_play_record(int64_t ms) {
+    cs_play_built++;
+    cs_play_sum_ms += ms;
+    if (ms >= 30) cs_play_over30++;
+    if (ms >= 100) cs_play_over100++;
+    for (int64_t cur = cs_play_max_ms.load(); ms > cur && !cs_play_max_ms.compare_exchange_weak(cur, ms);) {}
+}
 void res_pipeline_counts(size_t* graphics, size_t* used, int64_t* modules_dropped) {
     *graphics = pipelines.size();   // (the replay's map, read for a count only)
     *used = res_pipelines_used();
     *modules_dropped = cs_modules_dropped.load();
-    logf("vk: compute pipelines built in play: %lld from the pipeline cache (or under 30 ms), %lld compiled", (long long)cs_cache_hits.load(),
-         (long long)cs_cache_misses.load());
+    logf("vk: compute pipelines built in play: %lld from the pipeline cache (or under 30 ms), %lld compiled; the dispatch thread's "
+         "%lld in all (mean %.1f ms, %lld over 30 ms, %lld over 100 ms, %lld the longest)",
+         (long long)cs_cache_hits.load(), (long long)cs_cache_misses.load(), (long long)cs_play_built.load(),
+         cs_play_built.load() ? (double)cs_play_sum_ms.load() / cs_play_built.load() : 0.0, (long long)cs_play_over30.load(),
+         (long long)cs_play_over100.load(), (long long)cs_play_max_ms.load());
     if (const int64_t z = null_writes[kNwAddressZero].load(), nb = null_writes[kNwNotBuffer].load(), np = null_writes[kNwNotBound].load(); z + nb + np)
         logf("vk: written storage buffers that resolved to nothing (RX_VK_NULL_WRITE %s): %lld in all, address 0 %lld, not a buffer %lld, pool not bound %lld",
              null_write_on() ? "on: scratch bound" : "off", (long long)(z + nb + np), (long long)z, (long long)nb, (long long)np);
@@ -10844,6 +10889,35 @@ void precompile_finished(Pre* pre) {
              "(RX_VK_PRECOMPILE_SAVE_S=0: not)", build_s,
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
     }
+    // (FOOT2, RX_VK_PCACHE_RELEASE=1, off by default) The driver holds the file's whole data (2.1 GB here) and every pipeline it built
+    // from it in host memory for the session (nvoglv64's arenas: 6 GB of commit, 5.8 GB of it resident in the first minute, 2 GB of it
+    // this cache). The start-up precompile built everything the notes name; what is built in play after this goes into an empty
+    // cache and is saved to a file of its own (FOOT3: mkw_vk_pipelines_play.bin, which the empty cache is created from, so a later
+    // session's play finds those pipelines instead of compiling them; the file the release let go of stays as it was).
+    static const bool release = pcache_release_wanted();
+    if (release && !pre->background && pcache && !pcache_released.load()) {
+        VkPipelineCache old = pcache;
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = pcache_play_data.size();   // (FOOT3: what play met last session, a few MB: not the file's 2 GB)
+        ci.pInitialData = pcache_play_data.empty() ? nullptr : pcache_play_data.data();
+        VkPipelineCache fresh = VK_NULL_HANDLE;
+        if (vkCreatePipelineCache(dev.device, &ci, nullptr, &fresh) == VK_SUCCESS) {
+            pcache_released = true;
+            pcache = fresh;
+            vkDestroyPipelineCache(dev.device, old, nullptr);
+            const size_t play_kb = pcache_play_data.size() >> 10;   // (before the buffer goes: the log says what was taken in)
+            pcache_play_data.clear();   // (the driver has its own copy now: a few MB of the heap given back)
+            std::vector<uint8_t>().swap(pcache_play_data);
+            pcache_play_saved_at_s = -1;
+            pcache_built_since_save = 0;   // (the precompile's: they were built into the cache that went; play's debt starts here)
+            logf("vk: pipeline cache released after the precompile (RX_VK_PCACHE_RELEASE): the driver's copy of the file's data is gone; "
+                 "%zu KB of the play file's data taken in, %lld pipelines the precompile did not find in the file",
+                 play_kb, (long long)pcache_new_total.load());
+        }
+    }
+    if (!pre->background)   // (FOOT3: what play starts with, for a comparison of the arms)
+        logf("vk: pipeline cache: %lld pipelines are new to the file when play begins (%zu made in all, %zu graphics by the precompile)",
+             (long long)pcache_new_total.load(), st_pipelines.load(), pre->made.load());
 }
 }  // namespace
 
@@ -11719,7 +11793,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                                   (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)) ||
                                  (pcache_loaded && ms < 30);
                 (hit ? cs_cache_hits : cs_cache_misses)++;
-                if (!hit) pcache_built_since_save++;
+                if (!hit) pcache_built_since_save++, pcache_new_total++;
                 q.compute_state.store(2, std::memory_order_release);
             };
             // (first: a dispatch is a pass over the scene (its light, its exposure), left out while it builds; the mesh fallback's
@@ -11768,13 +11842,14 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             SKIP_HERE();
         }
         std::atomic_ref<VkPipeline>(p.compute_pipeline).store(built, std::memory_order_release);
-        {
-            const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-            if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms", (unsigned long long)p.key, (long long)ms);
-        }
+        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms", (unsigned long long)p.key, (long long)ms);
+        // (FOOT3: how long the dispatch thread's builds took: what the pipeline cache's file saved a later session, or did not)
+        cs_play_record(ms);
         st_pipeline_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         st_pipelines++;
         pcache_built_since_save++;
+        pcache_new_total++;
         if (cpipe()) cs_module_release(p);   // (TICK-038)
     }
     if (plk.on) par_mutex().unlock(), plk.on = false;
@@ -12276,12 +12351,100 @@ int caches_save_at_exit(uint32_t budget_ms) {
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), budget_ms);
     return ok ? 1 : 0;
 }
+// (FOOT3, RX_VK_PCACHE_RELEASE=1 only) A save of the play file: the cache the release left holds only what play met (a few hundred
+// pipelines, a few MB), so the room the file's own saves in play ask for (twice the cache and kPlaySaveSpareMB more, for a 2 GB
+// fetch) is not what this fetch takes: its own size twice is. Written on a thread of its own, as those are; RX_VK_PCACHE_PLAY_SAVE=0
+// keeps it to the forced saves (Restart now), and force writes it there and then.
+constexpr int64_t kPlayFileSaveMinS = 120;
+constexpr uint64_t kPlayFileSaveSpareMB = 128;
+void pcache_play_save(bool force) {
+    if (!pcache) return;
+    if (!force && pcache_built_since_save.load() < 32) return;
+    static std::atomic<bool> busy{false};
+    int64_t now_s = 0;
+    if (!force) {
+        now_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last = pcache_play_saved_at_s.load();
+        if (last >= 0 && now_s - last < kPlayFileSaveMinS) return;
+        const uint64_t avail = pcache_available_bytes(), size = pcache_play_known_bytes.load();
+        if (avail < 2 * size + (kPlayFileSaveSpareMB << 20)) {
+            static int64_t told;
+            if (++told <= 4 || told % 32 == 0)
+                logf("vk: play pipeline cache save put off (%llu MB available, %llu MB of play cache: it wants twice that and %llu MB more)",
+                     (unsigned long long)(avail >> 20), (unsigned long long)(size >> 20), (unsigned long long)kPlayFileSaveSpareMB);
+            return;
+        }
+        if (busy.exchange(true)) return;   // (the one under way writes; what was built meanwhile is the next save's)
+        pcache_play_saved_at_s = now_s;
+    } else {
+        while (busy.load()) Sleep(1);
+        busy = true;
+    }
+    const int64_t built = pcache_built_since_save.exchange(0);
+    auto save = [built, force] {
+        struct Done { ~Done() { busy = false; } } done;
+        const auto put_off = [built] {
+            pcache_built_since_save += built;   // (not written: the next save owes them too)
+        };
+        try {
+            size_t n = 0;
+            bool had = true;
+            {
+                PcacheFetch lock(force ? -1 : kFetchPollMs, force);
+                had = lock.held();
+                if (!had || vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) != VK_SUCCESS || !n) return put_off();
+            }
+            if (n == pcache_play_known_bytes.load()) {   // (nothing the file lacks)
+                pcache_play_saved_at_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch()).count();
+                return;
+            }
+            std::vector<uint8_t> data(n);
+            {
+                PcacheFetch lock(force ? -1 : kFetchPollMs, force);
+                had = lock.held();
+                if (!had || vkGetPipelineCacheData(dev.device, pcache, &n, data.data()) != VK_SUCCESS) return put_off();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const uint64_t private_before = pcache_private_mb();
+            const std::string tmp = pcache_play_path + ".tmp";
+            bool ok = false;
+            if (FILE* f = fopen(tmp.c_str(), "wb")) {
+                ok = fwrite(data.data(), 1, n, f) == n;
+                fclose(f);
+                if (ok) ok = MoveFileExA(tmp.c_str(), pcache_play_path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+            }
+            if (!ok) return put_off();
+            pcache_play_known_bytes = n;
+            const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            logf("vk: play pipeline cache saved: %llu MB in %lld ms (process private commit %llu MB before the fetch, %llu MB with its "
+                 "data in hand); %lld pipelines new to it, %lld in all since the start",
+                 (unsigned long long)(n >> 20), (long long)ms, (unsigned long long)private_before,
+                 (unsigned long long)pcache_private_mb(), (long long)built, (long long)pcache_new_total.load());
+        } catch (const std::exception& e) {
+            logf("vk: play pipeline cache save failed: %s", e.what());
+        }
+    };
+    if (force) save();
+    else {
+        try {
+            std::thread(save).detach();
+        } catch (const std::exception& e) {
+            busy = false;
+            pcache_built_since_save += built;
+            logf("vk: could not start play pipeline cache save: %s", e.what());
+        }
+    }
+}
 void pipeline_cache_save(bool force) {
     const bool between = pcache_save_between;
     // (RX_VK_PCACHE_SAVE_ALWAYS=1, for measurements: every save asked in play goes ahead to the gate even with fewer than 32
     // pipelines built since the last one, as play with many new pipelines would have it)
     static const bool always = getenv("RX_VK_PCACHE_SAVE_ALWAYS") && atoi(getenv("RX_VK_PCACHE_SAVE_ALWAYS")) != 0;
-    if (!pcache || (!force && !between && !always && pcache_built_since_save < 32)) return;
+    if (!pcache) return;
+    // (FOOT3) after the release the file is not this cache's: what play builds goes to the play file
+    if (pcache_released.load()) return pcache_play_save(force);
+    if (!force && !between && !always && pcache_built_since_save < 32) return;
     if (!force && !between) {   // (a save asked in play: RX_VK_PCACHE_PLAY_SAVE's gate)
         const int64_t now_s =
             std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -12408,6 +12571,10 @@ void pipeline_cache_save(bool force) {
 } // namespace mkwvk
 
 namespace mkwvk {
+// (FOOT3) the pipeline cache's count for vk_replay.cpp's log line: what the cache's file did not hold, since the start and since the
+// last save (the play file's, after the release). Out here, not beside their counters: those sit in the file's unnamed namespace
+int64_t pcache_new_since_start() { return pcache_new_total.load(); }
+int64_t pcache_new_since_save() { return pcache_built_since_save.load(); }
 /// (longshot #252) The Intel shader compiles row (Debug tab: side by side) or RX_VK_NO_INTEL_SERIAL=1 over it: Intel's compiler on
 /// Windows is entered by several threads at once, as on every other GPU. Off (the default): one at a time, vk_internal.h IntelDriverGate
 bool intel_compiles_side_by_side() {
