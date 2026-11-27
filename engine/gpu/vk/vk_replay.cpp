@@ -7725,12 +7725,14 @@ struct PJob {
     int64_t at, period;
     int64_t slot;   // (mode 4: when to show it, given at the hand-over; 0 in mode 3)
     bool late;      // (mode 4: handed over after its slot)
+    bool pass;      // (mode 4, the line stopped: the game does not hold its limit, the frame goes out as it comes)
 };
 // (HL_PRESENT_PACE=4, the slot line: present_pace_rule.h slot / free_wait / Step) under t_mu: the line, the slots of the last
 // hand-overs (the game's window acquire waits on them: pace_free_ns) and the game's time step (pace_step_ns)
 present_pace_rule::Line s_line;
 present_pace_rule::Step s_step;
-int64_t s_slots[16], s_period = 0, s_kept = 0, s_restarts = 0;
+present_pace_rule::Able s_able;   // (whether the line paces: not where the game cannot hold its limit)
+int64_t s_slots[16], s_period = 0, s_kept = 0, s_restarts = 0, s_passed = 0, s_stops = 0;
 uint64_t s_n = 0;
 std::atomic<int> s_step_ns{0};
 std::mutex t_mu;
@@ -7779,11 +7781,12 @@ void thread_main() {
         }
         // (mode 4: the slot was given at the hand-over and the wake is to the slot itself; mode 3: this thread's own line)
         present_pace_rule::Hold h;
-        if (j.slot) h.until = j.late ? 0 : j.slot - early, h.late = j.late;
+        if (j.pass) h = {};   // (the line stopped: as it comes)
+        else if (j.slot) h.until = j.late ? 0 : j.slot - early, h.late = j.late;
         else h = present_pace_rule::hold(t_line, j.at, j.period, early);
         // (mode 3: never closer than a period, less the wake's allowance and the slew's step: the line can come earlier, 0.25 ms a
         // frame. Mode 4 keeps the phase: the frame after a late one comes sooner than a period, by the lateness)
-        const int64_t until = j.slot ? h.until : std::max(h.until, present_pace_rule::not_before(t_last, j.period, early + 250000));
+        const int64_t until = j.slot || j.pass ? h.until : std::max(h.until, present_pace_rule::not_before(t_last, j.period, early + 250000));
         if (until > now_ns()) spin_until_ns(until);
         if (h.late) t_lates++;
         VkResult r = VK_SUCCESS;
@@ -7830,13 +7833,13 @@ void thread_main() {
             int expected = VK_SUCCESS;
             t_res.compare_exchange_strong(expected, (int)r);
         }
-        int64_t full = 0, blocked = 0, block_ns = 0, kept = 0, restarts = 0;
+        int64_t full = 0, blocked = 0, block_ns = 0, kept = 0, restarts = 0, passed = 0, stops = 0;
         {
             std::lock_guard lk(t_mu);
             t_q.pop_front();
             if (++t_n % 1200 == 0) {
                 full = t_full, blocked = t_blocked, block_ns = t_block_ns, t_full = t_blocked = t_block_ns = 0;
-                kept = s_kept, restarts = s_restarts, s_kept = s_restarts = 0;
+                kept = s_kept, restarts = s_restarts, passed = s_passed, stops = s_stops, s_kept = s_restarts = s_passed = s_stops = 0;
             }
         }
         t_cv.notify_all();
@@ -7851,8 +7854,10 @@ void thread_main() {
                  t_shortest == INT64_MAX ? 0.0 : t_shortest / 1e6);
             if (mode() == 4)
                 logf("vk: present pacer's slot line: of the late frames %lld kept the line's phase (late by less than a period) and "
-                     "%lld started it again; the game's time step follows the slots: %.3f ms now",
-                     (long long)kept, (long long)restarts, s_step_ns.load(std::memory_order_relaxed) / 1e6);
+                     "%lld started it again; the game's time step follows the slots: %.3f ms now; %lld frames went out as they came "
+                     "(the game under its limit: the line stopped %lld times)",
+                     (long long)kept, (long long)restarts, s_step_ns.load(std::memory_order_relaxed) / 1e6, (long long)passed,
+                     (long long)stops);
             t_lates = t_hold_sum = t_wake_sum = t_wake_max = t_wakes = t_slewed = 0, t_shortest = INT64_MAX;
             for (int64_t& v : t_hold_hist) v = 0;
             for (int64_t& v : t_wake_hist) v = 0;
@@ -7872,7 +7877,7 @@ bool pace_thread_wanted() {
     t_cv.wait(lk, [] { return t_q.empty(); });
     menu_pacer_presents(false);
     t_line = {}, t_last = 0, t_ring_n = 0;
-    s_line = {}, s_step = {}, s_period = 0, s_n = 0, s_step_ns.store(0, std::memory_order_relaxed);   // (the host: its own pacing and step again)
+    s_line = {}, s_step = {}, s_able = {}, s_period = 0, s_n = 0, s_step_ns.store(0, std::memory_order_relaxed);   // (the host: its own pacing and step again)
     return false;
 }
 /// (do_present, mode 3) the image to the pacer thread; an earlier paced present's result back (VK_SUCCESS when none failed)
@@ -7888,13 +7893,20 @@ VkResult pace_thread_push(VkSwapchainKHR sc, uint32_t index) {
             t_blocked++, t_block_ns += now_ns() - t0;
         }
         const int64_t now = now_ns(), period = period_now();
-        PJob j{sc, index, now, period, 0, false};
-        if (mode() == 4 && period) {   // (the slot line: the frame's slot now, at the hand-over)
+        PJob j{sc, index, now, period, 0, false, false};
+        if (mode() == 4 && period && !s_able.on) {   // (the line stopped: the game under its limit; as it comes, the host's own wait and step)
+            j.pass = true, s_passed++;
+            if (present_pace_rule::passed(s_able, now, period)) s_line = {}, s_step = {};   // (it holds the limit again: the line from the next frame)
+        } else if (mode() == 4 && period) {   // (the slot line: the frame's slot now, at the hand-over)
             const present_pace_rule::Slot s = present_pace_rule::slot(s_line, now, period);
             j.slot = s.at, j.late = s.late;
             if (s.late) (s.restarted ? s_restarts : s_kept)++;
             s_slots[s_n++ & 15] = s.at, s_period = period;
             s_step_ns.store((int)std::min<int64_t>(present_pace_rule::step(s_step, s.at, 250000000), INT32_MAX), std::memory_order_relaxed);
+            if (!present_pace_rule::paced(s_able, s.late)) {   // (a quarter of the last 32 late: stop)
+                s_stops++, s_period = 0, s_n = 0;
+                s_step_ns.store(0, std::memory_order_relaxed);
+            }
         }
         t_q.push_back(j);
     }

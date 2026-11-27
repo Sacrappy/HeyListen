@@ -207,6 +207,49 @@ int main() {
             CHECK(last - at100 == (int64_t)2899 * P);
         }
     }
+    {   // (mode 4) whether the line paces: it stops once a quarter of the last 32 paced frames came late, and paces again once 64
+        // frames in a row came at the limit's rate on average
+        Able a;
+        for (int k = 0; k < 200; k++) CHECK(paced(a, k % 20 == 0));        // (one late in twenty: it paces)
+        CHECK(a.on);
+        int stopped_at = -1;
+        for (int k = 0; k < 40 && stopped_at < 0; k++)
+            if (!paced(a, k % 2 == 0)) stopped_at = k;                     // (every second frame late: stops at the 8th late one)
+        CHECK(stopped_at == 14 && !a.on);
+        int64_t t = T;
+        for (int k = 0; k < 200; k++) CHECK(!passed(a, t += P * 12 / 10, P));   // (frames 20 % slower than the limit: stays stopped)
+        bool on = false;
+        int after = 0;
+        for (int k = 0; k < 200 && !on; k++, after++) on = passed(a, t += P, P);   // (the limit held again: on within two counts of 64)
+        CHECK(on && after <= 129 && a.on && a.late_bits == 0);
+    }
+    {   // (mode 4) the whole loop on a game that cannot hold its limit (work 10-13 ms against a period of 8.33 ms): with the stop,
+        // the frames go out as they come: the rate is the game's own, not lower
+        const int64_t P120 = 8333333;
+        Line l;
+        Able a;
+        int64_t ready = T, first = 0, last = 0;
+        int shown = 0, passes = 0;
+        uint32_t seed = 4242;
+        for (int k = 0; k < 2000; k++) {
+            seed = seed * 1103515245u + 12345u;
+            ready += 10000000 + (int64_t)(seed >> 8) % 3000000;            // (no acquire wait: the game is behind its limit)
+            int64_t at = ready;
+            if (!a.on) {
+                passes++;
+                if (passed(a, ready, P120)) l = {};
+            } else {
+                const Slot s = slot(l, ready, P120);
+                at = s.at;
+                paced(a, s.late);
+            }
+            if (k == 100) first = at;
+            last = at, shown++;
+        }
+        const double fps = 1899.0 / ((last - first) / 1e9), own = 1e9 / 11500000.0;
+        std::printf("under the limit: %.1f fps shown against the game's own %.1f; %d of 2000 frames went out as they came\n", fps, own, passes);
+        CHECK(fps > own * 0.99 && passes > 1900);
+    }
     if (fails) return 1;
     std::printf("present pace rule: ok\n");
     return 0;

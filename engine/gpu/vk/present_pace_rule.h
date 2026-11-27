@@ -116,6 +116,40 @@ inline Slot slot(Line& l, int64_t now, int64_t period) {
     return s;
 }
 
+/// (the slot line) Whether the line paces at all. Where the game cannot hold its limit the line only costs frames: a frame
+/// faster than the period waits for its slot, a slower one starts the line again, and nothing is caught up (the Market in DLAA at
+/// a 120 limit this PC cannot hold: 93.8 fps without the pacer, 64.6 with it; at a 90 limit 80.4 against 72.5). So the line STOPS
+/// pacing once a quarter of the last 32 paced frames came late (paced), and while it is stopped the frames go out as they come
+/// and the game's own wait holds the limit (host/nn_vi.c); it paces AGAIN once 64 frames in a row came at the limit's rate on
+/// average, within 1 % (passed): the game holds its limit again
+struct Able {
+    uint32_t late_bits = 0;          // (the last 32 paced frames, a bit each: late)
+    int64_t last = 0, sum = 0;       // (stopped: the last hand-over, and the sum of the intervals since the count began)
+    int n = 0;
+    bool on = true;
+};
+inline int ones32(uint32_t v) {
+    int c = 0;
+    for (; v; v &= v - 1) c++;
+    return c;
+}
+/// a frame the line paced, late or not: whether the line still paces
+inline bool paced(Able& a, bool late) {
+    a.late_bits = a.late_bits << 1 | (late ? 1u : 0u);
+    if (ones32(a.late_bits) >= 8) a = Able{}, a.on = false;
+    return a.on;
+}
+/// a frame handed over at `now` while the line is stopped: whether it paces again from the next frame
+inline bool passed(Able& a, int64_t now, int64_t period) {
+    if (a.last && now > a.last) a.sum += now - a.last, a.n++;
+    a.last = now;
+    if (a.n >= 64) {
+        if (period > 0 && a.sum <= (int64_t)64 * period * 101 / 100) a = Able{};
+        else a.sum = 0, a.n = 0;
+    }
+    return a.on;
+}
+
 /// (the slot line) The game's wait at its window acquire: the window texture it takes is free one period after the slot of the
 /// frame that used it (`slot_back`: the slot of the frame as many hand-overs back as the window has textures; 0: none yet). The
 /// game's frames start on the line's own clock, so the line never has to follow another one
