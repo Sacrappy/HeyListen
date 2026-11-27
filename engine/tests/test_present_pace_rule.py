@@ -30,9 +30,14 @@ def check_source():
                    "present_pace_rule::step(s_step, s.at, 250000000)",
                    "present_pace_rule::free_wait(slot_back, now_ns(), s_period)",
                    "if (id == HL_OPT_PACE_STEP_NS) return pace_step_ns();",
+                   "menu_pacer_presents(true);   // (the overlay's frame times: at this thread's presents, not at the hand-overs)",
+                   "if (shown) menu_note_paced_present();",
                    "if (id >= HL_OPT_PACE_FREE_NS && id < HL_OPT_PACE_FREE_NS + 4) return pace_free_ns(id - HL_OPT_PACE_FREE_NS + 1);"]:
         if needle not in src:
             raise SystemExit("gpu/vk/vk_replay.cpp no longer has: " + needle)
+    menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
+    if "if (!pacer_presents.load(std::memory_order_relaxed)) menu_note_paced_present();" not in menu:
+        raise SystemExit("gpu/vk/vk_menu.cpp: the overlay's frame times must come from the pacer thread's presents while it shows the frames")
     host = (ROOT / "host/nn_vi.c").read_text(encoding="utf-8")
     for needle in ["const int wait_ns = rx_option(HL_OPT_PACE_FREE_NS + back - 1, -1);",
                    "const int back = textures < ahead + 1 ? textures : ahead + 1;",

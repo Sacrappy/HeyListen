@@ -125,6 +125,12 @@ bool menu_is_open();
 /// Unlimited; the row (HOS_FPS_LIMIT over it). -1 in Game speed Per frame: the game's steps are whole frames of 1/60 s there,
 /// so the limit does not apply (it needs Real time)
 int menu_fps_limit();
+/// (the present pacer's thread, HL_PRESENT_PACE=3 / 4) The overlay's frame times are taken where the pictures really go out:
+/// menu_pacer_presents(true) while the pacer thread shows the frames (menu_note_frame, called at the hand-over, then leaves the
+/// overlay's times alone), menu_note_paced_present() at each of its presents. Before 27 Nov 2026 the overlay timed the hand-overs:
+/// with the pacer on its 1% low read lower than without it while 99 % of the pictures went out exactly a period apart
+void menu_pacer_presents(bool on);
+void menu_note_paced_present();
 /// The Base frame rate limit in frames a second: the game's own rate before frame generation, 0 for Off (the row; Game speed Per frame:
 /// none, as the Frame rate limit; HOS_FPS_LIMIT stands over it). With it on menu_fps_limit answers 0 (the shown rate is not held)
 int menu_base_fps();

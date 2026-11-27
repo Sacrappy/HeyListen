@@ -2985,12 +2985,18 @@ void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t wi
     const auto c = [](uint32_t v) { return (uint64_t)std::min(v, 0xffffu); };
     present_sizes.store(c(picture_w) << 48 | c(picture_h) << 32 | c(window_w) << 16 | c(window_h), std::memory_order_relaxed);
 }
+std::atomic<bool> pacer_presents{false};   // (the present pacer's thread shows the frames: the overlay's times are its presents')
+void menu_pacer_presents(bool on) { pacer_presents.store(on, std::memory_order_relaxed); }
+void menu_note_paced_present() {
+    if (opts.show_fps) perf_note_frame();   // (the overlay's frame times: vk_perf.cpp)
+}
 void menu_note_frame(bool game_frame, int shown) {
     if (shown) {
         shown_frames.fetch_add(shown, std::memory_order_relaxed);
         lowend_probe_frame();   // (the Lowest preset measure, while it runs)
         perf_frame_shown();   // (the performance summary's frame, when it is on: perf_report.cpp)
-        if (opts.show_fps) perf_note_frame();   // (the overlay's frame times: vk_perf.cpp)
+        // (the overlay's frame times, unless the present pacer's thread shows the frames: then at its presents, above)
+        if (!pacer_presents.load(std::memory_order_relaxed)) menu_note_paced_present();
     }
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
 }

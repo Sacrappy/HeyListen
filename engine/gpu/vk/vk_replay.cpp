@@ -7823,6 +7823,7 @@ void thread_main() {
             }
         }
         if (shown) frame_log_note();   // (RX_VK_FRAME_LOG: a frame not shown (its swapchain made again) is no line)
+        if (shown) menu_note_paced_present();   // (the overlay's frame times and its lows: where the picture goes out)
         if (r != VK_SUCCESS) {
             int expected = VK_SUCCESS;
             t_res.compare_exchange_strong(expected, (int)r);
@@ -7861,9 +7862,13 @@ void thread_main() {
 bool pace_thread_wanted() {
     using namespace pace;
     if (mode() < 3) return false;
-    if (period_now()) return true;
+    if (period_now()) {
+        menu_pacer_presents(true);   // (the overlay's frame times: at this thread's presents, not at the hand-overs)
+        return true;
+    }
     std::unique_lock lk(t_mu);   // (the pace stops (a menu row, frame generation): what the thread holds goes out first, in order)
     t_cv.wait(lk, [] { return t_q.empty(); });
+    menu_pacer_presents(false);
     t_line = {}, t_last = 0, t_ring_n = 0;
     s_line = {}, s_step = {}, s_period = 0, s_n = 0, s_step_ns.store(0, std::memory_order_relaxed);   // (the host: its own pacing and step again)
     return false;
