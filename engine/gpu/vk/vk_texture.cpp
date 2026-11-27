@@ -6179,7 +6179,10 @@ bool block_reclaim_on() {
     static const bool v = [] {
         const char* e = getenv("RX_VK_BLOCK_RECLAIM");
         if (e && *e) return atoi(e) != 0;
-        return block_reclaim_small_card();
+        /* (OLD1, 27 Nov) off by default everywhere until measured: the small-card rule (block_reclaim_small_card, 6.5 GB or
+           less allowed) has no recorded numbers yet (VRAM4 stopped before measuring it), and the owner put the default flip of
+           batch C after the release. RX_VK_BLOCK_RECLAIM=1 turns it on, with the small card's 128 MB free threshold there */
+        return false;
     }();
     return v;
 }
@@ -6196,7 +6199,7 @@ void block_reclaim(uint64_t completed) {
     static bool told = false;
     if (!told) {
         told = true;
-        logf("vk: the textures' image blocks given back (RX_VK_BLOCK_RECLAIM, on by default on a card of 6.5 GB or less): a block whose images are all textures uploaded "
+        logf("vk: the textures' image blocks given back (RX_VK_BLOCK_RECLAIM=1; off by default): a block whose images are all textures uploaded "
              "from memory, unused %llu presents, evicted while the blocks hold %llu MB free or more (%llu MB a pass at most)",
              (unsigned long long)min_unused, (unsigned long long)(free_min >> 20), (unsigned long long)(pass_max >> 20));
     }
