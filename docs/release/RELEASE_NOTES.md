@@ -42,7 +42,9 @@ stutters more than usual. The second start is smooth again.
   99.9th percentile frame over the last 30 seconds), so one long frame no longer drags the line down for seconds.
 * **HDR10 static metadata** (McNartin): on an HDR screen the game now tells the screen the picture's peak and black level.
 * **Button prompts follow a change while you play**: with *Auto*, the prompts follow the device that gave input last.
-  When the `prompts` folder is missing, the game's log, the row's help and the Builder now say so.
+  When the `prompts` folder is missing, the game's log, the row's help and the Builder now say so. The ocarina's hint
+  bar keeps its icons when the prompts change while it is on screen (it shows the new ones the next time it comes up),
+  and the keyboard prompts show their key letters around the action button.
 * **A touchpad click opens the menu.**
 * **AMD FSR 4 frame generation** (Windows, Radeon RX 9000 only) is still **not tested on real hardware**. If you have the
   card and try it, a report is welcome.
