@@ -10,7 +10,7 @@ python -I engine/scripts/list_switches.py
 
 and commit both files. A test (`engine/tests/test_switches_documented.py`) fails when a switch read in the source is missing here or the data file is out of date.
 
-1590 switches: 56 players may be told to use, 403 diagnostic, 1131 developer-only; 1371 have a real explanation and 219 are marked `undocumented`.
+1591 switches: 56 players may be told to use, 404 diagnostic, 1131 developer-only; 1372 have a real explanation and 219 are marked `undocumented`.
 
 ## How to set a switch
 
@@ -68,7 +68,7 @@ The entries below say what each one does, its values and default, and when it is
 | [Shaders and pipelines](#shaders-and-pipelines) | 129 | 6 | 0 | 123 |
 | [Memory and textures](#memory-and-textures) | 229 | 10 | 0 | 219 |
 | [Audio](#audio) | 15 | 5 | 10 | 0 |
-| [Input and controllers](#input-and-controllers) | 13 | 1 | 12 | 0 |
+| [Input and controllers](#input-and-controllers) | 14 | 1 | 13 | 0 |
 | [Native engine (`HL_*`)](#native-engine-hl_) | 125 | 1 | 42 | 82 |
 | [Host and OS (`HOS_*` and the system's variables)](#host-and-os-hos_-and-the-systems-variables) | 140 | 10 | 0 | 130 |
 | [Telemetry and crash reports](#telemetry-and-crash-reports) | 12 | 0 | 12 | 0 |
@@ -843,7 +843,7 @@ The draws are held instead of the present: the frames show the area's earlier pi
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8435`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8447`.
 
 #### `RX_VK_UI_GAME_FONT` - player
 
@@ -863,7 +863,7 @@ The menu's button prompts for a controller or the keys, whatever was used last (
 
 **When a player would use it:** Screenshots need one set of button prompts: `pad` or `keys`.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_menu.cpp:3187`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_menu.cpp:3188`.
 
 #### `SDL_VIDEODRIVER` - diagnostic
 
@@ -2255,7 +2255,7 @@ RX_VK_CATCHUP_FORCE=1: forced, as before.
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9266`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9278`.
 
 #### `RX_VK_CHUNK` - developer
 
@@ -2565,7 +2565,7 @@ The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the fram
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8294`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8306`.
 
 #### `RX_VK_FLASH_CELLS` - developer
 
@@ -2575,7 +2575,7 @@ The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the fram
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8323`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8335`.
 
 #### `RX_VK_FLASH_DIFF` - developer
 
@@ -2585,7 +2585,7 @@ The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the fram
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8322`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8334`.
 
 #### `RX_VK_FLASH_DUMPS` - developer
 
@@ -2595,7 +2595,7 @@ The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the fram
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8319`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8331`.
 
 #### `RX_VK_FLASH_RECORD` - developer
 
@@ -2615,7 +2615,7 @@ The flash detector, with `RX_VK_SHOTS` and `RX_VK_SHOT_EVERY=1`: writes the fram
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8346`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8358`.
 
 #### `RX_VK_FOG` - developer
 
@@ -3175,7 +3175,7 @@ Timed Insert menu keys: `INS`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `ESC`, `ENTER`, `T
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_menu.cpp:3215`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_menu.cpp:3216`.
 
 #### `RX_VK_METER_HOLD` - player
 
@@ -3625,7 +3625,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9387`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9399`.
 
 #### `RX_VK_ORDER_PIN` - developer
 
@@ -3635,7 +3635,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9536`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9548`.
 
 #### `RX_VK_ORDER_POLL_JOIN` - developer
 
@@ -3645,7 +3645,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10053`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10065`.
 
 #### `RX_VK_ORDER_PRIO` - developer
 
@@ -3655,7 +3655,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9531`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9543`.
 
 #### `RX_VK_ORDER_R4_LEARN` - developer
 
@@ -3665,7 +3665,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9854`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9866`.
 
 #### `RX_VK_ORDER_R4_MAP` - developer
 
@@ -3675,7 +3675,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9947`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9959`.
 
 #### `RX_VK_ORDER_R4_OWN` - developer
 
@@ -3685,7 +3685,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9871`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9883`.
 
 #### `RX_VK_ORDER_RB_AUDIT` - developer
 
@@ -3695,7 +3695,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10010`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10022`.
 
 #### `RX_VK_ORDER_RB_JOIN` - developer
 
@@ -3705,7 +3705,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9834`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9846`.
 
 #### `RX_VK_ORDER_SIGNAL_MS` - developer
 
@@ -3715,7 +3715,7 @@ undocumented: gpu/vk/vk_draw.cpp:10631 reads it as a text value: `bool warm = gp
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9547`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9559`.
 
 #### `RX_VK_ORDER_THREAD` - developer
 
@@ -3995,7 +3995,7 @@ Over RX_VK_PREDICT_MAX_KWORDS (100: 100k words, v0.4.3; 0: no limit) a program i
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9116`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9128`.
 
 #### `RX_VK_PRESYNC_EARLY` - developer
 
@@ -4325,7 +4325,7 @@ Texture and sampler registrations: in order with the submits ---- A registration
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10388` and 2 more places.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10400` and 2 more places.
 
 #### `RX_VK_REJECT_KEYS` - developer
 
@@ -4365,7 +4365,7 @@ Texture and sampler registrations: in order with the submits ---- A registration
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10646`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10658`.
 
 #### `RX_VK_REMADE_SKIP` - developer
 
@@ -4735,7 +4735,7 @@ Engages while this many shader translations are queued (200), the cold arrival's
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8427`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8439`.
 
 #### `RX_VK_STORM_LIVE` - developer
 
@@ -4745,7 +4745,7 @@ The release counts only the jobs a draw asked for (pushed, or left out for want 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8433`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8445`.
 
 #### `RX_VK_STORM_LIVE_DEPTH` - developer
 
@@ -4755,7 +4755,7 @@ The release counts only the jobs a draw asked for (pushed, or left out for want 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8434`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8446`.
 
 #### `RX_VK_STORM_MIN_FRAMES` - developer
 
@@ -4765,7 +4765,7 @@ No release within this many presents of the engage (0).
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8428`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8440`.
 
 #### `RX_VK_STORM_OFF_DEPTH` - developer
 
@@ -4775,7 +4775,7 @@ Released once fewer than this many jobs are queued (100) for this many presents 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8430`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8442`.
 
 #### `RX_VK_STORM_QUIET_FRAMES` - developer
 
@@ -4785,7 +4785,7 @@ No release while a job was pushed in the last this many presents (0: off; the qu
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8429`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8441`.
 
 #### `RX_VK_STORM_SETTLE` - developer
 
@@ -4795,7 +4795,7 @@ Released once fewer than this many jobs are queued (100) for this many presents 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8432`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8444`.
 
 #### `RX_VK_STORM_WHOLE` - developer
 
@@ -4805,7 +4805,7 @@ Also released by `RX_VK_STORM_SETTLE` frames running that left no draw or dispat
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8431`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8443`.
 
 #### `RX_VK_STORM_WORKERS` - developer
 
@@ -4885,7 +4885,7 @@ While the storm hold is on, n workers translate: the base ones (a third of the h
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10165`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10177`.
 
 #### `RX_VK_SUB_OVERLAP` - developer
 
@@ -4955,7 +4955,7 @@ Keeps the threads that only compile in the background (RX_VK_THREAD_PRIO) off th
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9164` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9176` and 1 more place.
 
 #### `RX_VK_TL` - developer
 
@@ -5125,7 +5125,7 @@ RX_VK_WAIT_OWN=1 / 0 turns the wait on / off on any GPU; setting RX_VK_WAIT_GPU 
 
 **When a player would use it:** HUD icons flashing mid-screen or a minimap drawn with another texture on a Radeon handheld or iGPU: `=1` makes each present wait for its own frame's GPU work (v0.4.3's rule, lower fps), `=2` for the frame before's, `=3` for the frame before's and the frame's own after a texture upload (the default on AMD integrated GPUs), `=0` turns the wait off.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8181` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8193` and 1 more place.
 
 #### `RX_VK_WARM_COMPUTES` - developer
 
@@ -8815,7 +8815,7 @@ Linux: a pool larger than udmabuf's limit (several dma-bufs in a sparse buffer) 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10070` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10082` and 1 more place.
 
 #### `RX_VK_WAIT_GPU` - developer
 
@@ -8825,7 +8825,7 @@ RX_VK_WAIT_OWN=1 / 0 turns the wait on / off on any GPU; setting RX_VK_WAIT_GPU 
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8159` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8171` and 1 more place.
 
 ## Audio
 
@@ -8989,7 +8989,7 @@ S16LE F32LE (both's numbers).
 
 ## Input and controllers
 
-13 switches of the controllers, the mouse and scripted input.
+14 switches of the controllers, the mouse and scripted input.
 
 ### Keyboard and mouse
 
@@ -9053,7 +9053,7 @@ As above; the last lets every device count while the window is behind another on
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_hid.c:928` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_hid.c:936` and 1 more place.
 
 #### `HOS_INPUT_EXCLUSIVE` - diagnostic
 
@@ -9063,7 +9063,7 @@ As above; the last lets every device count while the window is behind another on
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_hid.c:914`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_hid.c:922`.
 
 #### `HOS_INPUT_FRAME_CLOCK` - diagnostic
 
@@ -9113,7 +9113,17 @@ As above; the last lets every device count while the window is behind another on
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_hid.c:922`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_hid.c:930`.
+
+#### `HOS_INPUT_SCRIPT_ONLY` - diagnostic
+
+HOS_INPUT_SCRIPT_ONLY=1 (test runs): the player's keyboard, mouse and pads are never read, whatever the script holds and wherever the window is. HOS_INPUT_EXCLUSIVE keeps them out only until 5 s after the script's last press, and a harness that passes an empty script (tools/bench/run_bench.py's kokiri-idle) left them in for the whole run: with HOS_INPUT_SCRIPT_BACKGROUND the owner's typing opened menus in test runs behind his windows (27 Nov 2026).
+
+**Values:** on or off (0, false, off, no and empty are off); the description names `1`. **Default:** off (unset).
+
+**When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
+
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_menu.cpp:3159` and 1 more place.
 
 ### Input diagnostics
 
@@ -10103,13 +10113,13 @@ In the owner's Kakariko (main PC, 60 limit) 12 % of the frames were 20-33 ms, 70
 
 #### `HL_PRESENT_PACE_TARGET_US` - developer
 
-undocumented: gpu/vk/vk_replay.cpp:7772 (in `thread_main()`) reads it as a text value: `const int64_t target = env_us("HL_PRESENT_PACE_TARGET_US", 500);`. No comment in the source says what it changes.
+undocumented: gpu/vk/vk_replay.cpp:7774 (in `thread_main()`) reads it as a text value: `const int64_t target = env_us("HL_PRESENT_PACE_TARGET_US", 500);`. No comment in the source says what it changes.
 
 **Values:** text. **Default:** unset.
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7772`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7774`.
 
 #### `HL_PROG_MEMO` - developer
 
@@ -12877,7 +12887,7 @@ A developer's bisection of what `RX_VK_FOLD_PSEUDO` changes in a picture. Progra
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9723`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9735`.
 
 #### `RX_VK_LATE_TEX_LOG` - diagnostic
 
@@ -13217,7 +13227,7 @@ undocumented: gpu/vk/vk_replay.cpp:6691 (in `invalidate()`) reads it as an on/of
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9020`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9032`.
 
 #### `RX_VK_LOG_REMADE` - diagnostic
 
@@ -13301,13 +13311,13 @@ RX_VK_LOG_UPLOADS=<present>: the uploads from that present on (200 of them; what
 
 #### `RX_VK_LOG_VMAP_CHANGING` - diagnostic
 
-undocumented: gpu/vk/vk_replay.cpp:9039 (in `vmap_changing()`) reads it as an on/off switch: `static const bool log_calls = getenv("RX_VK_LOG_VMAP_CHANGING") != nullptr;`. No comment in the source says what it changes.
+undocumented: gpu/vk/vk_replay.cpp:9051 (in `vmap_changing()`) reads it as an on/off switch: `static const bool log_calls = getenv("RX_VK_LOG_VMAP_CHANGING") != nullptr;`. No comment in the source says what it changes.
 
 **Values:** on or off (0, false, off, no and empty are off). **Default:** off (unset).
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9039`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9051`.
 
 #### `RX_VK_LOG_WRITEBACK` - diagnostic
 
@@ -13397,7 +13407,7 @@ A count not there yet, a window of several draws, or a proxy in the segment itse
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9824` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9836` and 1 more place.
 
 #### `RX_VK_ORDER_WATCH_PENDING` - diagnostic
 
@@ -13427,7 +13437,7 @@ The passes of the last frames, logged at a flash or a dark frame (`RX_VK_PASS_TR
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7969`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7981`.
 
 #### `RX_VK_PRESENT_LOG` - diagnostic
 
@@ -13437,7 +13447,7 @@ The passes of the last frames, logged at a flash or a dark frame (`RX_VK_PASS_TR
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8880`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8892`.
 
 #### `RX_VK_REFLEX_LOG` - diagnostic
 
@@ -13487,7 +13497,7 @@ While held, the queue's depth and its quiet clock logged every 2 s.
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8471`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8483`.
 
 #### `RX_VK_TEX_PAGE_WATCH` - diagnostic
 
@@ -14109,7 +14119,7 @@ Every step of the frame after that present as PNGs, in `dump_<present>` under `R
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8249`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8261`.
 
 #### `RX_VK_DUMP_DEPTH_ONLY` - diagnostic
 
@@ -14159,7 +14169,7 @@ The native code of every program that does not translate, for `nx2/lower_test.py
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In the process environment (or in a file named by `HOS_ENV_FILE`); `hookshot_env.txt` refuses this one. **Read at:** `gpu/vk/vk_replay.cpp:8219`.
+**Set it:** In the process environment (or in a file named by `HOS_ENV_FILE`); `hookshot_env.txt` refuses this one. **Read at:** `gpu/vk/vk_replay.cpp:8231`.
 
 #### `RX_VK_DUMP_KEY` - diagnostic
 
@@ -14169,17 +14179,17 @@ The native code of every program that does not translate, for `nx2/lower_test.py
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8203`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8215`.
 
 #### `RX_VK_DUMP_KEY_N` - diagnostic
 
-undocumented: gpu/vk/vk_replay.cpp:8209 (in `do_present()`) reads it as a number: `static const int n = getenv("RX_VK_DUMP_KEY_N") ? std::max(1, atoi(getenv("RX_VK_DUMP_KEY_N"))) : 1;`. No comment in the source says what it changes.
+undocumented: gpu/vk/vk_replay.cpp:8221 (in `do_present()`) reads it as a number: `static const int n = getenv("RX_VK_DUMP_KEY_N") ? std::max(1, atoi(getenv("RX_VK_DUMP_KEY_N"))) : 1;`. No comment in the source says what it changes.
 
 **Values:** a whole number. **Default:** 1.
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8209`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8221`.
 
 #### `RX_VK_DUMP_LIVE` - diagnostic
 
@@ -14209,7 +14219,7 @@ undocumented: gpu/vk/vk_replay.cpp:8209 (in `do_present()`) reads it as a number
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8223`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8235`.
 
 #### `RX_VK_DUMP_NATIVE` - diagnostic
 
@@ -14359,17 +14369,17 @@ Every frame shown, at 320x180, while `<file>.go` exists; `python -I scripts/fram
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8494`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8506`.
 
 #### `RX_VK_FRAMELOG_DROP` - diagnostic
 
-undocumented: gpu/vk/vk_replay.cpp:8664 (in `framelog_collect()`) reads it as an on/off switch: `static const bool drop = getenv("RX_VK_FRAMELOG_DROP") != nullptr;`. No comment in the source says what it changes.
+undocumented: gpu/vk/vk_replay.cpp:8676 (in `framelog_collect()`) reads it as an on/off switch: `static const bool drop = getenv("RX_VK_FRAMELOG_DROP") != nullptr;`. No comment in the source says what it changes.
 
 **Values:** on or off (0, false, off, no and empty are off). **Default:** off (unset).
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8664`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8676`.
 
 #### `RX_VK_GPU_DUMP` - diagnostic
 
@@ -14399,7 +14409,7 @@ Every thread's stack to the file once no frame was shown for `RX_VK_HANG_SEC` se
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:9995`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10007`.
 
 #### `RX_VK_SHOTS` - diagnostic
 
@@ -14419,17 +14429,17 @@ A PNG every `RX_VK_SHOT_EVERY` presents (300) as `vk_<present>.png`, at `RX_VK_S
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7973`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:7985`.
 
 #### `RX_VK_SHOT_FROM` - diagnostic
 
-undocumented: gpu/vk/vk_replay.cpp:8076 (in `do_present()`) reads it as a number: `static const int64_t shot_from = getenv("RX_VK_SHOT_FROM") ? atoll(getenv("RX_VK_SHOT_FROM")) : -1;`. No comment in the source says what it changes.
+undocumented: gpu/vk/vk_replay.cpp:8088 (in `do_present()`) reads it as a number: `static const int64_t shot_from = getenv("RX_VK_SHOT_FROM") ? atoll(getenv("RX_VK_SHOT_FROM")) : -1;`. No comment in the source says what it changes.
 
 **Values:** a whole number. **Default:** -1.
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8076`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8088`.
 
 #### `RX_VK_SHOT_GO` - diagnostic
 
@@ -14439,7 +14449,7 @@ undocumented: gpu/vk/vk_replay.cpp:8076 (in `do_present()`) reads it as a number
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8080`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8092`.
 
 #### `RX_VK_SHOT_H` - diagnostic
 
@@ -14459,7 +14469,7 @@ undocumented: gpu/vk/vk_replay.cpp:8076 (in `do_present()`) reads it as a number
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8032` and 1 more place.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8044` and 1 more place.
 
 #### `RX_VK_SHOT_MENU` - diagnostic
 
@@ -14469,7 +14479,7 @@ undocumented: gpu/vk/vk_replay.cpp:8076 (in `do_present()`) reads it as a number
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8091`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8103`.
 
 #### `RX_VK_SHOT_TO` - diagnostic
 
@@ -14479,7 +14489,7 @@ undocumented: gpu/vk/vk_replay.cpp:8076 (in `do_present()`) reads it as a number
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8077`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:8089`.
 
 #### `RX_VK_SHOT_W` - diagnostic
 
@@ -14761,7 +14771,7 @@ RX_VK_MSYNC_DIFF_GROUP=<chunks> (1, 2, 4, 8): copy granularity (default 1, 256 b
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10741`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `gpu/vk/vk_replay.cpp:10753`.
 
 #### `RX_VK_PASS_SAMPLE_MASK` - diagnostic
 

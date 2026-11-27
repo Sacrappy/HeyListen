@@ -3156,7 +3156,8 @@ void menu_tick() {
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
-    const bool mine = pid == GetCurrentProcessId();
+    static const bool script_only = getenv("HOS_INPUT_SCRIPT_ONLY") != nullptr;   // (test runs: no key of the player's, host/nn_hid.c)
+    const bool mine = pid == GetCurrentProcessId() && !script_only;
     bool press[K_N] = {};
     for (int i = 0; i < K_N; i++) {
         const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;

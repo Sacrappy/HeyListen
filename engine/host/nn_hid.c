@@ -904,6 +904,14 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     scripted_input(buttons, stick);
     void hos_oot_autoload_input(void);   /* (host/oot_autoload.c: the Skip title screen row's presses) */
     hos_oot_autoload_input();
+    {   /* HOS_INPUT_SCRIPT_ONLY=1 (test runs): the player's keyboard, mouse and pads are never read, whatever the script holds
+           and wherever the window is. HOS_INPUT_EXCLUSIVE keeps them out only until 5 s after the script's last press, and a
+           harness that passes an empty script (tools/bench/run_bench.py's kokiri-idle) left them in for the whole run: with
+           HOS_INPUT_SCRIPT_BACKGROUND the owner's typing opened menus in test runs behind his windows (27 Nov 2026) */
+        static int script_only = -1;
+        if (script_only < 0) script_only = getenv("HOS_INPUT_SCRIPT_ONLY") != NULL;
+        if (script_only) return;
+    }
     /* A scripted run (a test) takes no input from the player's devices until 5 s after its last press (a variable
        left set in a shell no longer leaves the game without controls), and otherwise the pads count only
        while the game's window is in front, like the keyboard: XInput is global, so a test run in the background
