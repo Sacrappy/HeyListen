@@ -1254,7 +1254,8 @@ static void lines_free(Lines *l) {
     free(l->at);
     memset(l, 0, sizeof *l);
 }
-static int crash_lines(const Shown *s, Lines *tail, Lines *crash, char *lifted, size_t lifted_cap) {
+typedef struct Extras { Lines slow, switches; char vulkan[HOS_CRASH_LINE_LIMIT + 1]; } Extras;
+static int crash_lines(const Shown *s, Lines *tail, Lines *crash, char *lifted, size_t lifted_cap, Extras *ex) {
     FILE *f = s->log->path[0] ? open_utf8(s->log->path, "rb") : NULL;
     if (!f) return 0;
     char line[4096], one[4096];
@@ -1272,6 +1273,17 @@ static int crash_lines(const Shown *s, Lines *tail, Lines *crash, char *lifted, 
             }
         }
         if (!found && hos_crash_starts(line)) found = 1;
+        if (!found && ex) {   /* (OLD1: the last 3 slow frames or stalls, the last Vulkan error, the switches hookshot_env.txt set) */
+            const int kind = hos_crash_extra_kind(line);
+            if (kind == HOS_CRASH_EXTRA_SLOW) {
+                if (ex->slow.n == 3) free(ex->slow.at[0]), memmove(ex->slow.at, ex->slow.at + 1, sizeof *ex->slow.at * 2), ex->slow.n--;
+                lines_add(&ex->slow, line);
+            } else if (kind == HOS_CRASH_EXTRA_VULKAN) {
+                snprintf(ex->vulkan, sizeof ex->vulkan, "%s", line);
+            } else if (kind == HOS_CRASH_EXTRA_SWITCH && ex->switches.n < 64 && hos_crash_switch_line(one, sizeof one, line)) {
+                lines_add(&ex->switches, one);
+            }
+        }
         if (!found) {   /* (the lines before it: the last 150, a ring) */
             if (ring.n < HOS_CRASH_TAIL_LINES) lines_add(&ring, line);
             else {
@@ -1281,6 +1293,7 @@ static int crash_lines(const Shown *s, Lines *tail, Lines *crash, char *lifted, 
                 if (!ring.at[HOS_CRASH_TAIL_LINES - 1]) ring.n--;
             }
         } else if (crash->n < HOS_CRASH_CRASH_LINES && hos_crash_report_line(one, sizeof one, line)) {
+            hos_crash_mask_registers(one);   /* (OLD1: a register's value that looks like text goes as <text>) */
             lines_add(crash, one);
         }
     }
@@ -1309,7 +1322,9 @@ static int put_frame_array(Buf *json, const Lines *crash, const char *kind, cons
 static int build_report(const Shown *s, Buf *json, Buf *shown, const char **why) {
     Lines tail = {0}, crash = {0};
     char lifted[64] = "";
-    if (!crash_lines(s, &tail, &crash, lifted, sizeof lifted) || !crash.n) {
+    static Extras ex;
+    lines_free(&ex.slow), lines_free(&ex.switches), ex.vulkan[0] = 0;
+    if (!crash_lines(s, &tail, &crash, lifted, sizeof lifted, &ex) || !crash.n) {
         *why = s->log->path[0] ? "The log of the run that crashed has no crash in it, so there is no report to send."
                                : "The log of the run that crashed is gone (four runs since), so there is no report to send.";
         lines_free(&tail), lines_free(&crash);
@@ -1364,9 +1379,40 @@ static int build_report(const Shown *s, Buf *json, Buf *shown, const char **why)
         if (guest_frames) put(json, "\n  ]");
         else json->n = mark2, json->s[mark2] = 0;
     }
+    /* (OLD1) what places a crash without reproducing it, from the log before the crash: the last slow frames and stalls, the
+       last Vulkan error, the switches hookshot_env.txt set (a value only when it is a number or on/off) */
+    if (ex.slow.n) {
+        put(json, ",\n  \"slow\": [");
+        for (int i = 0; i < ex.slow.n; i++) put_field(json, i ? ",\n    " : "\n    ", NULL, ex.slow.at[i], HOS_CRASH_LINE_LIMIT, s, devices, nd);
+        put(json, "\n  ]");
+    }
+    if (ex.vulkan[0]) put_field(json, ",\n  ", "vulkan_error", ex.vulkan, HOS_CRASH_LINE_LIMIT, s, devices, nd);
+    if (ex.switches.n) {
+        put(json, ",\n  \"switches\": [");
+        for (int i = 0; i < ex.switches.n; i++) put_field(json, i ? ",\n    " : "\n    ", NULL, ex.switches.at[i], 160, s, devices, nd);
+        put(json, "\n  ]");
+    }
     put(json, ",\n  \"log_tail\": [");
-    for (int i = 0; i < tail.n; i++) put_field(json, i ? ",\n    " : "\n    ", NULL, tail.at[i], HOS_CRASH_LINE_LIMIT, s, devices, nd);
-    put(json, tail.n ? "\n  ]" : "]");
+    int sent_lines = 0;
+    {   /* (after feat/crash-report-public b4acd8920) the payload kept to HOS_CRASH_PAYLOAD_BUDGET bytes (the relay puts it on a
+           GitHub comment, 65,536 characters at most): the log's newest lines, cut to 200 characters when the whole tail does not
+           fit, then the oldest left out, never fewer than the last HOS_CRASH_TAIL_KEEP */
+        const size_t fixed = json->n + settings.n + 16;
+        const size_t room = HOS_CRASH_PAYLOAD_BUDGET > fixed ? HOS_CRASH_PAYLOAD_BUDGET - fixed : 0;
+        size_t whole = 0;
+        for (int i = 0; i < tail.n; i++) whole += strlen(tail.at[i]) + 8;
+        const size_t limit = whole > room ? 200 : HOS_CRASH_LINE_LIMIT;
+        int first = tail.n;
+        size_t used = 0;
+        while (first > 0) {
+            const size_t len = strlen(tail.at[first - 1]), one = (len < limit ? len : limit) + 8;
+            if (used + one > room && tail.n - first >= HOS_CRASH_TAIL_KEEP) break;
+            used += one, first--;
+        }
+        for (int i = first; i < tail.n; i++) put_field(json, i > first ? ",\n    " : "\n    ", NULL, tail.at[i], limit, s, devices, nd);
+        sent_lines = tail.n - first;
+    }
+    put(json, sent_lines ? "\n  ]" : "]");
     put(json, settings.s);
     put(json, "\n}\n");
     /* (the page: the card's rows, the crash's first lines, what else goes; the whole of it is the file Show all of it opens.
@@ -1385,8 +1431,9 @@ static int build_report(const Shown *s, Buf *json, Buf *shown, const char **why)
         putf(shown, "%s\n", line);
     }
     if (crash.n > 12) putf(shown, "(and %d more lines of it)\n", crash.n - 12);
-    putf(shown, "\nand the %d log lines before it, and every setting (Show all of it).", tail.n);
-    free(settings.s), lines_free(&tail), lines_free(&crash);
+    putf(shown, "\nand the %d log lines before it, the last slow frames, Vulkan error and hookshot_env.txt switches when the log "
+                "has them, and every setting (Show all of it).", sent_lines);
+    free(settings.s), lines_free(&tail), lines_free(&crash), lines_free(&ex.slow), lines_free(&ex.switches);
     return 1;
 }
 /* The system's curl (Windows 10 and 11 have one in System32): its path, 0 without one */

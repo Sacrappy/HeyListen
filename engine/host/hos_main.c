@@ -61,6 +61,7 @@ const char *hos_lift_key(void) { return HOOKSHOT_LIFT_KEY; } /* (the crash recor
    through MkwVkHost perf_info) and the crash report's "where in the game": "" while no save is loaded */
 static SRWLOCK map_lock = SRWLOCK_INIT;
 static char map_now[100];
+static int64_t map_changed_ns;   /* (hos_now_ns when the "map:" line last changed; 0 never) */
 void hos_movie_stats(int64_t out[5]);   /* nn_video.c */
 const char *hos_perf_info(char *map, int cap, int64_t movie[5]) {
     AcquireSRWLockShared(&map_lock);
@@ -884,6 +885,7 @@ static void oot_inventory_refresh(Ctx *c, int64_t now) {
                      oot_gamedata_bool(c, 0xcea220d3u, &child) ? (child ? "child" : "adult") : "age not known");
             if (strcmp(line, logged)) {
                 hos_log("map: %s", line), snprintf(logged, sizeof logged, "%s", line);
+                __atomic_store_n(&map_changed_ns, hos_now_ns(), __ATOMIC_RELAXED);   /* (the crash report: hos_crash_times) */
                 AcquireSRWLockExclusive(&map_lock);
                 snprintf(map_now, sizeof map_now, "%s", line);
                 ReleaseSRWLockExclusive(&map_lock);
@@ -1310,6 +1312,20 @@ static _Thread_local uint64_t flight_pose_actor;
 static _Thread_local float flight_transform_yaw;
 static int64_t flight_player_seen;
 static int64_t play_began;   /* (the first time the player ran, hos_now_ns clock; 0 before) */
+/* (OLD1, the crash report: host/mkw_glue.c "CRASH: play:") seconds since play began and since the map last changed, -1 for
+   never; the map's name as the "map:" line gives it. Read on the crash path: two atomic loads and a copy, no lock (a crash
+   inside the map lock must not wait for it; the copy may be torn at worst) */
+void hos_crash_times(double *since_play, double *since_map, char *map, size_t cap) {
+    const int64_t now = hos_now_ns(), p = __atomic_load_n(&play_began, __ATOMIC_RELAXED),
+                  m = __atomic_load_n(&map_changed_ns, __ATOMIC_RELAXED);
+    *since_play = p ? (double)(now - p) / 1e9 : -1;
+    *since_map = m ? (double)(now - m) / 1e9 : -1;
+    if (cap) {
+        size_t i = 0;
+        for (; i + 1 < cap && i < sizeof map_now && map_now[i]; i++) map[i] = map_now[i];
+        map[i] = 0;
+    }
+}
 static int64_t process_start_ns;   /* (hos_now_ns when main began) */
 
 /* First person, the Gameplay page's First person row (HL_OPT_FIRST_PERSON). The player's update keeps Link's place, facing

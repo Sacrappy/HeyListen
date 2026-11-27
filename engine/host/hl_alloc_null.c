@@ -76,6 +76,14 @@ static int describe(Ctx *c, uint64_t heap, char *out, int cap) {
                     (unsigned long long)recomp_load64(c, heap + HEAP_START));
 }
 
+/* (OLD1, the crash report) the last of these lines, kept for the crash handler (host/mkw_glue.c "CRASH: last failed allocation"):
+   the log tells only the first twelve, and the report's log tail may have lost them */
+static char alloc_null_last[400];
+static void alloc_null_keep(const char *line) {
+    snprintf(alloc_null_last, sizeof alloc_null_last, "%s", line);
+}
+const char *hl_alloc_null_last(void) { return alloc_null_last; }
+
 void hl_oot_new_null(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint64_t lr, int kind) {
     static volatile long told;
     static int off = -1;
@@ -103,6 +111,7 @@ void hl_oot_new_null(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint6
     }
     (void)at;
     hos_log("%s", line);
+    alloc_null_keep(line);
 }
 
 /* ---- the module system's heaps: f_83b7b340 makes each module's heap with f_809df710 (x0 the size, x1 a record whose first word is

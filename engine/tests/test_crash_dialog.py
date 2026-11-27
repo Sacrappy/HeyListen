@@ -502,13 +502,15 @@ def source_checks():
     assert form == "https://github.com/Sacrappy/HeyListen/issues/new", "the manual report opens HeyListen's new-issue page"
     header = (ROOT / "host/hos_crash_dialog.h").read_text(encoding="utf-8")
     public = re.search(r'#define HOS_CRASH_PUBLIC_TEXT "([^"]+)"', header).group(1)
-    assert public == "Your report is published on the project's GitHub (issue #55) and Discord, without your user name or " \
-                     "folders.", "the sentence players are told"
+    assert public.startswith("Your report is published on the project's GitHub (issue #55) and Discord, without your user name or "
+                             "folders. It holds the crash's place and the registers' values"), "the sentences players are told"
+    assert all(w in public for w in ("masked", "GPU, driver, CPU, RAM and memory use", "hookshot_env.txt", "never saves")), \
+        "the public text says what is sent (OLD1)"
     build = dialog[dialog.index("static int build_report("):]
     assert "HOS_CRASH_PUBLIC_TEXT" in build[:build.index("\n}\n")], "Report automatically's page says the report is published"
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     assert "Your report is published on the project's GitHub (issue #55) and " in menu and \
-        "\"Discord, without your user name or folders.\"" in menu, "the auto-send row says it too"
+        "\"Discord, without your user name or folders. It holds the crash's place" in menu, "the auto-send row says it too"
     launcher = (ROOT.parent / "recomplauncher.json").read_text(encoding="utf-8")
     assert launcher.count("published on the project's GitHub (issue #55) and Discord") == 2, \
         "the RecompLauncher's crash tick says it in both places it describes the report"
@@ -1154,8 +1156,12 @@ esac
 "[hos host] report: os Arch Linux","[hos host] report: cpu Ryzen 7 7700 (16 threads), 32 GB",
            "[hos host] sdl: SDL3 3.2.8, revision SDL-release-3.2.8-0-g1a2b3c4d5 (libsdl.org), from beside the game",
            "[hos Main] map: Kokiri Forest", "[hos Main] reading %s/secret.txt" % home,
+           "[hos host] env: hookshot_env.txt sets RX_VK_FOG=0", "[hos host] env: hookshot_env.txt sets HL_ROOM_TOKEN=abc123",
+           "[hos Presentation Thread] vk: slow frame at present 812: 84.1 ms; submit 3.0",
+           "[hos Presentation Thread] vk: queue submit failed (VK_ERROR_DEVICE_LOST) at %s/x" % home,
            "[hos host] CRASH: exception 0xc0000005 (read 0x8, guest 0x8) at %s/Games/hookshot+0x1a2b" % home,
            "[hos host] CRASH:   x0 0000000000000001", "[hos host] CRASH: host backtrace: hookshot+0x1a2b libc.so.6+0x10",
+           "[hos host] CRASH: guest regs: x0=6c6c6568 x1=10 x2=7ff6a0001000",
            "[hos host] CRASH: stack rsp 0x7ffd10: hookshot+0x1a2b 0x1 0x2c1f0a0 -")
     for answer, buttons in (("sent", "0,1,0,0"), ("busy", "0,0,1"), ("refused", "0,0")):
         folder = home / ("send-" + answer)
@@ -1168,11 +1174,16 @@ esac
         assert calls == ["https://d.example/telemetry/crash"], "posted once, to the stamp's address: %s" % calls
         report = json.loads((folder / "sent.json").read_text(encoding="utf-8"))
         assert sorted(report) == ["cpu", "crash", "gpu", "log_tail", "map", "options", "os", "release", "renderer", "signature",
-                                   "version"]
+                                   "slow", "switches", "version", "vulkan_error"], sorted(report)
+        # (OLD1: the last slow frames, the last Vulkan error, hookshot_env.txt's switches with a secret's value left out)
+        assert report["slow"] == ["[hos Presentation Thread] vk: slow frame at present 812: 84.1 ms; submit 3.0"], report["slow"]
+        assert report["vulkan_error"] == "[hos Presentation Thread] vk: queue submit failed (VK_ERROR_DEVICE_LOST) at <path>/x", report
+        assert report["switches"] == ["RX_VK_FOG=0", "HL_ROOM_TOKEN=(value left out)"], report["switches"]
         assert report["signature"] == "hookshot+0x1a2b", report
         assert (report["version"], report["release"], report["os"], report["map"]) == ("vtest-1", False, "Arch Linux", "Kokiri Forest")
         assert report["crash"] == ["CRASH: exception 0xc0000005 (read 0x8, guest 0x8) at hookshot+0x1a2b",
                                    "CRASH: host backtrace: hookshot+0x1a2b libc.so.6+0x10",
+                                   "CRASH: guest regs: x0=<text> x1=10 x2=7ff6a0001000",
                                    "CRASH: stack rsp 0x7ffd10: hookshot+0x1a2b 0x1 0x2c1f0a0 -"], report["crash"]
         assert "[hos host] sdl: SDL3 3.2.8, revision SDL-release-3.2.8-0-g1a2b3c4d5 (libsdl.org), from beside the game" in report["log_tail"], report["log_tail"]
         assert "[hos Main] reading <path>/secret.txt" in report["log_tail"] and "private-user" not in json.dumps(report), report

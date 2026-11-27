@@ -474,7 +474,10 @@ in-game menu (Insert) control it:
   automatically** shows you the exact report and sends it only when you press Send. With this row on, the report is sent at
   once and the window shows only if that fails. The report has the crash's error line with the code of each step named
   (`f_80580b38+0x1c4`, a function name, or a system file and offset), the game version and which lifted code it ran,
-  your GPU, CPU, RAM and operating system, the map, the last 150 lines of the game's log and its settings. Your home
+  your GPU, driver, CPU, RAM and operating system, the map and how long you had played (in all, and in that map), the RAM
+  and memory in use at the crash, the registers' values (a value that looks like text is masked), the last slow frames and
+  Vulkan error of the log, the switches set in hookshot_env.txt (their values only when they are numbers or on/off), the
+  last 150 lines of the game's log (at least the last 100 when it is long) and its settings. Your home
   folder, user name, every folder path and the names of your audio devices are taken out first. It never has your saves,
   the game's files or keys. See [crash reports](crash-reports.md).
 - **Crash reports are published, not kept private**: a report becomes a comment on the project's GitHub issue #55 and a

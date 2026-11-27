@@ -14,6 +14,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #ifdef _WIN32
+#include <psapi.h>   /* (the crash report: PROCESS_MEMORY_COUNTERS_EX) */
+#endif
+#ifdef _WIN32
 #include "ws_floor.h"   /* (HL_PREFAULT asks for the soft working-set minimum VirtualLock needs) */
 #endif
 #ifndef _WIN32
@@ -654,6 +657,66 @@ static void crash_regs(const CONTEXT *h, const Ctx *c, uint64_t fault_guest) {
     else if (lines < 3) hos_log("%s", line);
 }
 
+/* (OLD1, the crash report: what a report needs to place a crash without reproducing it) one line each, all numbers or the
+   game's own names, nothing of the player's (the report's cleaning still runs over them, host/hos_crash_dialog.c):
+   - diagnosis: the kind of fault in words (a guest access to a null pointer, a fault in the renderer or the graphics driver);
+   - play: seconds since play began and since the map last changed, and the map;
+   - memory: RAM and the commit charge at the crash, and this process's private bytes and working set (a crash at the commit
+     limit reads differently from one with room);
+   - last failed allocation: the game's allocator's last null (host/hl_alloc_null.c), when it had one */
+void hos_crash_times(double *since_play, double *since_map, char *map, size_t cap);
+const char *hl_alloc_null_last(void);
+static int crash_driver_module(const char *m) {   /* (the graphics drivers' own libraries, by their names' start, any case) */
+    static const char *const starts[] = {"nv", "amd", "atiu", "ig", "libnvidia", "libvulkan_radeon", "libvulkan_intel"};
+    for (size_t i = 0; i < sizeof starts / sizeof starts[0]; i++) {
+        size_t k = 0;
+        while (starts[i][k] && m[k] && (m[k] | 0x20) == starts[i][k]) k++;
+        if (!starts[i][k]) return 1;
+    }
+    return 0;
+}
+static void crash_context_lines(DWORD code, int write, uint64_t guest, const char *module) {
+    const char *how = write ? "write" : "read";
+    if (code == 0xc0000005u && guest < 0x10000)
+        hos_log("CRASH: diagnosis: a guest %s through a null pointer (+%#llx): the game used an object it did not get", how,
+                (unsigned long long)guest);
+    else if (code == 0xc0000005u && guest < (uint64_t)HOS_SPACE_END)
+        hos_log("CRASH: diagnosis: a guest %s of an address the game does not hold (guest %#llx)", how, (unsigned long long)guest);
+    else if (strstr(module, "hookshot_vk"))
+        hos_log("CRASH: diagnosis: a fault in the renderer (%s), exception %#lx", module, (unsigned long)code);
+    else if (crash_driver_module(module))
+        hos_log("CRASH: diagnosis: a fault in the graphics driver (%s), exception %#lx", module, (unsigned long)code);
+    else
+        hos_log("CRASH: diagnosis: exception %#lx in %s", (unsigned long)code, module);
+    double play = -1, since_map = -1;
+    char map[100] = "";
+    hos_crash_times(&play, &since_map, map, sizeof map);
+    if (play < 0) hos_log("CRASH: play: not begun (the title, a load or the start)");
+    else hos_log("CRASH: play: %.1f s since play began, %.1f s since the map changed (%s)", play, since_map, map[0] ? map : "no map yet");
+#ifdef _WIN32
+    MEMORYSTATUSEX m;
+    m.dwLength = sizeof m;
+    PROCESS_MEMORY_COUNTERS_EX pm;
+    memset(&pm, 0, sizeof pm);
+    typedef BOOL(WINAPI * MemInfo)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+    MemInfo info = (MemInfo)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    const int got = info && info(GetCurrentProcess(), (PPROCESS_MEMORY_COUNTERS)&pm, sizeof pm);
+    if (GlobalMemoryStatusEx(&m))
+        hos_log("CRASH: memory: RAM %llu MB, %llu MB free; commit %llu of %llu MB; process private %llu MB, working set %llu MB",
+                (unsigned long long)(m.ullTotalPhys >> 20), (unsigned long long)(m.ullAvailPhys >> 20),
+                (unsigned long long)((m.ullTotalPageFile - m.ullAvailPageFile) >> 20), (unsigned long long)(m.ullTotalPageFile >> 20),
+                got ? (unsigned long long)(pm.PrivateUsage >> 20) : 0ull, got ? (unsigned long long)(pm.WorkingSetSize >> 20) : 0ull);
+#else
+    struct sysinfo si;
+    if (sysinfo(&si) == 0)
+        hos_log("CRASH: memory: RAM %llu MB, %llu MB free; swap %llu of %llu MB used", (unsigned long long)si.totalram * si.mem_unit >> 20,
+                (unsigned long long)si.freeram * si.mem_unit >> 20, (unsigned long long)(si.totalswap - si.freeswap) * si.mem_unit >> 20,
+                (unsigned long long)si.totalswap * si.mem_unit >> 20);
+#endif
+    const char *alloc = hl_alloc_null_last();
+    if (alloc && alloc[0]) hos_log("CRASH: last failed allocation: %s", alloc);
+}
+
 static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     record_exception(info);
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
@@ -681,6 +744,8 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
         const char *hos_lift_key(void);
         hos_log("CRASH: build %s, lifted code %s", hos_version(), hos_lift_key());
     }
+    crash_context_lines(rec->ExceptionCode, rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1,
+                        addr - (uint64_t)A64_MEM, base ? base + 1 : name);
 #ifdef _WIN32
     {
         char hb[1024], sk[320];

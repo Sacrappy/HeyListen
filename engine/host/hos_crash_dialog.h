@@ -26,7 +26,7 @@
 #define HOS_CRASH_ISSUE_FORM "https://github.com/Sacrappy/HeyListen/issues/new"
 #define HOS_CRASH_ISSUES "https://github.com/Sacrappy/HeyListen/issues/new"
 /* (what the crash window and the menu's row say before a report is sent: it is public, not private to the team) */
-#define HOS_CRASH_PUBLIC_TEXT "Your report is published on the project's GitHub (issue #55) and Discord, without your user name or folders."
+#define HOS_CRASH_PUBLIC_TEXT "Your report is published on the project's GitHub (issue #55) and Discord, without your user name or folders. It holds the crash's place and the registers' values (any that look like text are masked), the map and the time played, the PC's GPU, driver, CPU, RAM and memory use, the log's last lines, the settings and the switches of hookshot_env.txt; never saves, game files or memory."
 enum { HOS_CRASH_LINK_MAX = 7500, HOS_CRASH_LOG_LINES = 200 };
 
 /* ---- the helper's command line ---- */
@@ -1000,6 +1000,9 @@ static inline int hos_crash_auto_send(const char *ini) {
    crash, log_tail, options}. The crash lines are the run's log's CRASH: lines from its exception on, without the rows of the
    game's memory, each module named without its folder: the relay's signature reads them, so they must stay as they are */
 enum { HOS_CRASH_LINE_LIMIT = 300, HOS_CRASH_CRASH_LINES = 80, HOS_CRASH_TAIL_LINES = 150 };
+/* (after feat/crash-report-public b4acd8920) the posted payload's size: the relay puts it on a GitHub comment (65,536 characters at
+   most, with its own words around it): 48,000 bytes, of which the log's last 100 lines are never left out */
+enum { HOS_CRASH_PAYLOAD_BUDGET = 48000, HOS_CRASH_TAIL_KEEP = 100 };
 enum { HOS_CRASH_MAX_VERSION = 40, HOS_CRASH_MAX_OS = 200, HOS_CRASH_MAX_RENDERER = 120, HOS_CRASH_MAX_GPU = 200,
        HOS_CRASH_MAX_CPU = 200, HOS_CRASH_MAX_MAP = 120, HOS_CRASH_MAX_OPTIONS = 4000 };
 /* A crash's first line: "CRASH: exception 0x<hex> " anywhere in it */
@@ -1026,6 +1029,76 @@ static inline int hos_crash_memory_row(const char *crash) {
         if (*p == 'x' && isdigit((unsigned char)p[1])) return 1;
     }
     return 0;
+}
+/* (OLD1, after feat/crash-report-public 4ef33a20d) Does a register's value, as 8 bytes of memory (least significant first),
+   look like text: 4 printable bytes in a row (ASCII 0x20-0x7e), or 3 or more non-zero bytes that are all printable. Pointers
+   (top bytes 0x00 or 0x7f), small numbers and 0 are not text. A value that is text is a name, a path or a string the game
+   held: it is not for a public page */
+static inline int hos_crash_text_like(uint64_t v) {
+    int run = 0, best = 0, nonzero = 0, all = 1;
+    for (int i = 0; i < 8; i++) {
+        const unsigned char b = (unsigned char)(v >> (8 * i));
+        const int printable = b >= 0x20 && b <= 0x7e;
+        if (b) nonzero++;
+        if (b && !printable) all = 0;
+        run = printable ? run + 1 : 0;
+        if (run > best) best = run;
+    }
+    return best >= 4 || (nonzero >= 3 && all);
+}
+/* A crash line's register values that look like text, as <text>, in place: the "name=<hex>" tokens of "CRASH: guest regs:"
+   and "CRASH: host regs:" lines (host/mkw_glue.c crash_regs). Other lines are left as they are; the line never grows */
+static inline void hos_crash_mask_registers(char *s) {
+    if (!strstr(s, "CRASH: guest regs:") && !strstr(s, "CRASH: host regs:")) return;
+    char *o = s;
+    const char *p = s;
+    while (*p) {
+        if (*p == '=' && p > s && isalnum((unsigned char)p[-1])) {
+            const char *h = p + 1;
+            size_t n = 0;
+            while (isxdigit((unsigned char)h[n])) n++;
+            if (n && n <= 16 && (h[n] == 0 || h[n] == ' ')) {
+                uint64_t v = 0;
+                for (size_t i = 0; i < n; i++) v = v << 4 | (uint64_t)(isdigit((unsigned char)h[i]) ? h[i] - '0' : (h[i] | 0x20) - 'a' + 10);
+                if (hos_crash_text_like(v) && n >= 6) {
+                    *o++ = '=';
+                    memcpy(o, "<text>", 6), o += 6;
+                    p = h + n;
+                    continue;
+                }
+            }
+        }
+        *o++ = *p++;
+    }
+    *o = 0;
+}
+/* (OLD1) The log lines the posted report takes besides the crash's and the tail: the last slow frames and stalls, the last
+   Vulkan error, the switches hookshot_env.txt set. Which kind a line is (0 none) */
+enum { HOS_CRASH_EXTRA_SLOW = 1, HOS_CRASH_EXTRA_VULKAN = 2, HOS_CRASH_EXTRA_SWITCH = 3 };
+static inline int hos_crash_extra_kind(const char *line) {
+    if (strstr(line, "vk: slow frame") || strstr(line, "stallwatch: gap") || strstr(line, "] hitch"))
+        return HOS_CRASH_EXTRA_SLOW;
+    if (strstr(line, "VK_ERROR") || strstr(line, "device lost") || (strstr(line, "] vk: ") && strstr(line, " failed (")))
+        return HOS_CRASH_EXTRA_VULKAN;
+    if (strstr(line, "env: hookshot_env.txt sets ")) return HOS_CRASH_EXTRA_SWITCH;
+    return 0;
+}
+/* A switch line ("env: hookshot_env.txt sets NAME=value[ over the environment's old]") as the report sends it: NAME=value
+   when the value is shown (hos_crash_value_shown: a number or on/off, and never for a name with TOKEN, KEY...), else
+   NAME=(value left out). 0 when the line is not one */
+static inline int hos_crash_switch_line(char *out, size_t cap, const char *line) {
+    const char *at = strstr(line, "env: hookshot_env.txt sets ");
+    if (!at || !cap) return 0;
+    at += 27;
+    const char *eq = strchr(at, '=');
+    if (!eq || eq == at || (size_t)(eq - at) >= 96) return 0;
+    char name[96], value[128];
+    memcpy(name, at, (size_t)(eq - at)), name[eq - at] = 0;
+    size_t n = 0;
+    for (const char *v = eq + 1; *v && *v != ' ' && *v != '\r' && *v != '\n' && n + 1 < sizeof value; v++) value[n++] = *v;
+    value[n] = 0;
+    snprintf(out, cap, "%s=%s", name, hos_crash_value_shown(name, value) ? value : "(value left out)");
+    return 1;
 }
 /* A log line's crash part, "CRASH: ..." at its start or after the log's "] ", as the report holds it: modules without their
    folder ("at /usr/lib/libc.so.6+0x10" is "at libc.so.6+0x10") and, on the crash's first line, the module of the place in the

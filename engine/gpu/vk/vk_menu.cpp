@@ -1144,7 +1144,8 @@ Row rows[] = {
      "Off by default: after a crash a window asks what to do. On: the crash report (the error, your PC's hardware, the end of the "
      "log, the settings, with your home folder, user name, every folder path and device names taken out) is sent at once, without "
      "the window; if it cannot be sent the window shows as usual. Your report is published on the project's GitHub (issue #55) and "
-     "Discord, without your user name or folders.", hn_telemetry, false, true},
+     "Discord, without your user name or folders. It holds the crash's place and the registers' values (any th"
+     "at look like text are masked), the map and the time played, the PC's GPU, driver, CPU, RAM and memory use, the log's last lines, the settings and the switches of hookshot_env.txt; never saves, game files or memory.", hn_telemetry, false, true},
     {TAB_GAMEPLAY, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Hookshot\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
      true},

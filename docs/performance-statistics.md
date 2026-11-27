@@ -54,11 +54,14 @@ refused one, 429 or 5xx when busy.
 
 | Field | Type | Required | Limits | What it is |
 |---|---|---|---|---|
-| `crash` | array of string | yes |  | The crash handler's lines; the first is `CRASH: exception <code> (<read\|write> ...) at <module+offset>`. The rows of the game's memory (registers and what they point to) are left out. The host backtrace and, after it, `CRASH: stack rsp <hex>: ...` (the first 8 words at the host stack pointer) are kept: a word is `module+offset` (module without its folder), a small value or the hex of a readable address, or `-`; never what a pointer points to |
+| `crash` | array of string | yes |  | The crash handler's lines; the first is `CRASH: exception <code> (<read\|write> ...) at <module+offset>`, then `CRASH: build` (the version and the lifted code's key), `CRASH: diagnosis` (the kind of fault in words), `CRASH: play` (seconds since play began and since the map changed, and the map), `CRASH: memory` (RAM, the commit charge, the process's private bytes and working set), `CRASH: last failed allocation` (the game allocator's last null, when it had one), the registers' values (`CRASH: guest regs`, `CRASH: host regs`; a value that looks like text, 4 printable bytes in a row or 3 non-zero bytes all printable, is sent as `<text>`) and `CRASH: GPU write-back` (the GPU's last write-back over the fault's and the registers' pages). What the registers point to, the rows of the game's memory, is left out. The host backtrace and, after it, `CRASH: stack rsp <hex>: ...` (the first 8 words at the host stack pointer) are kept: a word is `module+offset` (module without its folder), a small value or the hex of a readable address, or `-`; never what a pointer points to |
 | `version` | string | yes | ≤ 40 characters | The game's version |
 | `cpu` | string |  | ≤ 200 characters | The CPU, its threads and the RAM |
 | `gpu` | string |  | ≤ 200 characters | The GPU |
-| `log_tail` | array of string |  |  | The log's last 150 lines before the crash |
+| `log_tail` | array of string |  |  | The log's last 150 lines before the crash; when the report would pass 48,000 bytes (a GitHub comment holds 65,536 characters), lines are cut to 200 characters, then the oldest left out, never fewer than the last 100 |
+| `slow` | array of string |  |  | The log's last 3 slow-frame and stall lines before the crash (`vk: slow frame`, `stallwatch: gap`), when it has any |
+| `vulkan_error` | string |  |  | The log's last Vulkan error line before the crash (`VK_ERROR`, a device lost, a failed Vulkan call), when it has one |
+| `switches` | array of string |  |  | The switches hookshot_env.txt set, `NAME=value`, the value only when it is a number or on/off and never for a name with TOKEN, KEY, ROOM, SECRET, PASS, SERVER or USER in it (else `NAME=(value left out)`) |
 | `map` | string |  | ≤ 120 characters | The map played when it crashed: the scene and Link's age (or "Preparing shaders", "Title and intro") |
 | `options` | string |  | ≤ 4000 characters | The game's settings, one per line, a value only when it is a number, a size or on/off |
 | `os` | string |  | ≤ 200 characters | The operating system and its version |
