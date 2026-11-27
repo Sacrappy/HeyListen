@@ -7536,6 +7536,250 @@ void status_tick() {
     slowest_ns = 0;
 }
 
+void frame_log_note() {
+    {   // (RX_VK_FRAME_LOG=<file>: one CSV line a present: frame, seconds since the first, frame time in ms. Frame
+        // pacing on the Steam Deck, where MangoHud's log stays empty under gamescope)
+        static FILE* fl = getenv("RX_VK_FRAME_LOG") ? std::fopen(getenv("RX_VK_FRAME_LOG"), "w") : nullptr;
+        static std::chrono::steady_clock::time_point first, prev;
+        static uint64_t frames;
+        // (HeyListen) and the QueryPerformanceCounter value of the present, PresentMon's TimeInQPC clock and HOS_LOG_QPC's:
+        // a long frame then falls next to the log lines around it (0 where there is no such counter)
+        if (fl) {
+            const auto t = std::chrono::steady_clock::now();
+            long long qpc = 0;
+#ifdef _WIN32
+            LARGE_INTEGER q;
+            if (QueryPerformanceCounter(&q)) qpc = (long long)q.QuadPart;
+#endif
+            if (!frames) first = prev = t, std::fputs("frame,time_s,frametime_ms,qpc\n", fl);
+            std::fprintf(fl, "%llu,%.4f,%.3f,%lld\n", (unsigned long long)frames, std::chrono::duration<double>(t - first).count(),
+                         std::chrono::duration<double, std::milli>(t - prev).count(), qpc);
+            prev = t;
+            if (++frames % 60 == 0) std::fflush(fl);
+        }
+    }
+}
+
+/// (ARR1, 27 Nov) The present pace (present_pace_rule.h): at a frame rate limit each frame is handed over on an even line, one
+/// period after the line's last point, the game's presenting thread waiting here when it is early, before the order lock and the
+/// replay's drain (no lock held, nothing of the replay waits). The limit itself waits at the game's window acquire (host/nn_vi.c),
+/// at the START of the game's frame: the present came one period after the one before plus the difference of the two frames'
+/// work, and a mailbox swapchain (V-Sync off) showed that difference. In the owner's Kakariko (main PC, 60 limit) 12 % of the
+/// frames were 20-33 ms, 70 % of them followed by one under 14 ms, with about 11 ms of work a frame: the hitch log named the
+/// pacing sleep in 365 of 428 such frames. HL_PRESENT_PACE=0 (the default): off; 1: the hold; 2: the hold, and after the present the game's
+/// next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point:
+/// the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace),
+/// a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that
+/// much early, for the timer's wake-up
+namespace pace {
+int mode() {
+    static const int m = [] {
+        const char* e = getenv("HL_PRESENT_PACE");
+        return e && *e ? std::clamp(atoi(e), 0, 3) : 0;   // (off by default until =3 is measured: =1 and =2 lost frames)
+    }();
+    return m;
+}
+int64_t env_us(const char* name, int otherwise) {
+    const char* e = getenv(name);
+    return (int64_t)(e && *e ? std::max(0, atoi(e)) : otherwise) * 1000;
+}
+present_pace_rule::Line line;
+int64_t last_exit = 0, ring[64];
+int ring_n = 0, ring_at = 0;
+int64_t n = 0, holds = 0, hold_ns = 0, lates = 0, starts = 0, start_ns = 0, hist[8];
+int64_t now_ns() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void sleep_until_ns(int64_t want) {
+    const int64_t now = now_ns();
+    if (want <= now) return;
+#ifdef _WIN32
+    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    LARGE_INTEGER d;
+    d.QuadPart = -std::max<int64_t>(1, (want - now) / 100);
+    if (timer && SetWaitableTimerEx(timer, &d, 0, nullptr, nullptr, nullptr, 0)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::nanoseconds(want - now));
+}
+/// the period, 0 where the pace does not apply now
+int64_t period_now() {
+    if (!mode()) return 0;
+    const int limit = menu_fps_limit();
+    if (limit <= 0 || framegen_on()) return 0;
+    if (dev.present_mode_name && dev.present_mode_name[0] == 'f') return 0;   // (FIFO: V-Sync on, the display paces)
+    return 1000000000LL / limit;
+}
+}  // namespace pace
+/// (present(), on the game's presenting thread, first) the hold
+void present_pace_begin() {
+    using namespace pace;
+    const int64_t period = mode() == 3 ? 0 : period_now();   // (mode 3: the pacer thread holds, not the game's)
+    int64_t now = now_ns();
+    if (last_exit && period) {   // (the frame's work since the last present: the game's, and the replays at its submits)
+        ring[ring_at] = now - last_exit, ring_at = (ring_at + 1) % 64, ring_n = std::min(ring_n + 1, 64);
+    }
+    if (!period) {
+        line = {}, last_exit = 0, ring_n = 0;
+        return;
+    }
+    const present_pace_rule::Hold h = present_pace_rule::hold(line, now, period, env_us("HL_PRESENT_PACE_EARLY_US", 200));
+    if (h.until) {
+        sleep_until_ns(h.until);
+        const int64_t held = now_ns() - now;
+        holds++, hold_ns += held, hist[std::min<int64_t>(7, held / 1000000)]++;
+        perf_parts::pace_us.fetch_add(held / 1000, std::memory_order_relaxed);   // (the hitch log's pace part)
+    } else {
+        hist[0]++;
+    }
+    if (h.late) lates++;
+    if (++n % 1200 == 0) {
+        int64_t c = 0, p90 = 0;
+        for (int i = 0; i < 8; i++)
+            if ((c += hist[i]) * 10 >= 9 * 1200 && !p90) p90 = i + 1;
+        logf("vk: present pace (HL_PRESENT_PACE=%d): over 1200 presents %lld held, %.2f ms a present (p90 under %lld ms), %lld late; "
+             "start waits %lld, %.2f ms a present", mode(), (long long)holds, hold_ns / 1e6 / 1200, (long long)p90, (long long)lates,
+             (long long)starts, start_ns / 1e6 / 1200);
+        holds = hold_ns = lates = starts = start_ns = 0;
+        for (int64_t& v : hist) v = 0;
+    }
+}
+/// (present(), last) form 2: the game's next frame starts later
+void present_pace_end() {
+    using namespace pace;
+    const int64_t period = mode() == 3 ? 0 : period_now();
+    int64_t now = now_ns();
+    if (period && mode() == 2 && ring_n >= 16) {
+        const int64_t work = present_pace_rule::high_mark(ring, ring_n, 4);
+        const int64_t w = present_pace_rule::start_wait(line, now, period, work, env_us("HL_PRESENT_PACE_MARGIN_US", 1500));
+        if (w > 0) {
+            sleep_until_ns(now + w);
+            now = now_ns();
+            starts++, start_ns += w;
+        }
+    }
+    last_exit = period ? now : 0;
+}
+
+/// (HL_PRESENT_PACE=3) The pacer thread: do_present hands it the image to show and goes back to the game at once; the thread shows
+/// it at the line's next point (present_pace_rule::hold on the hand-over time). The game keeps its run-ahead (its window
+/// textures, host/nn_vi.c): holding its own thread for the line (=1, =2) left it no room, and a frame that ran long made the next
+/// late in turn (Kakariko walks: 55-57.5 fps in 2 of 3 runs). One frame at most waits here: a second one coming shows the first
+/// at once. The present itself under dev.present_mu (on the presents' own queue when there is one, RX_VK_PRESENT_QUEUE), the
+/// swapchain checked: one made again since is not shown into
+namespace pace {
+struct PJob {
+    VkSwapchainKHR sc;
+    uint32_t index;
+    int64_t at, period;
+};
+std::mutex t_mu;
+std::condition_variable t_cv;
+std::deque<PJob> t_q;
+std::atomic<int> t_res{VK_SUCCESS};
+bool t_started = false;
+present_pace_rule::Line t_line;
+int64_t t_n = 0, t_hold_ns = 0, t_holds = 0, t_lates = 0, t_cut = 0, t_hist[8];
+void thread_main() {
+#ifdef _WIN32
+    SetThreadDescription(GetCurrentThread(), L"hl present pacer");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+    for (;;) {
+        PJob j;
+        {
+            std::unique_lock lk(t_mu);
+            t_cv.wait(lk, [] { return !t_q.empty(); });
+            j = t_q.front();
+        }
+        const present_pace_rule::Hold h = present_pace_rule::hold(t_line, j.at, j.period, env_us("HL_PRESENT_PACE_EARLY_US", 200));
+        const int64_t t0 = now_ns();
+        if (h.until > t0) {
+            bool cut = false;
+            if (h.until - t0 > 1500000) {   // (the long part on the condition: a second frame coming cuts it short)
+                std::unique_lock lk(t_mu);
+                cut = t_cv.wait_for(lk, std::chrono::nanoseconds(h.until - t0 - 1000000), [] { return t_q.size() > 1; });
+            }
+            if (!cut) sleep_until_ns(h.until);
+            else t_cut++, t_line.at = now_ns();
+            const int64_t held = now_ns() - t0;
+            t_holds++, t_hold_ns += held, t_hist[std::min<int64_t>(7, held / 1000000)]++;
+        } else {
+            t_hist[0]++;
+        }
+        if (h.late) t_lates++;
+        VkResult r = VK_SUCCESS;
+        {
+            std::lock_guard qk(dev.present_mu);
+            if (j.sc == dev.swapchain && dev.swapchain) {
+                VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                pi.waitSemaphoreCount = 1;
+                pi.pWaitSemaphores = &dev.swap_rendered[j.index];
+                pi.swapchainCount = 1;
+                pi.pSwapchains = &j.sc;
+                pi.pImageIndices = &j.index;
+                if (dev.present_queue) {   // (the presents' own queue: its lock too; else the replay's queue, under dev.present_mu as here)
+                    std::lock_guard pq(dev.present_queue_mu);
+                    r = vkQueuePresentKHR(dev.present_queue, &pi);
+                } else {
+                    r = vkQueuePresentKHR(dev.queue, &pi);
+                }
+            }
+        }
+        frame_log_note();
+        if (r != VK_SUCCESS) {
+            int expected = VK_SUCCESS;
+            t_res.compare_exchange_strong(expected, (int)r);
+        }
+        {
+            std::lock_guard lk(t_mu);
+            t_q.pop_front();
+        }
+        t_cv.notify_all();
+        if (++t_n % 1200 == 0) {
+            int64_t c = 0, p90 = 0;
+            for (int i = 0; i < 8; i++)
+                if ((c += t_hist[i]) * 10 >= 9 * 1200 && !p90) p90 = i + 1;
+            logf("vk: present pacer (HL_PRESENT_PACE=3): over 1200 presents %lld held, %.2f ms a present (p90 under %lld ms), %lld late, "
+                 "%lld cut short by the next frame", (long long)t_holds, t_hold_ns / 1e6 / 1200, (long long)p90, (long long)t_lates,
+                 (long long)t_cut);
+            t_holds = t_hold_ns = t_lates = t_cut = 0;
+            for (int64_t& v : t_hist) v = 0;
+        }
+    }
+}
+}  // namespace pace
+/// (do_present, mode 3) whether this present goes to the pacer thread now; once it does not, the thread is waited for to be empty
+bool pace_thread_wanted() {
+    using namespace pace;
+    if (mode() != 3) return false;
+    if (period_now()) return true;
+    std::unique_lock lk(t_mu);   // (the pace stops (a menu row, frame generation): what the thread holds goes out first, in order)
+    t_cv.wait(lk, [] { return t_q.empty(); });
+    t_line = {};
+    return false;
+}
+/// (do_present, mode 3) the image to the pacer thread; an earlier paced present's result back (VK_SUCCESS when none failed)
+VkResult pace_thread_push(VkSwapchainKHR sc, uint32_t index) {
+    using namespace pace;
+    {
+        std::lock_guard lk(t_mu);
+        if (!t_started) t_started = true, std::thread(thread_main).detach();
+        t_q.push_back({sc, index, now_ns(), period_now()});
+    }
+    t_cv.notify_all();
+    return (VkResult)t_res.exchange(VK_SUCCESS);
+}
+/// (mode 3) before the swapchain is made again or the image acquired: nothing of the old one left in the pacer thread
+void pace_thread_drain() {
+    using namespace pace;
+    if (mode() != 3) return;
+    std::unique_lock lk(t_mu);
+    t_cv.wait(lk, [] { return t_q.empty(); });
+}
+
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
 struct PendingShot {
     bool on = false;
@@ -8583,7 +8827,11 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     // out with the submits' lock let go: the blit above signals swap_rendered on the replay's queue (submitted already, as a binary
     // semaphore's wait needs). (Waiting for the blit's fence before the present, with the lock let go, was worse.)
     hdr_metadata_refresh();   // (the HDR peak row changed in the menu: no new swapchain for it)
-    {   // (the present call itself, which can hold the presenting thread: the summary's present cause)
+    const bool paced = !pi.pNext && pace_thread_wanted();   // (ARR1: HL_PRESENT_PACE=3, the pacer thread)
+    if (paced) {   // (the pacer thread presents it on the line; the result here is an earlier paced present's, for the checks below)
+        qk.unlock();
+        res = pace_thread_push(dev.swapchain, index);
+    } else {   // (the present call itself, which can hold the presenting thread: the summary's present cause)
         perf_parts::Scope perf_wait(perf_parts::t_present);
         if (dev.present_queue) {
             qk.unlock();
@@ -8599,27 +8847,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         static int logged;
         if (logged++ < 8) logf("vk: present failed (VkResult %d%s)", (int)res, dev.present_queue ? ", on the presents' own queue" : "");
     }
-    {   // (RX_VK_FRAME_LOG=<file>: one CSV line a present: frame, seconds since the first, frame time in ms. Frame
-        // pacing on the Steam Deck, where MangoHud's log stays empty under gamescope)
-        static FILE* fl = getenv("RX_VK_FRAME_LOG") ? std::fopen(getenv("RX_VK_FRAME_LOG"), "w") : nullptr;
-        static std::chrono::steady_clock::time_point first, prev;
-        static uint64_t frames;
-        // (HeyListen) and the QueryPerformanceCounter value of the present, PresentMon's TimeInQPC clock and HOS_LOG_QPC's:
-        // a long frame then falls next to the log lines around it (0 where there is no such counter)
-        if (fl) {
-            const auto t = std::chrono::steady_clock::now();
-            long long qpc = 0;
-#ifdef _WIN32
-            LARGE_INTEGER q;
-            if (QueryPerformanceCounter(&q)) qpc = (long long)q.QuadPart;
-#endif
-            if (!frames) first = prev = t, std::fputs("frame,time_s,frametime_ms,qpc\n", fl);
-            std::fprintf(fl, "%llu,%.4f,%.3f,%lld\n", (unsigned long long)frames, std::chrono::duration<double>(t - first).count(),
-                         std::chrono::duration<double, std::milli>(t - prev).count(), qpc);
-            prev = t;
-            if (++frames % 60 == 0) std::fflush(fl);
-        }
-    }
+    if (!paced) frame_log_note();
     {   // (every 600 presents: how they ended; a window shot is taken before the present, so a black window shows only here)
         static int64_t n_ok, n_subopt, n_old, n_other;
         (res == VK_SUCCESS ? n_ok : res == VK_SUBOPTIMAL_KHR ? n_subopt : res == VK_ERROR_OUT_OF_DATE_KHR ? n_old : n_other)++;
@@ -9910,109 +10138,6 @@ bool present_handed_over(const nvn_tex* t, const int crop[4]) {
     pj_cv.notify_one();
     return true;
 }
-/// (ARR1, 27 Nov) The present pace (present_pace_rule.h): at a frame rate limit each frame is handed over on an even line, one
-/// period after the line's last point, the game's presenting thread waiting here when it is early, before the order lock and the
-/// replay's drain (no lock held, nothing of the replay waits). The limit itself waits at the game's window acquire (host/nn_vi.c),
-/// at the START of the game's frame: the present came one period after the one before plus the difference of the two frames'
-/// work, and a mailbox swapchain (V-Sync off) showed that difference. In the owner's Kakariko (main PC, 60 limit) 12 % of the
-/// frames were 20-33 ms, 70 % of them followed by one under 14 ms, with about 11 ms of work a frame: the hitch log named the
-/// pacing sleep in 365 of 428 such frames. HL_PRESENT_PACE=0: off; 1 (the default): the hold; 2: the hold, and after the present the game's
-/// next frame waits so that its work (the 4th longest of the last 64) ends HL_PRESENT_PACE_MARGIN_US (1500) before its point:
-/// the input is read later, and the hold's delay is not added to its age. Not with frame generation (its own pacer, opts.pace),
-/// a FIFO swapchain (V-Sync on: the display paces), Unlimited or Per frame. HL_PRESENT_PACE_EARLY_US (200): the hold ends that
-/// much early, for the timer's wake-up
-namespace pace {
-int mode() {
-    static const int m = [] {
-        const char* e = getenv("HL_PRESENT_PACE");
-        return e && *e ? std::clamp(atoi(e), 0, 2) : 1;   // (on by default, 27 Nov: ARR1's walks)
-    }();
-    return m;
-}
-int64_t env_us(const char* name, int otherwise) {
-    const char* e = getenv(name);
-    return (int64_t)(e && *e ? std::max(0, atoi(e)) : otherwise) * 1000;
-}
-present_pace_rule::Line line;
-int64_t last_exit = 0, ring[64];
-int ring_n = 0, ring_at = 0;
-int64_t n = 0, holds = 0, hold_ns = 0, lates = 0, starts = 0, start_ns = 0, hist[8];
-int64_t now_ns() {
-    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-void sleep_until_ns(int64_t want) {
-    const int64_t now = now_ns();
-    if (want <= now) return;
-#ifdef _WIN32
-    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
-    LARGE_INTEGER d;
-    d.QuadPart = -std::max<int64_t>(1, (want - now) / 100);
-    if (timer && SetWaitableTimerEx(timer, &d, 0, nullptr, nullptr, nullptr, 0)) {
-        WaitForSingleObject(timer, INFINITE);
-        return;
-    }
-#endif
-    std::this_thread::sleep_for(std::chrono::nanoseconds(want - now));
-}
-/// the period, 0 where the pace does not apply now
-int64_t period_now() {
-    if (!mode()) return 0;
-    const int limit = menu_fps_limit();
-    if (limit <= 0 || framegen_on()) return 0;
-    if (dev.present_mode_name && dev.present_mode_name[0] == 'f') return 0;   // (FIFO: V-Sync on, the display paces)
-    return 1000000000LL / limit;
-}
-}  // namespace pace
-/// (present(), on the game's presenting thread, first) the hold
-void present_pace_begin() {
-    using namespace pace;
-    const int64_t period = period_now();
-    int64_t now = now_ns();
-    if (last_exit && period) {   // (the frame's work since the last present: the game's, and the replays at its submits)
-        ring[ring_at] = now - last_exit, ring_at = (ring_at + 1) % 64, ring_n = std::min(ring_n + 1, 64);
-    }
-    if (!period) {
-        line = {}, last_exit = 0, ring_n = 0;
-        return;
-    }
-    const present_pace_rule::Hold h = present_pace_rule::hold(line, now, period, env_us("HL_PRESENT_PACE_EARLY_US", 200));
-    if (h.until) {
-        sleep_until_ns(h.until);
-        const int64_t held = now_ns() - now;
-        holds++, hold_ns += held, hist[std::min<int64_t>(7, held / 1000000)]++;
-        perf_parts::pace_us.fetch_add(held / 1000, std::memory_order_relaxed);   // (the hitch log's pace part)
-    } else {
-        hist[0]++;
-    }
-    if (h.late) lates++;
-    if (++n % 1200 == 0) {
-        int64_t c = 0, p90 = 0;
-        for (int i = 0; i < 8; i++)
-            if ((c += hist[i]) * 10 >= 9 * 1200 && !p90) p90 = i + 1;
-        logf("vk: present pace (HL_PRESENT_PACE=%d): over 1200 presents %lld held, %.2f ms a present (p90 under %lld ms), %lld late; "
-             "start waits %lld, %.2f ms a present", mode(), (long long)holds, hold_ns / 1e6 / 1200, (long long)p90, (long long)lates,
-             (long long)starts, start_ns / 1e6 / 1200);
-        holds = hold_ns = lates = starts = start_ns = 0;
-        for (int64_t& v : hist) v = 0;
-    }
-}
-/// (present(), last) form 2: the game's next frame starts later
-void present_pace_end() {
-    using namespace pace;
-    const int64_t period = period_now();
-    int64_t now = now_ns();
-    if (period && mode() == 2 && ring_n >= 16) {
-        const int64_t work = present_pace_rule::high_mark(ring, ring_n, 4);
-        const int64_t w = present_pace_rule::start_wait(line, now, period, work, env_us("HL_PRESENT_PACE_MARGIN_US", 1500));
-        if (w > 0) {
-            sleep_until_ns(now + w);
-            now = now_ns();
-            starts++, start_ns += w;
-        }
-    }
-    last_exit = period ? now : 0;
-}
-
 void present(const nvn_tex* t, const int crop[4]) {
     present_pace_begin();   // (ARR1: the frame handed over on an even line at the limit; before the renderer's own part)
     struct PaceEnd { ~PaceEnd() { present_pace_end(); } } pace_end;
