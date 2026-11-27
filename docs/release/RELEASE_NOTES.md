@@ -54,8 +54,8 @@ stutters more than usual. The second start is smooth again.
 
 * **One-frame brightness flashes** (the lit ground, the lights and the ground fog getting brighter or darker for a single
   frame, seen in the late-November builds; #93): found and fixed. The **order thread**, the renderer's work on a thread of
-  its own that gave those builds their frame-rate gain, is **off by default** in this release. If your CPU has 8 or more
-  logical processors you can try it with `RX_VK_ORDER_THREAD=1` in `hookshot_env.txt`.
+  its own that gave those builds their frame-rate gain, is **on by default again** where the game keeps a processor core
+  for it (`RX_VK_ORDER_THREAD=0` in `hookshot_env.txt` turns it off).
 * **Leaves and grass that vanished and came back** while you moved: fixed.
 * **Freezes of several seconds from file calls**: one cause fixed (no file or log call is made while a thread holds its
   core).
@@ -109,6 +109,12 @@ stutters more than usual. The second start is smooth again.
 
 ## Performance
 
+* **Even frame pacing at a frame rate limit** (after the pacing of MacNativeGames and Rekarina): each frame is shown on an
+  even line and the game's time follows the frames as they are shown, so motion no longer jumps by uneven steps at 60,
+  90 or 120 fps. On by default with a frame rate limit and V-Sync off; a frame waits a few milliseconds for its place
+  (`HL_PRESENT_PACE=0` in `hookshot_env.txt` gives the old pacing back).
+* **More of the game's own code runs on the processor's native floating point** (the build takes longer for it: several
+  minutes more on a slow processor).
 * **Texture disk cache**: on integrated GPUs and cards under 10 GB, transcoded textures are kept on disk and read ahead,
   and the entered map's textures are read first.
 * **Memory**: cold pages are trimmed only while RAM is short, and freed address regions stay resident for a while.
@@ -130,9 +136,6 @@ stutters more than usual. The second start is smooth again.
 * **On an integrated GPU, the first start after installing can freeze about 20 seconds** when play begins. Later starts do
   not.
 * **A freeze of 1 to 2 seconds at the start of play**, and shorter ones when an area loads.
-* **At a frame rate limit the frame times are slightly uneven.** Two fixes are in this build, both off by default and not
-  validated yet: `HL_PRESENT_PACE=4` in `hookshot_env.txt` (frames shown on an even line, the game's time following
-  it) or `HL_PRESENT_PACE=3` (the earlier attempt).
 * **A rare one-frame white floor in Gerudo Fortress**, and **a rare single black frame of the 3D picture** with the HUD
   intact.
 * **GTX 1060 3 GB class cards can lose the device entering Kokiri Forest**: try Texture resolution Low and
