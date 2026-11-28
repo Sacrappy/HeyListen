@@ -59,6 +59,10 @@ stutters more than usual. The second start is smooth again.
   its own that gave those builds their frame-rate gain, is **on by default again** where the game keeps a processor core
   for it (`RX_VK_ORDER_THREAD=0` in `hookshot_env.txt` turns it off).
 * **Leaves and grass that vanished and came back** while you moved: fixed.
+* **Frame rate falling during a long session, and memory filling up, on PCs with 32 GB of RAM or more** (#121): there
+  the game was never told how much memory it used, so it never gave any back; its memory grew by several GB in the first
+  minutes, until the system ran short and the frame rate collapsed, or the game closed. It is told on every PC now
+  (`HOS_MEMINFO_OLD=1` in `hookshot_env.txt` gives the old behaviour back).
 * **Freezes of several seconds from file calls**: one cause fixed (no file or log call is made while a thread holds its
   core).
 * **Lock-on ring** (#89): all four triangles show around the target.
