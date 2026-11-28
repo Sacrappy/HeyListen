@@ -44,7 +44,7 @@ def main():
     if "hos_gpu_live_pools" not in block(source, "void refresh_pool_ranges_locked("):
         raise SystemExit("the pool list's refresh does not read the host's live pools")
     union = block(source, "std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked(")
-    if "nvn_pool_record_ranges(gpu);" not in union or "ranges_clip(imp, gpu, true)" not in union:
+    if "nvn_pool_record_ranges(gpu, &live_now);" not in union or "ranges_clip(imp, gpu, true)" not in union:
         raise SystemExit("the clip does not keep every pool the back end has a record of")
     if "o->magic == NVN_MAGIC('P', 'O', 'O', 'L')" not in block((ROOT / "host" / "nvn_native.c").read_text(encoding="utf-8"),
                                                                 "NV(nvnMemoryPoolFinalize)"):

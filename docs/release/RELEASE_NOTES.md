@@ -146,6 +146,15 @@ stutters more than usual. The second start is smooth again.
 * **On an integrated GPU, the first start after installing can freeze about 20 seconds** when play begins. Later starts do
   not.
 * **A freeze of 1 to 2 seconds at the start of play**, and shorter ones when an area loads.
+* **The frame rate falls during a long session with many area changes** (about a quarter lower after ten areas; older
+  than this release; restarting the game restores it). The cause is found; `RX_VK_CAP_RECORDS_KEEP_S=10` in
+  `hookshot_env.txt` is an experimental cure, not on by default yet.
+* **Above 60 fps, the pieces of a cut sign and other debris can fall slowly** on some PCs (reported at about 160 fps;
+  normal at a 60 limit). Under investigation.
+* **A sign's or a chest's text can take 2 to 5 seconds to appear**, now and then (reported in Goron City). The game's
+  log now has a `talk:` line for each text box with the time it took: a `hookshot_log.txt` from a session where it
+  happens tells where the seconds go.
+* **A rare crash a few seconds after entering an area** (seen in Dodongo's Cavern).
 * **A rare one-frame white floor in Gerudo Fortress**, and **a rare single black frame of the 3D picture** with the HUD
   intact.
 * **GTX 1060 3 GB class cards can lose the device entering Kokiri Forest**: try Texture resolution Low and
