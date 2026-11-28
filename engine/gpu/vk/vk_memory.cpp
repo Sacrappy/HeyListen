@@ -1056,7 +1056,8 @@ namespace { int cap_only_gpu(); bool cap_excl_hit(uint64_t lo, uint64_t hi); voi
 // (RX_VK_CAP_ONLY_GPU's report of a read into a left-out range: the back end's record of the game's pool at g, below)
 bool nvn_pool_record_at(uint64_t g, uint64_t* lo, uint64_t* hi, uint32_t* flags, uint64_t* made_ns);
 // (RX_VK_CAP_ONLY_GPU: every pool the back end has a record of, page-aligned, appended to out; below)
-void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out);
+void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out,
+                            const std::vector<std::pair<uint64_t, uint64_t>>* live = nullptr);
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
 void memory_collect_written() {
     if (cap_only_gpu() == 1) {   // (pools made since: their pages' earlier writes were dropped as heap memory's, see below)
@@ -2051,7 +2052,8 @@ std::vector<std::pair<uint64_t, uint64_t>> capture_union_locked() {
         // pool of it (a pool object finalized twice untracked a newer pool's entry: nvn_native.c), and a pool finalized after a
         // submission's capture may still be bound by its replay. A record stays: never left out while it can be bound
         std::vector<std::pair<uint64_t, uint64_t>> gpu = all_pool_ranges;
-        nvn_pool_record_ranges(gpu);
+        const std::vector<std::pair<uint64_t, uint64_t>> live_now = gpu;   // (DEGRADE3: the records' age is told against it)
+        nvn_pool_record_ranges(gpu, &live_now);
         gpu = ranges_merged(std::move(gpu));
         std::vector<std::pair<uint64_t, uint64_t>> keep = gpu;
         keep.insert(keep.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
@@ -3644,6 +3646,23 @@ std::unique_ptr<Capture> capture_make() {
                  "copied (%.1f MB)", ms / 600, ms_lock / 600, ms_scan / 600, mirrored.size(),
                  (unsigned long long)(span >> 20), ms_copy / 600, written / 600.0, copied / 600.0, copied * 4096.0 / 600 / 1048576);
             ms = ms_lock = ms_scan = ms_copy = 0, written = copied = 0;
+            {   // (DEGRADE3, diagnostic: what the capture's range list is made of, to name what grows in a long session)
+                size_t n_cap, n_capm, n_tex, n_pool, n_all;
+                {
+                    std::lock_guard lk(cap_ranges_mu);
+                    n_cap = cap_ranges.size(), n_capm = ranges_merged(cap_ranges).size(), n_tex = tex_cap_ranges.size(), n_pool = pool_cap_ranges.size(), n_all = all_pool_ranges.size();
+                }
+                std::vector<std::pair<uint64_t, uint64_t>> rec;
+                nvn_pool_record_ranges(rec);
+                size_t n_spans;
+                {
+                    std::lock_guard lk(shadow_mu);
+                    n_spans = tex_spans.size();
+                }
+                logf("vk: capture ranges by source: imports of mirrored pools %zu (merged %zu), texture storage %zu (spans %zu), game pools "
+                     "up to 64 MB %zu, every game pool %zu, the back end's pool records %zu", n_cap, n_capm,
+                     n_tex, n_spans, n_pool, n_all, rec.size());
+            }
             if (capture_gran_on()) {
                 const int64_t pg = st_gran_pages.exchange(0), by = st_gran_bytes.exchange(0), fu = st_gran_full.exchange(0),
                               un = st_gran_union.exchange(0);
@@ -5058,6 +5077,7 @@ struct NvnPool {
     uint32_t flags = 0;
     uint64_t first_wb = 0;   // (mirror_epoch + 1 of its first write-back)
     uint64_t made_ns = 0;    // (host->now_ns() when the game made it)
+    uint64_t seen_ns = 0;    // (DEGRADE3: the last time the capture's list found it inside a live pool)
     bool eager = false, skipped = false;
     uint8_t why = 0;   // (eager: 1 read by the CPU, 2 written by it)
 };
@@ -5702,9 +5722,28 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
 // NVN's CPU_NO_ACCESS flag keep no zero pages in RAM. The back end's part: no import of such a pool's pages for another pool's
 // binding (clip_noaccess below), and no upload of a texture whose storage lies in such a pool and is all reserved
 // (texture_touch: the image is made cleared to zero, which is what the storage reads as)
-void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out) {
+// (DEGRADE3, RX_VK_CAP_RECORDS_KEEP_S=<s>, default 0: every record stays, as before) The records of pools the game freed stay
+// until their memory is made a pool again, and the capture's range list took them all: 2170 records in the Market at the
+// start of a tour, 10394 after twenty minutes of zone changes, the imports' clipped pieces and the capture's scan with them
+// (3000 -> 6700 ranges, the replay's memory work 0.6 -> 2.9 ms a frame). With a number, a record that has lain outside every
+// live pool for that many seconds (and was made that long ago) is left out of the capture's list; the record itself stays
+// for the flags' lookups
+double cap_records_keep_s() {
+    static const double v = getenv("RX_VK_CAP_RECORDS_KEEP_S") ? atof(getenv("RX_VK_CAP_RECORDS_KEEP_S")) : 0.0;
+    return v;
+}
+void nvn_pool_record_ranges(std::vector<std::pair<uint64_t, uint64_t>>& out, const std::vector<std::pair<uint64_t, uint64_t>>* live) {
     std::lock_guard lk(nvn_pools_mu);
-    for (const auto& [lo, np] : nvn_pools) out.push_back({lo & ~4095ull, (np.hi + 4095) & ~4095ull});
+    const double keep = live ? cap_records_keep_s() : 0.0;
+    const uint64_t now = keep > 0 ? (uint64_t)host->now_ns() : 0;
+    for (auto& [lo, np] : nvn_pools) {
+        const uint64_t a = lo & ~4095ull, b = (np.hi + 4095) & ~4095ull;
+        if (keep > 0) {
+            if (ranges_hit(*live, a, b)) np.seen_ns = now;
+            else if ((double)(now - std::max(np.seen_ns, np.made_ns)) > keep * 1e9) continue;
+        }
+        out.push_back({a, b});
+    }
 }
 bool nvn_pool_record_at(uint64_t g, uint64_t* lo, uint64_t* hi, uint32_t* flags, uint64_t* made_ns) {
     std::lock_guard lk(nvn_pools_mu);
