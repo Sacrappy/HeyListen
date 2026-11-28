@@ -2,7 +2,7 @@
  "schema": 1,
  "generated_by": "engine/scripts/list_switches.py",
  "scope": "C, C++ and headers under engine/ (engine/tests and vendored trees other than a64-kit excluded) and the Python the builder, the lifter and the scripts run: getenv, std::getenv, _wgetenv, the code's own env helpers and table-driven reads, and os.environ.",
- "count": 1594,
+ "count": 1595,
  "switches": [
   {
    "name": "A64_",
@@ -16379,7 +16379,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4723
+     "line": 4755
     }
    ],
    "default": "off (unset)",
@@ -16610,7 +16610,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1361
+     "line": 1393
     }
    ],
    "default": "true",
@@ -16631,7 +16631,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 945
+     "line": 977
     }
    ],
    "default": "unset",
@@ -16652,7 +16652,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3235
+     "line": 3267
     }
    ],
    "default": "unset",
@@ -16673,7 +16673,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3230
+     "line": 3262
     }
    ],
    "default": "2",
@@ -16694,7 +16694,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3247
+     "line": 3279
     }
    ],
    "default": "64",
@@ -16715,7 +16715,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 645
+     "line": 677
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -16736,7 +16736,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1738
+     "line": 1770
     }
    ],
    "default": "unset",
@@ -16757,7 +16757,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 680
+     "line": 712
     }
    ],
    "default": "unset",
@@ -16778,7 +16778,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3310
+     "line": 3342
     }
    ],
    "default": "off (unset)",
@@ -16799,7 +16799,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 909
+     "line": 941
     }
    ],
    "default": "unset",
@@ -16820,7 +16820,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1878
+     "line": 1910
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -16908,7 +16908,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 323
+     "line": 355
     }
    ],
    "default": "off (unset)",
@@ -16992,7 +16992,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3781
+     "line": 3813
     }
    ],
    "default": "off (unset)",
@@ -17013,7 +17013,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3921
+     "line": 3953
     }
    ],
    "default": "off (unset)",
@@ -17034,7 +17034,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3613
+     "line": 3645
     }
    ],
    "default": "on (set at the start by host/hos_main.c; =0: off)",
@@ -17076,7 +17076,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3724
+     "line": 3756
     }
    ],
    "default": "0",
@@ -17097,7 +17097,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3666
+     "line": 3698
     }
    ],
    "default": "on (set at the start by host/hos_main.c; =0: off)",
@@ -17202,7 +17202,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1461
+     "line": 1493
     }
    ],
    "default": "0",
@@ -17223,7 +17223,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1418
+     "line": 1450
     }
    ],
    "default": "0 (unset)",
@@ -17244,7 +17244,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1402
+     "line": 1434
     }
    ],
    "default": "the engine's own value",
@@ -17328,7 +17328,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4266
+     "line": 4298
     }
    ],
    "default": "the engine's own value",
@@ -17370,11 +17370,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1526
+     "line": 1558
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1528
+     "line": 1560
     }
    ],
    "default": "unset",
@@ -17395,7 +17395,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1696
+     "line": 1728
     }
    ],
    "default": "60000",
@@ -17416,7 +17416,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1561
+     "line": 1593
     }
    ],
    "default": "0",
@@ -17437,7 +17437,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1624
+     "line": 1656
     }
    ],
    "default": "unset",
@@ -17458,7 +17458,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1626
+     "line": 1658
     }
    ],
    "default": "off (unset)",
@@ -17521,7 +17521,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 844
+     "line": 876
     }
    ],
    "default": "0",
@@ -17542,11 +17542,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 790
+     "line": 822
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 1974
+     "line": 2006
     }
    ],
    "default": "0 (unset)",
@@ -17567,11 +17567,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 856
+     "line": 888
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 980
+     "line": 1012
     }
    ],
    "default": "off (unset)",
@@ -17592,7 +17592,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 810
+     "line": 842
     }
    ],
    "default": "the engine's own value",
@@ -17613,7 +17613,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3354
+     "line": 3386
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -17747,7 +17747,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6180
+     "line": 6212
     }
    ],
    "default": "unset",
@@ -17768,11 +17768,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6195
+     "line": 6227
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6196
+     "line": 6228
     }
    ],
    "default": "512",
@@ -17793,11 +17793,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6197
+     "line": 6229
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6198
+     "line": 6230
     }
    ],
    "default": "256",
@@ -17818,11 +17818,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6193
+     "line": 6225
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6194
+     "line": 6226
     }
    ],
    "default": "1800",
@@ -17843,7 +17843,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6575
+     "line": 6607
     }
    ],
    "default": "off (unset)",
@@ -17864,7 +17864,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6732
+     "line": 6778
     }
    ],
    "default": "off (unset)",
@@ -18800,6 +18800,27 @@
    "use": null
   },
   {
+   "name": "RX_VK_COMMIT_GROW",
+   "area": "memory",
+   "group": "VRAM, pools and mirrors",
+   "audience": "developer",
+   "files": [
+    {
+     "path": "gpu/vk/vk_texture.cpp",
+     "line": 327
+    }
+   ],
+   "default": "on (unless set to 0, false, off or no)",
+   "values": "on or off (0, false, off, no and empty are off); the description names `0`",
+   "explanation": "(COMMIT1, RX_VK_COMMIT_GROW, 0: off) Windows only. A system-managed page file grows when a commit request does not fit, but the reserve above keeps the charge under the limit, so none ever fails and the textures are cut for the whole session. Near the limit a detached helper thread (never the render thread: the commit may wait while Windows extends the file) commits a block, gives it back at once, and reads the limit again (commit_grow_rule.h: the size, one try every 10 s, none after 6 in a row that did not raise the limit). The textures' cut stays as it is: with more commit left it stops by itself.",
+   "comment": "(COMMIT1, RX_VK_COMMIT_GROW, 0: off) Windows only. A system-managed page file grows when a commit request does not fit, but the reserve above keeps the charge under the limit, so none ever fails and the textures are cut for the whole session. Near the limit a detached helper thread (never the render thread: the commit may wait while Windows extends the file) commits a block, gives it back at once, and reads the limit again (commit_grow_rule.h: the size, one try every 10 s, none after 6 in a row that did not raise the limit). The textures' cut stays as it is: with more commit left it stops by itself.",
+   "documented_in": null,
+   "source": "comment at gpu/vk/vk_texture.cpp",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
    "name": "RX_VK_COMMIT_RESERVE_MB",
    "area": "memory",
    "group": "VRAM, pools and mirrors",
@@ -18807,7 +18828,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 304
+     "line": 305
     }
    ],
    "default": "off (unset)",
@@ -18895,7 +18916,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3095
+     "line": 3127
     }
    ],
    "default": "off (unset)",
@@ -19000,7 +19021,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3488
+     "line": 3520
     }
    ],
    "default": "off (unset)",
@@ -19021,7 +19042,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4375
+     "line": 4407
     }
    ],
    "default": "off (unset)",
@@ -19063,7 +19084,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6091
+     "line": 6123
     }
    ],
    "default": "1",
@@ -19084,7 +19105,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6095
+     "line": 6127
     }
    ],
    "default": "1",
@@ -19105,7 +19126,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6087
+     "line": 6119
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -19336,7 +19357,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6494
+     "line": 6526
     }
    ],
    "default": "0",
@@ -19399,7 +19420,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3980
+     "line": 4012
     }
    ],
    "default": "off (unset)",
@@ -20454,7 +20475,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2402
+     "line": 2434
     }
    ],
    "default": "0",
@@ -20790,7 +20811,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7004
+     "line": 7050
     }
    ],
    "default": "60",
@@ -20811,7 +20832,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7247
+     "line": 7293
     }
    ],
    "default": "off (unset)",
@@ -20832,7 +20853,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6973
+     "line": 7019
     }
    ],
    "default": "unset",
@@ -20853,7 +20874,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7188
+     "line": 7234
     }
    ],
    "default": "off (unset)",
@@ -20874,7 +20895,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7221
+     "line": 7267
     }
    ],
    "default": "off (unset)",
@@ -21368,7 +21389,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4936
+     "line": 4968
     }
    ],
    "default": "off (unset)",
@@ -21908,7 +21929,7 @@
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 463
+     "line": 495
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -21929,7 +21950,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7156
+     "line": 7202
     }
    ],
    "default": "unset",
@@ -22210,7 +22231,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3676
+     "line": 3708
     }
    ],
    "default": "off (unset)",
@@ -22231,7 +22252,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4009
+     "line": 4041
     }
    ],
    "default": "unset",
@@ -22252,7 +22273,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4216
+     "line": 4248
     },
     {
      "path": "host/rx_backend.c",
@@ -22407,7 +22428,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2191
+     "line": 2223
     }
    ],
    "default": "off (unset)",
@@ -23249,7 +23270,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7047
+     "line": 7093
     }
    ],
    "default": "512",
@@ -23291,7 +23312,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7196
+     "line": 7242
     }
    ],
    "default": "off (unset)",
@@ -23793,7 +23814,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6882
+     "line": 6928
     }
    ],
    "default": "off (unset)",
@@ -24112,12 +24133,12 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4187
+     "line": 4219
     }
    ],
    "default": "-1",
    "values": "a whole number",
-   "explanation": "undocumented: gpu/vk/vk_texture.cpp:4187 (in `texture_get()`) reads it as a number: `static const int64_t log_from = getenv(\"RX_VK_LOG_MADE\") ? atoll(getenv(\"RX_VK_LOG_MADE\")) : -1;`. No comment in the source says what it changes.",
+   "explanation": "undocumented: gpu/vk/vk_texture.cpp:4219 (in `texture_get()`) reads it as a number: `static const int64_t log_from = getenv(\"RX_VK_LOG_MADE\") ? atoll(getenv(\"RX_VK_LOG_MADE\")) : -1;`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -24288,12 +24309,12 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4516
+     "line": 4548
     }
    ],
    "default": "unset",
    "values": "text",
-   "explanation": "undocumented: gpu/vk/vk_texture.cpp:4516 (in `texture_touch()`) reads it as a text value: `if (partial && getenv(\"RX_VK_LOG_PARTIAL\")) {`. No comment in the source says what it changes.",
+   "explanation": "undocumented: gpu/vk/vk_texture.cpp:4548 (in `texture_touch()`) reads it as a text value: `if (partial && getenv(\"RX_VK_LOG_PARTIAL\")) {`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -24456,7 +24477,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 218
+     "line": 219
     }
    ],
    "default": "off (unset)",
@@ -24477,7 +24498,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2997
+     "line": 3029
     }
    ],
    "default": "off (unset)",
@@ -24540,7 +24561,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4726
+     "line": 4758
     }
    ],
    "default": "off (unset)",
@@ -24582,7 +24603,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5013
+     "line": 5045
     }
    ],
    "default": "off (unset)",
@@ -24603,7 +24624,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2712
+     "line": 2744
     }
    ],
    "default": "-1",
@@ -24716,7 +24737,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6440
+     "line": 6472
     }
    ],
    "default": "192",
@@ -24825,7 +24846,7 @@
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6639
+     "line": 6685
     }
    ],
    "default": "unset",
@@ -26078,7 +26099,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5440
+     "line": 5472
     }
    ],
    "default": "off (unset)",
@@ -26099,7 +26120,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5180
+     "line": 5212
     }
    ],
    "default": "off (unset)",
@@ -26204,11 +26225,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6537
+     "line": 6569
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6955
+     "line": 7001
     }
    ],
    "default": "off (unset)",
@@ -26539,7 +26560,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4426
+     "line": 4458
     }
    ],
    "default": "off (unset)",
@@ -26882,7 +26903,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4829
+     "line": 4861
     }
    ],
    "default": "off (unset)",
@@ -27870,7 +27891,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4023
+     "line": 4055
     }
    ],
    "default": "unset",
@@ -28000,7 +28021,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3965
+     "line": 3997
     }
    ],
    "default": "off (unset)",
@@ -28390,7 +28411,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 379
+     "line": 411
     }
    ],
    "default": "the engine's own value",
@@ -29845,7 +29866,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3910
+     "line": 3942
     }
    ],
    "default": "0",
@@ -30071,7 +30092,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 230
+     "line": 231
     }
    ],
    "default": "off (unset)",
@@ -30344,11 +30365,11 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4403
+     "line": 4435
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5507
+     "line": 5539
     }
    ],
    "default": "unset",
@@ -30411,7 +30432,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4452
+     "line": 4484
     }
    ],
    "default": "off (unset)",
@@ -30687,7 +30708,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3142
+     "line": 3174
     }
    ],
    "default": "the engine's own value",
@@ -31236,7 +31257,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 418
+     "line": 450
     }
    ],
    "default": "6",
@@ -31257,7 +31278,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6514
+     "line": 6546
     }
    ],
    "default": "256",
@@ -31299,7 +31320,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5783
+     "line": 5815
     }
    ],
    "default": "unset",
@@ -31446,7 +31467,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6411
+     "line": 6443
     }
    ],
    "default": "2",
@@ -31467,7 +31488,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6403
+     "line": 6435
     }
    ],
    "default": "30",
@@ -31488,7 +31509,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6394
+     "line": 6426
     }
    ],
    "default": "0 (unset)",
@@ -32327,7 +32348,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 334
+     "line": 366
     }
    ],
    "default": "0 (unset)",
@@ -32411,7 +32432,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3892
+     "line": 3924
     }
    ],
    "default": "0",
@@ -32516,7 +32537,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4583
+     "line": 4615
     }
    ],
    "default": "off (unset)",
@@ -32583,7 +32604,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 258
+     "line": 259
     }
    ],
    "default": "the engine's own value",
@@ -32625,7 +32646,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3167
+     "line": 3199
     }
    ],
    "default": "2048",
@@ -32646,7 +32667,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3168
+     "line": 3200
     }
    ],
    "default": "1536",
@@ -32688,7 +32709,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3190
+     "line": 3222
     }
    ],
    "default": "64",
@@ -32888,7 +32909,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5484
+     "line": 5516
     }
    ],
    "default": "unset",
@@ -32909,7 +32930,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5483
+     "line": 5515
     }
    ],
    "default": "off (unset)",
@@ -33131,7 +33152,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3269
+     "line": 3301
     }
    ],
    "default": "unset",
@@ -33152,7 +33173,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3272
+     "line": 3304
     }
    ],
    "default": "off (unset)",
@@ -33173,12 +33194,12 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2863
+     "line": 2895
     }
    ],
    "default": "off (unset)",
    "values": "on or off (0, false, off, no and empty are off)",
-   "explanation": "undocumented: gpu/vk/vk_texture.cpp:2863 (in `upload_inner()`) reads it as an on/off switch: `static const bool check = getenv(\"RX_VK_UNSWIZZLE_CHECK\") != nullptr;`. No comment in the source says what it changes.",
+   "explanation": "undocumented: gpu/vk/vk_texture.cpp:2895 (in `upload_inner()`) reads it as an on/off switch: `static const bool check = getenv(\"RX_VK_UNSWIZZLE_CHECK\") != nullptr;`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -33194,7 +33215,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4450
+     "line": 4482
     }
    ],
    "default": "off (unset)",
@@ -33215,7 +33236,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4339
+     "line": 4371
     }
    ],
    "default": "the engine's own value",
@@ -33236,7 +33257,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4331
+     "line": 4363
     }
    ],
    "default": "the engine's own value",
@@ -33257,7 +33278,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 4332
+     "line": 4364
     }
    ],
    "default": "off (unset)",
@@ -33366,7 +33387,7 @@
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2312
+     "line": 2344
     }
    ],
    "default": "unset",
@@ -33408,15 +33429,15 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6545
+     "line": 6577
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6557
+     "line": 6589
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6726
+     "line": 6772
     }
    ],
    "default": "70",
@@ -33437,7 +33458,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 6725
+     "line": 6771
     }
    ],
    "default": "80",
@@ -33734,12 +33755,12 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2384
+     "line": 2416
     }
    ],
    "default": "unset",
    "values": "text",
-   "explanation": "undocumented: gpu/vk/vk_texture.cpp:2384 (in `watch_tex()`) reads it as a text value: `if (const char* e = getenv(\"RX_VK_WATCH_DIM\")) sscanf(e, \"%ux%u\", &w, &h);`. No comment in the source says what it changes.",
+   "explanation": "undocumented: gpu/vk/vk_texture.cpp:2416 (in `watch_tex()`) reads it as a text value: `if (const char* e = getenv(\"RX_VK_WATCH_DIM\")) sscanf(e, \"%ux%u\", &w, &h);`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -33755,7 +33776,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 5589
+     "line": 5621
     }
    ],
    "default": "unset",
@@ -33830,11 +33851,11 @@
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2389
+     "line": 2421
     },
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 7423
+     "line": 7469
     },
     {
      "path": "gpu/vk/vk_xfer.cpp",
@@ -33884,7 +33905,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2372
+     "line": 2404
     }
    ],
    "default": "unset",
@@ -34354,7 +34375,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 3626
+     "line": 3658
     },
     {
      "path": "host/hos_main.c",
@@ -34363,7 +34384,7 @@
    ],
    "default": "on (set at the start by host/hos_main.c; =0: off)",
    "values": "text",
-   "explanation": "undocumented: gpu/vk/vk_texture.cpp:3626 (in `work_seg_begin()`) reads it as a text value: `const char* e = getenv(\"RX_VK_WORK_LOCAL\");`. No comment in the source says what it changes.",
+   "explanation": "undocumented: gpu/vk/vk_texture.cpp:3658 (in `work_seg_begin()`) reads it as a text value: `const char* e = getenv(\"RX_VK_WORK_LOCAL\");`. No comment in the source says what it changes.",
    "comment": null,
    "documented_in": null,
    "source": "undocumented",
@@ -34379,7 +34400,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 582
+     "line": 614
     }
    ],
    "default": "on (unless set to 0, false, off or no)",
@@ -34421,7 +34442,7 @@
    "files": [
     {
      "path": "gpu/vk/vk_texture.cpp",
-     "line": 2601
+     "line": 2633
     }
    ],
    "default": "off (unset)",

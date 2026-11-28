@@ -63,6 +63,10 @@ stutters more than usual. The second start is smooth again.
   the game was never told how much memory it used, so it never gave any back; its memory grew by several GB in the first
   minutes, until the system ran short and the frame rate collapsed, or the game closed. It is told on every PC now
   (`HOS_MEMINFO_OLD=1` in `hookshot_env.txt` gives the old behaviour back).
+* **Textures starved for a whole session on PCs whose page file is managed by Windows**: when the system's memory
+  commit ran close to its limit, the game gave up its textures' memory and never got it back, because Windows only
+  grows the page file when a request does not fit. The game now asks Windows for more first (Windows may grow the page
+  file by a few GB, as it does for any program; `RX_VK_COMMIT_GROW=0` turns this off).
 * **Freezes of several seconds from file calls**: one cause fixed (no file or log call is made while a thread holds its
   core).
 * **Lock-on ring** (#89): all four triangles show around the target.

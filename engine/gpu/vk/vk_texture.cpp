@@ -42,6 +42,7 @@
 #include "vk_ledger.h"   // (RX_VK_LEDGER)
 #include "vk_menu.h"
 #include "vk_draw.h"
+#include "commit_grow_rule.h"   // (COMMIT1: RX_VK_COMMIT_GROW's rule)
 #include "linux_pressure.h"   // (Longshot f1b17d59: /proc/meminfo's reserves and the budget hold)
 #include "vk_gprof.h"
 #include "vk_dump.h"
@@ -314,6 +315,37 @@ static bool commit_headroom(uint64_t* free_bytes) {
     *free_bytes = m.ullAvailPageFile;
     return true;
 }
+// (COMMIT1, RX_VK_COMMIT_GROW, 0: off) Windows only. A system-managed page file grows when a commit request does not fit, but the
+// reserve above keeps the charge under the limit, so none ever fails and the textures are cut for the whole session. Near the limit
+// a detached helper thread (never the render thread: the commit may wait while Windows extends the file) commits a block, gives it
+// back at once, and reads the limit again (commit_grow_rule.h: the size, one try every 10 s, none after 6 in a row that did not raise
+// the limit). The textures' cut stays as it is: with more commit left it stops by itself.
+#ifdef _WIN32
+static std::atomic<bool> commit_grow_busy{false};
+static commit_grow_rule::State commit_grow_state;
+static bool commit_grow_on() {
+    static const bool v = !getenv("RX_VK_COMMIT_GROW") || atoi(getenv("RX_VK_COMMIT_GROW")) != 0;
+    return v;
+}
+static uint64_t commit_limit_now() {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    return GlobalMemoryStatusEx(&m) ? (uint64_t)m.ullTotalPageFile : 0;
+}
+static void commit_grow_try(uint64_t size) {
+    const uint64_t before = commit_limit_now();
+    if (void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS)) VirtualFree(p, 0, MEM_RELEASE);
+    const uint64_t after = commit_limit_now();
+    const int k = commit_grow_rule::finished(commit_grow_state, before, after);
+    if (!k)
+        logf("vk: commit limit near: asked Windows for %llu MB more commit: the limit went from %llu to %llu MB (the page file grew)",
+             (unsigned long long)(size >> 20), (unsigned long long)(before >> 20), (unsigned long long)(after >> 20));
+    else
+        logf("vk: commit limit near: Windows gave no more commit (the limit stays %llu MB; try %d of %d)",
+             (unsigned long long)(after >> 20), k, commit_grow_rule::kMaxFailed);
+    commit_grow_busy.store(false);
+}
+#endif
 // (Longshot f1b17d59) Linux's physical reserve (RX_VK_AVAIL_RESERVE_MB, 1536 MB by default, 0: off) and the sample that
 // texture_frame takes of /proc/meminfo. The latest shortfall (bytes) and its sample number are published here for
 // vk_memory.cpp's imports_give_back, which must not read a file under pools_mu: linux_pressure_shortfall below. Nothing off
@@ -6617,6 +6649,20 @@ void texture_frame(uint64_t completed) {
         uint64_t commit_free = 0;
         const uint64_t reserve = commit_reserve();
         if (reserve && commit_headroom(&commit_free) && commit_free < reserve) {
+#ifdef _WIN32
+            const int64_t grow_now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            // (the busy flag first: while a try runs, its thread owns the rule's state; the flag is cleared after its last write)
+            if (commit_grow_on() && !commit_grow_busy.load() &&
+                commit_grow_rule::should_try(commit_grow_state, commit_free, reserve, grow_now) && !commit_grow_busy.exchange(true)) {
+                const uint64_t ask = commit_grow_rule::ask_bytes(commit_free, reserve);
+                commit_grow_rule::started(commit_grow_state, grow_now);
+                try {
+                    std::thread(commit_grow_try, ask).detach();
+                } catch (...) {
+                    commit_grow_busy.store(false);
+                }
+            }
+#endif
             const uint64_t over = reserve - commit_free;
             budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
             static uint64_t said_at;
