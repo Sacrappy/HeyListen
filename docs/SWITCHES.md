@@ -10,7 +10,7 @@ python -I engine/scripts/list_switches.py
 
 and commit both files. A test (`engine/tests/test_switches_documented.py`) fails when a switch read in the source is missing here or the data file is out of date.
 
-1593 switches: 56 players may be told to use, 404 diagnostic, 1133 developer-only; 1374 have a real explanation and 219 are marked `undocumented`.
+1594 switches: 56 players may be told to use, 405 diagnostic, 1133 developer-only; 1375 have a real explanation and 219 are marked `undocumented`.
 
 ## How to set a switch
 
@@ -72,7 +72,7 @@ The entries below say what each one does, its values and default, and when it is
 | [Native engine (`HL_*`)](#native-engine-hl_) | 125 | 1 | 42 | 82 |
 | [Host and OS (`HOS_*` and the system's variables)](#host-and-os-hos_-and-the-systems-variables) | 142 | 10 | 0 | 132 |
 | [Telemetry and crash reports](#telemetry-and-crash-reports) | 12 | 0 | 12 | 0 |
-| [Diagnostics and logging](#diagnostics-and-logging) | 313 | 0 | 313 | 0 |
+| [Diagnostics and logging](#diagnostics-and-logging) | 314 | 0 | 314 | 0 |
 | [Build and lift time (`A64_*`, `RX_*` and `HOOKSHOT_*` the builder reads)](#build-and-lift-time-a64_-rx_-and-hookshot_-the-builder-reads) | 100 | 0 | 0 | 100 |
 
 ## Renderer: upscaling, frame generation, HDR, V-Sync and presentation
@@ -995,7 +995,7 @@ HOS_FRAME_SLEEP_MS (diagnostic): slower frames, for game speed against frame rat
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:577`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:579`.
 
 #### `HOS_VIDEO_AHEAD` - developer
 
@@ -11347,13 +11347,13 @@ The used memory the game is told (`QueryMemoryInfo`, svc `GetInfo` 7 and 22) is 
 
 #### `HOS_MKW_INTERVAL` - developer
 
-HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice, which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts vsyncs, so an interval the renderer cannot keep slows the game down rather than dropping frames.
+(Host/hl_talklog.c: a talk request still without its box after 10 s says so) HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice, which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts vsyncs, so an interval the renderer cannot keep slows the game down rather than dropping frames.
 
 **Values:** a whole number. **Default:** 1.
 
 **When a player would use it:** Not for players: an internal experiment or A/B switch, changed only by a developer.
 
-**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:601`.
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nn_vi.c:604`.
 
 #### `HOS_MW_BUCKETS` - developer
 
@@ -11965,7 +11965,7 @@ No crash window: the helper (`HeyListen --crash-watch <pid> <run id> <game folde
 
 ## Diagnostics and logging
 
-313 switches for logs, dumps, profiles and checks.
+314 switches for logs, dumps, profiles and checks.
 
 ### Logs and traces
 
@@ -12177,7 +12177,7 @@ The game's frame limiter, VRR flags and nominal rate every 300 presents; a CSV l
 
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
-**Set it:** In the process environment (or in a file named by `HOS_ENV_FILE`); `hookshot_env.txt` refuses this one. **Read at:** `host/nn_vi.c:511`.
+**Set it:** In the process environment (or in a file named by `HOS_ENV_FILE`); `hookshot_env.txt` refuses this one. **Read at:** `host/nn_vi.c:513`.
 
 #### `HOS_QUEUE_TRACE` - diagnostic
 
@@ -12258,6 +12258,16 @@ HOS_SYNC_TRACE=1: log fences and sync point waits.
 **When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
 
 **Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/nvdrv.c:60`.
+
+#### `HOS_TALK_LOG` - diagnostic
+
+The `talk:` log lines off (on by default); `2` also measures the message dialogs opened with no talk request (not by default: the open request fires for many things that are not messages). Each talk logs one line when its text box is first drawn: `talk: text box 812 ms after the talk request (dialog asked at 310 ms, text thread ran at 640 ms; walk-back: none)`, with the walk-back's time and updates when Link walked to the sign first; over 1.5 s also the frames in between and the map; no box in 10 s, one line saying so (`host/hl_talklog.c`, `host/oot_talk_log.h`; lift hooks `HL_TALK_HOOK`).
+
+**Values:** a whole number. **Default:** 1.
+
+**When a player would use it:** For a bug report or a measurement: set it only when a maintainer asks, and keep the log, dump or numbers it writes.
+
+**Set it:** In `hookshot_env.txt`, or in the environment. **Read at:** `host/hl_talklog.c:37`.
 
 #### `HOS_TICK_LOG` - diagnostic
 

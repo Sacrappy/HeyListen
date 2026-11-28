@@ -81,6 +81,12 @@ void hl_answer(uint64_t guest, A64Fn fn, HlOn on, const char *what);
    held while the choice only flickers. One line. Nothing in C. */
 #define HL_OCB_HOOK(addr, hash)     __attribute__((constructor)) static void hl_ocb_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); }     extern const int hl_ocb_hook_##addr
 
+/* HL_TALK_HOOK(826df3c0, "<hash>", <event>): a lift hook (nx2/hl_gates.py) at the entry of a function: hos_oot_talk_event(<event>)
+   (host/hl_talklog.c, a diagnostic: how long a talk takes to show its text box). Nothing in C. */
+#define HL_TALK_HOOK(addr, hash, event) \
+    __attribute__((constructor)) static void hl_talk_decl_##addr(void) { hl_gate_declared(0x##addr##ULL); } \
+    extern const int hl_talk_hook_##addr
+
 /* HL_HEAP_HOOK(804566e0, "<hash>"): a lift hook (nx2/hl_gates.py) around f_804566e0's four allocations that are not checked
    (two CPU buffers, two GPU-memory calls): a failed one is tried again in the heap's parents (host/hl_heap_retry.c). Both
    pairs of lines or none. Nothing in C. */

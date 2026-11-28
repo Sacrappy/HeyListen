@@ -2,7 +2,7 @@
  "schema": 1,
  "generated_by": "engine/scripts/list_switches.py",
  "scope": "C, C++ and headers under engine/ (engine/tests and vendored trees other than a64-kit excluded) and the Python the builder, the lifter and the scripts run: getenv, std::getenv, _wgetenv, the code's own env helpers and table-driven reads, and os.environ.",
- "count": 1593,
+ "count": 1594,
  "switches": [
   {
    "name": "A64_",
@@ -6144,7 +6144,7 @@
    "files": [
     {
      "path": "host/nn_vi.c",
-     "line": 577
+     "line": 579
     }
    ],
    "default": "0",
@@ -7516,13 +7516,13 @@
    "files": [
     {
      "path": "host/nn_vi.c",
-     "line": 601
+     "line": 604
     }
    ],
    "default": "1",
    "values": "a whole number",
-   "explanation": "HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice, which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts vsyncs, so an interval the renderer cannot keep slows the game down rather than dropping frames.",
-   "comment": "HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice, which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts vsyncs, so an interval the renderer cannot keep slows the game down rather than dropping frames.",
+   "explanation": "(Host/hl_talklog.c: a talk request still without its box after 10 s says so) HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice, which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts vsyncs, so an interval the renderer cannot keep slows the game down rather than dropping frames.",
+   "comment": "(Host/hl_talklog.c: a talk request still without its box after 10 s says so) HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice, which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts vsyncs, so an interval the renderer cannot keep slows the game down rather than dropping frames.",
    "documented_in": null,
    "source": "comment at host/nn_vi.c",
    "documented": true,
@@ -9080,7 +9080,7 @@
    "files": [
     {
      "path": "host/nn_vi.c",
-     "line": 511
+     "line": 513
     }
    ],
    "default": "unset",
@@ -9804,7 +9804,7 @@
     },
     {
      "path": "host/nn_vi.c",
-     "line": 554
+     "line": 556
     }
    ],
    "default": "off (unset)",
@@ -9943,6 +9943,27 @@
    "comment": "HOS_SYNC_TRACE=1: log fences and sync point waits.",
    "documented_in": null,
    "source": "comment at host/nvdrv.c",
+   "documented": true,
+   "set_via": "In `hookshot_env.txt`, or in the environment.",
+   "use": null
+  },
+  {
+   "name": "HOS_TALK_LOG",
+   "area": "logging",
+   "group": "Logs and traces",
+   "audience": "diagnostic",
+   "files": [
+    {
+     "path": "host/hl_talklog.c",
+     "line": 37
+    }
+   ],
+   "default": "1",
+   "values": "a whole number",
+   "explanation": "The `talk:` log lines off (on by default); `2` also measures the message dialogs opened with no talk request (not by default: the open request fires for many things that are not messages). Each talk logs one line when its text box is first drawn: `talk: text box 812 ms after the talk request (dialog asked at 310 ms, text thread ran at 640 ms; walk-back: none)`, with the walk-back's time and updates when Link walked to the sign first; over 1.5 s also the frames in between and the map; no box in 10 s, one line saying so (`host/hl_talklog.c`, `host/oot_talk_log.h`; lift hooks `HL_TALK_HOOK`).",
+   "comment": "HOS_TALK_LOG (default on): 0 turns off the \"talk:\" lines (how long a talk's text box took after the request, with the stages it went through); 2 also measures the message dialogs that open with no talk request (not by default: the open request fires for many things that are not messages).",
+   "documented_in": "development.md",
+   "source": "development.md",
    "documented": true,
    "set_via": "In `hookshot_env.txt`, or in the environment.",
    "use": null

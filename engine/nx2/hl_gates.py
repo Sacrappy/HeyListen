@@ -197,9 +197,12 @@ def movie_site(s, addr, off):
 # - HL_OCB_HOOK(832b9880, "<hash>"): (Longshot c88f70440, SadTransGirl, #1814; Castle Town's market) the OptimizeChangeBank preload
 #   manager's update, at its label L_832b9dc8 (the unit it chose is in x21, bit 31 of w21: none; the manager in x19): the choice
 #   goes through hos_oot_ocb_pick (host/hl_ocb_hold.c) before the update tests it. A line after the label, once.
+# - HL_TALK_HOOK(826df3c0, "<hash>", <event>): (HeyListen, a diagnostic: host/hl_talklog.c) a call at the entry of a function,
+#   hos_oot_talk_event(<event>) with nothing but the number: 0 the talk request, 1 the walk-back's start, 2 its end, 3 one of
+#   its updates (host/oot_talk_log.h has what the host does with them). The function is not changed otherwise.
 # Each goes in only where its function's text hashes as recorded, both lines of a kind or none. The marker is the address
 # plus one, as a step hook's (one hook a function), so a tree that does not ask for it takes it out as a stale gate.
-WANT_LIFT = re.compile(r'^HL_(SOUND|SOLVER|WHOLE|HEAP|NEW|BGM|TURN|HORSE|FLOOR|DRIVE|LOOP|POSE|SONG|OCB)_HOOK\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f,]*)"((?:\s*,\s*(?:\d+|"[^"\n]*"))*)\s*\)',
+WANT_LIFT = re.compile(r'^HL_(SOUND|SOLVER|WHOLE|HEAP|NEW|BGM|TURN|HORSE|FLOOR|DRIVE|LOOP|POSE|SONG|OCB|TALK)_HOOK\(\s*([0-9a-f]{8})\s*,\s*"([0-9a-f,]*)"((?:\s*,\s*(?:\d+|"[^"\n]*"))*)\s*\)',
                        re.M)
 CUT = "    c->x[%d]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);\n"
 SOUND_SLOT = "g_module_base + 0x80435000ULL + (int64_t)75927552"   # (the page of the step's pointer, whose +2192 holds it)
@@ -343,6 +346,8 @@ def lift_lines(kind, addr, args, body=None):
     if kind == "song":
         return ["    { extern uint64_t hos_oot_song_cue(uint32_t, uint64_t); c->x[0] = hos_oot_song_cue(%d, c->x[0]); }" %
                 (0 if addr == "832b2af0" else 1) + mark]
+    if kind == "talk":
+        return ["    { extern void hos_oot_talk_event(int); hos_oot_talk_event(%d); }" % args[0] + mark]
     if kind == "ocb":
         return ["    { extern uint64_t hos_oot_ocb_pick(Ctx *A64_NOESC, uint64_t, uint64_t); "
                 "c->x[21] = hos_oot_ocb_pick(c, c->x[19], c->x[21]); }" + mark]
@@ -455,6 +460,8 @@ def lift_places(body, addr, kind, args):
     if kind == "song":
         call = SONG_CALLS.get(addr)
         return [body.index(call) + len(call)] if call and body.count(call) == 1 else None
+    if kind == "talk":
+        return [len(HEAD % addr)] if len(args) == 1 and isinstance(args[0], int) else None
     if kind == "ocb":
         anchor = OCB_LABEL + OCB_TEST
         return [body.index(anchor) + len(OCB_LABEL)] if body.count(anchor) == 1 else None

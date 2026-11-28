@@ -36,6 +36,8 @@ static volatile int present_interval = 1;
 static int64_t next_frame_at, window_start, frames_in_window, shown_at[16];
 static volatile LONG64 presents, shown_count;
 static volatile uint64_t hos_mkw_pacer;
+volatile int hos_talk_armed;   /* (host/hl_talklog.c) */
+void hos_talk_poll(void) {}
 static uint32_t guest32;
 static int scans, steps, sleeps, reads;
 static int64_t clock_now;

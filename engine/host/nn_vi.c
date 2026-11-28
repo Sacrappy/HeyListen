@@ -500,6 +500,8 @@ static void realtime_step(int64_t now) {
     }
     if (!(steps++ % 3000)) hos_log("vi: real-time step on: ratio %.3f, game's frame rate %d", ratio, fps);
 }
+extern volatile int hos_talk_armed;   /* (host/hl_talklog.c: a talk request waits for its box) */
+extern void hos_talk_poll(void);
 /* HOS_PRESENT_TRACE=<csv>: native game present-call returns, not GPU completion or display times.
    Uses the existing frame ID/clock; a forced stop can lose the last second of buffered present records. */
 static void present_trace(int64_t frame, int64_t now) {
@@ -593,6 +595,7 @@ void hos_vi_native_presented(void) {
     }
     const int64_t n = InterlockedIncrement64(&presents);
     present_trace(n, now);
+    if (hos_talk_armed) hos_talk_poll();   /* (host/hl_talklog.c: a talk request still without its box after 10 s says so) */
     {   /* HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any
            non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice,
            which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts

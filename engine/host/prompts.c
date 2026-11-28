@@ -1183,6 +1183,15 @@ static int boxes_rewrite(int *looked) {
     return done;
 }
 
+/* (host/hl_talklog.c) what a box is: its text length (0: none readable), whether the text has codes, and the box's class (vtable) */
+void hos_prompts_box_desc(uint64_t box, uint32_t *len, int *codes, uint64_t *vtable) {
+    uint64_t at;
+    uint32_t n = 0;
+    const uint8_t *s = box_text(box, &at, &n);
+    const uint64_t *vtp = (const uint64_t *)hos_guest_range(box, 8);
+    *len = s ? n : 0, *codes = s ? has_code(s, n) : 0, *vtable = vtp ? *vtp : 0;
+}
+
 /* nx2/oot_patches.py, as the game lays a text box out (f_8152aec0, before it looks at the box's status: laid out now) */
 void hos_prompts_text_layout(uint64_t box) {
     InterlockedIncrement(&calls_layout);
@@ -1195,6 +1204,11 @@ void hos_prompts_text_draw(uint64_t box) {
     static int first = 1;
     if (first) first = 0, hos_log("prompts: the first text box drawn since the start (box %#llx)", (unsigned long long)box);
     InterlockedIncrement(&calls_draw);
+    {   /* (host/hl_talklog.c: the first box after a talk request ends its measure) */
+        extern volatile int hos_talk_armed;
+        extern void hos_talk_box_drawn(uint64_t box);
+        if (hos_talk_armed) hos_talk_box_drawn(box);
+    }
     if (pending_n) box_drawn(box);
     if (text_rewrite(box)) mark_box(box, 0x20000 | 0x100000);
 }
