@@ -147,8 +147,9 @@ stutters more than usual. The second start is smooth again.
   not.
 * **A freeze of 1 to 2 seconds at the start of play**, and shorter ones when an area loads.
 * **The frame rate falls during a long session with many area changes** (about a quarter lower after ten areas; older
-  than this release; restarting the game restores it). The cause is found; `RX_VK_CAP_RECORDS_KEEP_S=10` in
-  `hookshot_env.txt` is an experimental cure, not on by default yet.
+  than this release; restarting the game restores it). One cause is found; `RX_VK_CAP_RECORDS_KEEP_S=10` in
+  `hookshot_env.txt` is an experimental cure for it that helped on one PC and not on another, so it is not on by
+  default.
 * **Above 60 fps, the pieces of a cut sign and other debris can fall slowly** on some PCs (reported at about 160 fps;
   normal at a 60 limit). Under investigation.
 * **A sign's or a chest's text can take 2 to 5 seconds to appear**, now and then (reported in Goron City). The game's
